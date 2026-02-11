@@ -145,6 +145,10 @@ class DisplacementDetector:
         Returns:
             DisplacementAnalysis with findings
         """
+        # Exclude the current still-forming candle from analysis
+        from . import exclude_forming_candle
+        df = exclude_forming_candle(df)
+        
         if len(df) < self.atr_period + 5:
             return DisplacementAnalysis(
                 recent_displacements=[],

@@ -232,7 +232,8 @@ class ClaudeTradeManager:
         take_profit: float,
         confidence: float = 0.7,
         setup_grade: str = "B",
-        order_type: str = "market"
+        order_type: str = "market",
+        trade_type: str = "intraday"
     ) -> TradePrecheck:
         """
         Comprehensive pre-trade validation.
@@ -268,11 +269,13 @@ class ClaudeTradeManager:
             try:
                 live_positions = await self.mt5.get_positions()
                 current_positions = len(live_positions) if live_positions else 0
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Could not fetch live positions: {e} — using internal tracker")
                 current_positions = len(self.position_manager.positions) if self.position_manager else 0
             
             is_pending = order_type in ('buy_limit', 'sell_limit', 'buy_stop', 'sell_stop')
             is_high_confidence = confidence >= 0.80
+            is_scalp = trade_type == 'scalp'
             
             if current_positions >= self.max_concurrent_positions:
                 if is_pending:
@@ -281,6 +284,14 @@ class ClaudeTradeManager:
                     warnings.append(
                         f"At position limit ({current_positions}/{self.max_concurrent_positions}) "
                         f"- pending order allowed (slot used on fill)"
+                    )
+                elif is_scalp and current_positions <= self.max_concurrent_positions + 1:
+                    # Scalps are fast in-and-out (<30 min); allow 1 extra slot
+                    # since they'll close quickly and free the slot
+                    warnings.append(
+                        f"Position limit override for SCALP: "
+                        f"({current_positions}/{self.max_concurrent_positions} positions, "
+                        f"+1 allowed for scalps — fast exit expected)"
                     )
                 elif is_high_confidence and current_positions <= self.max_concurrent_positions + 1:
                     # Allow 1 extra position for very high-confidence signals (A+/A setups)
@@ -306,8 +317,8 @@ class ClaudeTradeManager:
             )
             
             # 3. Margin validation
-            order_type = "buy" if direction == "long" else "sell"
-            margin_check = await self.validate_margin(symbol, initial_size.lots, order_type)
+            margin_action = "buy" if direction == "long" else "sell"
+            margin_check = await self.validate_margin(symbol, initial_size.lots, margin_action)
             
             if not margin_check.can_trade:
                 # Instead of blocking, check if we can trade a smaller size
@@ -392,16 +403,19 @@ class ClaudeTradeManager:
                 blockers.append("Position size too small after constraints")
                 recommended_lots = 0
             
-            # 6. Risk check
+            # 6. Risk check — R:R thresholds vary by trade type
             rr_ratio = self.risk_manager.calculate_risk_reward(entry_price, stop_loss, take_profit)
             risk_check = {
                 "risk_amount": initial_size.risk_amount,
                 "risk_percent": initial_size.risk_percentage * 100,
-                "rr_ratio": rr_ratio
+                "rr_ratio": rr_ratio,
+                "trade_type": trade_type
             }
             
-            if rr_ratio < 1.5:
-                warnings.append(f"Low R:R ratio: {rr_ratio:.2f}")
+            _rr_warn_thresholds = {'scalp': 1.2, 'intraday': 1.5, 'swing': 2.0}
+            _rr_warn = _rr_warn_thresholds.get(trade_type, 1.5)
+            if rr_ratio < _rr_warn:
+                warnings.append(f"Low R:R ratio for {trade_type}: {rr_ratio:.2f} (warn < {_rr_warn:.1f})")
             
             # 7. Confidence check
             if confidence < 0.6:

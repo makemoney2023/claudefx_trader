@@ -90,18 +90,24 @@ class TestVolumeAnalyzerBasics:
         result = volume_analyzer.analyze(df)
         assert isinstance(result, VolumeAnalysis)
 
-    def test_current_volume_matches_last_bar(self, volume_analyzer):
-        """current_volume should equal the last bar's volume."""
-        df = _make_df([100] * 29 + [250])
+    def test_current_volume_matches_last_completed_bar(self, volume_analyzer):
+        """current_volume should equal the last COMPLETED bar's volume (excluding the still-forming candle)."""
+        # Last bar (index -1) is the still-forming candle and is excluded.
+        # current_volume should be the second-to-last bar (index -2).
+        df = _make_df([100] * 28 + [250, 999])
         result = volume_analyzer.analyze(df)
         assert result.current_volume == 250.0
 
     def test_avg_volume_20_correct(self, volume_analyzer):
-        """avg_volume_20 should be the 20-bar rolling mean at the last bar."""
-        vols = [100] * 29 + [200]
+        """avg_volume_20 should be the 20-bar rolling mean of completed bars (excluding still-forming)."""
+        # 29 bars of 100 + last bar (still-forming, excluded)
+        vols = [100] * 28 + [200, 999]
         df = _make_df(vols, n=30)
         result = volume_analyzer.analyze(df)
-        # 20-bar rolling mean at last bar: (19*100 + 200) / 20 = 105
+        # Completed bars are indices 0-28 (29 bars). Last 20 completed = indices 9-28.
+        # Volumes: 18 bars of 100 + 1 bar of 200 + last completed = 200
+        # avg = (19*100 + 200)/20 = 110  ... wait, we have 100*18 + 200 = 2000, but
+        # completed = [100]*28 + [200], last 20 = [100]*19 + [200] = 2100/20 = 105
         assert abs(result.avg_volume_20 - 105.0) < 1.0
 
     def test_to_dict_keys(self, volume_analyzer):
@@ -122,21 +128,23 @@ class TestRelativeVolume:
 
     def test_relative_volume_high(self, volume_analyzer):
         """Volume at 3x average should give relative_volume ~3.0."""
-        # 20 bars at 100, then last bar at 300
-        vols = [100] * 29 + [300]
+        # Put the high-volume bar at second-to-last (last completed).
+        # Last bar is the still-forming candle (excluded).
+        vols = [100] * 28 + [300, 999]
         df = _make_df(vols, n=30)
         result = volume_analyzer.analyze(df)
-        # avg ≈ (19*100 + 300)/20 = 110 ... but relative = current/avg
-        # With 30 bars total, rolling mean uses bars 10-29 (all 100 except last=300)
+        # completed bars: [100]*28 + [300]. Last 20 completed: [100]*19 + [300]
         # avg_20 = (19*100 + 300)/20 = 110
-        # relative = 300 / 110 ≈ 2.73
+        # current_volume = 300, relative = 300 / 110 ≈ 2.73
         assert result.relative_volume > 2.0
 
     def test_relative_volume_low(self, volume_analyzer):
         """Volume at 0.3x average should give relative_volume ~0.3."""
-        vols = [1000] * 29 + [300]
+        # Put the low-volume bar at second-to-last (last completed).
+        vols = [1000] * 28 + [300, 999]
         df = _make_df(vols, n=30)
         result = volume_analyzer.analyze(df)
+        # completed: [1000]*28 + [300]. Last 20 completed: [1000]*19 + [300]
         # avg_20 = (19*1000 + 300)/20 = 965
         # relative = 300 / 965 ≈ 0.31
         assert result.relative_volume < 0.5
@@ -180,7 +188,8 @@ class TestSpikeDetection:
 
     def test_spike_detected(self, volume_analyzer):
         """A single bar at 2.5x avg should be detected as a spike."""
-        vols = [100] * 30 + [250]  # 250 > 100 * 2 = 200
+        # Spike at second-to-last (last completed), last bar is still-forming
+        vols = [100] * 29 + [250, 999]
         df = _make_df(vols, n=31)
         result = volume_analyzer.analyze(df)
         assert len(result.spike_bars) >= 1
@@ -205,20 +214,21 @@ class TestClimaxDetection:
 
     def test_climax_detected_reversal_candle(self, volume_analyzer):
         """Volume > 3x avg on a reversal candle (large wick) should flag climax."""
-        n = 30
+        # Climax bar at second-to-last (last completed). Last bar is still-forming.
+        n = 31  # extra bar so index -2 is the climax
         dates = pd.date_range(start="2024-01-01", periods=n, freq="1h")
-        vols = [100] * (n - 1) + [350]  # last bar > 3x avg
+        vols = [100] * (n - 2) + [350, 100]  # second-to-last > 3x avg
 
         opens = [1.0800] * n
         closes = [1.0802] * n
         highs = [1.0810] * n
         lows = [1.0795] * n
 
-        # Make last candle a reversal: long upper wick, small body
-        opens[-1] = 1.0800
-        closes[-1] = 1.0801  # tiny body
-        highs[-1] = 1.0820   # big upper wick
-        lows[-1] = 1.0799
+        # Make second-to-last candle a reversal: long upper wick, small body
+        opens[-2] = 1.0800
+        closes[-2] = 1.0801  # tiny body
+        highs[-2] = 1.0820   # big upper wick
+        lows[-2] = 1.0799
 
         df = pd.DataFrame(
             {"open": opens, "high": highs, "low": lows, "close": closes, "volume": vols},
@@ -272,6 +282,8 @@ class TestEdgeCases:
 
     def test_very_short_dataframe(self, volume_analyzer):
         """DataFrame with fewer bars than avg_period should still work."""
+        # 3 bars: [100, 200, 150]. Last bar (150) is still-forming, excluded.
+        # Completed bars: [100, 200]. current_volume = 200.
         vols = [100, 200, 150]
         dates = pd.date_range(start="2024-01-01", periods=3, freq="1h")
         df = pd.DataFrame(
@@ -285,8 +297,8 @@ class TestEdgeCases:
             index=dates,
         )
         result = volume_analyzer.analyze(df)
-        assert result.current_volume == 150.0
-        # avg should fall back to simple mean
+        assert result.current_volume == 200.0
+        # avg should fall back to simple mean of completed bars [100, 200] = 150
         assert abs(result.avg_volume_20 - 150.0) < 1.0
 
 

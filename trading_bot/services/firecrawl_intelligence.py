@@ -391,81 +391,60 @@ class FirecrawlIntelligenceService:
             return None
         
         try:
-            logger.info("🔍 Starting Deep Research: Geopolitical Risk Analysis...")
+            logger.info("🔍 Starting Deep Research: Geopolitical Risk Analysis (via search)...")
             
-            # Use Agent with structured schema for autonomous research
-            schema = {
-                "type": "object",
-                "properties": {
-                    "risk_level": {"type": "string", "description": "Overall risk: low, medium, high, extreme"},
-                    "events": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "headline": {"type": "string"},
-                                "source": {"type": "string"},
-                                "impact_level": {"type": "string"},
-                                "affected_currencies": {"type": "array", "items": {"type": "string"}},
-                                "summary": {"type": "string"},
-                                "region": {"type": "string"}
-                            }
-                        }
-                    },
-                    "trading_recommendation": {"type": "string"},
-                    "safe_haven_demand": {"type": "string"},
-                    "risk_currencies_warning": {"type": "string"}
-                },
-                "required": ["risk_level", "events", "trading_recommendation"]
-            }
-            
-            prompt = """Research current geopolitical events affecting global forex markets.
-            
-Include analysis of:
-- Active military conflicts, wars, or escalations
-- Sanctions and trade restrictions
-- Political instability or elections in major economies
-- Trade tensions between major powers (US, China, EU)
-- Energy supply disruptions
-- Terrorist threats or security concerns
-
-Assess impact on major currencies: USD, EUR, GBP, JPY, CHF, AUD, CAD, NZD.
-Rate the overall risk level and provide specific trading recommendations.
-Identify safe haven flows (JPY, CHF, Gold, USD)."""
-
-            # Run agent (blocking call wrapped in thread for async)
-            result = await asyncio.to_thread(
-                lambda: self.client.agent(
-                    prompt=prompt,
-                    schema=schema
+            # Use search instead of agent to save credits
+            results = await asyncio.to_thread(
+                lambda: self.client.search(
+                    query="geopolitical risk forex war sanctions trade tensions military conflict 2026",
+                    limit=5
                 )
             )
             
-            # Parse result
-            if hasattr(result, 'data') and result.data:
-                data = result.data
-            elif isinstance(result, dict) and result.get('data'):
-                data = result['data']
-            else:
-                data = result if isinstance(result, dict) else {}
+            normalized = self._normalize_search_results(results)
             
-            # Create structured response
+            # Parse search results into events
+            events = []
+            risk_keywords_extreme = ['nuclear', 'invasion', 'war declared', 'massive attack']
+            risk_keywords_high = ['war', 'military strike', 'sanctions imposed', 'conflict escalates', 'troops deployed']
+            risk_keywords_medium = ['tensions', 'trade war', 'tariffs', 'crisis', 'threat']
+            
+            all_text = ""
+            for item in normalized[:10]:
+                title = item.get('title', '')
+                desc = item.get('description', '')[:200]
+                url = item.get('url', '')
+                all_text += f" {title} {desc}"
+                
+                if title:
+                    events.append(GeopoliticalEvent(
+                        headline=title,
+                        source=self._extract_source_from_url(url),
+                        impact_level='high' if any(kw in title.lower() for kw in risk_keywords_high) else 'medium',
+                        affected_currencies=[],
+                        summary=desc,
+                        region='Global'
+                    ))
+            
+            # Determine risk level from all text
+            all_lower = all_text.lower()
+            if any(kw in all_lower for kw in risk_keywords_extreme):
+                risk_level = 'extreme'
+            elif any(kw in all_lower for kw in risk_keywords_high):
+                risk_level = 'high'
+            elif any(kw in all_lower for kw in risk_keywords_medium):
+                risk_level = 'medium'
+            else:
+                risk_level = 'low'
+            
+            safe_haven = 'elevated' if risk_level in ('high', 'extreme') else 'normal'
+            
             analysis = GeopoliticalAnalysis(
-                risk_level=data.get('risk_level', 'medium'),
-                events=[
-                    GeopoliticalEvent(
-                        headline=e.get('headline', ''),
-                        source=e.get('source', 'Unknown'),
-                        impact_level=e.get('impact_level', 'medium'),
-                        affected_currencies=e.get('affected_currencies', []),
-                        summary=e.get('summary', ''),
-                        region=e.get('region', 'Global')
-                    )
-                    for e in data.get('events', [])[:10]
-                ],
-                trading_recommendation=data.get('trading_recommendation', 'Normal trading conditions'),
-                safe_haven_demand=data.get('safe_haven_demand', 'normal'),
-                risk_currencies_warning=data.get('risk_currencies_warning', '')
+                risk_level=risk_level,
+                events=events[:10],
+                trading_recommendation=f"Risk level {risk_level} — {'reduce position sizes, favor safe havens' if risk_level in ('high', 'extreme') else 'normal trading conditions'}",
+                safe_haven_demand=safe_haven,
+                risk_currencies_warning='Avoid AUD, NZD, CAD during elevated geopolitical risk' if risk_level in ('high', 'extreme') else ''
             )
             
             self._update_cache(cache_key, analysis.model_dump(), ttl_override=30)
@@ -495,113 +474,63 @@ Identify safe haven flows (JPY, CHF, Gold, USD)."""
             return None
         
         try:
-            logger.info("🔍 Starting Deep Research: Central Bank Policy Analysis...")
+            logger.info("🔍 Starting Deep Research: Central Bank Policy Analysis (via search)...")
             
-            schema = {
-                "type": "object",
-                "properties": {
-                    "fed": {
-                        "type": "object",
-                        "properties": {
-                            "bank": {"type": "string"},
-                            "stance": {"type": "string"},
-                            "current_rate": {"type": "number"},
-                            "expected_action": {"type": "string"},
-                            "key_statement": {"type": "string"},
-                            "currency_impact": {"type": "string"}
-                        }
-                    },
-                    "ecb": {
-                        "type": "object",
-                        "properties": {
-                            "bank": {"type": "string"},
-                            "stance": {"type": "string"},
-                            "current_rate": {"type": "number"},
-                            "expected_action": {"type": "string"},
-                            "key_statement": {"type": "string"},
-                            "currency_impact": {"type": "string"}
-                        }
-                    },
-                    "boe": {
-                        "type": "object",
-                        "properties": {
-                            "bank": {"type": "string"},
-                            "stance": {"type": "string"},
-                            "current_rate": {"type": "number"},
-                            "expected_action": {"type": "string"},
-                            "key_statement": {"type": "string"},
-                            "currency_impact": {"type": "string"}
-                        }
-                    },
-                    "boj": {
-                        "type": "object",
-                        "properties": {
-                            "bank": {"type": "string"},
-                            "stance": {"type": "string"},
-                            "current_rate": {"type": "number"},
-                            "expected_action": {"type": "string"},
-                            "key_statement": {"type": "string"},
-                            "currency_impact": {"type": "string"}
-                        }
-                    },
-                    "divergence_plays": {"type": "array", "items": {"type": "string"}},
-                    "overall_bias": {"type": "string"}
-                },
-                "required": ["fed", "ecb", "overall_bias"]
-            }
-            
-            prompt = """Research the latest monetary policy from major central banks:
-
-1. Federal Reserve (Fed) - USD
-2. European Central Bank (ECB) - EUR  
-3. Bank of England (BOE) - GBP
-4. Bank of Japan (BOJ) - JPY
-
-For each bank, analyze:
-- Current policy stance (hawkish, dovish, neutral)
-- Current interest rate
-- Expected next action (hike, cut, hold)
-- Key recent statements or speeches
-- Currency impact outlook
-
-Also identify policy divergence opportunities between pairs.
-Note which currency pairs benefit from rate differentials."""
-
-            result = await asyncio.to_thread(
-                lambda: self.client.agent(
-                    prompt=prompt,
-                    schema=schema
+            # Use search instead of agent to save credits
+            results = await asyncio.to_thread(
+                lambda: self.client.search(
+                    query="Federal Reserve ECB BOE BOJ monetary policy rate decision interest rate 2026",
+                    limit=5
                 )
             )
             
-            # Parse result
-            if hasattr(result, 'data') and result.data:
-                data = result.data
-            elif isinstance(result, dict) and result.get('data'):
-                data = result['data']
-            else:
-                data = result if isinstance(result, dict) else {}
+            normalized = self._normalize_search_results(results)
+            all_text = ' '.join([
+                f"{item.get('title', '')} {item.get('description', '')}"
+                for item in normalized
+            ]).lower()
             
-            # Create central bank stances
-            def parse_bank_stance(bank_data: dict, default_bank: str) -> Optional[CentralBankStance]:
-                if not bank_data:
-                    return None
-                return CentralBankStance(
-                    bank=bank_data.get('bank', default_bank),
-                    stance=bank_data.get('stance', 'neutral'),
-                    current_rate=bank_data.get('current_rate'),
-                    expected_action=bank_data.get('expected_action', 'hold'),
-                    key_statement=bank_data.get('key_statement', ''),
-                    currency_impact=bank_data.get('currency_impact', 'neutral')
-                )
+            # Detect stances from search text
+            def detect_stance(text: str, bank_keywords: list) -> str:
+                bank_text = ' '.join([s for s in text.split('.') if any(kw in s.lower() for kw in bank_keywords)])
+                if any(w in bank_text for w in ['hawkish', 'hike', 'tighten', 'raising']):
+                    return 'hawkish'
+                elif any(w in bank_text for w in ['dovish', 'cut', 'easing', 'lower']):
+                    return 'dovish'
+                return 'neutral'
+            
+            fed_stance = detect_stance(all_text, ['fed', 'federal reserve', 'powell', 'fomc'])
+            ecb_stance = detect_stance(all_text, ['ecb', 'european central bank', 'lagarde'])
+            boe_stance = detect_stance(all_text, ['boe', 'bank of england', 'bailey'])
+            boj_stance = detect_stance(all_text, ['boj', 'bank of japan', 'ueda'])
+            
+            # Build summary from search headlines
+            headlines = [item.get('title', '') for item in normalized if item.get('title')]
+            summary = '; '.join(headlines[:3]) if headlines else 'No recent policy updates found'
             
             analysis = CentralBankAnalysis(
-                fed=parse_bank_stance(data.get('fed', {}), 'Federal Reserve'),
-                ecb=parse_bank_stance(data.get('ecb', {}), 'ECB'),
-                boe=parse_bank_stance(data.get('boe', {}), 'Bank of England'),
-                boj=parse_bank_stance(data.get('boj', {}), 'Bank of Japan'),
-                divergence_plays=data.get('divergence_plays', []),
-                overall_bias=data.get('overall_bias', 'mixed')
+                fed=CentralBankStance(
+                    bank='Federal Reserve', stance=fed_stance, current_rate=None,
+                    expected_action='hold', key_statement=summary[:200],
+                    currency_impact='bullish USD' if fed_stance == 'hawkish' else ('bearish USD' if fed_stance == 'dovish' else 'neutral')
+                ),
+                ecb=CentralBankStance(
+                    bank='ECB', stance=ecb_stance, current_rate=None,
+                    expected_action='hold', key_statement='',
+                    currency_impact='bullish EUR' if ecb_stance == 'hawkish' else ('bearish EUR' if ecb_stance == 'dovish' else 'neutral')
+                ),
+                boe=CentralBankStance(
+                    bank='Bank of England', stance=boe_stance, current_rate=None,
+                    expected_action='hold', key_statement='',
+                    currency_impact='neutral'
+                ),
+                boj=CentralBankStance(
+                    bank='Bank of Japan', stance=boj_stance, current_rate=None,
+                    expected_action='hold', key_statement='',
+                    currency_impact='neutral'
+                ),
+                divergence_plays=[],
+                overall_bias='mixed'
             )
             
             self._update_cache(cache_key, analysis.model_dump(), ttl_override=30)
@@ -631,118 +560,50 @@ Note which currency pairs benefit from rate differentials."""
             return None
         
         try:
-            logger.info("🔍 Starting Deep Research: Intermarket Correlations...")
+            logger.info("🔍 Starting Deep Research: Intermarket Correlations (via search)...")
             
-            schema = {
-                "type": "object",
-                "properties": {
-                    "spx": {
-                        "type": "object",
-                        "properties": {
-                            "market": {"type": "string"},
-                            "trend": {"type": "string"},
-                            "current_value": {"type": "number"},
-                            "change_percent": {"type": "number"}
-                        }
-                    },
-                    "vix": {
-                        "type": "object",
-                        "properties": {
-                            "market": {"type": "string"},
-                            "trend": {"type": "string"},
-                            "current_value": {"type": "number"},
-                            "change_percent": {"type": "number"}
-                        }
-                    },
-                    "dxy": {
-                        "type": "object",
-                        "properties": {
-                            "market": {"type": "string"},
-                            "trend": {"type": "string"},
-                            "current_value": {"type": "number"},
-                            "change_percent": {"type": "number"}
-                        }
-                    },
-                    "gold": {
-                        "type": "object",
-                        "properties": {
-                            "market": {"type": "string"},
-                            "trend": {"type": "string"},
-                            "current_value": {"type": "number"},
-                            "change_percent": {"type": "number"}
-                        }
-                    },
-                    "oil": {
-                        "type": "object",
-                        "properties": {
-                            "market": {"type": "string"},
-                            "trend": {"type": "string"},
-                            "current_value": {"type": "number"},
-                            "change_percent": {"type": "number"}
-                        }
-                    },
-                    "risk_environment": {"type": "string"},
-                    "correlations_normal": {"type": "boolean"},
-                    "anomalies": {"type": "array", "items": {"type": "string"}},
-                    "trading_implications": {"type": "array", "items": {"type": "string"}}
-                },
-                "required": ["risk_environment", "trading_implications"]
-            }
-            
-            prompt = """Analyze current intermarket correlations and risk sentiment:
-
-Markets to analyze:
-1. S&P 500 (SPX) - Risk appetite indicator
-2. VIX - Volatility/fear index
-3. Dollar Index (DXY) - USD strength
-4. Gold (XAU) - Safe haven
-5. Oil (WTI) - Risk/growth indicator
-
-Determine:
-- Current trend for each market (bullish, bearish, neutral)
-- Current values and recent changes
-- Overall risk environment (strong_risk_on, risk_on, neutral, risk_off, strong_risk_off)
-- Any correlation anomalies (e.g., stocks up but VIX also up)
-- Trading implications for forex:
-  - Risk-on favors: AUD, NZD, CAD
-  - Risk-off favors: JPY, CHF, USD
-  - Gold correlation with JPY, CHF"""
-
-            result = await asyncio.to_thread(
-                lambda: self.client.agent(
-                    prompt=prompt,
-                    schema=schema
+            # Use search instead of agent to save credits
+            results = await asyncio.to_thread(
+                lambda: self.client.search(
+                    query="SPX VIX DXY gold oil intermarket correlation risk sentiment forex 2026",
+                    limit=5
                 )
             )
             
-            # Parse result
-            if hasattr(result, 'data') and result.data:
-                data = result.data
-            elif isinstance(result, dict) and result.get('data'):
-                data = result['data']
-            else:
-                data = result if isinstance(result, dict) else {}
+            normalized = self._normalize_search_results(results)
+            all_text = ' '.join([
+                f"{item.get('title', '')} {item.get('description', '')}"
+                for item in normalized
+            ]).lower()
             
-            def parse_market_trend(market_data: dict, default_market: str) -> Optional[MarketTrend]:
-                if not market_data:
-                    return None
-                return MarketTrend(
-                    market=market_data.get('market', default_market),
-                    trend=market_data.get('trend', 'neutral'),
-                    current_value=market_data.get('current_value'),
-                    change_percent=market_data.get('change_percent')
-                )
+            # Detect risk environment from search text
+            if any(w in all_text for w in ['sell-off', 'crash', 'panic', 'fear', 'plunge']):
+                risk_env = 'strong_risk_off'
+            elif any(w in all_text for w in ['risk off', 'safe haven', 'decline', 'bearish']):
+                risk_env = 'risk_off'
+            elif any(w in all_text for w in ['rally', 'surge', 'record high', 'bullish', 'risk on']):
+                risk_env = 'risk_on'
+            else:
+                risk_env = 'neutral'
+            
+            implications = []
+            if risk_env in ('risk_off', 'strong_risk_off'):
+                implications = ['Favor JPY, CHF, USD safe havens', 'Reduce AUD, NZD, CAD exposure']
+            elif risk_env == 'risk_on':
+                implications = ['Favor AUD, NZD, CAD risk currencies', 'Reduce JPY, CHF positions']
+            else:
+                implications = ['Mixed signals — trade individual setups']
             
             analysis = IntermarketAnalysis(
-                spx=parse_market_trend(data.get('spx', {}), 'S&P 500'),
-                vix=parse_market_trend(data.get('vix', {}), 'VIX'),
-                dxy=parse_market_trend(data.get('dxy', {}), 'DXY'),
-                gold=parse_market_trend(data.get('gold', {}), 'Gold'),
-                oil=parse_market_trend(data.get('oil', {}), 'Oil'),
-                risk_environment=data.get('risk_environment', 'neutral'),
-                correlations_normal=data.get('correlations_normal', True),
-                anomalies=data.get('anomalies', []),
-                trading_implications=data.get('trading_implications', [])
+                spx=MarketTrend(market='S&P 500', trend='neutral', current_value=None, change_percent=None),
+                vix=MarketTrend(market='VIX', trend='neutral', current_value=None, change_percent=None),
+                dxy=MarketTrend(market='DXY', trend='neutral', current_value=None, change_percent=None),
+                gold=MarketTrend(market='Gold', trend='neutral', current_value=None, change_percent=None),
+                oil=MarketTrend(market='Oil', trend='neutral', current_value=None, change_percent=None),
+                risk_environment=risk_env,
+                correlations_normal=True,
+                anomalies=[],
+                trading_implications=implications
             )
             
             self._update_cache(cache_key, analysis.model_dump(), ttl_override=30)
@@ -773,78 +634,54 @@ Determine:
             return None
         
         try:
-            logger.info(f"🔍 Starting Deep Research: {symbol} Fundamentals...")
+            logger.info(f"🔍 Starting Deep Research: {symbol} Fundamentals (via search)...")
             
             # Determine base and quote currencies
             base = symbol[:3].upper()
             quote = symbol[3:6].upper() if len(symbol) >= 6 else "USD"
             
-            schema = {
-                "type": "object",
-                "properties": {
-                    "symbol": {"type": "string"},
-                    "base_currency": {"type": "string"},
-                    "quote_currency": {"type": "string"},
-                    "fundamental_bias": {"type": "string"},
-                    "key_drivers": {"type": "array", "items": {"type": "string"}},
-                    "upcoming_events": {"type": "array", "items": {"type": "string"}},
-                    "rate_differential": {"type": "number"},
-                    "rate_differential_trend": {"type": "string"},
-                    "economic_strength_comparison": {"type": "string"},
-                    "trade_recommendation": {"type": "string"},
-                    "confidence": {"type": "number"}
-                },
-                "required": ["symbol", "fundamental_bias", "key_drivers"]
-            }
-            
-            prompt = f"""Analyze the fundamental outlook for {symbol}:
-
-Base Currency: {base}
-Quote Currency: {quote}
-
-Research and provide:
-1. Current fundamental bias (bullish, bearish, neutral) for {symbol}
-2. Key fundamental drivers affecting this pair
-3. Upcoming economic events for both currencies
-4. Interest rate differential and its trend
-5. Relative economic strength comparison
-6. Trade recommendation based on fundamentals
-7. Confidence level (0-100)
-
-Consider:
-- GDP growth differentials
-- Inflation rates and central bank policy
-- Trade balance and current account
-- Political stability
-- Recent economic data releases"""
-
-            result = await asyncio.to_thread(
-                lambda: self.client.agent(
-                    prompt=prompt,
-                    schema=schema
+            # Use search instead of agent to save credits
+            results = await asyncio.to_thread(
+                lambda: self.client.search(
+                    query=f"{symbol} fundamental analysis outlook forecast {base} {quote} 2026",
+                    limit=5
                 )
             )
             
-            # Parse result
-            if hasattr(result, 'data') and result.data:
-                data = result.data
-            elif isinstance(result, dict) and result.get('data'):
-                data = result['data']
+            normalized = self._normalize_search_results(results)
+            all_text = ' '.join([
+                f"{item.get('title', '')} {item.get('description', '')}"
+                for item in normalized
+            ]).lower()
+            
+            # Extract key drivers from headlines
+            key_drivers = [item.get('title', '')[:100] for item in normalized if item.get('title')][:5]
+            
+            # Detect bias from search text
+            bullish_words = ['bullish', 'rally', 'surge', 'strong', 'upside', 'buy']
+            bearish_words = ['bearish', 'decline', 'weak', 'downside', 'sell', 'drop']
+            bull_count = sum(1 for w in bullish_words if w in all_text)
+            bear_count = sum(1 for w in bearish_words if w in all_text)
+            
+            if bull_count > bear_count + 1:
+                bias = 'bullish'
+            elif bear_count > bull_count + 1:
+                bias = 'bearish'
             else:
-                data = result if isinstance(result, dict) else {}
+                bias = 'neutral'
             
             analysis = SymbolFundamentals(
                 symbol=symbol,
                 base_currency=base,
                 quote_currency=quote,
-                fundamental_bias=data.get('fundamental_bias', 'neutral'),
-                key_drivers=data.get('key_drivers', []),
-                upcoming_events=data.get('upcoming_events', []),
-                rate_differential=data.get('rate_differential'),
-                rate_differential_trend=data.get('rate_differential_trend', 'stable'),
-                economic_strength_comparison=data.get('economic_strength_comparison', ''),
-                trade_recommendation=data.get('trade_recommendation', ''),
-                confidence=data.get('confidence', 50.0)
+                fundamental_bias=bias,
+                key_drivers=key_drivers,
+                upcoming_events=[],
+                rate_differential=None,
+                rate_differential_trend='stable',
+                economic_strength_comparison='',
+                trade_recommendation=f"Fundamental outlook: {bias} for {symbol}",
+                confidence=50.0
             )
             
             self._update_cache(cache_key, analysis.model_dump(), ttl_override=30)
@@ -991,62 +828,37 @@ Consider:
             return None
         
         try:
-            logger.info("📅 Extracting Economic Calendar...")
+            logger.info("📅 Fetching Economic Calendar (via search)...")
             
-            schema = {
-                "type": "object",
-                "properties": {
-                    "events": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "datetime": {"type": "string"},
-                                "currency": {"type": "string"},
-                                "event": {"type": "string"},
-                                "impact": {"type": "string"},
-                                "forecast": {"type": "string"},
-                                "previous": {"type": "string"}
-                            }
-                        }
-                    },
-                    "high_impact_count": {"type": "number"},
-                    "blackout_periods": {"type": "array", "items": {"type": "string"}}
-                },
-                "required": ["events"]
-            }
-            
-            # Use extract for structured data from known URLs
-            result = await asyncio.to_thread(
-                lambda: self.client.extract(
-                    urls=["https://www.forexfactory.com/calendar"],
-                    prompt="Extract all high and medium impact economic events for the next 7 days. Include datetime, currency, event name, impact level, forecast and previous values.",
-                    schema=schema,
-                    enable_web_search=True
+            # Use search instead of extract to save credits
+            results = await asyncio.to_thread(
+                lambda: self.client.search(
+                    query="forex high impact economic events this week FOMC NFP CPI GDP central bank decision",
+                    limit=5
                 )
             )
             
-            # Parse result
-            if hasattr(result, 'data') and result.data:
-                data = result.data
-            elif isinstance(result, dict) and result.get('data'):
-                data = result['data']
-            else:
-                data = result if isinstance(result, dict) else {}
+            normalized = self._normalize_search_results(results)
             
-            # Create structured events
+            # Parse events from search results
             events = []
-            for e in data.get('events', [])[:30]:  # Limit to 30 events
-                events.append(EconomicCalendarEvent(
-                    datetime=e.get('datetime', ''),
-                    currency=e.get('currency', ''),
-                    event=e.get('event', ''),
-                    impact=e.get('impact', 'medium'),
-                    forecast=e.get('forecast'),
-                    previous=e.get('previous')
-                ))
+            high_impact_keywords = ['fomc', 'nfp', 'non-farm', 'cpi', 'gdp', 'rate decision', 'inflation', 'employment']
             
-            # Find next major event
+            for item in normalized:
+                title = item.get('title', '')
+                desc = item.get('description', '')[:200]
+                
+                if title:
+                    impact = 'high' if any(kw in title.lower() for kw in high_impact_keywords) else 'medium'
+                    events.append(EconomicCalendarEvent(
+                        datetime='',
+                        currency='',
+                        event=title[:100],
+                        impact=impact,
+                        forecast=None,
+                        previous=None
+                    ))
+            
             high_impact = [e for e in events if e.impact.lower() == 'high']
             next_major = high_impact[0] if high_impact else None
             
@@ -1054,7 +866,7 @@ Consider:
                 events=events,
                 high_impact_count=len(high_impact),
                 next_major_event=next_major,
-                blackout_periods=data.get('blackout_periods', [])
+                blackout_periods=[]
             )
             
             self._update_cache(cache_key, calendar.model_dump(), ttl_override=15)
@@ -1082,64 +894,50 @@ Consider:
             return None
         
         try:
-            logger.info("📊 Extracting COT Positioning Data...")
+            logger.info("📊 Fetching COT Positioning Data (via search)...")
             
-            schema = {
-                "type": "object",
-                "properties": {
-                    "currencies": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "currency": {"type": "string"},
-                                "net_position": {"type": "number"},
-                                "change_weekly": {"type": "number"},
-                                "positioning": {"type": "string"},
-                                "extreme_level": {"type": "boolean"},
-                                "interpretation": {"type": "string"}
-                            }
-                        }
-                    },
-                    "key_insights": {"type": "array", "items": {"type": "string"}},
-                    "reversal_signals": {"type": "array", "items": {"type": "string"}}
-                },
-                "required": ["currencies"]
-            }
-            
-            result = await asyncio.to_thread(
-                lambda: self.client.extract(
-                    urls=["https://www.myfxbook.com/commitments-of-traders"],
-                    prompt="Extract Commitment of Traders data for major currencies: EUR, GBP, JPY, AUD, CAD, CHF, NZD. Include net speculative positions, weekly changes, whether positions are at extreme levels, and any reversal signals.",
-                    schema=schema,
-                    enable_web_search=True
+            # Use search instead of extract to save credits
+            results = await asyncio.to_thread(
+                lambda: self.client.search(
+                    query="COT commitment of traders latest forex speculative positioning EUR GBP JPY 2026",
+                    limit=3
                 )
             )
             
-            # Parse result
-            if hasattr(result, 'data') and result.data:
-                data = result.data
-            elif isinstance(result, dict) and result.get('data'):
-                data = result['data']
-            else:
-                data = result if isinstance(result, dict) else {}
+            normalized = self._normalize_search_results(results)
+            all_text = ' '.join([
+                f"{item.get('title', '')} {item.get('description', '')}"
+                for item in normalized
+            ]).lower()
             
-            # Create structured positioning
+            # Parse key insights from headlines
+            key_insights = [item.get('title', '')[:100] for item in normalized if item.get('title')][:5]
+            
+            # Build basic positioning from search text for major currencies
             currencies = []
-            for c in data.get('currencies', []):
-                currencies.append(InstitutionalPositioning(
-                    currency=c.get('currency', ''),
-                    net_position=c.get('net_position', 0),
-                    change_weekly=c.get('change_weekly', 0),
-                    positioning=c.get('positioning', 'neutral'),
-                    extreme_level=c.get('extreme_level', False),
-                    interpretation=c.get('interpretation', '')
-                ))
+            for currency in ['EUR', 'GBP', 'JPY', 'AUD', 'CAD', 'CHF', 'NZD']:
+                if currency.lower() in all_text:
+                    # Detect positioning from text context
+                    if any(w in all_text for w in [f'{currency.lower()} long', f'{currency.lower()} bullish', f'buy {currency.lower()}']):
+                        pos = 'long'
+                    elif any(w in all_text for w in [f'{currency.lower()} short', f'{currency.lower()} bearish', f'sell {currency.lower()}']):
+                        pos = 'short'
+                    else:
+                        pos = 'neutral'
+                    
+                    currencies.append(InstitutionalPositioning(
+                        currency=currency,
+                        net_position=0,
+                        change_weekly=0,
+                        positioning=pos,
+                        extreme_level=False,
+                        interpretation=f"Positioning derived from search results"
+                    ))
             
             cot = COTAnalysis(
                 currencies=currencies,
-                key_insights=data.get('key_insights', []),
-                reversal_signals=data.get('reversal_signals', [])
+                key_insights=key_insights,
+                reversal_signals=[]
             )
             
             self._update_cache(cache_key, cot.model_dump(), ttl_override=60)
@@ -1167,82 +965,56 @@ Consider:
             return None
         
         try:
-            logger.info("💰 Extracting Interest Rate Expectations...")
+            logger.info("💰 Fetching Interest Rate Expectations (via search)...")
             
-            schema = {
-                "type": "object",
-                "properties": {
-                    "fed": {
-                        "type": "object",
-                        "properties": {
-                            "bank": {"type": "string"},
-                            "currency": {"type": "string"},
-                            "current_rate": {"type": "number"},
-                            "next_meeting_date": {"type": "string"},
-                            "expected_rate": {"type": "number"},
-                            "hike_probability": {"type": "number"},
-                            "cut_probability": {"type": "number"},
-                            "hold_probability": {"type": "number"},
-                            "terminal_rate": {"type": "number"},
-                            "currency_impact": {"type": "string"}
-                        }
-                    },
-                    "ecb": {
-                        "type": "object",
-                        "properties": {
-                            "bank": {"type": "string"},
-                            "currency": {"type": "string"},
-                            "current_rate": {"type": "number"},
-                            "hike_probability": {"type": "number"},
-                            "cut_probability": {"type": "number"},
-                            "hold_probability": {"type": "number"}
-                        }
-                    },
-                    "rate_differentials": {"type": "object"},
-                    "carry_trade_outlook": {"type": "string"}
-                },
-                "required": ["fed"]
-            }
-            
-            result = await asyncio.to_thread(
-                lambda: self.client.extract(
-                    urls=["https://www.cmegroup.com/markets/interest-rates/cme-fedwatch-tool.html"],
-                    prompt="Extract interest rate expectations from FedWatch tool. Include current rates, probabilities for next meeting (hike/cut/hold), and any terminal rate expectations. Also note currency implications.",
-                    schema=schema,
-                    enable_web_search=True
+            # Use search instead of extract to save credits
+            results = await asyncio.to_thread(
+                lambda: self.client.search(
+                    query="Fed funds rate probability expectations CME FedWatch rate cut hike 2026",
+                    limit=3
                 )
             )
             
-            # Parse result
-            if hasattr(result, 'data') and result.data:
-                data = result.data
-            elif isinstance(result, dict) and result.get('data'):
-                data = result['data']
-            else:
-                data = result if isinstance(result, dict) else {}
+            normalized = self._normalize_search_results(results)
+            all_text = ' '.join([
+                f"{item.get('title', '')} {item.get('description', '')}"
+                for item in normalized
+            ]).lower()
             
-            # Create structured expectations
-            def parse_rate_expectation(rate_data: dict, default_bank: str, default_currency: str) -> Optional[RateExpectation]:
-                if not rate_data:
-                    return None
-                return RateExpectation(
-                    bank=rate_data.get('bank', default_bank),
-                    currency=rate_data.get('currency', default_currency),
-                    current_rate=rate_data.get('current_rate', 0.0),
-                    next_meeting_date=rate_data.get('next_meeting_date'),
-                    expected_rate=rate_data.get('expected_rate'),
-                    hike_probability=rate_data.get('hike_probability', 0.0),
-                    cut_probability=rate_data.get('cut_probability', 0.0),
-                    hold_probability=rate_data.get('hold_probability', 100.0),
-                    terminal_rate=rate_data.get('terminal_rate'),
-                    currency_impact=rate_data.get('currency_impact', 'neutral')
-                )
+            # Detect Fed stance from search text
+            if any(w in all_text for w in ['rate cut', 'cutting', 'dovish pivot', 'easing']):
+                fed_impact = 'bearish USD — rate cuts expected'
+                cut_prob = 60.0
+                hold_prob = 30.0
+                hike_prob = 10.0
+            elif any(w in all_text for w in ['rate hike', 'raising', 'hawkish', 'tightening']):
+                fed_impact = 'bullish USD — rate hikes expected'
+                cut_prob = 10.0
+                hold_prob = 30.0
+                hike_prob = 60.0
+            else:
+                fed_impact = 'neutral — rates on hold'
+                cut_prob = 20.0
+                hold_prob = 60.0
+                hike_prob = 20.0
             
             rates = RateExpectations(
-                fed=parse_rate_expectation(data.get('fed', {}), 'Federal Reserve', 'USD'),
-                ecb=parse_rate_expectation(data.get('ecb', {}), 'ECB', 'EUR'),
-                rate_differentials=data.get('rate_differentials', {}),
-                carry_trade_outlook=data.get('carry_trade_outlook', '')
+                fed=RateExpectation(
+                    bank='Federal Reserve', currency='USD', current_rate=0.0,
+                    next_meeting_date=None, expected_rate=None,
+                    hike_probability=hike_prob, cut_probability=cut_prob,
+                    hold_probability=hold_prob, terminal_rate=None,
+                    currency_impact=fed_impact
+                ),
+                ecb=RateExpectation(
+                    bank='ECB', currency='EUR', current_rate=0.0,
+                    next_meeting_date=None, expected_rate=None,
+                    hike_probability=20.0, cut_probability=20.0,
+                    hold_probability=60.0, terminal_rate=None,
+                    currency_impact='neutral'
+                ),
+                rate_differentials={},
+                carry_trade_outlook='Based on search results; check CME FedWatch for precise probabilities'
             )
             
             self._update_cache(cache_key, rates.model_dump(), ttl_override=30)

@@ -184,6 +184,10 @@ class IPDATracker:
         Returns:
             Updated IPDAAnalysis
         """
+        # Exclude the current still-forming candle from analysis
+        from . import exclude_forming_candle
+        df = exclude_forming_candle(df)
+        
         if len(df) < 2:
             return self._analysis
         

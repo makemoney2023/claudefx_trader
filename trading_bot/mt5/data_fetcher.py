@@ -123,7 +123,7 @@ class DataFetcher:
             Dict of timeframe -> DataFrame
         """
         if timeframes is None:
-            timeframes = [settings.timeframes.htf, settings.timeframes.ltf]
+            timeframes = [settings.timeframes.higher_tf, settings.timeframes.execution_tf]
         
         data = {}
         

@@ -73,6 +73,11 @@ TRADE_SIGNAL_TOOL = {
                 "enum": ["bullish", "bearish", "ranging"],
                 "description": "Current market structure"
             },
+            "trade_type": {
+                "type": "string",
+                "enum": ["scalp", "intraday", "swing"],
+                "description": "REQUIRED: Classify this trade based on setup timeframe. 'scalp' = M5/M1 setup, target 5-20 pips, hold <30 min. 'intraday' = M15/H1 setup, target 20-80 pips, hold <8 hrs. 'swing' = H4/D1 setup, target 80+ pips, hold 1-5 days."
+            },
             "order_type": {
                 "type": "string",
                 "enum": ["market", "buy_limit", "sell_limit", "buy_stop", "sell_stop"],
@@ -118,7 +123,7 @@ TRADE_SIGNAL_TOOL = {
                 "description": "Risk factors or concerns"
             }
         },
-        "required": ["direction", "confidence", "reasoning", "market_structure"]
+        "required": ["direction", "confidence", "reasoning", "market_structure", "trade_type"]
     }
 }
 
@@ -141,6 +146,9 @@ class TradeSignal:
     order_blocks: List[str] = field(default_factory=list)
     fvg_zones: List[str] = field(default_factory=list)
     liquidity_targets: List[str] = field(default_factory=list)
+    
+    # Trade classification
+    trade_type: str = "intraday"    # scalp, intraday, swing
     
     # Pending order fields
     order_type: str = "market"      # market, buy_limit, sell_limit, buy_stop, sell_stop
@@ -170,6 +178,7 @@ class TradeSignal:
             "risk_reward": self.risk_reward,
             "reasoning": self.reasoning,
             "market_structure": self.market_structure,
+            "trade_type": self.trade_type,
             "order_blocks": self.order_blocks,
             "fvg_zones": self.fvg_zones,
             "liquidity_targets": self.liquidity_targets,
@@ -815,7 +824,7 @@ If you see a potential setup developing but price hasn't reached the ideal entry
 """
             
             # =============================================
-            # HIGHER TIMEFRAME CONTEXT (DO NOT IGNORE)
+            # FULL MULTI-TIMEFRAME CONTEXT (D1 → H4 → H1 → M15 → M5 → M1)
             # =============================================
             
             if market_data.get('htf_bias'):
@@ -832,43 +841,101 @@ If you see a potential setup developing but price hasn't reached the ideal entry
                         return f"⚠️ Insufficient data"
                 
                 prompt += f"""
-## Higher Timeframe Context
-- HTF Bias: {htf_bias}
+## Multi-Timeframe Analysis (Top-Down: D1 → H4 → H1 → M15 → M5 → M1)
+
+### Daily (D1) — Directional Narrative
+- D1 Bias: {str(market_data.get('d1_bias', 'N/A')).upper()}
+- D1 Structure: {market_data.get('d1_structure', 'N/A')}
+- D1 Trend: {market_data.get('d1_trend', 'N/A')}
+
+### 4-Hour (H4) — Intermediate Trend
+- H4 Bias: {str(market_data.get('h4_bias', 'N/A')).upper()}
 - H4 Structure: {market_data.get('h4_structure', 'N/A')}
+- H4 Trend: {market_data.get('h4_trend', 'N/A')}
+
+### 1-Hour (H1) — Swing Context
+- H1 Bias: {str(market_data.get('h1_bias', 'N/A')).upper()}
 - H1 Structure: {market_data.get('h1_structure', 'N/A')}
-- Timeframe Alignment: {"✅ YES" if market_data.get('htf_alignment') else "❌ NO - CONFLICTING TIMEFRAMES"}
+- H1 Trend: {market_data.get('h1_trend', 'N/A')}
+
+### Overall HTF Summary
+- Combined HTF Bias: {htf_bias}
+- Timeframe Alignment: {"✅ YES — D1/H4/H1 agree" if market_data.get('htf_alignment') else "❌ NO — CONFLICTING TIMEFRAMES across D1/H4/H1"}
 - Trade Long: {_format_direction_status(long_status, 'long')}
 - Trade Short: {_format_direction_status(short_status, 'short')}
 - Key HTF Levels: {market_data.get('htf_key_levels', [])}
 
 ⚠️ DIRECTIONAL GUIDANCE (not a hard block):
-- PREFER trading in the direction of the HTF bias -- it is your primary edge.
-- If HTF is BEARISH: prefer SHORT setups. For LONG setups, you need EXTRA
+- PREFER trading in the direction of the D1 bias -- it is your primary edge.
+- If D1 is BEARISH: prefer SHORT setups. For LONG setups, you need EXTRA
   confluence: full Tier 1 swing validation (4+ swings, rounding, sweep) on
   M5/M1, and reduce confidence by 10-15%.
-- If HTF is BULLISH: prefer LONG setups. For SHORT setups, same rule applies.
+- If D1 is BULLISH: prefer LONG setups. For SHORT setups, same rule applies.
 - Counter-trend reversals at key levels with full swing exhaustion validation
   are VALID high-probability trades. The swing validation framework exists
   precisely for this purpose -- to catch reversals!
-- If timeframes are NOT aligned, reduce confidence by 15%.
+- If D1/H4/H1 are NOT aligned, reduce confidence by 15%.
 - ALWAYS evaluate BOTH long AND short setups. Do not default to one side.
 """
             
             # =============================================
-            # LOWER TIMEFRAME CONTEXT (M5/M1 Precision)
+            # EXECUTION & ENTRY TIMEFRAMES (M15 → M5 → M1)
             # =============================================
             
-            if market_data.get('m5_bias') or market_data.get('m1_bias'):
+            has_ltf = any(market_data.get(k) for k in ['m15_bias', 'm5_bias', 'm1_bias'])
+            if has_ltf:
                 prompt += f"""
-## Lower Timeframe Context (M5/M1 -- YOUR ENTRY PRECISION TOOL)
-- M5 Bias: {market_data.get('m5_bias', 'N/A')}
+### 15-Minute (M15) — Execution Timeframe
+- M15 Bias: {str(market_data.get('m15_bias', 'N/A')).upper()}
+- M15 Structure: {market_data.get('m15_structure', 'N/A')}
+- M15 Trend: {market_data.get('m15_trend', 'N/A')}
+
+### 5-Minute (M5) — Entry Precision
+- M5 Bias: {str(market_data.get('m5_bias', 'N/A')).upper()}
 - M5 Structure: {market_data.get('m5_structure', 'N/A')}
 - M5 Trend: {market_data.get('m5_trend', 'N/A')}
-- M1 Bias: {market_data.get('m1_bias', 'N/A')}
+
+### 1-Minute (M1) — Sniper Entry
+- M1 Bias: {str(market_data.get('m1_bias', 'N/A')).upper()}
 - M1 Structure: {market_data.get('m1_structure', 'N/A')}
 - M1 Trend: {market_data.get('m1_trend', 'N/A')}
 
-⚠️ CRITICAL: M5/M1 data is your PRECISION TOOL for finding exact entry levels.
+⚠️ CRITICAL: Use M15 for intraday trade setup identification, M5/M1 for precision entries AND scalps.
+
+## Trade Type Classification (REQUIRED — you MUST set trade_type for every signal)
+
+### SCALP (trade_type = "scalp")
+- Setup identified on M5/M1 charts
+- Target: 5-20 pips (metals: 50-200 pips due to pip value), hold time <30 min
+- Valid when: M5/M1 shows a clean ICT setup (OB, FVG, sweep, displacement) even if
+  D1/H4 are ranging or unclear. Scalps do NOT require full HTF alignment.
+- Requirements: Must have at least 2 confluences on M5/M1 (e.g., OB + FVG, sweep + displacement)
+- SL: Tight — just beyond the M1 structure level (typically 5-15 pips)
+- R:R: Minimum 1.5:1 (lower threshold than intraday since high win-rate setups)
+- Confidence: Can be 60%+ with clean M5/M1 structure, no need for 75%+
+
+### INTRADAY (trade_type = "intraday")
+- Setup identified on M15/H1 charts, entry refined on M5/M1
+- Target: 20-80 pips (metals: 200-800 pips), hold time <8 hours
+- Valid when: H1 structure supports the trade direction, M15 shows entry setup
+- Requirements: H1 bias + M15 setup + M5/M1 entry confirmation
+- SL: Beyond the M15 structure level
+- R:R: Minimum 2:1
+
+### SWING (trade_type = "swing")
+- Setup identified on H4/D1 charts, entry on M15/H1
+- Target: 80+ pips (metals: 800+ pips), hold time 1-5 days
+- Valid when: D1 and H4 agree on direction with clear structure
+- Requirements: Full D1/H4/H1 alignment + key level confluence
+- SL: Beyond the H1/H4 structure level
+- R:R: Minimum 3:1
+
+⚠️ SCALP OPPORTUNITY RULE: When D1/H4 are ranging/unclear but M5/M1 shows
+a textbook ICT setup (clean sweep of liquidity + displacement + FVG/OB retest),
+you SHOULD signal a SCALP trade. Do NOT default to no_trade just because
+the higher timeframes lack a clear trend. Scalps are valid reactive trades
+on lower timeframe structure.
+
 You MUST use M5/M1 to:
 1. COUNT SWINGS into the POI (4-6 swing rule -- mandatory for reversals)
 2. IDENTIFY ROUNDING / CIRCULAR PRICE ACTION (dome/saucer patterns on M5/M1)
@@ -882,6 +949,34 @@ If M5/M1 shows structure aligning with your trade thesis, boost confidence.
 If M5/M1 shows structure AGAINST your thesis (e.g., bearish M1 for a long), reduce confidence.
 ALWAYS prefer PENDING ORDERS (buy_limit/sell_limit/buy_stop/sell_stop) at key levels
 over market orders for better risk:reward.
+
+## MANDATORY ANALYSIS WORKFLOW (follow this order)
+
+You MUST evaluate trade opportunities in this exact sequence:
+
+**PASS 1 — SWING CHECK (D1 + H4):**
+Do D1 and H4 agree on a clear directional bias with structure (BOS/CHoCH)?
+If YES → look for a SWING setup. Entry on H1/M15.
+
+**PASS 2 — INTRADAY CHECK (H1 + M15):**
+Does H1 show a clear trend/structure that M15 confirms?
+If YES → look for an INTRADAY setup. Entry refined on M5/M1.
+
+**PASS 3 — SCALP CHECK (M5 + M1) — DO NOT SKIP THIS:**
+Even if Pass 1 and Pass 2 found nothing (HTF ranging, no clear trend, misaligned),
+you MUST still examine the M5 and M1 charts for independent ICT setups:
+- Is there a liquidity sweep on M5/M1?
+- Is there displacement + FVG on M5/M1?
+- Is there an order block being tested on M1?
+- Is there a CHoCH/BOS on M5 with clean structure?
+If M5/M1 shows 2+ confluences → signal a SCALP trade with trade_type="scalp".
+
+**PASS 4 — NO TRADE (only after all 3 passes fail):**
+Only return no_trade if NONE of the above passes found a valid setup.
+
+⚠️ You MUST NOT skip Pass 3. If you are about to return no_trade, first
+re-examine the M5/M1 data and charts one more time for scalp opportunities.
+The most common mistake is ignoring clean M5/M1 setups because D1/H4 are unclear.
 """
             
             # =============================================
@@ -1341,6 +1436,13 @@ If you cannot point to at least two of these as ALREADY HAPPENED, you MUST retur
                         f"R:R enforcement in main.py will auto-extend TP to meet minimum ratio."
                     )
         
+        # Validate trade_type
+        valid_trade_types = {'scalp', 'intraday', 'swing'}
+        trade_type = str(tool_input.get('trade_type', 'intraday')).lower()
+        if trade_type not in valid_trade_types:
+            trade_type = 'intraday'
+        tool_input['trade_type'] = trade_type
+        
         # Validate order_type
         valid_order_types = {'market', 'buy_limit', 'sell_limit', 'buy_stop', 'sell_stop'}
         order_type = str(tool_input.get('order_type', 'market')).lower()
@@ -1402,6 +1504,7 @@ If you cannot point to at least two of these as ALREADY HAPPENED, you MUST retur
                 risk_reward=tool_input.get('risk_reward'),
                 reasoning=tool_input.get('reasoning', ''),
                 market_structure=tool_input.get('market_structure'),
+                trade_type=tool_input.get('trade_type', 'intraday'),
                 order_blocks=tool_input.get('order_blocks', []),
                 fvg_zones=tool_input.get('fvg_zones', []),
                 liquidity_targets=tool_input.get('liquidity_targets', []),
@@ -1458,6 +1561,7 @@ If you cannot point to at least two of these as ALREADY HAPPENED, you MUST retur
                     risk_reward=data.get('risk_reward'),
                     reasoning=data.get('reasoning', ''),
                     market_structure=data.get('market_structure'),
+                    trade_type=data.get('trade_type', 'intraday'),
                     order_blocks=data.get('order_blocks', []),
                     fvg_zones=data.get('fvg_zones', []),
                     liquidity_targets=data.get('liquidity_targets', []),
@@ -1750,8 +1854,8 @@ Respond with JSON:
         Pre-execution trade judge: validate a trade signal against learned
         patterns and risk math before committing capital.
         
-        Returns a verdict: APPROVE (proceed as-is) or DEMOTE (convert to
-        pending limit order at a tighter entry price).
+        Returns a verdict: APPROVE (proceed as-is), DEMOTE (convert to
+        pending limit order at a tighter entry price), or REJECT (skip entirely).
         
         Args:
             signal: Trade signal dict (symbol, direction, confidence, entry, SL, TP, reasoning)
@@ -1773,7 +1877,12 @@ Respond with JSON:
         stop_loss = signal.get('stop_loss', 0)
         take_profit = signal.get('take_profit', 0)
         order_type = signal.get('order_type', 'market')
+        trade_type = signal.get('trade_type', 'intraday')
         reasoning = str(signal.get('reasoning', ''))[:300]
+        
+        # R:R expectations per trade type
+        _rr_expectations = {'scalp': '1.5:1', 'intraday': '2:1', 'swing': '3:1'}
+        expected_rr = _rr_expectations.get(trade_type, '2:1')
         
         prompt = f"""You are a TRADE JUDGE — a risk-focused second opinion before a trade is executed with real money.
 
@@ -1782,12 +1891,19 @@ A trade analyst has proposed the following trade. Your job is to check it agains
 ## Proposed Trade
 - Symbol: {symbol}
 - Direction: {direction.upper()}
+- Trade Type: {trade_type.upper()}
 - Confidence: {confidence:.0%}
 - Entry Price: {entry_price}
 - Stop Loss: {stop_loss}
 - Take Profit: {take_profit}
 - Order Type: {order_type}
 - Reasoning: {reasoning}
+
+## Trade Type Context
+- This is a **{trade_type.upper()}** trade. Expected minimum R:R is {expected_rr}.
+- SCALP trades have tighter SL/TP and shorter hold times — this is NORMAL, do not penalize.
+- SWING trades should have wider SL/TP and require full HTF alignment.
+- Judge the R:R against the trade type's expected minimum, not a universal 3:1 standard.
 
 ## Risk Metrics
 - Account Balance: ${risk_metrics.get('account_balance', 0):.2f}
@@ -1809,7 +1925,8 @@ A trade analyst has proposed the following trade. Your job is to check it agains
 
 ## Rules
 - If confidence >= 90% AND no critical risk flags, you MUST verdict APPROVE.
-- Only verdict DEMOTE if you find a concrete, specific problem — not vague concerns.
+- Verdict DEMOTE if you find a concrete, specific problem with entry price — not vague concerns.
+- Verdict REJECT only for serious, deal-breaking issues (e.g., opposing HTF trend with no reversal confirmation, absurd R:R, already at max daily trades, critical risk flag).
 - DEMOTE means: convert to a pending limit order at a better entry price (tighter).
   - For LONG: suggested_entry should be BELOW current entry (buy cheaper).
   - For SHORT: suggested_entry should be ABOVE current entry (sell higher).
@@ -1820,7 +1937,7 @@ A trade analyst has proposed the following trade. Your job is to check it agains
 Respond ONLY with JSON:
 ```json
 {{
-    "verdict": "APPROVE" or "DEMOTE",
+    "verdict": "APPROVE" or "DEMOTE" or "REJECT",
     "reason": "<one sentence explanation>",
     "suggested_entry": <float price or null if APPROVE>,
     "risk_flags": ["<flag1>", "<flag2>"]
@@ -1847,7 +1964,7 @@ Respond ONLY with JSON:
             
             # Validate the response structure
             verdict = result.get('verdict', 'APPROVE').upper()
-            if verdict not in ('APPROVE', 'DEMOTE'):
+            if verdict not in ('APPROVE', 'DEMOTE', 'REJECT'):
                 logger.warning(f"[JUDGE] Invalid verdict '{verdict}', defaulting to APPROVE")
                 verdict = 'APPROVE'
             

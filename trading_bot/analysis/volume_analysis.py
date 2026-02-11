@@ -97,28 +97,49 @@ class VolumeAnalyzer:
             return result
 
         # --- basic metrics ---------------------------------------------------
-        result.current_volume = float(vol.iloc[-1])
-        result.avg_volume_20 = float(vol.rolling(self.avg_period).mean().iloc[-1]) if len(vol) >= self.avg_period else float(vol.mean())
+        # IMPORTANT: The last bar in MT5 data is the *current, still-forming*
+        # candle whose tick_volume is incomplete.  Comparing it against the
+        # 20-bar average of completed candles produces a misleadingly low
+        # relative_volume (typically 0.2x-0.4x even in active sessions).
+        # Fix: use the most recent COMPLETED bar (iloc[-2]) as "current" and
+        # compute the rolling average from completed bars only (exclude last).
+        if len(vol) >= 2:
+            completed_vol = vol.iloc[:-1]  # all completed bars
+            result.current_volume = float(completed_vol.iloc[-1])
+        else:
+            completed_vol = vol
+            result.current_volume = float(vol.iloc[-1])
+
+        if len(completed_vol) >= self.avg_period:
+            result.avg_volume_20 = float(
+                completed_vol.rolling(self.avg_period).mean().iloc[-1]
+            )
+        else:
+            result.avg_volume_20 = float(completed_vol.mean())
 
         if result.avg_volume_20 > 0:
             result.relative_volume = result.current_volume / result.avg_volume_20
         else:
             result.relative_volume = 0.0
 
-        # --- 10-bar SMA of volume (latest) -----------------------------------
-        if len(vol) >= self.trend_period:
-            result.volume_sma_10 = float(vol.rolling(self.trend_period).mean().iloc[-1])
+        # --- 10-bar SMA of volume (latest completed) -------------------------
+        if len(completed_vol) >= self.trend_period:
+            result.volume_sma_10 = float(
+                completed_vol.rolling(self.trend_period).mean().iloc[-1]
+            )
         else:
-            result.volume_sma_10 = float(vol.mean())
+            result.volume_sma_10 = float(completed_vol.mean())
 
         # --- volume trend (slope of SMA over last *trend_period* bars) --------
-        result.volume_trend = self._compute_trend(vol)
+        result.volume_trend = self._compute_trend(completed_vol)
 
         # --- spike detection --------------------------------------------------
-        result.spike_bars = self._detect_spikes(vol)
+        result.spike_bars = self._detect_spikes(completed_vol)
 
         # --- climax detection -------------------------------------------------
-        result.climax_detected = self._detect_climax(df, vol)
+        # Use completed bars for climax detection too
+        completed_df = df.iloc[:-1] if len(df) >= 2 else df
+        result.climax_detected = self._detect_climax(completed_df, completed_vol)
 
         return result
 

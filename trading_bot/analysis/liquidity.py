@@ -167,6 +167,10 @@ class LiquidityMapper:
         Returns:
             LiquidityAnalysis object with all findings
         """
+        # Exclude the current still-forming candle from analysis
+        from . import exclude_forming_candle
+        df = exclude_forming_candle(df)
+        
         logger.debug(f"Analyzing liquidity in {len(df)} candles")
         
         # Find swing points

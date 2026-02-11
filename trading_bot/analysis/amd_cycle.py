@@ -112,6 +112,10 @@ class AMDCycleAnalyzer:
         Returns:
             Current AMDCycleState
         """
+        # Exclude the current still-forming candle from analysis
+        from . import exclude_forming_candle
+        df = exclude_forming_candle(df)
+        
         if len(df) < 10:
             return self._current_state
         

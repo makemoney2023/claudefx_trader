@@ -165,7 +165,7 @@ class OrderManager:
             
         except Exception as e:
             logger.warning(f"Could not check spread for {symbol}: {e}")
-            return True, 0, 0  # Allow through on error
+            return False, 0, 0  # Block trade if spread can't be verified
     
     def set_mt5_client(self, client):
         """Set the MT5 client."""

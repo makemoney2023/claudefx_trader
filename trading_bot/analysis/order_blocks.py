@@ -168,6 +168,10 @@ class OrderBlockDetector:
         Returns:
             OrderBlockAnalysis object with all detected OBs
         """
+        # Exclude the current still-forming candle from analysis
+        from . import exclude_forming_candle
+        df = exclude_forming_candle(df)
+        
         logger.debug(f"Detecting Order Blocks in {len(df)} candles")
         
         bullish_obs = []

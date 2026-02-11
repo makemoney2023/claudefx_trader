@@ -404,7 +404,9 @@ class MT5Client:
             
         except Exception as e:
             logger.error(f"Error getting account info: {e}")
-            return self._get_simulated_account()
+            if self._use_simulation:
+                return self._get_simulated_account()
+            return None  # Don't fake data when connected to real MT5
     
     def _get_simulated_account(self) -> AccountInfo:
         """Return simulated account info."""
@@ -463,7 +465,9 @@ class MT5Client:
             
         except Exception as e:
             logger.error(f"Error getting symbol info: {e}")
-            return self._get_simulated_symbol(symbol)
+            if self._use_simulation:
+                return self._get_simulated_symbol(symbol)
+            return None  # Don't fake data when connected to real MT5
     
     def _get_simulated_symbol(self, symbol: str) -> SymbolInfo:
         """Return simulated symbol info."""
@@ -868,7 +872,9 @@ class MT5Client:
             
         except Exception as e:
             logger.error(f"Error getting OHLCV data: {e}")
-            return self._get_simulated_ohlcv(symbol, timeframe, count)
+            if self._use_simulation:
+                return self._get_simulated_ohlcv(symbol, timeframe, count)
+            return None  # Don't fake data when connected to real MT5
     
     def _get_simulated_ohlcv(self, symbol: str, timeframe: str, count: int) -> List[Dict[str, Any]]:
         """Generate simulated OHLCV data."""

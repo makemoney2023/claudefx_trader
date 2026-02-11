@@ -150,6 +150,10 @@ class MarketStructureAnalyzer:
         Returns:
             StructureAnalysis object with all findings
         """
+        # Exclude the current still-forming candle from analysis
+        from . import exclude_forming_candle
+        df = exclude_forming_candle(df)
+        
         logger.debug(f"Analyzing market structure for {len(df)} candles")
         
         # Find swing points

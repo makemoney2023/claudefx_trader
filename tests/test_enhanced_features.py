@@ -569,12 +569,12 @@ class TestSwingInClaudePrompt:
             analysis_data=None,
         )
 
-        assert "M5 Bias: bullish" in prompt, "M5 bias missing from prompt"
+        assert "M5 Bias: BULLISH" in prompt, "M5 bias missing from prompt"
         assert "M5 Structure: BOS" in prompt, "M5 structure missing from prompt"
-        assert "M1 Bias: bearish" in prompt, "M1 bias missing from prompt"
+        assert "M1 Bias: BEARISH" in prompt, "M1 bias missing from prompt"
         assert "M1 Structure: CHoCH" in prompt, "M1 structure missing from prompt"
-        assert "Lower Timeframe Context" in prompt, (
-            "Lower Timeframe Context header missing"
+        assert "5-Minute (M5)" in prompt, (
+            "M5 Entry Precision section header missing"
         )
 
     def test_build_analysis_prompt_no_m5_m1_when_absent(self):
@@ -598,7 +598,7 @@ class TestSwingInClaudePrompt:
             analysis_data=None,
         )
 
-        assert "Lower Timeframe Context" not in prompt, (
+        assert "5-Minute (M5)" not in prompt, (
             "LTF section should not appear when m5/m1 data is absent"
         )
 

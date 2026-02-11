@@ -258,6 +258,10 @@ class MTFAnalyzer:
                 trend='unknown'
             )
         
+        # Exclude the current still-forming candle from analysis
+        from . import exclude_forming_candle
+        df = exclude_forming_candle(df)
+        
         try:
             # Get market structure
             structure = self.structure_analyzer.analyze(df)

@@ -44,6 +44,9 @@ class Position:
     current_price: float = 0.0
     unrealized_pnl: float = 0.0
     
+    # Trade classification
+    trade_type: str = "intraday"  # scalp, intraday, swing
+    
     # Management
     initial_sl: float = 0.0
     be_triggered: bool = False
@@ -86,6 +89,7 @@ class Position:
             "ticket": self.ticket,
             "symbol": self.symbol,
             "direction": self.direction,
+            "trade_type": self.trade_type,
             "volume": self.volume,
             "entry_price": self.entry_price,
             "stop_loss": self.stop_loss,
@@ -197,6 +201,7 @@ class PositionManager:
                     'ticket': position.ticket,
                     'symbol': position.symbol,
                     'direction': position.direction,
+                    'trade_type': position.trade_type,
                     'volume': position.volume,
                     'entry_price': position.entry_price,
                     'stop_loss': position.stop_loss,
@@ -250,7 +255,8 @@ class PositionManager:
                         stop_loss=p.stop_loss,
                         take_profit=p.take_profit,
                         open_time=p.open_time,
-                        status=PositionStatus(p.status) if p.status else PositionStatus.OPEN
+                        status=PositionStatus(p.status) if p.status else PositionStatus.OPEN,
+                        trade_type=getattr(p, 'trade_type', 'intraday') or 'intraday',
                     )
                     position.initial_sl = p.initial_sl
                     position.be_triggered = p.be_triggered
@@ -417,6 +423,14 @@ class PositionManager:
         """
         r_multiple = position.current_r_multiple
         can_partial = position.volume >= 0.03  # Need at least 0.03 to split meaningfully
+        
+        # SCALP: No partial close management — MT5 TP will close full position.
+        # Just move to break-even at 0.5R for protection.
+        if getattr(position, 'trade_type', 'intraday') == 'scalp':
+            if not position.be_triggered and r_multiple >= 0.5:
+                logger.info(f"SCALP: Moving {position.ticket} to break-even at {r_multiple:.1f}R")
+                return await self._move_to_break_even(position)
+            return None  # Let MT5 TP handle the full close
         
         # Stage 0.5: If TP1 fired (partial close done) but break-even modification failed,
         # retry the break-even move. Without this, tp1_hit=True prevents re-entering Stage 1.
@@ -638,16 +652,41 @@ class PositionManager:
                 position.stop_loss = new_sl
                 position.be_triggered = True
                 position.status = PositionStatus.BREAK_EVEN
+                return {
+                    "action": "break_even",
+                    "success": True,
+                    "ticket": position.ticket,
+                    "new_sl": new_sl
+                }
+            else:
+                logger.warning(
+                    f"Break-even modification FAILED for {position.ticket}: "
+                    f"{getattr(result, 'message', 'unknown error')}"
+                )
+                return {
+                    "action": "break_even",
+                    "success": False,
+                    "ticket": position.ticket,
+                    "new_sl": new_sl,
+                    "error": getattr(result, 'message', 'MT5 rejected modification')
+                }
         
         return {
             "action": "break_even",
+            "success": False,
             "ticket": position.ticket,
-            "new_sl": new_sl
+            "new_sl": new_sl,
+            "error": "No order manager available"
         }
     
     async def _partial_close(self, position: Position) -> Dict[str, Any]:
         """Close partial position."""
-        close_volume = position.volume * self.partial_close_percent
+        close_volume = round(position.volume * self.partial_close_percent, 2)
+        
+        # Ensure minimum lot size
+        if close_volume < 0.01:
+            logger.warning(f"Partial close volume {close_volume} below minimum 0.01 for {position.ticket}")
+            close_volume = 0.01
         
         logger.info(f"Partial close position {position.ticket}: {close_volume} lots")
         
@@ -658,7 +697,7 @@ class PositionManager:
             )
             
             if result.success:
-                position.volume -= close_volume
+                position.volume = round(position.volume - close_volume, 2)
                 position.partial_closed = True
                 position.status = PositionStatus.PARTIAL_CLOSE
         

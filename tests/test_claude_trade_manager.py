@@ -206,6 +206,92 @@ class TestTradePrecheck:
         assert any("override" in w.lower() or "position limit" in w.lower() for w in result.warnings)
     
     @pytest.mark.asyncio
+    async def test_precheck_allows_scalp_override_at_position_limit(self):
+        """Test precheck allows +1 position for scalps at position limit."""
+        from trading_bot.services.claude_trade_manager import ClaudeTradeManager
+        
+        mock_mt5 = AsyncMock()
+        mock_mt5.get_account_info.return_value = MockAccountInfo()
+        mock_mt5.get_symbol_info.return_value = MockSymbolInfo()
+        mock_mt5.calc_margin.return_value = 108.50
+        # Return 5 live positions from MT5 (at the max)
+        mock_mt5.get_positions.return_value = [MagicMock() for _ in range(5)]
+        
+        mock_risk_manager = MagicMock()
+        mock_risk_manager.calculate_position_size.return_value = MockPositionSize()
+        mock_risk_manager.calculate_risk_reward.return_value = 1.5
+        
+        manager = ClaudeTradeManager(
+            mt5_client=mock_mt5,
+            position_manager=MagicMock(),
+            risk_manager=mock_risk_manager,
+            claude_client=MagicMock(),
+            max_concurrent_positions=5
+        )
+        
+        # Scalp with moderate confidence should override position limit
+        result = await manager.precheck_trade(
+            symbol="EURUSD",
+            direction="long",
+            entry_price=1.0850,
+            stop_loss=1.0830,
+            take_profit=1.0880,
+            confidence=0.65,
+            trade_type="scalp"
+        )
+        
+        assert result.can_execute == True
+        assert any("scalp" in w.lower() for w in result.warnings)
+    
+    @pytest.mark.asyncio
+    async def test_precheck_scalp_rr_warning_uses_lower_threshold(self):
+        """Test that scalps use a lower R:R warning threshold (1.2 instead of 1.5)."""
+        from trading_bot.services.claude_trade_manager import ClaudeTradeManager
+        
+        mock_mt5 = AsyncMock()
+        mock_mt5.get_account_info.return_value = MockAccountInfo()
+        mock_mt5.get_symbol_info.return_value = MockSymbolInfo()
+        mock_mt5.calc_margin.return_value = 108.50
+        mock_mt5.get_positions.return_value = []
+        
+        mock_risk_manager = MagicMock()
+        mock_risk_manager.calculate_position_size.return_value = MockPositionSize()
+        # R:R of 1.3 — should warn for intraday (< 1.5) but NOT for scalp (>= 1.2)
+        mock_risk_manager.calculate_risk_reward.return_value = 1.3
+        
+        manager = ClaudeTradeManager(
+            mt5_client=mock_mt5,
+            position_manager=MagicMock(),
+            risk_manager=mock_risk_manager,
+            claude_client=MagicMock(),
+            max_concurrent_positions=5
+        )
+        
+        # Scalp: R:R 1.3 >= 1.2 threshold — no warning
+        result_scalp = await manager.precheck_trade(
+            symbol="EURUSD",
+            direction="long",
+            entry_price=1.0850,
+            stop_loss=1.0830,
+            take_profit=1.0880,
+            confidence=0.70,
+            trade_type="scalp"
+        )
+        assert not any("r:r" in w.lower() for w in result_scalp.warnings)
+        
+        # Intraday: R:R 1.3 < 1.5 threshold — should warn
+        result_intraday = await manager.precheck_trade(
+            symbol="EURUSD",
+            direction="long",
+            entry_price=1.0850,
+            stop_loss=1.0830,
+            take_profit=1.0880,
+            confidence=0.70,
+            trade_type="intraday"
+        )
+        assert any("r:r" in w.lower() for w in result_intraday.warnings)
+    
+    @pytest.mark.asyncio
     async def test_precheck_passes_all_validations(self):
         """Test precheck passes when all conditions are met."""
         from trading_bot.services.claude_trade_manager import ClaudeTradeManager

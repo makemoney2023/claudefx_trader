@@ -175,6 +175,9 @@ class PositionStateModel(Base):
     open_time: Mapped[datetime] = mapped_column(DateTime)
     status: Mapped[str] = mapped_column(String(20), default="open")
     
+    # Trade classification
+    trade_type: Mapped[str] = mapped_column(String(20), default="intraday")
+    
     # Position management state
     initial_sl: Mapped[float] = mapped_column(Float, default=0)
     be_triggered: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -328,6 +331,7 @@ async def init_db():
             ("position_states", "tp1_hit", "BOOLEAN DEFAULT 0"),
             ("position_states", "tp2_hit", "BOOLEAN DEFAULT 0"),
             ("position_states", "initial_volume", "FLOAT DEFAULT 0"),
+            ("position_states", "trade_type", "VARCHAR(20) DEFAULT 'intraday'"),
             ("trade_learnings", "entry_reason", "TEXT"),
             ("trade_learnings", "original_confidence", "FLOAT"),
             ("trade_learnings", "timeframe", "VARCHAR(10)"),

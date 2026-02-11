@@ -859,8 +859,8 @@ class TradingBot:
                             # Use balance (realized P/L) not equity for mode determination
                             mode = self.scaling_manager.determine_mode(account.balance)
                             self.scaling_manager.current_mode = mode
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning(f"Scaling manager mode determination failed: {e}")
             
             # ============================================
             # STEP 2: CHECK NEWS BLACKOUT
@@ -1808,61 +1808,62 @@ class TradingBot:
                     logger.warning(f"Could not add precious metals context: {e}")
             
             # Prepare ENRICHED analysis data for Claude (full price levels, not just counts)
-            ms_obj = analysis_results["market_structure"]
-            fvg_obj = analysis_results["fvg"]
-            ob_obj = analysis_results["order_blocks"]
-            liq_obj = analysis_results["liquidity"]
+            # Use .get() to avoid KeyError if any analyzer failed
+            ms_obj = analysis_results.get("market_structure")
+            fvg_obj = analysis_results.get("fvg")
+            ob_obj = analysis_results.get("order_blocks")
+            liq_obj = analysis_results.get("liquidity")
             
             analysis_data = {
                 "market_structure": {
-                    "trend": ms_obj.trend.value,
-                    "structure_breaks": len(ms_obj.structure_breaks),
+                    "trend": ms_obj.trend.value if ms_obj and hasattr(ms_obj, 'trend') else "unknown",
+                    "structure_breaks": len(ms_obj.structure_breaks) if ms_obj and hasattr(ms_obj, 'structure_breaks') else 0,
                     "break_details": [
                         {"type": sb.type if hasattr(sb, 'type') else str(sb), 
                          "price": sb.price if hasattr(sb, 'price') else 0}
                         for sb in ms_obj.structure_breaks[-5:]
-                    ] if hasattr(ms_obj, 'structure_breaks') else [],
+                    ] if ms_obj and hasattr(ms_obj, 'structure_breaks') and ms_obj.structure_breaks else [],
                     "swing_highs": [float(sh.price) if hasattr(sh, 'price') else float(sh) 
-                                    for sh in (ms_obj.swing_highs[-5:] if hasattr(ms_obj, 'swing_highs') else [])],
+                                    for sh in (ms_obj.swing_highs[-5:] if hasattr(ms_obj, 'swing_highs') and ms_obj.swing_highs else [])] if ms_obj else [],
                     "swing_lows": [float(sl.price) if hasattr(sl, 'price') else float(sl) 
-                                   for sl in (ms_obj.swing_lows[-5:] if hasattr(ms_obj, 'swing_lows') else [])],
+                                   for sl in (ms_obj.swing_lows[-5:] if hasattr(ms_obj, 'swing_lows') and ms_obj.swing_lows else [])] if ms_obj else [],
                 },
                 "fvg": {
-                    "bullish": len(fvg_obj.bullish_fvgs),
-                    "bearish": len(fvg_obj.bearish_fvgs),
-                    "active": len(fvg_obj.active_fvgs),
+                    "bullish": len(fvg_obj.bullish_fvgs) if fvg_obj and hasattr(fvg_obj, 'bullish_fvgs') else 0,
+                    "bearish": len(fvg_obj.bearish_fvgs) if fvg_obj and hasattr(fvg_obj, 'bearish_fvgs') else 0,
+                    "active": len(fvg_obj.active_fvgs) if fvg_obj and hasattr(fvg_obj, 'active_fvgs') else 0,
                     "bullish_zones": [
                         {"high": float(f.top), "low": float(f.bottom)} 
                         for f in fvg_obj.bullish_fvgs[-3:]
-                    ] if hasattr(fvg_obj, 'bullish_fvgs') and fvg_obj.bullish_fvgs else [],
+                    ] if fvg_obj and hasattr(fvg_obj, 'bullish_fvgs') and fvg_obj.bullish_fvgs else [],
                     "bearish_zones": [
                         {"high": float(f.top), "low": float(f.bottom)} 
                         for f in fvg_obj.bearish_fvgs[-3:]
-                    ] if hasattr(fvg_obj, 'bearish_fvgs') and fvg_obj.bearish_fvgs else [],
+                    ] if fvg_obj and hasattr(fvg_obj, 'bearish_fvgs') and fvg_obj.bearish_fvgs else [],
                 },
                 "order_blocks": {
-                    "bullish": len(ob_obj.bullish_obs),
-                    "bearish": len(ob_obj.bearish_obs),
+                    "bullish": len(ob_obj.bullish_obs) if ob_obj and hasattr(ob_obj, 'bullish_obs') else 0,
+                    "bearish": len(ob_obj.bearish_obs) if ob_obj and hasattr(ob_obj, 'bearish_obs') else 0,
                     "bullish_zones": [
                         {"high": float(ob.high), "low": float(ob.low)} 
                         for ob in ob_obj.bullish_obs[-3:]
-                    ] if hasattr(ob_obj, 'bullish_obs') and ob_obj.bullish_obs else [],
+                    ] if ob_obj and hasattr(ob_obj, 'bullish_obs') and ob_obj.bullish_obs else [],
                     "bearish_zones": [
                         {"high": float(ob.high), "low": float(ob.low)} 
                         for ob in ob_obj.bearish_obs[-3:]
-                    ] if hasattr(ob_obj, 'bearish_obs') and ob_obj.bearish_obs else [],
+                    ] if ob_obj and hasattr(ob_obj, 'bearish_obs') and ob_obj.bearish_obs else [],
                 },
                 "liquidity": {
-                    "nearest_bsl": float(liq_obj.nearest_bsl) if liq_obj.nearest_bsl else None,
-                    "nearest_ssl": float(liq_obj.nearest_ssl) if liq_obj.nearest_ssl else None,
+                    "nearest_bsl": float(liq_obj.nearest_bsl) if liq_obj and liq_obj.nearest_bsl else None,
+                    "nearest_ssl": float(liq_obj.nearest_ssl) if liq_obj and liq_obj.nearest_ssl else None,
                     "all_bsl": [float(p.price) if hasattr(p, 'price') else float(p) 
-                                for p in (liq_obj.bsl_pools[-5:] if hasattr(liq_obj, 'bsl_pools') and liq_obj.bsl_pools else [])],
+                                for p in (liq_obj.bsl_pools[-5:] if hasattr(liq_obj, 'bsl_pools') and liq_obj.bsl_pools else [])] if liq_obj else [],
                     "all_ssl": [float(p.price) if hasattr(p, 'price') else float(p) 
-                                for p in (liq_obj.ssl_pools[-5:] if hasattr(liq_obj, 'ssl_pools') and liq_obj.ssl_pools else [])],
+                                for p in (liq_obj.ssl_pools[-5:] if hasattr(liq_obj, 'ssl_pools') and liq_obj.ssl_pools else [])] if liq_obj else [],
                     "equal_highs": [float(eh.price) if hasattr(eh, 'price') else float(eh) 
-                                    for eh in (liq_obj.equal_highs[-3:] if hasattr(liq_obj, 'equal_highs') and liq_obj.equal_highs else [])],
+                                    for eh in (liq_obj.equal_highs[-3:] if hasattr(liq_obj, 'equal_highs') and liq_obj.equal_highs else [])] if liq_obj else [],
                     "equal_lows": [float(el.price) if hasattr(el, 'price') else float(el) 
-                                   for el in (liq_obj.equal_lows[-3:] if hasattr(liq_obj, 'equal_lows') and liq_obj.equal_lows else [])],
+                                   for el in (liq_obj.equal_lows[-3:] if hasattr(liq_obj, 'equal_lows') and liq_obj.equal_lows else [])] if liq_obj else [],
                 },
                 "volume": analysis_results.get("volume", {})
             }
@@ -1873,10 +1874,24 @@ class TradingBot:
                 market_data["htf_alignment"] = mtf_result.alignment
                 market_data["htf_can_trade_long"] = mtf_result.can_trade_long
                 market_data["htf_can_trade_short"] = mtf_result.can_trade_short
+                # D1 context (top-down starting point)
+                market_data["d1_bias"] = mtf_result.daily_analysis.bias.value if mtf_result.daily_analysis else None
+                market_data["d1_structure"] = mtf_result.daily_analysis.structure if mtf_result.daily_analysis else None
+                market_data["d1_trend"] = mtf_result.daily_analysis.trend if mtf_result.daily_analysis else None
+                # H4 context
+                market_data["h4_bias"] = mtf_result.h4_analysis.bias.value if mtf_result.h4_analysis else None
                 market_data["h4_structure"] = mtf_result.h4_analysis.structure if mtf_result.h4_analysis else None
+                market_data["h4_trend"] = mtf_result.h4_analysis.trend if mtf_result.h4_analysis else None
+                # H1 context
+                market_data["h1_bias"] = mtf_result.h1_analysis.bias.value if mtf_result.h1_analysis else None
                 market_data["h1_structure"] = mtf_result.h1_analysis.structure if mtf_result.h1_analysis else None
+                market_data["h1_trend"] = mtf_result.h1_analysis.trend if mtf_result.h1_analysis else None
                 market_data["htf_key_levels"] = mtf_result.htf_key_levels
-                # Lower timeframe context for precision entries
+                # M15 context (execution timeframe)
+                market_data["m15_bias"] = mtf_result.m15_analysis.bias.value if mtf_result.m15_analysis else None
+                market_data["m15_structure"] = mtf_result.m15_analysis.structure if mtf_result.m15_analysis else None
+                market_data["m15_trend"] = mtf_result.m15_analysis.trend if mtf_result.m15_analysis else None
+                # M5/M1 context (precision entry)
                 market_data["m5_bias"] = mtf_result.m5_analysis.bias.value if mtf_result.m5_analysis else None
                 market_data["m5_structure"] = mtf_result.m5_analysis.structure if mtf_result.m5_analysis else None
                 market_data["m5_trend"] = mtf_result.m5_analysis.trend if mtf_result.m5_analysis else None
@@ -1910,14 +1925,17 @@ class TradingBot:
                 additional_charts=additional_charts if additional_charts else None
             )
             
-            print(f"[ANALYSIS] Claude analysis complete for {symbol}", flush=True)
             # Extract trade signal from result
             trade_signal = claude_result.signal
+            
+            # Print detailed analysis block to terminal
+            self._print_analysis_summary(symbol, trade_signal, claude_result, market_data)
             
             # Update cycle-to-cycle signal memory
             self._last_signal_per_symbol[symbol] = {
                 "direction": trade_signal.direction,
                 "confidence": trade_signal.confidence,
+                "trade_type": getattr(trade_signal, 'trade_type', 'intraday'),
                 "timestamp": datetime.now().isoformat(),
                 "reasoning": (trade_signal.reasoning or "")[:200],
             }
@@ -2055,7 +2073,11 @@ class TradingBot:
             # Ensure TP distance >= min_rr * SL distance
             # If Claude gives bad R:R, auto-correct the TP
             # ============================================
-            min_rr = settings.trading.min_risk_reward  # default 3.0 (1:3 risk-reward)
+            # Adjust min R:R based on trade type
+            _trade_type = getattr(trade_signal, 'trade_type', 'intraday') or 'intraday'
+            _rr_by_type = {'scalp': 1.5, 'intraday': 2.0, 'swing': 3.0}
+            min_rr = _rr_by_type.get(_trade_type, settings.trading.min_risk_reward)
+            logger.info(f"R:R threshold for {symbol} ({_trade_type}): {min_rr:.1f}:1")
             sl_distance = abs(_entry - _sl)
             tp_distance = abs(_tp - _entry)
             
@@ -2211,7 +2233,7 @@ class TradingBot:
                     return
             
             # Validate confidence (fallback if no scaling manager)
-            min_confidence = 0.75
+            min_confidence = 0.60
             if self.scaling_manager:
                 min_confidence = self.scaling_manager.get_mode_config().confidence_threshold
                 
@@ -2264,6 +2286,12 @@ class TradingBot:
                                 "required_confidence": flip_min_confidence,
                                 "minutes_since_last": round(minutes_since, 1),
                             }
+                        )
+                        # Print BLOCKED to terminal
+                        print(
+                            f"[BLOCKED] ║  Direction flip {symbol}: was {last_dir.upper()} {minutes_since:.0f}m ago, "
+                            f"need {flip_min_confidence:.0%} conf (got {trade_signal.confidence:.0%})",
+                            flush=True
                         )
                         if bot_state:
                             bot_state.trade_decision(symbol, "rejected", 
@@ -2414,6 +2442,8 @@ class TradingBot:
                 
                 if not validation.is_valid:
                     logger.warning(f"Trade validation failed for {symbol}: {validation.errors}")
+                    self.daily_trades = max(0, self.daily_trades - 1)
+                    logger.info(f"Trade slot released after validation failure ({self.daily_trades}/{settings.trading.max_daily_trades})")
                     return
                 
                 # =============================================
@@ -2650,6 +2680,7 @@ class TradingBot:
                 # P0 CRITICAL: MARGIN VALIDATION BEFORE TRADE
                 # =============================================
                 signal_order_type = getattr(trade_signal, 'order_type', 'market') or 'market'
+                signal_trade_type = getattr(trade_signal, 'trade_type', 'intraday') or 'intraday'
                 precheck = await self.claude_trade_manager.precheck_trade(
                     symbol=symbol,
                     direction=trade_signal.direction,
@@ -2657,7 +2688,8 @@ class TradingBot:
                     stop_loss=trade_signal.stop_loss,
                     take_profit=trade_signal.take_profit,
                     confidence=trade_signal.confidence,
-                    order_type=signal_order_type
+                    order_type=signal_order_type,
+                    trade_type=signal_trade_type
                 )
                 
                 if not precheck.can_execute:
@@ -2687,7 +2719,8 @@ class TradingBot:
                                 stop_loss=trade_signal.stop_loss,
                                 take_profit=trade_signal.take_profit,
                                 confidence=trade_signal.confidence,
-                                order_type=signal_order_type
+                                order_type=signal_order_type,
+                                trade_type=signal_trade_type
                             )
                     
                     if not precheck.can_execute:
@@ -2871,8 +2904,38 @@ class TradingBot:
                     symbol, trade_signal, position_size, current_price
                 )
                 
+                # Handle REJECT verdict — skip trade entirely
+                if judge_verdict.get('verdict') == 'REJECT':
+                    reason = judge_verdict.get('reason', 'Judge rejected')
+                    flags = judge_verdict.get('risk_flags', [])
+                    logger.warning(f"[JUDGE] REJECTED {symbol} {trade_signal.direction}: {reason}")
+                    
+                    from .api.routes.activity import add_activity
+                    add_activity(
+                        "trade_judge_reject",
+                        f"Judge REJECTED {symbol} {trade_signal.direction}: {reason}",
+                        symbol,
+                        {
+                            "verdict": "REJECT",
+                            "reason": reason,
+                            "risk_flags": flags,
+                            "confidence": trade_signal.confidence,
+                        }
+                    )
+                    
+                    flags_str = ", ".join(flags) if flags else "none"
+                    print(
+                        f"[JUDGE] ║  REJECT {symbol} — \"{reason}\"  "
+                        f"| flags: [{flags_str}]",
+                        flush=True
+                    )
+                    
+                    self.daily_trades = max(0, self.daily_trades - 1)
+                    logger.info(f"Trade slot released after judge rejection ({self.daily_trades}/{settings.trading.max_daily_trades})")
+                    return
+                
                 # Handle DEMOTE verdict — convert to pending limit order
-                if judge_verdict.get('verdict') == 'DEMOTE':
+                elif judge_verdict.get('verdict') == 'DEMOTE':
                     suggested = judge_verdict.get('suggested_entry')
                     
                     # Calculate demoted entry price
@@ -2914,6 +2977,14 @@ class TradingBot:
                             "confidence": trade_signal.confidence,
                         }
                     )
+                    
+                    # Print DEMOTE to terminal
+                    flags_str = ", ".join(flags) if flags else "none"
+                    print(
+                        f"[JUDGE] ║  DEMOTE {symbol} — \"{reason}\" → limit @ {demoted_entry:.5f}  "
+                        f"| flags: [{flags_str}]",
+                        flush=True
+                    )
                 else:
                     # APPROVE — log for visibility
                     reason = judge_verdict.get('reason', 'Approved')
@@ -2932,6 +3003,14 @@ class TradingBot:
                             "risk_flags": flags,
                             "confidence": trade_signal.confidence,
                         }
+                    )
+                    
+                    # Print APPROVE to terminal
+                    flags_str = ", ".join(flags) if flags else "none"
+                    print(
+                        f"[JUDGE] ║  APPROVE {symbol} — \"{reason}\"  "
+                        f"| flags: [{flags_str}]",
+                        flush=True
                     )
                 
                 # =============================================
@@ -3070,19 +3149,38 @@ class TradingBot:
                     
                     # Track position
                     if result.ticket:
+                        # Validate SL/TP are real values before tracking
+                        tracked_sl = trade_signal.stop_loss if trade_signal.stop_loss and trade_signal.stop_loss > 0 else None
+                        tracked_tp = trade_signal.take_profit if trade_signal.take_profit and trade_signal.take_profit > 0 else None
+                        if not tracked_sl:
+                            logger.error(f"CRITICAL: Position {result.ticket} has no valid SL! trade_signal.stop_loss={trade_signal.stop_loss}")
+                        if not tracked_tp:
+                            logger.warning(f"Position {result.ticket} has no TP set: trade_signal.take_profit={trade_signal.take_profit}")
+                        
                         position = Position(
                             ticket=result.ticket,
                             symbol=symbol,
                             direction=trade_signal.direction,
                             volume=position_size.lots,
                             entry_price=result.fill_price or current_price,
-                            stop_loss=trade_signal.stop_loss or 0.0,
-                            take_profit=trade_signal.take_profit or 0.0,
-                            open_time=datetime.now()
+                            stop_loss=tracked_sl or (result.fill_price or current_price),  # Fallback to entry (0 risk) rather than 0.0
+                            take_profit=tracked_tp or 0.0,
+                            open_time=datetime.now(),
+                            trade_type=getattr(trade_signal, 'trade_type', 'intraday') or 'intraday',
                         )
                         
                         # Set multi-TP levels for partial close management
-                        if take_profit_levels:
+                        # Scalps: single TP — close full position, no partials
+                        # Intraday/Swing: multi-TP with partial close management
+                        _pos_trade_type = getattr(trade_signal, 'trade_type', 'intraday') or 'intraday'
+                        
+                        if _pos_trade_type == 'scalp':
+                            # Scalps: single TP, full close. No multi-TP complexity.
+                            position.tp1 = position.take_profit
+                            position.tp2 = 0.0
+                            position.tp3 = 0.0
+                            logger.info(f"  SCALP: Single TP at {position.tp1:.5f} (full close)")
+                        elif take_profit_levels:
                             position.tp1 = take_profit_levels.get('tp1', 0.0) or 0.0
                             position.tp2 = take_profit_levels.get('tp2', 0.0) or 0.0
                             position.tp3 = take_profit_levels.get('tp3', 0.0) or 0.0
@@ -3176,6 +3274,10 @@ class TradingBot:
             logger.error(f"Error analyzing {symbol}: {e}")
             import traceback
             traceback.print_exc()
+            # Release trade slot if it was reserved before the crash
+            if hasattr(self, '_trade_lock') and self.daily_trades > 0:
+                self.daily_trades = max(0, self.daily_trades - 1)
+                logger.info(f"Trade slot released after crash ({self.daily_trades}/{settings.trading.max_daily_trades})")
     
     async def _run_analysis_only(self, symbol: str):
         """
@@ -3644,6 +3746,115 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Error handling high volatility: {e}")
     
+    def _print_analysis_summary(
+        self,
+        symbol: str,
+        trade_signal,
+        claude_result,
+        market_data: dict,
+    ):
+        """
+        Print a structured multi-line analysis block to the terminal
+        for real-time visibility into every Claude decision.
+        """
+        try:
+            W = 62  # inner width
+            direction = (trade_signal.direction or "no_trade").upper()
+            confidence = trade_signal.confidence or 0
+            
+            # Header
+            trade_type = (getattr(trade_signal, 'trade_type', None) or "intraday").upper()
+            header = f"  {symbol} — {trade_type} {direction} @ {confidence:.0%} confidence"
+            
+            # Structure info
+            structure = (trade_signal.market_structure or "unknown").capitalize()
+            amd = (getattr(trade_signal, 'amd_phase', None) or "unknown").capitalize()
+            d1_bias = str(market_data.get('d1_bias', 'N/A')).capitalize()
+            h4_bias = str(market_data.get('h4_bias', 'N/A')).capitalize()
+            h1_bias = str(market_data.get('h1_bias', 'N/A')).capitalize()
+            htf_bias = str(market_data.get('htf_bias', 'N/A')).capitalize()
+            raw_alignment = market_data.get('htf_alignment')
+            alignment = "Aligned" if raw_alignment else ("Misaligned" if raw_alignment is not None else "N/A")
+            m15_bias = str(market_data.get('m15_bias', 'N/A')).capitalize()
+            m5_bias = str(market_data.get('m5_bias', 'N/A')).capitalize()
+            m1_bias = str(market_data.get('m1_bias', 'N/A')).capitalize()
+            fib_zone = str(market_data.get('fibonacci_zone', 'N/A'))
+            in_ote = "Yes" if market_data.get('in_ote') else "No"
+            
+            # Trade levels
+            entry = trade_signal.entry_price
+            sl = trade_signal.stop_loss
+            tp = trade_signal.take_profit
+            rr = trade_signal.risk_reward
+            order_type = getattr(trade_signal, 'order_type', 'market') or 'market'
+            
+            # Key levels from claude_result
+            key_levels = getattr(claude_result, 'key_levels', {}) or {}
+            s1 = key_levels.get('support_1')
+            r1 = key_levels.get('resistance_1')
+            
+            # Reasoning (truncated, cleaned of newlines and markdown)
+            raw_reasoning = (trade_signal.reasoning or "No reasoning provided")
+            raw_reasoning = raw_reasoning.replace('\n', ' ').replace('\r', ' ').replace('**', '').replace('*', '')
+            raw_reasoning = ' '.join(raw_reasoning.split())  # collapse multiple spaces
+            reasoning = raw_reasoning[:120]
+            if len(raw_reasoning) > 120:
+                reasoning += "..."
+            
+            # Warnings
+            warnings_list = getattr(claude_result, 'warnings', []) or []
+            warnings_str = ", ".join(warnings_list) if warnings_list else "None"
+            
+            # Analysis time
+            analysis_time = getattr(claude_result, 'analysis_time', 0) or 0
+            
+            # Build the box
+            def pad(text: str) -> str:
+                """Pad text to fit inside the box."""
+                return text[:W].ljust(W)
+            
+            lines = []
+            lines.append(f"[SIGNAL] ╔{'═' * W}╗")
+            lines.append(f"[SIGNAL] ║{pad(header)}║")
+            lines.append(f"[SIGNAL] ╠{'═' * W}╣")
+            lines.append(f"[SIGNAL] ║{pad(f'  Structure: {structure:<10} | AMD Phase: {amd}')}║")
+            lines.append(f"[SIGNAL] ║{pad(f'  D1: {d1_bias:<8} H4: {h4_bias:<8} H1: {h1_bias:<8} [{alignment}]')}║")
+            lines.append(f"[SIGNAL] ║{pad(f'  M15: {m15_bias:<7} M5: {m5_bias:<8} M1: {m1_bias}')}║")
+            lines.append(f"[SIGNAL] ║{pad(f'  Fib Zone:  {fib_zone:<10} | In OTE:    {in_ote}')}║")
+            
+            # Only show trade levels if there's an actual signal
+            if direction not in ("NO_TRADE",):
+                lines.append(f"[SIGNAL] ╠{'─' * W}╣")
+                entry_str = f"{entry:.5f}" if entry else "market"
+                sl_str = f"{sl:.5f}" if sl else "N/A"
+                tp_str = f"{tp:.5f}" if tp else "N/A"
+                rr_str = f"{rr:.1f}" if rr else "N/A"
+                lines.append(f"[SIGNAL] ║{pad(f'  Entry: {entry_str}  | SL: {sl_str}  | TP: {tp_str}')}║")
+                lines.append(f"[SIGNAL] ║{pad(f'  R:R: {rr_str:<12} | Order: {order_type}')}║")
+                if s1 or r1:
+                    s1_str = f"S1={s1:.5f}" if s1 else "S1=N/A"
+                    r1_str = f"R1={r1:.5f}" if r1 else "R1=N/A"
+                    lines.append(f"[SIGNAL] ║{pad(f'  Key Levels: {s1_str}  {r1_str}')}║")
+            
+            lines.append(f"[SIGNAL] ╠{'─' * W}╣")
+            # Wrap reasoning to fit box
+            reason_line1 = reasoning[:W - 4]
+            lines.append(f"[SIGNAL] ║{pad(f'  {reason_line1}')}║")
+            if len(reasoning) > W - 4:
+                reason_line2 = reasoning[W - 4:]
+                lines.append(f"[SIGNAL] ║{pad(f'  {reason_line2}')}║")
+            
+            lines.append(f"[SIGNAL] ║{pad(f'  Warnings: [{warnings_str[:W - 16]}]')}║")
+            lines.append(f"[SIGNAL] ║{pad(f'  Analysis Time: {analysis_time:.1f}s')}║")
+            lines.append(f"[SIGNAL] ╚{'═' * W}╝")
+            
+            print("\n".join(lines), flush=True)
+            
+        except Exception as e:
+            # Never let display code crash the trading loop
+            print(f"[SIGNAL] {symbol} — {(trade_signal.direction or 'unknown').upper()} "
+                  f"@ {(trade_signal.confidence or 0):.0%} (display error: {e})", flush=True)
+    
     async def _run_trade_judge(
         self,
         symbol: str,
@@ -3675,6 +3886,7 @@ class TradingBot:
                 'stop_loss': trade_signal.stop_loss,
                 'take_profit': trade_signal.take_profit,
                 'order_type': getattr(trade_signal, 'order_type', 'market'),
+                'trade_type': getattr(trade_signal, 'trade_type', 'intraday'),
                 'reasoning': getattr(trade_signal, 'reasoning', ''),
             }
             
@@ -3722,7 +3934,7 @@ class TradingBot:
                 'risk_reward': risk_reward,
                 'position_size_pct': position_size_pct,
                 'trades_today': self.daily_trades,
-                'max_daily_trades': self.settings.trading.max_daily_trades if hasattr(self.settings, 'trading') else 5,
+                'max_daily_trades': settings.trading.max_daily_trades if hasattr(settings, 'trading') else 5,
                 'session': session_name,
             }
             
@@ -3735,7 +3947,6 @@ class TradingBot:
                     logger.debug(f"[JUDGE] Could not get learning context: {e}")
             
             # Call the judge with a timeout — fail open
-            import asyncio
             verdict = await asyncio.wait_for(
                 self.claude_client.judge_trade(signal_dict, risk_metrics, learning_context),
                 timeout=5.0
@@ -3883,8 +4094,8 @@ class TradingBot:
             return False
             
         except Exception as e:
-            logger.error(f"Error checking drawdown: {e}")
-            return False
+            logger.error(f"Error checking drawdown: {e} — failing SAFE (halt trading)")
+            return True  # Fail safe: assume drawdown exceeded when check errors
     
     async def _check_daily_profit_target(self) -> bool:
         """
@@ -4261,14 +4472,25 @@ Include brief reasoning.
                     logger.info(f"Added MT5 position {ticket} to tracking")
             
             # Initialize daily_trades from MT5 history to prevent counter drift after restart
+            # But skip if a manual reset was requested (skip_mt5_trade_recount flag)
             try:
-                today_start = datetime.combine(datetime.now().date(), datetime.min.time())
-                today_deals = await self.mt5_client.get_history(today_start, datetime.now())
-                # Count only entry deals (entry=0 is trade-in)
-                entry_deals = [d for d in today_deals if d.get('entry') == 0 and d.get('volume', 0) > 0]
-                if entry_deals:
-                    self.daily_trades = len(entry_deals)
-                    logger.info(f"Initialized daily_trades from MT5 history: {self.daily_trades} trades today")
+                from trading_bot.utils.state_persistence import get_persistence
+                _persistence = get_persistence()
+                skip_recount = _persistence.get('skip_mt5_trade_recount', False)
+                
+                if skip_recount:
+                    logger.info("⚡ skip_mt5_trade_recount flag detected — daily_trades counter reset to 0")
+                    self.daily_trades = 0
+                    # Clear the flag so future restarts behave normally
+                    _persistence.set('skip_mt5_trade_recount', False)
+                else:
+                    today_start = datetime.combine(datetime.now().date(), datetime.min.time())
+                    today_deals = await self.mt5_client.get_history(today_start, datetime.now())
+                    # Count only entry deals (entry=0 is trade-in)
+                    entry_deals = [d for d in today_deals if d.get('entry') == 0 and d.get('volume', 0) > 0]
+                    if entry_deals:
+                        self.daily_trades = len(entry_deals)
+                        logger.info(f"Initialized daily_trades from MT5 history: {self.daily_trades} trades today")
             except Exception as e:
                 logger.warning(f"Could not initialize daily trades from history: {e}")
             
@@ -4622,6 +4844,8 @@ Include brief reasoning.
                             current_session = self.session_analytics.get_current_session()
                             session_name = current_session.value if current_session else ""
                         
+                        # Use trade_type for setup classification (scalp/intraday/swing)
+                        _setup_type = f"ICT-{getattr(position, 'trade_type', 'intraday').upper()}"
                         await self.learning_service.store_trade_review(
                             trade_id=str(position.ticket),
                             symbol=position.symbol,
@@ -4630,7 +4854,7 @@ Include brief reasoning.
                             r_multiple=position.current_r_multiple,
                             review=review,
                             session=session_name,
-                            setup_type="ICT",
+                            setup_type=_setup_type,
                             entry_reason=entry_reason,
                             original_confidence=original_confidence,
                             timeframe=trade_timeframe,

@@ -13,6 +13,21 @@ Provides technical analysis components including:
 - Market Maker Model (MMXM)
 """
 
+import pandas as pd
+
+
+def exclude_forming_candle(df: pd.DataFrame) -> pd.DataFrame:
+    """Strip the last (still-forming) candle from MT5 OHLCV data.
+
+    MT5's ``copy_rates_from_pos`` includes the current, incomplete candle as
+    the final row.  Using it for analysis produces misleading signals
+    (false displacements, wrong volume ratios, phantom structure breaks).
+    Call this at the top of every analyzer's entry-point method.
+    """
+    if df is not None and len(df) >= 2:
+        return df.iloc[:-1].copy()
+    return df
+
 from .market_structure import MarketStructureAnalyzer, MarketStructure, StructureType
 from .fair_value_gap import FVGDetector, FairValueGap, FVGType
 from .order_blocks import OrderBlockDetector, OrderBlock, OrderBlockType

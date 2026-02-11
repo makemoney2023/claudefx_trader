@@ -613,3 +613,163 @@ def populated_cache_service():
     }
     
     return service
+
+
+class TestFirecrawlCostOptimization:
+    """
+    Tests to verify Firecrawl cost optimization:
+    - No agent() calls remain in the service
+    - No extract() calls remain in the service  
+    - search() is the only Firecrawl API method used (besides scrape() for page fetches)
+    """
+    
+    def _get_source_code(self) -> str:
+        """Read the firecrawl_intelligence.py source for static analysis."""
+        import os
+        source_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "trading_bot", "services", "firecrawl_intelligence.py"
+        )
+        with open(source_path, "r", encoding="utf-8") as f:
+            return f.read()
+    
+    def test_no_agent_calls_remain(self):
+        """Verify no self.client.agent() calls exist in the service."""
+        source = self._get_source_code()
+        import re
+        agent_calls = re.findall(r'self\.client\.agent\s*\(', source)
+        assert len(agent_calls) == 0, (
+            f"Found {len(agent_calls)} agent() call(s) in firecrawl_intelligence.py. "
+            f"All agent() calls should be replaced with search() to save credits."
+        )
+    
+    def test_no_extract_calls_remain(self):
+        """Verify no self.client.extract() calls exist in the service."""
+        source = self._get_source_code()
+        import re
+        extract_calls = re.findall(r'self\.client\.extract\s*\(', source)
+        assert len(extract_calls) == 0, (
+            f"Found {len(extract_calls)} extract() call(s) in firecrawl_intelligence.py. "
+            f"All extract() calls should be replaced with search() to save credits."
+        )
+    
+    def test_search_calls_exist(self):
+        """Verify search() calls are present in the service."""
+        source = self._get_source_code()
+        import re
+        search_calls = re.findall(r'self\.client\.search\s*\(', source)
+        assert len(search_calls) >= 10, (
+            f"Expected at least 10 search() calls (original + replacements), "
+            f"found {len(search_calls)}."
+        )
+    
+    def test_only_search_and_scrape_api_methods(self):
+        """Verify only search() and scrape() are used as Firecrawl API calls."""
+        source = self._get_source_code()
+        import re
+        all_client_calls = re.findall(r'self\.client\.(\w+)\s*\(', source)
+        allowed_methods = {'search', 'scrape'}
+        disallowed = [m for m in all_client_calls if m not in allowed_methods]
+        assert len(disallowed) == 0, (
+            f"Found disallowed Firecrawl API methods: {set(disallowed)}. "
+            f"Only search() and scrape() should be used."
+        )
+    
+    def test_firecrawl_package_importable(self):
+        """Verify firecrawl-py package is installed and importable."""
+        try:
+            from firecrawl import FirecrawlApp
+            assert FirecrawlApp is not None
+        except ImportError:
+            pytest.fail("firecrawl-py package is not installed. Run: pip install firecrawl-py")
+    
+    def test_research_geopolitical_uses_search(self):
+        """Verify research_geopolitical_risk uses search instead of agent."""
+        source = self._get_source_code()
+        import re
+        method_match = re.search(
+            r'async def research_geopolitical_risk\(self\).*?(?=\n    async def |\n    def |\nclass |\Z)',
+            source, re.DOTALL
+        )
+        assert method_match, "research_geopolitical_risk method not found"
+        method_body = method_match.group()
+        assert 'self.client.search(' in method_body, "research_geopolitical_risk should use search()"
+        assert 'self.client.agent(' not in method_body, "research_geopolitical_risk should NOT use agent()"
+    
+    def test_research_central_bank_uses_search(self):
+        """Verify research_central_bank_policy uses search instead of agent."""
+        source = self._get_source_code()
+        import re
+        method_match = re.search(
+            r'async def research_central_bank_policy\(self\).*?(?=\n    async def |\n    def |\nclass |\Z)',
+            source, re.DOTALL
+        )
+        assert method_match, "research_central_bank_policy method not found"
+        method_body = method_match.group()
+        assert 'self.client.search(' in method_body, "research_central_bank_policy should use search()"
+        assert 'self.client.agent(' not in method_body, "research_central_bank_policy should NOT use agent()"
+    
+    def test_research_intermarket_uses_search(self):
+        """Verify research_intermarket_correlations uses search instead of agent."""
+        source = self._get_source_code()
+        import re
+        method_match = re.search(
+            r'async def research_intermarket_correlations\(self\).*?(?=\n    async def |\n    def |\nclass |\Z)',
+            source, re.DOTALL
+        )
+        assert method_match, "research_intermarket_correlations method not found"
+        method_body = method_match.group()
+        assert 'self.client.search(' in method_body, "research_intermarket_correlations should use search()"
+        assert 'self.client.agent(' not in method_body, "research_intermarket_correlations should NOT use agent()"
+    
+    def test_research_symbol_fundamentals_uses_search(self):
+        """Verify research_symbol_fundamentals uses search instead of agent."""
+        source = self._get_source_code()
+        import re
+        method_match = re.search(
+            r'async def research_symbol_fundamentals\(self.*?(?=\n    async def |\n    def |\nclass |\Z)',
+            source, re.DOTALL
+        )
+        assert method_match, "research_symbol_fundamentals method not found"
+        method_body = method_match.group()
+        assert 'self.client.search(' in method_body, "research_symbol_fundamentals should use search()"
+        assert 'self.client.agent(' not in method_body, "research_symbol_fundamentals should NOT use agent()"
+    
+    def test_extract_economic_calendar_uses_search(self):
+        """Verify extract_economic_calendar uses search instead of extract."""
+        source = self._get_source_code()
+        import re
+        method_match = re.search(
+            r'async def extract_economic_calendar\(self\).*?(?=\n    async def |\n    def |\nclass |\Z)',
+            source, re.DOTALL
+        )
+        assert method_match, "extract_economic_calendar method not found"
+        method_body = method_match.group()
+        assert 'self.client.search(' in method_body, "extract_economic_calendar should use search()"
+        assert 'self.client.extract(' not in method_body, "extract_economic_calendar should NOT use extract()"
+    
+    def test_extract_cot_positioning_uses_search(self):
+        """Verify extract_cot_positioning uses search instead of extract."""
+        source = self._get_source_code()
+        import re
+        method_match = re.search(
+            r'async def extract_cot_positioning\(self\).*?(?=\n    async def |\n    def |\nclass |\Z)',
+            source, re.DOTALL
+        )
+        assert method_match, "extract_cot_positioning method not found"
+        method_body = method_match.group()
+        assert 'self.client.search(' in method_body, "extract_cot_positioning should use search()"
+        assert 'self.client.extract(' not in method_body, "extract_cot_positioning should NOT use extract()"
+    
+    def test_extract_rate_expectations_uses_search(self):
+        """Verify extract_rate_expectations uses search instead of extract."""
+        source = self._get_source_code()
+        import re
+        method_match = re.search(
+            r'async def extract_rate_expectations\(self\).*?(?=\n    async def |\n    def |\nclass |\Z)',
+            source, re.DOTALL
+        )
+        assert method_match, "extract_rate_expectations method not found"
+        method_body = method_match.group()
+        assert 'self.client.search(' in method_body, "extract_rate_expectations should use search()"
+        assert 'self.client.extract(' not in method_body, "extract_rate_expectations should NOT use extract()"
