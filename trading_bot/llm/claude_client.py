@@ -687,7 +687,29 @@ class ClaudeClient:
             prompt += f"""- Current Price: {market_data.get('current_price', 'N/A')}
 - Session: {market_data.get('session', 'N/A')}
 - Daily Range: {market_data.get('daily_high', 'N/A')} - {market_data.get('daily_low', 'N/A')}
+"""
+            # Cycle-to-cycle memory: show Claude what it said last time
+            last_signal = market_data.get('last_signal')
+            if last_signal:
+                last_dir = last_signal.get('direction', 'unknown').upper()
+                last_conf = last_signal.get('confidence', 0)
+                last_reason = last_signal.get('reasoning', '')[:150]
+                last_ts = last_signal.get('timestamp', '')
+                prompt += f"""
+## YOUR LAST SIGNAL FOR THIS SYMBOL
+- Direction: {last_dir}
+- Confidence: {last_conf:.0%}
+- Time: {last_ts}
+- Reasoning: {last_reason}
 
+**DIRECTION FLIP RULE**: If you are now recommending the OPPOSITE direction from your
+last signal above, you MUST cite a SPECIFIC confirmed change on the chart that justifies
+the flip: a new BOS/CHoCH, a completed liquidity sweep, a displacement candle, or a
+structure break that was NOT present during your last analysis. If nothing has materially
+changed on the chart, either maintain your previous direction or return no_trade.
+Flipping direction without citing a confirmed change is NOT allowed.
+"""
+            prompt += """
 **ENTRY STRATEGY REMINDER -- PREFER PENDING ORDERS**:
 When you identify a trade setup, PREFER pending orders over market orders for better entries:
 - Use buy_limit/sell_limit at Order Blocks, FVGs, sweep-and-reclaim zones, or prominent wicks
@@ -1151,18 +1173,32 @@ Analyze the chart image and provide:
 Trading these causes CATASTROPHIC losses due to incorrect position sizing.
 If the current symbol ends in BTC or BIT, you MUST return direction="no_trade" with reasoning explaining it's a dangerous BTC-quoted pair.
 
+## CORE MANDATE -- REACT, DO NOT PREDICT:
+You are a REACTIVE trader. You signal a trade ONLY when price has ALREADY confirmed a
+setup on the chart. You NEVER signal because you think price "will" move in a direction.
+If nothing has been confirmed yet, return no_trade. Missing a move is always better than
+predicting one and being wrong.
+
+**Before recommending ANY trade (long or short), you MUST cite at least TWO of these
+confirmations that have ALREADY OCCURRED on the chart -- not "developing" or "likely":**
+1. A displacement candle has CLOSED (strong impulsive move with body > 70% of range)
+2. A Break of Structure (BOS) or Change of Character (CHoCH) has PRINTED on M1/M5
+3. A liquidity sweep has COMPLETED (wick swept a high/low and price reclaimed)
+4. Price is AT or INSIDE a valid FVG/OB entry zone RIGHT NOW (not approaching it)
+
+If you cannot point to at least two of these as ALREADY HAPPENED, you MUST return no_trade.
+"Approaching a level" or "likely to break" is NOT confirmation -- that is prediction.
+
 ## Important Rules -- PATIENCE IS THE EDGE:
-- **CRITICAL: EVALUATE BOTH DIRECTIONS EVERY CYCLE.** If you find yourself recommending
-  the same direction for multiple consecutive cycles, actively look for the opposite setup.
-  Markets reverse -- a long at a swept low after 4+ swings of exhaustion can be the
-  highest-probability trade. Do not let HTF bias blind you to reversal setups on lower
-  timeframes. The swing exhaustion framework (Tier 1) exists specifically to catch these
-  high-probability reversals against the trend.
 - **Do NOT force a trade.** If the setup is not textbook (swing validation, confluence, clear levels), return no_trade. It is ALWAYS better to miss a move than to enter poorly and draw down.
 - **Quality over quantity.** One perfect entry with circular price action confirmation is worth more than five mediocre entries. Wait for the setup to come to you.
 - **PREFER PENDING ORDERS** at key levels identified on M1/M5 over market orders. Use buy_limit/sell_limit for reversal entries at sweep-and-reclaim zones, OBs, FVGs, or prominent wicks. Use buy_stop/sell_stop for breakout entries.
-- **ALWAYS report your TRUE confidence level** (0.0 to 1.0) based on your analysis. Do not artificially round down to 0. If you see a potential setup but it's not perfect, report your honest assessment (e.g., 0.55, 0.65, 0.72). Our system will filter based on thresholds -- your job is to give an accurate signal, not to self-censor.
-- **Reserve high confidence (0.80+)** for setups with full confluence: swing validation passed, clear M1/M5 entry level, proper R:R, kill zone timing, and volume confirmation.
+- **Confidence must reflect CONFIRMED evidence, not conviction in a direction.** Use this scale:
+  - 0.60-0.69: One confirmation present, setup developing but incomplete
+  - 0.70-0.79: Two confirmations present, valid but not ideal
+  - 0.80-0.89: Three+ confirmations, strong confluence, kill zone timing
+  - 0.90-1.00: Full confluence: swing validation + displacement + sweep + FVG/OB + volume
+  Do NOT park at exactly 0.75 every time. Your confidence MUST vary based on the actual evidence.
 - Only recommend trades with minimum 1:2 risk-reward ratio
 - Consider the current session (kill zone timing) -- outside kill zones, reduce confidence but still analyze
 - Identify specific price levels for entry, SL, and TP using M1/M5 precision
@@ -1170,6 +1206,7 @@ If the current symbol ends in BTC or BIT, you MUST return direction="no_trade" w
 - RESPECT news blackouts - recommend no_trade or reduce confidence
 - Consider recent performance and current streak when setting confidence
 - **ONLY trade USD-quoted pairs** (ending in USD, USDT, or standard forex like EURUSD)
+- **Do NOT flip direction without cause.** If market structure has not changed since the last analysis, do not switch from long to short or vice versa. Unchanged chart = unchanged signal or no_trade.
 
 ## Volume Confirmation Rules (Institutional Validation):
 - Relative volume must be > 0.7x average for valid setups

@@ -1183,3 +1183,265 @@ class TestTradeJudgePerformance:
         assert hasattr(TradingBot, '_run_trade_judge'), "TradingBot missing _run_trade_judge method"
         assert inspect.iscoroutinefunction(TradingBot._run_trade_judge), \
             "_run_trade_judge should be async"
+
+
+# ============================================================
+# 23. Reactive Trading Prompt Tests
+# ============================================================
+
+class TestReactiveTradingPrompt:
+    """Verify the analysis prompt enforces reactive trading, not prediction."""
+    
+    def test_prompt_contains_reactive_mandate(self):
+        """Prompt should contain the REACT, DO NOT PREDICT mandate."""
+        import inspect
+        from trading_bot.llm.claude_client import ClaudeClient
+        
+        source = inspect.getsource(ClaudeClient._build_analysis_prompt)
+        assert 'REACT' in source, "Prompt should contain REACT mandate"
+        assert 'REACTIVE' in source, "Prompt should use the word REACTIVE"
+        assert 'ALREADY' in source, "Prompt should require ALREADY confirmed setups"
+    
+    def test_prompt_does_not_encourage_direction_flipping(self):
+        """Prompt should NOT contain the old 'EVALUATE BOTH DIRECTIONS EVERY CYCLE'."""
+        import inspect
+        from trading_bot.llm.claude_client import ClaudeClient
+        
+        source = inspect.getsource(ClaudeClient._build_analysis_prompt)
+        assert 'EVALUATE BOTH DIRECTIONS EVERY CYCLE' not in source, \
+            "Old direction-flipping instruction should be removed"
+        assert 'actively look for the opposite setup' not in source, \
+            "Old direction-seeking instruction should be removed"
+    
+    def test_prompt_includes_confirmation_checklist(self):
+        """Prompt should require citing specific confirmations before any signal."""
+        import inspect
+        from trading_bot.llm.claude_client import ClaudeClient
+        
+        source = inspect.getsource(ClaudeClient._build_analysis_prompt)
+        # Should mention key confirmations
+        assert 'displacement' in source.lower(), "Prompt should mention displacement as confirmation"
+        assert 'BOS' in source or 'Break of Structure' in source, "Prompt should mention BOS"
+        assert 'CHoCH' in source or 'Change of Character' in source, "Prompt should mention CHoCH"
+        assert 'liquidity sweep' in source.lower(), "Prompt should mention liquidity sweep"
+        assert 'FVG' in source or 'Fair Value Gap' in source, "Prompt should mention FVG/OB"
+    
+    def test_prompt_has_variable_confidence_scale(self):
+        """Prompt should define a confidence scale (not flat 75%)."""
+        import inspect
+        from trading_bot.llm.claude_client import ClaudeClient
+        
+        source = inspect.getsource(ClaudeClient._build_analysis_prompt)
+        # Should have a multi-tier confidence scale
+        assert '0.60' in source or '60' in source, "Should have 0.60 tier in confidence scale"
+        assert '0.70' in source or '70' in source, "Should have 0.70 tier in confidence scale"
+        assert '0.80' in source or '80' in source, "Should have 0.80 tier in confidence scale"
+        assert '0.90' in source or '90' in source, "Should have 0.90 tier in confidence scale"
+        assert 'park at exactly 0.75' in source or 'MUST vary' in source, \
+            "Should warn against parking at 0.75"
+    
+    def test_prompt_warns_against_flipping_without_cause(self):
+        """Prompt should tell Claude not to flip direction without confirmed change."""
+        import inspect
+        from trading_bot.llm.claude_client import ClaudeClient
+        
+        source = inspect.getsource(ClaudeClient._build_analysis_prompt)
+        assert 'flip direction without cause' in source.lower() or \
+               'do not flip' in source.lower() or \
+               'flip direction' in source.lower(), \
+            "Prompt should warn against direction flips without cause"
+
+
+# ============================================================
+# 24. Cycle-to-Cycle Memory Tests
+# ============================================================
+
+class TestCycleMemory:
+    """Verify Claude receives its last signal for context."""
+    
+    def test_last_signal_dict_exists_on_trading_bot(self):
+        """TradingBot should have _last_signal_per_symbol dict."""
+        from trading_bot.main import TradingBot
+        
+        with patch.object(TradingBot, '__init__', lambda self, **kw: None):
+            bot = TradingBot.__new__(TradingBot)
+            bot._last_signal_per_symbol = {}
+            assert isinstance(bot._last_signal_per_symbol, dict)
+    
+    def test_prompt_includes_last_signal_section(self):
+        """When last_signal is in market_data, prompt should include it."""
+        from trading_bot.llm.claude_client import ClaudeClient
+        
+        with patch.object(ClaudeClient, '__init__', lambda self, **kw: None):
+            client = ClaudeClient.__new__(ClaudeClient)
+            
+            market_data = {
+                'current_price': 2650.50,
+                'session': 'london',
+                'daily_high': 2660.0,
+                'daily_low': 2640.0,
+                'last_signal': {
+                    'direction': 'long',
+                    'confidence': 0.75,
+                    'timestamp': '2026-02-11T12:00:00',
+                    'reasoning': 'Bullish OB test',
+                }
+            }
+            
+            prompt = client._build_analysis_prompt(
+                symbol='XAUUSD',
+                timeframe='M5',
+                strategy_context='Test context',
+                market_data=market_data,
+                analysis_data=None
+            )
+            
+            assert 'YOUR LAST SIGNAL' in prompt, "Prompt should include last signal section"
+            assert 'LONG' in prompt, "Should show the previous direction"
+            assert 'DIRECTION FLIP RULE' in prompt, "Should include direction flip rule"
+    
+    def test_prompt_omits_last_signal_when_none(self):
+        """When no last_signal exists, prompt should not include last signal section."""
+        from trading_bot.llm.claude_client import ClaudeClient
+        
+        with patch.object(ClaudeClient, '__init__', lambda self, **kw: None):
+            client = ClaudeClient.__new__(ClaudeClient)
+            
+            market_data = {
+                'current_price': 2650.50,
+                'session': 'london',
+                'daily_high': 2660.0,
+                'daily_low': 2640.0,
+            }
+            
+            prompt = client._build_analysis_prompt(
+                symbol='XAUUSD',
+                timeframe='M5',
+                strategy_context='Test context',
+                market_data=market_data,
+                analysis_data=None
+            )
+            
+            assert 'YOUR LAST SIGNAL' not in prompt, \
+                "Should not include last signal section when no data"
+    
+    def test_signal_memory_stored_in_analyze_and_trade(self):
+        """_analyze_and_trade should store signals in _last_signal_per_symbol."""
+        import inspect
+        from trading_bot.main import TradingBot
+        
+        source = inspect.getsource(TradingBot._analyze_and_trade)
+        assert '_last_signal_per_symbol' in source, \
+            "_analyze_and_trade should update _last_signal_per_symbol"
+        assert "market_data[\"last_signal\"]" in source or \
+               "market_data['last_signal']" in source, \
+            "_analyze_and_trade should inject last_signal into market_data"
+
+
+# ============================================================
+# 25. Direction-Flip Cooldown Tests
+# ============================================================
+
+class TestDirectionFlipCooldown:
+    """Test the direction-flip cooldown guard logic."""
+    
+    def test_flip_guard_exists_in_code(self):
+        """The flip guard logic should exist in _analyze_and_trade."""
+        import inspect
+        from trading_bot.main import TradingBot
+        
+        source = inspect.getsource(TradingBot._analyze_and_trade)
+        assert 'FLIP-GUARD' in source, "Should have FLIP-GUARD logic"
+        assert '_last_signal_direction' in source, "Should track last signal direction"
+        assert 'flip_cooldown_minutes' in source, "Should have cooldown window"
+        assert 'flip_min_confidence' in source, "Should have higher confidence for flips"
+    
+    def test_same_direction_always_passes(self):
+        """Same direction signal should never be blocked by the flip guard."""
+        from datetime import datetime, timedelta
+        
+        # Simulate: last signal was LONG 5 minutes ago, new signal is also LONG
+        last_dir = 'long'
+        last_time = datetime.now() - timedelta(minutes=5)
+        new_dir = 'long'
+        new_confidence = 0.75
+        flip_cooldown_minutes = 30
+        flip_min_confidence = 0.85
+        
+        minutes_since = (datetime.now() - last_time).total_seconds() / 60
+        is_flip = (last_dir != new_dir and last_dir != 'no_trade' and 
+                   minutes_since < flip_cooldown_minutes)
+        
+        assert not is_flip, "Same direction should not be considered a flip"
+    
+    def test_flip_within_cooldown_low_confidence_blocked(self):
+        """Direction flip within 30 min at 75% confidence should be blocked."""
+        from datetime import datetime, timedelta
+        
+        last_dir = 'long'
+        last_time = datetime.now() - timedelta(minutes=10)
+        new_dir = 'short'
+        new_confidence = 0.75
+        flip_cooldown_minutes = 30
+        flip_min_confidence = 0.85
+        
+        minutes_since = (datetime.now() - last_time).total_seconds() / 60
+        is_flip = (last_dir != new_dir and last_dir != 'no_trade' and 
+                   minutes_since < flip_cooldown_minutes)
+        should_block = is_flip and new_confidence < flip_min_confidence
+        
+        assert is_flip, "Different direction within cooldown is a flip"
+        assert should_block, "Low-confidence flip should be blocked"
+    
+    def test_flip_within_cooldown_high_confidence_passes(self):
+        """Direction flip within 30 min at 88% confidence should pass."""
+        from datetime import datetime, timedelta
+        
+        last_dir = 'long'
+        last_time = datetime.now() - timedelta(minutes=10)
+        new_dir = 'short'
+        new_confidence = 0.88
+        flip_cooldown_minutes = 30
+        flip_min_confidence = 0.85
+        
+        minutes_since = (datetime.now() - last_time).total_seconds() / 60
+        is_flip = (last_dir != new_dir and last_dir != 'no_trade' and 
+                   minutes_since < flip_cooldown_minutes)
+        should_block = is_flip and new_confidence < flip_min_confidence
+        
+        assert is_flip, "Different direction within cooldown is a flip"
+        assert not should_block, "High-confidence flip should pass through"
+    
+    def test_flip_after_cooldown_passes(self):
+        """Direction flip after 30+ minutes should always pass."""
+        from datetime import datetime, timedelta
+        
+        last_dir = 'long'
+        last_time = datetime.now() - timedelta(minutes=45)
+        new_dir = 'short'
+        new_confidence = 0.75
+        flip_cooldown_minutes = 30
+        flip_min_confidence = 0.85
+        
+        minutes_since = (datetime.now() - last_time).total_seconds() / 60
+        is_flip = (last_dir != new_dir and last_dir != 'no_trade' and 
+                   minutes_since < flip_cooldown_minutes)
+        
+        assert not is_flip, "Flip after cooldown should not trigger guard"
+    
+    def test_no_trade_does_not_count_as_flip(self):
+        """Switching from no_trade to a direction should not trigger the flip guard."""
+        from datetime import datetime, timedelta
+        
+        last_dir = 'no_trade'
+        last_time = datetime.now() - timedelta(minutes=5)
+        new_dir = 'long'
+        new_confidence = 0.75
+        flip_cooldown_minutes = 30
+        flip_min_confidence = 0.85
+        
+        minutes_since = (datetime.now() - last_time).total_seconds() / 60
+        is_flip = (last_dir != new_dir and last_dir != 'no_trade' and 
+                   minutes_since < flip_cooldown_minutes)
+        
+        assert not is_flip, "no_trade -> long is not a direction flip"

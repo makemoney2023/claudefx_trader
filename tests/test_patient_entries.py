@@ -414,15 +414,17 @@ class TestDirectionalBiasFix:
 
     # ----- Anti-Bias Instruction -----
 
-    def test_anti_bias_instruction_in_important_rules(self):
-        """Important Rules should contain anti-bias instruction."""
+    def test_reactive_mandate_in_important_rules(self):
+        """Important Rules should contain reactive trading mandate."""
         prompt = self._build_prompt_with_bearish_htf()
-        assert "EVALUATE BOTH DIRECTIONS EVERY CYCLE" in prompt
+        assert "REACT" in prompt, "Prompt should have reactive mandate"
+        assert "ALREADY" in prompt, "Prompt should require ALREADY confirmed setups"
 
-    def test_anti_bias_mentions_reversals(self):
-        """The anti-bias instruction should mention that markets reverse."""
+    def test_anti_flip_instruction_in_rules(self):
+        """Rules should warn against flipping direction without confirmed change."""
         prompt = self._build_prompt_with_bearish_htf()
-        assert "Markets reverse" in prompt or "markets reverse" in prompt
+        assert "flip direction" in prompt.lower(), \
+            "Prompt should warn against direction flips without cause"
 
     # ----- Premium/Discount Soft Guidance -----
 

@@ -177,6 +177,12 @@ class TradingBot:
         self._recent_signal_hashes: set = set()
         self._signal_hash_expiry: Dict[str, datetime] = {}
         
+        # Cycle-to-cycle signal memory (per symbol) for reactive context
+        self._last_signal_per_symbol: Dict[str, Dict[str, Any]] = {}
+        
+        # Direction-flip cooldown tracking
+        self._last_signal_direction: Dict[str, tuple] = {}  # symbol -> (direction, datetime)
+        
         # SAFE Crypto symbols (24/7 trading) - ONLY USD pairs!
         # WARNING: BTC pairs (ETHBTC, DASHBTC, etc.) are EXCLUDED because 
         # their contract value is in BTC, not USD, causing incorrect position sizing
@@ -1885,6 +1891,10 @@ class TradingBot:
                 market_data["optimal_entry"] = fib_analysis.optimal_entry
                 market_data["fib_levels"] = fib_analysis.fib_levels.to_dict() if fib_analysis.fib_levels else None
             
+            # Inject last signal memory so Claude knows what it said last cycle
+            if symbol in self._last_signal_per_symbol:
+                market_data["last_signal"] = self._last_signal_per_symbol[symbol]
+            
             # Get Claude's analysis
             logger.info(f"Requesting Claude analysis for {symbol}...")
             if bot_state:
@@ -1903,6 +1913,14 @@ class TradingBot:
             print(f"[ANALYSIS] Claude analysis complete for {symbol}", flush=True)
             # Extract trade signal from result
             trade_signal = claude_result.signal
+            
+            # Update cycle-to-cycle signal memory
+            self._last_signal_per_symbol[symbol] = {
+                "direction": trade_signal.direction,
+                "confidence": trade_signal.confidence,
+                "timestamp": datetime.now().isoformat(),
+                "reasoning": (trade_signal.reasoning or "")[:200],
+            }
             
             # Log Claude's response
             if bot_state:
@@ -2208,6 +2226,58 @@ class TradingBot:
             # We do NOT reject based on Claude's self-reported risk_reward field here
             # because the actual price-based R:R has already been fixed.
             # The final validate_trade() call will do the definitive R:R check.
+            
+            # =============================================
+            # DIRECTION-FLIP COOLDOWN
+            # =============================================
+            # If Claude just flipped direction on the same symbol within 30 minutes,
+            # require higher confidence (85%) to proceed. This prevents the
+            # prediction-driven flip-flopping pattern (e.g., LONG 75% -> SHORT 75%).
+            flip_cooldown_minutes = 30
+            flip_min_confidence = 0.85
+            
+            if symbol in self._last_signal_direction:
+                last_dir, last_time = self._last_signal_direction[symbol]
+                minutes_since = (datetime.now() - last_time).total_seconds() / 60
+                
+                if (last_dir != trade_signal.direction and 
+                    last_dir != 'no_trade' and 
+                    minutes_since < flip_cooldown_minutes):
+                    # Direction flip detected within cooldown window
+                    if trade_signal.confidence < flip_min_confidence:
+                        logger.warning(
+                            f"[FLIP-GUARD] {symbol}: Blocked direction flip "
+                            f"{last_dir.upper()} -> {trade_signal.direction.upper()} "
+                            f"({trade_signal.confidence:.0%} < {flip_min_confidence:.0%} required, "
+                            f"{minutes_since:.0f}min since last signal)"
+                        )
+                        from .api.routes.activity import add_activity
+                        add_activity(
+                            "direction_flip_blocked",
+                            f"Blocked {symbol} flip: {last_dir.upper()} -> {trade_signal.direction.upper()} "
+                            f"({trade_signal.confidence:.0%} < {flip_min_confidence:.0%})",
+                            symbol,
+                            {
+                                "previous_direction": last_dir,
+                                "new_direction": trade_signal.direction,
+                                "confidence": trade_signal.confidence,
+                                "required_confidence": flip_min_confidence,
+                                "minutes_since_last": round(minutes_since, 1),
+                            }
+                        )
+                        if bot_state:
+                            bot_state.trade_decision(symbol, "rejected", 
+                                f"Direction flip blocked ({last_dir} -> {trade_signal.direction}, need {flip_min_confidence:.0%})")
+                        return
+                    else:
+                        logger.info(
+                            f"[FLIP-GUARD] {symbol}: Allowing high-confidence flip "
+                            f"{last_dir.upper()} -> {trade_signal.direction.upper()} "
+                            f"({trade_signal.confidence:.0%} >= {flip_min_confidence:.0%})"
+                        )
+            
+            # Track this signal direction for future flip detection
+            self._last_signal_direction[symbol] = (trade_signal.direction, datetime.now())
             
             # Gap 21: Check for duplicate signals (prevent same trade within 1 hour)
             signal_hash = self._get_signal_hash(symbol, trade_signal.direction, trade_signal.entry_price or current_price)
