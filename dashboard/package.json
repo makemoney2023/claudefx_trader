@@ -1,0 +1,32 @@
+{
+  "name": "ict-trading-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "npx next dev --turbo",
+    "build": "npx next build",
+    "start": "npx next start",
+    "lint": "npx next lint"
+  },
+  "dependencies": {
+    "clsx": "^2.1.0",
+    "date-fns": "^3.3.1",
+    "echarts": "^5.5.0",
+    "echarts-for-react": "^3.0.2",
+    "lightweight-charts": "^4.1.0",
+    "lucide-react": "^0.314.0",
+    "next": "^14.1.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tailwind-merge": "^2.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "autoprefixer": "^10.4.17",
+    "postcss": "^8.4.35",
+    "tailwindcss": "^3.4.1",
+    "typescript": "^5.3.0"
+  }
+}

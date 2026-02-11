@@ -1,0 +1,62 @@
+# ===========================
+# Python
+# ===========================
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ===========================
+# Environment / Secrets
+# ===========================
+.env
+.env.local
+.env.production
+*.pem
+*.key
+
+# ===========================
+# Node / Next.js (dashboard)
+# ===========================
+node_modules/
+.next/
+out/
+.turbo/
+
+# ===========================
+# IDE / OS
+# ===========================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ===========================
+# Logs
+# ===========================
+logs/
+*.log
+*.log.*
+
+# ===========================
+# Runtime data
+# ===========================
+data/bot.lock
+trading_bot.db
+trades/journal.json
+
+# ===========================
+# Test / Cache
+# ===========================
+.pytest_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+coverage.xml

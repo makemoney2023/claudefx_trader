@@ -1,0 +1,779 @@
+{
+  "meta": {
+    "title": "ICT Trading Bot",
+    "tagline": "AI-Powered Forex & Crypto Trading with Institutional Intelligence",
+    "description": "An advanced algorithmic trading system combining Claude AI with ICT methodology and real-time market intelligence to execute institutional-grade trading strategies.",
+    "version": "2.0.0",
+    "lastUpdated": "2026-02-01"
+  },
+  
+  "hero": {
+    "headline": "Trade Like Institutions",
+    "subheadline": "AI-Powered ICT Strategy with Real-Time Market Intelligence",
+    "description": "Capture 100+ pip expansion moves with Claude AI, ICT methodology, and 19 real-time intelligence sources.",
+    "cta": {
+      "primary": {
+        "text": "Get Started",
+        "href": "#getting-started"
+      },
+      "secondary": {
+        "text": "View Features",
+        "href": "#features"
+      }
+    },
+    "stats": [
+      { "value": "19", "label": "Intelligence Sources" },
+      { "value": "100+", "label": "Pip Targets" },
+      { "value": "24/7", "label": "Crypto Trading" },
+      { "value": "AI", "label": "Powered Analysis" }
+    ]
+  },
+
+  "features": {
+    "title": "Powerful Features",
+    "subtitle": "Everything you need for institutional-grade trading",
+    "categories": [
+      {
+        "id": "ai-analysis",
+        "title": "AI-Powered Analysis",
+        "icon": "brain",
+        "description": "Claude Opus 4.5 analyzes charts with vision capabilities",
+        "features": [
+          {
+            "name": "Vision-Based Chart Analysis",
+            "description": "Claude analyzes actual chart images to identify patterns, structure, and setups with human-like understanding."
+          },
+          {
+            "name": "Contextual Learning",
+            "description": "The system learns from past trades to improve future recommendations and avoid repeated mistakes."
+          },
+          {
+            "name": "Confidence Scoring",
+            "description": "Every trade signal includes a confidence level (0-100%) based on multiple technical and fundamental factors."
+          },
+          {
+            "name": "Natural Language Reasoning",
+            "description": "Detailed explanations accompany every trade decision, making the AI's logic transparent and reviewable."
+          }
+        ]
+      },
+      {
+        "id": "ict-strategy",
+        "title": "ICT Strategy Implementation",
+        "icon": "chart-line",
+        "description": "Complete Inner Circle Trading methodology",
+        "features": [
+          {
+            "name": "AMD Cycle Detection",
+            "description": "Automatically identifies Accumulation, Manipulation, and Distribution phases for optimal entry timing."
+          },
+          {
+            "name": "Fair Value Gaps (FVG)",
+            "description": "Detects and tracks unfilled price imbalances that act as magnets for price."
+          },
+          {
+            "name": "Order Blocks",
+            "description": "Identifies institutional supply and demand zones where smart money has positioned."
+          },
+          {
+            "name": "Breaker Blocks",
+            "description": "Detects failed order blocks that transform into high-probability reversal zones."
+          },
+          {
+            "name": "Liquidity Mapping",
+            "description": "Tracks buy-side (BSL) and sell-side (SSL) liquidity pools that institutions target."
+          },
+          {
+            "name": "Market Structure Analysis",
+            "description": "Identifies Break of Structure (BOS), Change of Character (CHoCH), and Market Structure Shift (MSS)."
+          },
+          {
+            "name": "Kill Zone Timing",
+            "description": "Optimal trading windows during London, New York, and overlap sessions."
+          },
+          {
+            "name": "Silver Bullet Windows",
+            "description": "High-probability 1-hour windows at 3-4AM, 10-11AM, and 2-3PM EST."
+          }
+        ]
+      },
+      {
+        "id": "expansion-system",
+        "title": "100-Pip Expansion System",
+        "icon": "target",
+        "description": "Capture large institutional moves",
+        "features": [
+          {
+            "name": "Displacement Detection",
+            "description": "Confirms distribution phase start with impulsive candles (1.5x+ ATR) signaling institutional commitment."
+          },
+          {
+            "name": "IPDA Level Targeting",
+            "description": "Uses Previous Day/Week High/Low (PDH/PDL/PWH/PWL) as take profit targets instead of nearest liquidity."
+          },
+          {
+            "name": "Premium/Discount Zones",
+            "description": "Ensures optimal entry locations - longs only in discount (<50%), shorts only in premium (>50%)."
+          },
+          {
+            "name": "NWOG Tracking",
+            "description": "New Week Opening Gap targets provide confluence for larger moves."
+          },
+          {
+            "name": "Multi-Tier Take Profits",
+            "description": "30%/30%/40% scaling out strategy to secure profits while letting winners run."
+          }
+        ]
+      },
+      {
+        "id": "intelligence",
+        "title": "Real-Time Market Intelligence",
+        "icon": "globe",
+        "description": "19 intelligence sources via Firecrawl API",
+        "features": [
+          {
+            "name": "DXY Analysis",
+            "description": "Dollar Index trend and bias for EUR/GBP correlation trading."
+          },
+          {
+            "name": "Retail Sentiment",
+            "description": "Crowd positioning as a contrarian indicator - trade against extreme retail."
+          },
+          {
+            "name": "VIX Sentiment",
+            "description": "Fear/greed gauge for risk-on/risk-off environment detection."
+          },
+          {
+            "name": "Currency Strength",
+            "description": "Relative strength rankings to identify strongest vs weakest currencies."
+          },
+          {
+            "name": "TradingView Technical",
+            "description": "Community consensus signals for additional confirmation."
+          },
+          {
+            "name": "Rate Expectations",
+            "description": "Fed/ECB/BOE rate outlook for currency bias."
+          },
+          {
+            "name": "Options Flow",
+            "description": "Institutional positioning and magnet levels from options market."
+          },
+          {
+            "name": "Bond Yields",
+            "description": "US-German spread for EUR/USD directional bias."
+          },
+          {
+            "name": "Social Sentiment",
+            "description": "Twitter/X forex chatter for contrarian signals."
+          },
+          {
+            "name": "Seasonal Patterns",
+            "description": "Historical monthly bias with accuracy percentages."
+          },
+          {
+            "name": "Intermarket Analysis",
+            "description": "SPX/VIX/Gold correlations for risk environment."
+          },
+          {
+            "name": "Economic Calendar",
+            "description": "High-impact events with automatic blackout periods."
+          },
+          {
+            "name": "BTC Dominance",
+            "description": "Crypto market structure for altcoin sentiment."
+          }
+        ]
+      },
+      {
+        "id": "risk-management",
+        "title": "Risk Management",
+        "icon": "shield",
+        "description": "Comprehensive protection for your capital",
+        "features": [
+          {
+            "name": "Dynamic Position Sizing",
+            "description": "Automatically scales position size with account equity across 6 tiers from $1K to $100K+."
+          },
+          {
+            "name": "Margin Validation",
+            "description": "Pre-trade checks prevent overleveraging and ensure sufficient margin."
+          },
+          {
+            "name": "Correlation Protection",
+            "description": "Prevents excessive exposure to correlated currency pairs."
+          },
+          {
+            "name": "Max Exposure Limits",
+            "description": "Configurable caps on total account exposure percentage."
+          },
+          {
+            "name": "Emergency Controls",
+            "description": "One-click close all positions functionality for rapid risk reduction."
+          },
+          {
+            "name": "News Blackouts",
+            "description": "Automatic trade blocking during high-impact economic events."
+          }
+        ]
+      },
+      {
+        "id": "performance",
+        "title": "Performance Tracking",
+        "icon": "chart-bar",
+        "description": "Comprehensive analytics and reporting",
+        "features": [
+          {
+            "name": "Goal Tracking",
+            "description": "Progress toward $100K target with milestone achievements."
+          },
+          {
+            "name": "Session Analytics",
+            "description": "Performance breakdown by trading session (Asian, London, NY)."
+          },
+          {
+            "name": "R-Multiple Tracking",
+            "description": "Risk-adjusted performance metrics beyond simple P&L."
+          },
+          {
+            "name": "Equity Curve",
+            "description": "Visual progress tracking with drawdown analysis."
+          },
+          {
+            "name": "Trade Journal",
+            "description": "Automatic logging with AI-powered trade reviews."
+          },
+          {
+            "name": "Weekly Reviews",
+            "description": "Claude-generated comprehensive performance analysis."
+          }
+        ]
+      }
+    ]
+  },
+
+  "intelligence": {
+    "title": "Market Intelligence Sources",
+    "subtitle": "Real-time data powering smarter decisions",
+    "sources": [
+      {
+        "name": "DXY Analysis",
+        "category": "Currency",
+        "description": "US Dollar Index trend and key levels",
+        "usage": "EUR/GBP correlation, USD pair bias",
+        "updateFrequency": "15 minutes"
+      },
+      {
+        "name": "Retail Sentiment",
+        "category": "Sentiment",
+        "description": "Retail trader positioning data",
+        "usage": "Contrarian indicator - trade against extremes",
+        "updateFrequency": "15 minutes"
+      },
+      {
+        "name": "VIX Sentiment",
+        "category": "Risk",
+        "description": "CBOE Volatility Index",
+        "usage": "Risk-on/risk-off environment",
+        "updateFrequency": "5 minutes"
+      },
+      {
+        "name": "Currency Strength",
+        "category": "Currency",
+        "description": "Relative strength meter",
+        "usage": "Pair selection, strongest vs weakest",
+        "updateFrequency": "30 minutes"
+      },
+      {
+        "name": "TradingView Technical",
+        "category": "Technical",
+        "description": "Community technical consensus",
+        "usage": "Signal confirmation/conflict",
+        "updateFrequency": "15 minutes"
+      },
+      {
+        "name": "Rate Expectations",
+        "category": "Fundamental",
+        "description": "Central bank rate forecasts",
+        "usage": "Currency directional bias",
+        "updateFrequency": "1 hour"
+      },
+      {
+        "name": "Options Flow",
+        "category": "Institutional",
+        "description": "FX options positioning",
+        "usage": "Magnet levels, institutional bias",
+        "updateFrequency": "30 minutes"
+      },
+      {
+        "name": "Bond Yields",
+        "category": "Fundamental",
+        "description": "Government bond spreads",
+        "usage": "EUR/USD directional bias",
+        "updateFrequency": "30 minutes"
+      },
+      {
+        "name": "Social Sentiment",
+        "category": "Sentiment",
+        "description": "Twitter/X forex discussion",
+        "usage": "Contrarian social signals",
+        "updateFrequency": "15 minutes"
+      },
+      {
+        "name": "Seasonal Patterns",
+        "category": "Historical",
+        "description": "Monthly historical bias",
+        "usage": "Additional directional confirmation",
+        "updateFrequency": "Daily"
+      },
+      {
+        "name": "Intermarket Analysis",
+        "category": "Correlation",
+        "description": "SPX/VIX/Gold/DXY correlations",
+        "usage": "Risk environment assessment",
+        "updateFrequency": "15 minutes"
+      },
+      {
+        "name": "Economic Calendar",
+        "category": "Fundamental",
+        "description": "High-impact event schedule",
+        "usage": "Blackout period management",
+        "updateFrequency": "Daily"
+      },
+      {
+        "name": "BTC Dominance",
+        "category": "Crypto",
+        "description": "Bitcoin market share",
+        "usage": "Altcoin sentiment, crypto rotation",
+        "updateFrequency": "15 minutes"
+      }
+    ]
+  },
+
+  "scalingTiers": {
+    "title": "Dynamic Scaling System",
+    "subtitle": "Position sizing grows with your account",
+    "tiers": [
+      {
+        "name": "Micro",
+        "equityMin": 0,
+        "equityMax": 2500,
+        "baseLots": 0.01,
+        "maxLots": 0.05,
+        "riskPercent": 1.0,
+        "maxDailyTrades": 5,
+        "description": "Starting tier for small accounts"
+      },
+      {
+        "name": "Mini",
+        "equityMin": 2500,
+        "equityMax": 10000,
+        "baseLots": 0.02,
+        "maxLots": 0.10,
+        "riskPercent": 1.0,
+        "maxDailyTrades": 8,
+        "description": "Growing accounts with proven consistency"
+      },
+      {
+        "name": "Standard",
+        "equityMin": 10000,
+        "equityMax": 25000,
+        "baseLots": 0.05,
+        "maxLots": 0.25,
+        "riskPercent": 1.0,
+        "maxDailyTrades": 10,
+        "description": "Established accounts with track record"
+      },
+      {
+        "name": "Pro",
+        "equityMin": 25000,
+        "equityMax": 50000,
+        "baseLots": 0.10,
+        "maxLots": 0.50,
+        "riskPercent": 1.0,
+        "maxDailyTrades": 12,
+        "description": "Professional-level trading"
+      },
+      {
+        "name": "Elite",
+        "equityMin": 50000,
+        "equityMax": 100000,
+        "baseLots": 0.20,
+        "maxLots": 1.00,
+        "riskPercent": 1.0,
+        "maxDailyTrades": 15,
+        "description": "Approaching goal account size"
+      },
+      {
+        "name": "Master",
+        "equityMin": 100000,
+        "equityMax": null,
+        "baseLots": 0.50,
+        "maxLots": 2.00,
+        "riskPercent": 0.5,
+        "maxDailyTrades": 20,
+        "description": "Goal achieved - capital preservation focus"
+      }
+    ]
+  },
+
+  "orderTypes": {
+    "title": "Intelligent Order Selection",
+    "subtitle": "The right order type for every situation",
+    "types": [
+      {
+        "name": "Market Order",
+        "icon": "zap",
+        "whenUsed": "Distribution phase confirmed with displacement candle",
+        "conditions": [
+          "AMD phase = Distribution",
+          "Displacement candle confirmed",
+          "Silver Bullet window active",
+          "Entry zone already reached"
+        ]
+      },
+      {
+        "name": "Buy Limit",
+        "icon": "arrow-down",
+        "whenUsed": "Bullish setup, waiting for retracement to entry zone",
+        "conditions": [
+          "Bullish bias confirmed",
+          "Entry below current price",
+          "Waiting for FVG/OB fill",
+          "Manipulation phase active"
+        ]
+      },
+      {
+        "name": "Sell Limit",
+        "icon": "arrow-up",
+        "whenUsed": "Bearish setup, waiting for retracement to entry zone",
+        "conditions": [
+          "Bearish bias confirmed",
+          "Entry above current price",
+          "Waiting for FVG/OB fill",
+          "Manipulation phase active"
+        ]
+      },
+      {
+        "name": "Buy Stop",
+        "icon": "trending-up",
+        "whenUsed": "Bullish, waiting for breakout confirmation",
+        "conditions": [
+          "Bullish bias confirmed",
+          "Waiting for structure break",
+          "Entry above current price",
+          "Confirmation needed"
+        ]
+      },
+      {
+        "name": "Sell Stop",
+        "icon": "trending-down",
+        "whenUsed": "Bearish, waiting for breakdown confirmation",
+        "conditions": [
+          "Bearish bias confirmed",
+          "Waiting for structure break",
+          "Entry below current price",
+          "Confirmation needed"
+        ]
+      }
+    ]
+  },
+
+  "markets": {
+    "title": "Supported Markets",
+    "subtitle": "Trade forex, metals, and crypto",
+    "categories": [
+      {
+        "name": "Forex Majors",
+        "icon": "dollar-sign",
+        "pairs": ["EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD"]
+      },
+      {
+        "name": "Forex Crosses",
+        "icon": "repeat",
+        "pairs": ["EURGBP", "EURJPY", "GBPJPY", "AUDJPY", "CADJPY", "CHFJPY", "EURAUD"]
+      },
+      {
+        "name": "Precious Metals",
+        "icon": "gem",
+        "pairs": ["XAUUSD", "XAGUSD"]
+      },
+      {
+        "name": "Cryptocurrencies",
+        "icon": "bitcoin",
+        "pairs": ["BTCUSD", "ETHUSD", "XRPUSD", "ADAUSD", "SOLUSD", "DOTUSD", "LTCUSD", "DOGEUSD"],
+        "note": "USD-quoted pairs only. BTC-quoted pairs are blocked."
+      }
+    ]
+  },
+
+  "dashboard": {
+    "title": "Powerful Dashboard",
+    "subtitle": "Complete control at your fingertips",
+    "pages": [
+      {
+        "name": "Overview",
+        "description": "Real-time equity, positions, pending orders, and market intelligence",
+        "features": ["Live P&L", "Position cards", "Pending orders table", "AMD phase indicator", "Session status"]
+      },
+      {
+        "name": "Intelligence",
+        "description": "Comprehensive market intelligence display",
+        "features": ["DXY analysis", "Retail sentiment", "VIX risk mode", "Currency strength", "Options flow", "Bond yields"]
+      },
+      {
+        "name": "Performance",
+        "description": "Analytics and statistics",
+        "features": ["Equity curve", "Win rate stats", "Session breakdown", "Symbol analysis", "R-multiple tracking"]
+      },
+      {
+        "name": "Positions",
+        "description": "Position and order management",
+        "features": ["Open positions", "Pending orders", "Modify controls", "Emergency close", "Margin health"]
+      },
+      {
+        "name": "Analysis",
+        "description": "ICT technical analysis",
+        "features": ["Market structure", "FVG visualization", "Order blocks", "Liquidity levels", "Kill zones"]
+      },
+      {
+        "name": "Settings",
+        "description": "Configuration and controls",
+        "features": ["Risk parameters", "Symbol management", "Alert thresholds", "API keys", "Trading modes"]
+      }
+    ]
+  },
+
+  "api": {
+    "title": "RESTful API",
+    "subtitle": "Full programmatic access",
+    "categories": [
+      {
+        "name": "Trading",
+        "endpoints": [
+          { "method": "GET", "path": "/api/trades", "description": "List all trades" },
+          { "method": "GET", "path": "/api/trades/positions/open", "description": "Get open positions" },
+          { "method": "POST", "path": "/api/trades/sync-from-mt5", "description": "Sync positions from MT5" }
+        ]
+      },
+      {
+        "name": "Analysis",
+        "endpoints": [
+          { "method": "GET", "path": "/api/analysis/{symbol}", "description": "Full ICT analysis for symbol" },
+          { "method": "GET", "path": "/api/analysis/session", "description": "Current session info" },
+          { "method": "GET", "path": "/api/analysis/signals", "description": "Recent trade signals" }
+        ]
+      },
+      {
+        "name": "Intelligence",
+        "endpoints": [
+          { "method": "GET", "path": "/api/intelligence/status", "description": "Service status" },
+          { "method": "GET", "path": "/api/intelligence/complete/{symbol}", "description": "Full intelligence analysis" },
+          { "method": "POST", "path": "/api/intelligence/refresh", "description": "Refresh all intelligence" }
+        ]
+      },
+      {
+        "name": "Bot Control",
+        "endpoints": [
+          { "method": "GET", "path": "/api/bot/status", "description": "Bot running status" },
+          { "method": "POST", "path": "/api/bot/start", "description": "Start trading bot" },
+          { "method": "POST", "path": "/api/bot/stop", "description": "Stop trading bot" },
+          { "method": "POST", "path": "/api/bot/emergency-close", "description": "Close all positions" }
+        ]
+      }
+    ]
+  },
+
+  "techStack": {
+    "title": "Technology Stack",
+    "subtitle": "Built with modern, reliable technologies",
+    "categories": [
+      {
+        "name": "Trading Engine",
+        "technologies": ["Python 3.12+", "AsyncIO", "SQLAlchemy"]
+      },
+      {
+        "name": "AI Integration",
+        "technologies": ["Anthropic Claude API", "Vision Analysis", "Tool Use"]
+      },
+      {
+        "name": "Market Data",
+        "technologies": ["MetaTrader 5", "MCP Server", "WebSocket"]
+      },
+      {
+        "name": "Intelligence",
+        "technologies": ["Firecrawl API", "Real-time Scraping", "Data Parsing"]
+      },
+      {
+        "name": "Backend API",
+        "technologies": ["FastAPI", "Pydantic", "SQLite/PostgreSQL"]
+      },
+      {
+        "name": "Dashboard",
+        "technologies": ["Next.js 14", "React", "TailwindCSS", "TypeScript"]
+      },
+      {
+        "name": "Notifications",
+        "technologies": ["Telegram Bot API", "Discord Webhooks"]
+      }
+    ]
+  },
+
+  "gettingStarted": {
+    "title": "Getting Started",
+    "subtitle": "Up and running in minutes",
+    "prerequisites": [
+      "Python 3.12 or higher",
+      "Node.js 18 or higher",
+      "MetaTrader 5 Terminal",
+      "Anthropic API Key",
+      "Firecrawl API Key (optional)",
+      "Telegram Bot Token (optional)"
+    ],
+    "steps": [
+      {
+        "step": 1,
+        "title": "Clone Repository",
+        "command": "git clone https://github.com/your-repo/ict-trading-bot.git && cd ict-trading-bot"
+      },
+      {
+        "step": 2,
+        "title": "Install Dependencies",
+        "command": "pip install -r requirements.txt && cd dashboard && npm install && cd .."
+      },
+      {
+        "step": 3,
+        "title": "Configure Environment",
+        "command": "cp .env.example .env && nano .env"
+      },
+      {
+        "step": 4,
+        "title": "Start Bot",
+        "command": "python -m trading_bot.main"
+      },
+      {
+        "step": 5,
+        "title": "Start Dashboard",
+        "command": "cd dashboard && npm run dev"
+      }
+    ],
+    "configuration": {
+      "required": [
+        { "key": "MT5_SERVER", "description": "Your broker's MT5 server" },
+        { "key": "MT5_LOGIN", "description": "MT5 account number" },
+        { "key": "MT5_PASSWORD", "description": "MT5 account password" },
+        { "key": "ANTHROPIC_API_KEY", "description": "Claude API key" }
+      ],
+      "optional": [
+        { "key": "FIRECRAWL_API_KEY", "description": "Firecrawl API key for intelligence" },
+        { "key": "TELEGRAM_BOT_TOKEN", "description": "Telegram notifications" },
+        { "key": "TELEGRAM_CHAT_ID", "description": "Telegram chat ID" }
+      ]
+    }
+  },
+
+  "performance": {
+    "title": "Performance Expectations",
+    "subtitle": "Realistic targets for consistent trading",
+    "metrics": [
+      { "name": "Win Rate", "target": "55-65%", "description": "Percentage of winning trades" },
+      { "name": "Average R", "target": "1.5-2.5R", "description": "Average risk-adjusted return" },
+      { "name": "Profit Factor", "target": ">1.5", "description": "Gross profit / gross loss" },
+      { "name": "Max Drawdown", "target": "<10%", "description": "Maximum peak-to-trough decline" },
+      { "name": "Monthly Return", "target": "5-15%", "description": "Average monthly percentage gain" }
+    ],
+    "growthProjection": {
+      "startingCapital": 1000,
+      "monthlyReturn": 0.10,
+      "milestones": [
+        { "month": 6, "equity": 1772 },
+        { "month": 12, "equity": 3138 },
+        { "month": 18, "equity": 5560 },
+        { "month": 24, "equity": 9850 },
+        { "month": 30, "equity": 17449 },
+        { "month": 36, "equity": 30913 }
+      ]
+    }
+  },
+
+  "disclaimers": {
+    "title": "Important Disclaimers",
+    "items": [
+      {
+        "type": "risk",
+        "title": "Risk Warning",
+        "text": "Forex and cryptocurrency trading involves substantial risk of loss and is not suitable for all investors."
+      },
+      {
+        "type": "performance",
+        "title": "Past Performance",
+        "text": "Historical results do not guarantee future performance. Trading results may vary."
+      },
+      {
+        "type": "advice",
+        "title": "Not Financial Advice",
+        "text": "This software is for educational and informational purposes only. Consult a financial advisor."
+      },
+      {
+        "type": "responsibility",
+        "title": "User Responsibility",
+        "text": "Users are solely responsible for their trading decisions and any resulting profits or losses."
+      },
+      {
+        "type": "capital",
+        "title": "Capital at Risk",
+        "text": "Only trade with money you can afford to lose. Never risk more than you can afford."
+      }
+    ]
+  },
+
+  "testimonials": {
+    "title": "What Users Say",
+    "items": []
+  },
+
+  "faq": {
+    "title": "Frequently Asked Questions",
+    "items": [
+      {
+        "question": "What is ICT trading methodology?",
+        "answer": "Inner Circle Trading (ICT) is a trading methodology developed by Michael J. Huddleston that focuses on institutional order flow, liquidity, and smart money concepts to identify high-probability trade setups."
+      },
+      {
+        "question": "How does the AI analysis work?",
+        "answer": "The bot uses Claude Opus 4.5 with vision capabilities to analyze actual chart screenshots. Claude identifies ICT patterns, market structure, and generates trade recommendations with confidence scores and detailed reasoning."
+      },
+      {
+        "question": "What brokers are supported?",
+        "answer": "Any broker that provides MetaTrader 5 access is supported. The bot connects through the MT5 terminal installed on your computer."
+      },
+      {
+        "question": "Is the Firecrawl API required?",
+        "answer": "No, Firecrawl is optional but recommended. Without it, the bot still functions using ICT analysis and Claude AI, but won't have access to real-time market intelligence like retail sentiment and options flow."
+      },
+      {
+        "question": "How much capital do I need to start?",
+        "answer": "The bot is designed to scale from $1,000 to $100,000+. Position sizing automatically adjusts based on your account equity through the scaling tier system."
+      },
+      {
+        "question": "Can I run the bot 24/7?",
+        "answer": "Yes, but the bot respects market hours. Forex trading occurs during major sessions (London, NY), while crypto pairs can trade 24/7. The bot automatically pauses during weekends for forex."
+      }
+    ]
+  },
+
+  "footer": {
+    "copyright": "© 2026 ICT Trading Bot. All rights reserved.",
+    "links": [
+      { "text": "Documentation", "href": "/docs" },
+      { "text": "API Reference", "href": "/api" },
+      { "text": "GitHub", "href": "https://github.com" },
+      { "text": "Discord", "href": "https://discord.gg" }
+    ],
+    "legal": [
+      { "text": "Terms of Service", "href": "/terms" },
+      { "text": "Privacy Policy", "href": "/privacy" },
+      { "text": "Risk Disclosure", "href": "/risk" }
+    ]
+  }
+}

@@ -1,0 +1,82 @@
+{
+  "streaks": {
+    "win_streak": 0,
+    "loss_streak": 0
+  },
+  "last_saved": "2026-02-11T07:48:43.728505",
+  "daily_stats": {
+    "trades": 0,
+    "pnl": 0.0,
+    "date": "2026-02-11"
+  },
+  "notified_milestones": [],
+  "scaling_manager": {
+    "recent_trades": [],
+    "daily_high_equity": 209.0,
+    "weekly_high_equity": 209.0,
+    "current_mode": "normal"
+  },
+  "session_analytics": {
+    "trade_history": [],
+    "session_stats": {
+      "asian": {
+        "total_trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "total_pnl": 0.0,
+        "total_r": 0.0,
+        "best_trade_r": 0.0,
+        "worst_trade_r": 0.0,
+        "symbols_traded": {}
+      },
+      "london": {
+        "total_trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "total_pnl": 0.0,
+        "total_r": 0.0,
+        "best_trade_r": 0.0,
+        "worst_trade_r": 0.0,
+        "symbols_traded": {}
+      },
+      "new_york": {
+        "total_trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "total_pnl": 0.0,
+        "total_r": 0.0,
+        "best_trade_r": 0.0,
+        "worst_trade_r": 0.0,
+        "symbols_traded": {}
+      },
+      "london_ny_overlap": {
+        "total_trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "total_pnl": 0.0,
+        "total_r": 0.0,
+        "best_trade_r": 0.0,
+        "worst_trade_r": 0.0,
+        "symbols_traded": {}
+      },
+      "off_hours": {
+        "total_trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "total_pnl": 0.0,
+        "total_r": 0.0,
+        "best_trade_r": 0.0,
+        "worst_trade_r": 0.0,
+        "symbols_traded": {}
+      }
+    }
+  },
+  "goal_tracker": {
+    "snapshots": [
+      {
+        "equity": 252.85,
+        "timestamp": "2026-02-11T07:47:25.522686"
+      }
+    ]
+  }
+}

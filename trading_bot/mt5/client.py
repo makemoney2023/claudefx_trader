@@ -1,0 +1,1741 @@
+"""
+MetaTrader 5 MCP Client Wrapper.
+
+Provides a clean interface to the metatrader-mcp-server
+for account operations, market data, and order execution.
+
+Uses the Model Context Protocol (MCP) to communicate with MT5.
+"""
+
+import asyncio
+import json
+from typing import Optional, Dict, Any, List
+from datetime import datetime, timedelta
+from dataclasses import dataclass
+
+from ..config import settings
+from ..utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+@dataclass
+class AccountInfo:
+    """MT5 account information."""
+    login: int
+    balance: float
+    equity: float
+    margin: float
+    free_margin: float
+    margin_level: float
+    profit: float
+    currency: str
+    leverage: int
+    
+    def to_dict(self) -> dict:
+        return {
+            "login": self.login,
+            "balance": self.balance,
+            "equity": self.equity,
+            "margin": self.margin,
+            "free_margin": self.free_margin,
+            "margin_level": self.margin_level,
+            "profit": self.profit,
+            "currency": self.currency,
+            "leverage": self.leverage
+        }
+
+
+@dataclass
+class SymbolInfo:
+    """MT5 symbol information."""
+    name: str
+    bid: float
+    ask: float
+    spread: float
+    digits: int
+    point: float
+    trade_contract_size: float
+    volume_min: float
+    volume_max: float
+    volume_step: float
+    trade_stops_level: int = 0  # Minimum stop distance in points
+    
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "bid": self.bid,
+            "ask": self.ask,
+            "spread": self.spread,
+            "digits": self.digits,
+            "point": self.point,
+            "contract_size": self.trade_contract_size,
+            "stops_level": self.trade_stops_level
+        }
+    
+    def get_min_stop_distance(self) -> float:
+        """Get minimum stop loss distance in price terms."""
+        # stops_level is in points, convert to price
+        # Add a buffer of 5 points for safety
+        return (self.trade_stops_level + 5) * self.point
+
+
+@dataclass
+class Position:
+    """MT5 open position."""
+    ticket: int
+    symbol: str
+    type: str  # 'buy' or 'sell'
+    volume: float
+    price_open: float
+    price_current: float
+    sl: float
+    tp: float
+    profit: float
+    magic: int
+    comment: str
+    time: datetime
+    
+    def to_dict(self) -> dict:
+        return {
+            "ticket": self.ticket,
+            "symbol": self.symbol,
+            "type": self.type,
+            "volume": self.volume,
+            "price_open": self.price_open,
+            "price_current": self.price_current,
+            "sl": self.sl,
+            "tp": self.tp,
+            "profit": self.profit,
+            "magic": self.magic,
+            "comment": self.comment,
+            "time": self.time.isoformat() if self.time else None
+        }
+
+
+class MCPConnectionError(Exception):
+    """Raised when MCP connection fails."""
+    pass
+
+
+class MT5Client:
+    """
+    Client wrapper for MetaTrader 5 MCP server.
+    
+    Connects to the metatrader-mcp-server to interact with MT5
+    for market data, account info, and trading operations.
+    
+    All synchronous MT5 calls are wrapped in asyncio.to_thread() to avoid
+    blocking the async event loop. An asyncio.Lock ensures thread-safe
+    sequential access (MT5 Python module is not thread-safe).
+    
+    The MCP server must be running and accessible for this client to work.
+    Install via: pip install metatrader-mcp-server
+    """
+    
+    # Timeframe mapping (MT5 constants)
+    TIMEFRAMES = {
+        'M1': 1,
+        'M5': 5,
+        'M15': 15,
+        'M30': 30,
+        'H1': 60,
+        'H4': 240,
+        'D1': 1440,
+        'W1': 10080,
+        'MN1': 43200
+    }
+    
+    @staticmethod
+    def _get_filling_type(symbol_info) -> int:
+        """
+        Determine the best filling mode for a symbol.
+        Priority: FOK (most reliable full-fill) > IOC > RETURN (fallback).
+        
+        MT5 filling_mode bitmask: bit 0 (value 1) = FOK, bit 1 (value 2) = IOC
+        """
+        if hasattr(symbol_info, 'filling_mode'):
+            allowed = symbol_info.filling_mode
+            if allowed & 1:  # FOK supported — guarantees full fill or nothing
+                return 0  # ORDER_FILLING_FOK
+            elif allowed & 2:  # IOC supported — partial fills possible
+                return 1  # ORDER_FILLING_IOC
+        return 2  # ORDER_FILLING_RETURN — most brokers accept as fallback
+    
+    # Order type mapping
+    ORDER_TYPES = {
+        'buy': 0,
+        'sell': 1,
+        'buy_limit': 2,
+        'sell_limit': 3,
+        'buy_stop': 4,
+        'sell_stop': 5,
+        'buy_stop_limit': 6,
+        'sell_stop_limit': 7
+    }
+    
+    def __init__(
+        self,
+        login: Optional[int] = None,
+        password: Optional[str] = None,
+        server: Optional[str] = None,
+        mcp_endpoint: Optional[str] = None
+    ):
+        """
+        Initialize the MT5 client.
+        
+        Args:
+            login: MT5 account login
+            password: MT5 account password
+            server: MT5 broker server
+            mcp_endpoint: MCP server endpoint (default: stdio)
+        """
+        self.login = login or settings.mt5.login
+        self.password = password or settings.mt5.password
+        self.server = server or settings.mt5.server
+        self.mcp_endpoint = mcp_endpoint
+        
+        self._connected = False
+        self._mcp_client = None
+        self._use_simulation = False  # Set to True for demo mode
+        self._lock = asyncio.Lock()  # Concurrency lock for MT5 thread safety
+        self._closing_tickets: set = set()  # Guard against concurrent close of same position
+        
+        logger.info("MT5 client initialized")
+    
+    async def connect(self) -> bool:
+        """
+        Connect to MT5 terminal.
+        
+        Returns:
+            True if connection successful
+        """
+        async with self._lock:
+            try:
+                logger.info(f"Connecting to MT5 server: {self.server}")
+                
+                # Try to import MetaTrader5 package (Windows only)
+                try:
+                    import MetaTrader5 as mt5
+                    
+                    self._mcp_client = mt5
+                    
+                    # Initialize MT5 connection (offload blocking call)
+                    init_ok = await asyncio.to_thread(mt5.initialize)
+                    if not init_ok:
+                        error = await asyncio.to_thread(mt5.last_error)
+                        logger.warning(f"MT5 initialization failed: {error}, using simulation mode")
+                        self._use_simulation = True
+                    else:
+                        # Check if already logged in to any account
+                        account_info = await asyncio.to_thread(mt5.account_info)
+                        if account_info and account_info.login > 0:
+                            self._use_simulation = False
+                            self.login = account_info.login
+                            self.server = account_info.server
+                            logger.info(f"MT5 connected to account {account_info.login} on {account_info.server}")
+                        else:
+                            logger.info("MT5 not logged in, attempting login...")
+                            authorized = await asyncio.to_thread(
+                                mt5.login,
+                                int(self.login) if self.login else 0,
+                                str(self.password) if self.password else "",
+                                str(self.server) if self.server else ""
+                            )
+                            
+                            if not authorized:
+                                error = await asyncio.to_thread(mt5.last_error)
+                                logger.warning(f"MT5 login failed: {error}, using simulation mode")
+                                self._use_simulation = True
+                            else:
+                                self._use_simulation = False
+                                logger.info("Successfully logged in to MT5")
+                            
+                except ImportError:
+                    logger.warning(
+                        "MetaTrader5 package not installed or not available (Windows only). "
+                        "Using simulation mode. Install with: pip install MetaTrader5"
+                    )
+                    self._use_simulation = True
+                
+                # Verify connection by getting account info (uses its own lock, so release first)
+                # We need to release the lock before calling get_account_info which also acquires it
+                self._connected = True  # Temporarily set so get_account_info works
+                
+            except Exception as e:
+                logger.error(f"Failed to connect to MT5: {e}")
+                self._use_simulation = True
+                self._connected = True
+                return True
+        
+        # Now outside the lock, verify connection
+        account = await self.get_account_info()
+        
+        if account:
+            self._connected = True
+            logger.info(
+                f"MT5 {'(Simulated)' if self._use_simulation else ''}: "
+                f"Account {account.login}, Balance: {account.balance}"
+            )
+            return True
+        
+        self._connected = False
+        return False
+    
+    async def disconnect(self):
+        """Disconnect from MT5."""
+        async with self._lock:
+            if self._mcp_client and not self._use_simulation:
+                try:
+                    await asyncio.to_thread(self._mcp_client.shutdown)
+                except Exception as e:
+                    logger.error(f"Error during disconnect: {e}")
+            
+            self._connected = False
+            logger.info("Disconnected from MT5")
+    
+    @property
+    def is_connected(self) -> bool:
+        """Check if connected to MT5."""
+        return self._connected
+    
+    @property
+    def is_simulation(self) -> bool:
+        """Check if running in simulation mode."""
+        return self._use_simulation
+    
+    async def ensure_connected(self) -> bool:
+        """
+        Ensure MT5 connection is active, reconnecting if needed.
+        
+        Returns:
+            True if connected (or reconnected successfully)
+        """
+        if self._connected and not self._use_simulation:
+            # Verify connection is still alive
+            try:
+                import MetaTrader5 as mt5
+                async with self._lock:
+                    info = await asyncio.to_thread(mt5.terminal_info)
+                if info is not None:
+                    return True
+            except:
+                pass
+            
+            # Connection lost - try to reconnect
+            logger.warning("MT5 connection lost, attempting reconnect...")
+            self._connected = False
+        
+        # Try to reconnect
+        return await self.reconnect()
+    
+    async def reconnect(self, max_attempts: int = 3, delay: float = 5.0) -> bool:
+        """
+        Attempt to reconnect to MT5.
+        
+        Args:
+            max_attempts: Maximum reconnection attempts
+            delay: Delay between attempts in seconds
+            
+        Returns:
+            True if reconnected successfully
+        """
+        for attempt in range(1, max_attempts + 1):
+            logger.info(f"Reconnection attempt {attempt}/{max_attempts}...")
+            
+            try:
+                import MetaTrader5 as mt5
+                
+                async with self._lock:
+                    # Shutdown existing connection
+                    await asyncio.to_thread(mt5.shutdown)
+                    await asyncio.sleep(1)
+                    
+                    # Reinitialize
+                    init_ok = await asyncio.to_thread(mt5.initialize)
+                    if init_ok:
+                        account_info = await asyncio.to_thread(mt5.account_info)
+                        if account_info and account_info.login > 0:
+                            self._connected = True
+                            self._use_simulation = False
+                            logger.info(f"Reconnected to MT5 account {account_info.login}")
+                            return True
+                        
+            except Exception as e:
+                logger.error(f"Reconnection attempt {attempt} failed: {e}")
+            
+            if attempt < max_attempts:
+                logger.info(f"Waiting {delay}s before next attempt...")
+                await asyncio.sleep(delay)
+        
+        logger.error(f"Failed to reconnect after {max_attempts} attempts")
+        return False
+    
+    async def get_account_info(self) -> Optional[AccountInfo]:
+        """
+        Get current account information.
+        
+        Returns:
+            AccountInfo or None if failed
+        """
+        try:
+            if self._use_simulation:
+                return self._get_simulated_account()
+            
+            # Real MT5 call (non-blocking)
+            mt5 = self._mcp_client
+            async with self._lock:
+                result = await asyncio.to_thread(mt5.account_info)
+            
+            if result:
+                return AccountInfo(
+                    login=result.login,
+                    balance=result.balance,
+                    equity=result.equity,
+                    margin=result.margin,
+                    free_margin=result.margin_free,
+                    margin_level=result.margin_level if result.margin_level else 0,
+                    profit=result.profit,
+                    currency=result.currency,
+                    leverage=result.leverage
+                )
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting account info: {e}")
+            return self._get_simulated_account()
+    
+    def _get_simulated_account(self) -> AccountInfo:
+        """Return simulated account info."""
+        return AccountInfo(
+            login=self.login or 12345678,
+            balance=10000.0,
+            equity=10000.0,
+            margin=0.0,
+            free_margin=10000.0,
+            margin_level=0.0,
+            profit=0.0,
+            currency="USD",
+            leverage=100
+        )
+    
+    async def get_symbol_info(self, symbol: str) -> Optional[SymbolInfo]:
+        """
+        Get symbol information.
+        
+        Args:
+            symbol: Trading symbol
+            
+        Returns:
+            SymbolInfo or None if failed
+        """
+        try:
+            if self._use_simulation:
+                return self._get_simulated_symbol(symbol)
+            
+            # Real MT5 call (non-blocking)
+            mt5 = self._mcp_client
+            async with self._lock:
+                result = await asyncio.to_thread(mt5.symbol_info, symbol)
+            
+            if result:
+                # Get stops_level - minimum stop distance in points
+                stops_level = getattr(result, 'trade_stops_level', 0)
+                if stops_level == 0:
+                    stops_level = getattr(result, 'freeze_level', 10)
+                
+                return SymbolInfo(
+                    name=result.name,
+                    bid=result.bid,
+                    ask=result.ask,
+                    spread=result.spread,
+                    digits=result.digits,
+                    point=result.point,
+                    trade_contract_size=result.trade_contract_size,
+                    volume_min=result.volume_min,
+                    volume_max=result.volume_max,
+                    volume_step=result.volume_step,
+                    trade_stops_level=stops_level
+                )
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting symbol info: {e}")
+            return self._get_simulated_symbol(symbol)
+    
+    def _get_simulated_symbol(self, symbol: str) -> SymbolInfo:
+        """Return simulated symbol info."""
+        # Base prices for common symbols
+        prices = {
+            "EURUSD": (1.0850, 1.0852),
+            "GBPUSD": (1.2650, 1.2653),
+            "USDJPY": (148.50, 148.53),
+            "USDCHF": (0.8850, 0.8853),
+            "AUDUSD": (0.6550, 0.6552),
+            "NZDUSD": (0.6050, 0.6052),
+            "USDCAD": (1.3650, 1.3653),
+            "XAUUSD": (2050.00, 2050.50),
+        }
+        
+        bid, ask = prices.get(symbol.upper(), (1.0000, 1.0002))
+        digits = 3 if "JPY" in symbol else (2 if symbol == "XAUUSD" else 5)
+        point = 0.001 if "JPY" in symbol else (0.01 if symbol == "XAUUSD" else 0.00001)
+        
+        # Default stops level varies by instrument type
+        # Crypto and metals typically need larger stop distances
+        if any(x in symbol.upper() for x in ['BTC', 'ETH', 'XRP', 'ADA', 'LTC', 'DOGE', 'SOL']):
+            stops_level = 100  # Crypto needs larger stops
+        elif any(x in symbol.upper() for x in ['XAU', 'XAG', 'GOLD', 'SILVER']):
+            stops_level = 50   # Metals
+        else:
+            stops_level = 10   # Forex
+        
+        return SymbolInfo(
+            name=symbol,
+            bid=bid,
+            ask=ask,
+            spread=int((ask - bid) / point),
+            digits=digits,
+            point=point,
+            trade_contract_size=100000 if symbol != "XAUUSD" else 100,
+            volume_min=0.01,
+            volume_max=100.0,
+            volume_step=0.01,
+            trade_stops_level=stops_level
+        )
+    
+    async def calc_margin(self, symbol: str, volume: float, order_type: str = "buy") -> Optional[float]:
+        """
+        Calculate required margin for a trade using MT5's native calculation.
+        
+        This uses the broker's exact margin requirements, handling leverage,
+        contract sizes, and instrument-specific rules automatically.
+        
+        Args:
+            symbol: Trading symbol
+            volume: Position size in lots
+            order_type: 'buy' or 'sell'
+            
+        Returns:
+            Required margin in account currency, or None on error
+        """
+        try:
+            if self._use_simulation:
+                # Fallback calculation for simulation
+                info = await self.get_symbol_info(symbol)
+                if info:
+                    price = info.ask if order_type == "buy" else info.bid
+                    return (volume * info.trade_contract_size * price) / 100  # Assume 1:100 leverage
+                return None
+            
+            mt5 = self._mcp_client
+            import MetaTrader5 as mt5_module
+            
+            action = mt5_module.ORDER_TYPE_BUY if order_type.lower() == "buy" else mt5_module.ORDER_TYPE_SELL
+            
+            async with self._lock:
+                # Get current price
+                info = await asyncio.to_thread(mt5_module.symbol_info, symbol)
+                if not info:
+                    return None
+                price = info.ask if order_type.lower() == "buy" else info.bid
+                
+                margin = await asyncio.to_thread(mt5_module.order_calc_margin, action, symbol, volume, price)
+            
+            if margin is not None:
+                logger.debug(f"MT5 calc_margin: {symbol} {volume} lots = ${margin:.2f}")
+                return margin
+            else:
+                logger.warning(f"MT5 order_calc_margin returned None for {symbol}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error calculating margin for {symbol}: {e}")
+            return None
+    
+    async def get_current_price(self, symbol: str) -> Optional[Dict[str, float]]:
+        """
+        Get current bid/ask prices for a symbol.
+        
+        Args:
+            symbol: Trading symbol
+            
+        Returns:
+            Dict with 'bid' and 'ask' or None
+        """
+        info = await self.get_symbol_info(symbol)
+        if info:
+            return {"bid": info.bid, "ask": info.ask, "spread": info.spread}
+        return None
+    
+    async def get_all_symbols(
+        self,
+        group: Optional[str] = None,
+        include_info: bool = False
+    ) -> List[Dict[str, Any]]:
+        """
+        Get all symbols available from the broker.
+        
+        Args:
+            group: Optional filter pattern (e.g., "*USD*", "Forex*")
+            include_info: Whether to include detailed symbol info
+            
+        Returns:
+            List of symbol dicts with name and optional details
+        """
+        try:
+            if self._use_simulation:
+                return self._get_simulated_all_symbols(group, include_info)
+            
+            # Real MT5 call (non-blocking)
+            mt5 = self._mcp_client
+            
+            async with self._lock:
+                if group:
+                    symbols = await asyncio.to_thread(mt5.symbols_get, group=group)
+                else:
+                    symbols = await asyncio.to_thread(mt5.symbols_get)
+            
+            if not symbols:
+                logger.warning("No symbols returned from MT5")
+                return self._get_simulated_all_symbols(group, include_info)
+            
+            result = []
+            for sym in symbols:
+                symbol_data = {
+                    "name": sym.name,
+                    "description": sym.description if hasattr(sym, 'description') else "",
+                    "path": sym.path if hasattr(sym, 'path') else "",
+                    "visible": bool(sym.visible) if hasattr(sym, 'visible') else False,
+                    "tradeable": bool(sym.trade_mode > 0) if hasattr(sym, 'trade_mode') else True
+                }
+                
+                if include_info:
+                    symbol_data.update({
+                        "bid": float(sym.bid) if hasattr(sym, 'bid') else 0.0,
+                        "ask": float(sym.ask) if hasattr(sym, 'ask') else 0.0,
+                        "spread": int(sym.spread) if hasattr(sym, 'spread') else 0,
+                        "digits": int(sym.digits) if hasattr(sym, 'digits') else 5,
+                        "volume_min": float(sym.volume_min) if hasattr(sym, 'volume_min') else 0.01,
+                        "volume_max": float(sym.volume_max) if hasattr(sym, 'volume_max') else 100.0
+                    })
+                
+                result.append(symbol_data)
+            
+            logger.info(f"Retrieved {len(result)} symbols from MT5")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error getting all symbols: {e}")
+            return self._get_simulated_all_symbols(group, include_info)
+    
+    def _get_simulated_all_symbols(
+        self,
+        group: Optional[str] = None,
+        include_info: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Return simulated list of symbols for demo mode."""
+        # Common forex pairs and gold
+        all_symbols = [
+            {"name": "EURUSD", "description": "Euro vs US Dollar", "path": "Forex\\EURUSD", "category": "forex"},
+            {"name": "GBPUSD", "description": "British Pound vs US Dollar", "path": "Forex\\GBPUSD", "category": "forex"},
+            {"name": "USDJPY", "description": "US Dollar vs Japanese Yen", "path": "Forex\\USDJPY", "category": "forex"},
+            {"name": "USDCHF", "description": "US Dollar vs Swiss Franc", "path": "Forex\\USDCHF", "category": "forex"},
+            {"name": "AUDUSD", "description": "Australian Dollar vs US Dollar", "path": "Forex\\AUDUSD", "category": "forex"},
+            {"name": "NZDUSD", "description": "New Zealand Dollar vs US Dollar", "path": "Forex\\NZDUSD", "category": "forex"},
+            {"name": "USDCAD", "description": "US Dollar vs Canadian Dollar", "path": "Forex\\USDCAD", "category": "forex"},
+            {"name": "EURGBP", "description": "Euro vs British Pound", "path": "Forex\\EURGBP", "category": "forex"},
+            {"name": "EURJPY", "description": "Euro vs Japanese Yen", "path": "Forex\\EURJPY", "category": "forex"},
+            {"name": "GBPJPY", "description": "British Pound vs Japanese Yen", "path": "Forex\\GBPJPY", "category": "forex"},
+            {"name": "XAUUSD", "description": "Gold vs US Dollar", "path": "Metals\\XAUUSD", "category": "metals"},
+            {"name": "XAGUSD", "description": "Silver vs US Dollar", "path": "Metals\\XAGUSD", "category": "metals"},
+            {"name": "BTCUSD", "description": "Bitcoin vs US Dollar", "path": "Crypto\\BTCUSD", "category": "crypto"},
+            {"name": "ETHUSD", "description": "Ethereum vs US Dollar", "path": "Crypto\\ETHUSD", "category": "crypto"},
+            {"name": "US30", "description": "Dow Jones Industrial Average", "path": "Indices\\US30", "category": "indices"},
+            {"name": "US500", "description": "S&P 500 Index", "path": "Indices\\US500", "category": "indices"},
+            {"name": "NAS100", "description": "Nasdaq 100 Index", "path": "Indices\\NAS100", "category": "indices"},
+        ]
+        
+        # Apply group filter if provided
+        if group:
+            pattern = group.replace("*", "").upper()
+            all_symbols = [s for s in all_symbols if pattern in s["name"].upper() or pattern in s["description"].upper()]
+        
+        # Add simulation-specific fields
+        for sym in all_symbols:
+            sym["visible"] = sym["name"] in ["EURUSD", "GBPUSD", "XAUUSD"]  # Default Market Watch
+            sym["tradeable"] = True
+            
+            if include_info:
+                # Add price info from simulated data
+                sim_info = self._get_simulated_symbol(sym["name"])
+                sym["bid"] = sim_info.bid
+                sym["ask"] = sim_info.ask
+                sym["spread"] = sim_info.spread
+                sym["digits"] = sim_info.digits
+                sym["volume_min"] = sim_info.volume_min
+                sym["volume_max"] = sim_info.volume_max
+        
+        return all_symbols
+    
+    async def get_market_watch_symbols(self, include_info: bool = False) -> List[Dict[str, Any]]:
+        """
+        Get symbols currently visible in the MT5 Market Watch.
+        
+        Args:
+            include_info: Whether to include detailed symbol info
+            
+        Returns:
+            List of symbol dicts that are visible in Market Watch
+        """
+        try:
+            if self._use_simulation:
+                # In simulation, return a subset as "visible"
+                all_syms = self._get_simulated_all_symbols(include_info=include_info)
+                return [s for s in all_syms if s.get("visible", False)]
+            
+            # Real MT5 call - get only visible symbols (non-blocking)
+            mt5 = self._mcp_client
+            async with self._lock:
+                symbols = await asyncio.to_thread(mt5.symbols_get)
+            
+            if not symbols:
+                logger.warning("No symbols returned from MT5")
+                return []
+            
+            # Filter to only visible (in Market Watch) symbols
+            result = []
+            for sym in symbols:
+                if hasattr(sym, 'visible') and sym.visible:
+                    symbol_data = {
+                        "name": sym.name,
+                        "description": sym.description if hasattr(sym, 'description') else "",
+                        "path": sym.path if hasattr(sym, 'path') else "",
+                        "visible": True,
+                        "tradeable": bool(sym.trade_mode > 0) if hasattr(sym, 'trade_mode') else True
+                    }
+                    
+                    if include_info:
+                        symbol_data.update({
+                            "bid": float(sym.bid) if hasattr(sym, 'bid') else 0.0,
+                            "ask": float(sym.ask) if hasattr(sym, 'ask') else 0.0,
+                            "spread": int(sym.spread) if hasattr(sym, 'spread') else 0,
+                            "digits": int(sym.digits) if hasattr(sym, 'digits') else 5,
+                            "volume_min": float(sym.volume_min) if hasattr(sym, 'volume_min') else 0.01,
+                            "volume_max": float(sym.volume_max) if hasattr(sym, 'volume_max') else 100.0
+                        })
+                    
+                    result.append(symbol_data)
+            
+            logger.info(f"Retrieved {len(result)} symbols from Market Watch")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error getting Market Watch symbols: {e}")
+            return []
+    
+    async def add_symbol_to_market_watch(self, symbol: str) -> bool:
+        """
+        Add a symbol to the MT5 Market Watch.
+        
+        Args:
+            symbol: Symbol name to add
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            if self._use_simulation:
+                logger.info(f"[Simulation] Added {symbol} to Market Watch")
+                return True
+            
+            # Real MT5 call (non-blocking)
+            mt5 = self._mcp_client
+            async with self._lock:
+                result = await asyncio.to_thread(mt5.symbol_select, symbol, True)
+            
+            if result:
+                logger.info(f"Added {symbol} to Market Watch")
+                return True
+            else:
+                async with self._lock:
+                    error = await asyncio.to_thread(mt5.last_error)
+                logger.warning(f"Failed to add {symbol} to Market Watch: {error}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error adding symbol to Market Watch: {e}")
+            return False
+    
+    async def remove_symbol_from_market_watch(self, symbol: str) -> bool:
+        """
+        Remove a symbol from the MT5 Market Watch.
+        
+        Args:
+            symbol: Symbol name to remove
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            if self._use_simulation:
+                logger.info(f"[Simulation] Removed {symbol} from Market Watch")
+                return True
+            
+            # Real MT5 call (non-blocking)
+            mt5 = self._mcp_client
+            async with self._lock:
+                result = await asyncio.to_thread(mt5.symbol_select, symbol, False)
+            
+            if result:
+                logger.info(f"Removed {symbol} from Market Watch")
+                return True
+            else:
+                async with self._lock:
+                    error = await asyncio.to_thread(mt5.last_error)
+                logger.warning(f"Failed to remove {symbol} from Market Watch: {error}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error removing symbol from Market Watch: {e}")
+            return False
+    
+    async def get_ohlcv_data(
+        self,
+        symbol: str,
+        timeframe: str,
+        count: int = 100,
+        start_time: Optional[datetime] = None
+    ) -> Optional[List[Dict[str, Any]]]:
+        """
+        Get OHLCV (candlestick) data.
+        
+        Args:
+            symbol: Trading symbol
+            timeframe: Timeframe (M1, M5, M15, M30, H1, H4, D1)
+            count: Number of bars to retrieve
+            start_time: Optional start time
+            
+        Returns:
+            List of OHLCV dicts or None
+        """
+        try:
+            tf_value = self.TIMEFRAMES.get(timeframe.upper())
+            if not tf_value:
+                logger.error(f"Invalid timeframe: {timeframe}")
+                return None
+            
+            if self._use_simulation:
+                return self._get_simulated_ohlcv(symbol, timeframe, count)
+            
+            # Real MT5 call (non-blocking)
+            mt5 = self._mcp_client
+            tf_map = {
+                1: mt5.TIMEFRAME_M1,
+                5: mt5.TIMEFRAME_M5,
+                15: mt5.TIMEFRAME_M15,
+                30: mt5.TIMEFRAME_M30,
+                60: mt5.TIMEFRAME_H1,
+                240: mt5.TIMEFRAME_H4,
+                1440: mt5.TIMEFRAME_D1,
+                10080: mt5.TIMEFRAME_W1,
+                43200: mt5.TIMEFRAME_MN1,
+            }
+            mt5_tf = tf_map.get(tf_value, mt5.TIMEFRAME_H1)
+            
+            async with self._lock:
+                if start_time:
+                    result = await asyncio.to_thread(mt5.copy_rates_from, symbol, mt5_tf, start_time, count)
+                else:
+                    result = await asyncio.to_thread(mt5.copy_rates_from_pos, symbol, mt5_tf, 0, count)
+            
+            if result is not None and len(result) > 0:
+                bars = []
+                for bar in result:
+                    bars.append({
+                        'time': datetime.fromtimestamp(bar['time']).isoformat(),
+                        'open': float(bar['open']),
+                        'high': float(bar['high']),
+                        'low': float(bar['low']),
+                        'close': float(bar['close']),
+                        'volume': int(bar['tick_volume'])
+                    })
+                return bars
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting OHLCV data: {e}")
+            return self._get_simulated_ohlcv(symbol, timeframe, count)
+    
+    def _get_simulated_ohlcv(self, symbol: str, timeframe: str, count: int) -> List[Dict[str, Any]]:
+        """Generate simulated OHLCV data."""
+        import numpy as np
+        
+        tf_minutes = self.TIMEFRAMES.get(timeframe.upper(), 60)
+        base_price = self._get_simulated_symbol(symbol).bid
+        
+        bars = []
+        current_time = datetime.now()
+        price = base_price
+        
+        for i in range(count - 1, -1, -1):
+            bar_time = current_time - timedelta(minutes=tf_minutes * i)
+            
+            # Generate random price movement
+            change = np.random.randn() * 0.0005
+            price = price * (1 + change)
+            
+            # Generate OHLC
+            high = price * (1 + abs(np.random.randn()) * 0.0003)
+            low = price * (1 - abs(np.random.randn()) * 0.0003)
+            open_price = price * (1 + np.random.randn() * 0.0002)
+            
+            bars.append({
+                'time': bar_time.isoformat(),
+                'open': open_price,
+                'high': high,
+                'low': low,
+                'close': price,
+                'volume': int(np.random.exponential(1000))
+            })
+        
+        return bars
+    
+    async def place_order(
+        self,
+        symbol: str,
+        order_type: str,
+        volume: float,
+        price: Optional[float] = None,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        deviation: int = 20,
+        magic: int = 12345,
+        comment: str = "ICT_Bot",
+        expiration: Optional[datetime] = None
+    ) -> Dict[str, Any]:
+        """
+        Place a trading order.
+        
+        Args:
+            symbol: Trading symbol
+            order_type: Order type (buy, sell, buy_limit, etc.)
+            volume: Position size in lots
+            price: Price for limit/stop orders
+            stop_loss: Stop loss price
+            take_profit: Take profit price
+            deviation: Maximum price deviation in points
+            magic: Magic number for order identification
+            comment: Order comment
+            expiration: Expiration time for pending orders
+            
+        Returns:
+            Dict with order result
+        """
+        try:
+            logger.info(f"Placing {order_type} order: {symbol} {volume} lots")
+            
+            if self._use_simulation:
+                info = await self.get_symbol_info(symbol)
+                is_buy_sim = order_type.lower() in ('buy', 'buy_limit', 'buy_stop', 'buy_stop_limit')
+                fill_price = info.ask if is_buy_sim else info.bid
+                
+                # For pending orders, use the requested price as entry
+                is_pending_sim = order_type.lower() in ('buy_limit', 'sell_limit', 'buy_stop', 'sell_stop')
+                if is_pending_sim and price is not None:
+                    fill_price = price
+                
+                import random
+                sim_ticket = int(datetime.now().timestamp() * 1000) + random.randint(0, 999)
+                return {
+                    "success": True,
+                    "order_id": sim_ticket,
+                    "ticket": sim_ticket,
+                    "price": fill_price,
+                    "volume": volume,
+                    "simulated": True,
+                    "is_pending": is_pending_sim
+                }
+            
+            # Real MT5 call (non-blocking)
+            mt5 = self._mcp_client
+            
+            # Get symbol info for price and filling mode
+            async with self._lock:
+                symbol_info = await asyncio.to_thread(mt5.symbol_info, symbol)
+            if symbol_info is None:
+                return {"success": False, "error": f"Symbol {symbol} not found"}
+            
+            # Get current price if not provided
+            if price is None:
+                price = symbol_info.ask if order_type.lower() == 'buy' else symbol_info.bid
+            else:
+                # Round user-provided price (e.g. pending order entry) to symbol digits
+                price = round(price, symbol_info.digits)
+            
+            # Determine order type and whether this is a pending order
+            is_pending = order_type.lower() in ('buy_limit', 'sell_limit', 'buy_stop', 'sell_stop', 'buy_stop_limit', 'sell_stop_limit')
+            
+            # =============================================
+            # PENDING ORDER PRICE VALIDATION (prevents 10015 "Invalid Price")
+            # MT5 requires:
+            #   buy_limit  < Ask  (buy below market)
+            #   sell_limit > Bid  (sell above market)
+            #   buy_stop   > Ask  (buy above market / breakout)
+            #   sell_stop  < Bid  (sell below market / breakdown)
+            # Also must respect trade_stops_level minimum distance.
+            # =============================================
+            if is_pending:
+                current_ask = symbol_info.ask
+                current_bid = symbol_info.bid
+                stops_level = getattr(symbol_info, 'trade_stops_level', 0)
+                min_pending_distance = max(stops_level, 5) * symbol_info.point  # At least 5 points buffer
+                ot = order_type.lower()
+                
+                if ot == 'buy_limit':
+                    # buy_limit price must be BELOW ask
+                    if price >= current_ask:
+                        # Price is at or above market -- convert to market buy
+                        logger.warning(
+                            f"[PRICE-FIX] buy_limit price {price:.{symbol_info.digits}f} >= Ask {current_ask:.{symbol_info.digits}f} "
+                            f"-- converting to MARKET BUY (price already reached)"
+                        )
+                        order_type = 'buy'
+                        is_pending = False
+                        price = current_ask
+                    elif (current_ask - price) < min_pending_distance:
+                        adjusted = round(current_ask - min_pending_distance, symbol_info.digits)
+                        logger.warning(
+                            f"[PRICE-FIX] buy_limit price {price:.{symbol_info.digits}f} too close to Ask {current_ask:.{symbol_info.digits}f} "
+                            f"(min distance: {min_pending_distance:.{symbol_info.digits}f}) -- adjusted to {adjusted:.{symbol_info.digits}f}"
+                        )
+                        price = adjusted
+                
+                elif ot == 'sell_limit':
+                    # sell_limit price must be ABOVE bid
+                    if price <= current_bid:
+                        logger.warning(
+                            f"[PRICE-FIX] sell_limit price {price:.{symbol_info.digits}f} <= Bid {current_bid:.{symbol_info.digits}f} "
+                            f"-- converting to MARKET SELL (price already reached)"
+                        )
+                        order_type = 'sell'
+                        is_pending = False
+                        price = current_bid
+                    elif (price - current_bid) < min_pending_distance:
+                        adjusted = round(current_bid + min_pending_distance, symbol_info.digits)
+                        logger.warning(
+                            f"[PRICE-FIX] sell_limit price {price:.{symbol_info.digits}f} too close to Bid {current_bid:.{symbol_info.digits}f} "
+                            f"(min distance: {min_pending_distance:.{symbol_info.digits}f}) -- adjusted to {adjusted:.{symbol_info.digits}f}"
+                        )
+                        price = adjusted
+                
+                elif ot == 'buy_stop':
+                    # buy_stop price must be ABOVE ask
+                    if price <= current_ask:
+                        # Price is at or below market -- convert to market buy
+                        logger.warning(
+                            f"[PRICE-FIX] buy_stop price {price:.{symbol_info.digits}f} <= Ask {current_ask:.{symbol_info.digits}f} "
+                            f"-- converting to MARKET BUY (price already passed)"
+                        )
+                        order_type = 'buy'
+                        is_pending = False
+                        price = current_ask
+                    elif (price - current_ask) < min_pending_distance:
+                        adjusted = round(current_ask + min_pending_distance, symbol_info.digits)
+                        logger.warning(
+                            f"[PRICE-FIX] buy_stop price {price:.{symbol_info.digits}f} too close to Ask {current_ask:.{symbol_info.digits}f} "
+                            f"(min distance: {min_pending_distance:.{symbol_info.digits}f}) -- adjusted to {adjusted:.{symbol_info.digits}f}"
+                        )
+                        price = adjusted
+                
+                elif ot == 'sell_stop':
+                    # sell_stop price must be BELOW bid
+                    if price >= current_bid:
+                        logger.warning(
+                            f"[PRICE-FIX] sell_stop price {price:.{symbol_info.digits}f} >= Bid {current_bid:.{symbol_info.digits}f} "
+                            f"-- converting to MARKET SELL (price already passed)"
+                        )
+                        order_type = 'sell'
+                        is_pending = False
+                        price = current_bid
+                    elif (current_bid - price) < min_pending_distance:
+                        adjusted = round(current_bid - min_pending_distance, symbol_info.digits)
+                        logger.warning(
+                            f"[PRICE-FIX] sell_stop price {price:.{symbol_info.digits}f} too close to Bid {current_bid:.{symbol_info.digits}f} "
+                            f"(min distance: {min_pending_distance:.{symbol_info.digits}f}) -- adjusted to {adjusted:.{symbol_info.digits}f}"
+                        )
+                        price = adjusted
+            
+            if order_type.lower() == 'buy':
+                mt5_type = mt5.ORDER_TYPE_BUY
+            elif order_type.lower() == 'sell':
+                mt5_type = mt5.ORDER_TYPE_SELL
+            else:
+                mt5_type = self.ORDER_TYPES.get(order_type.lower())
+                if mt5_type is None:
+                    logger.error(f"Invalid order type: '{order_type}'. Valid types: {list(self.ORDER_TYPES.keys())}")
+                    return {"success": False, "error": f"Invalid order type: {order_type}"}
+            
+            # Build request - determine filling mode from symbol
+            filling_type = self._get_filling_type(symbol_info)
+            
+            # Use TRADE_ACTION_PENDING for limit/stop orders, TRADE_ACTION_DEAL for market
+            trade_action = mt5.TRADE_ACTION_PENDING if is_pending else mt5.TRADE_ACTION_DEAL
+            
+            request = {
+                "action": trade_action,
+                "symbol": symbol,
+                "volume": volume,
+                "type": mt5_type,
+                "price": price,
+                "magic": magic,
+                "comment": comment,
+                "type_filling": filling_type,
+            }
+            
+            # Market orders need deviation; pending orders need expiration
+            if is_pending:
+                # Determine which expiration modes the symbol supports
+                # expiration_mode bitmask: bit0=GTC(1), bit1=DAY(2), bit2=SPECIFIED(4), bit3=SPECIFIED_DAY(8)
+                exp_mode = getattr(symbol_info, 'expiration_mode', 0)
+                supports_gtc = bool(exp_mode & 1)
+                supports_day = bool(exp_mode & 2)
+                supports_specified = bool(exp_mode & 4)
+                
+                print(f"[MT5] {symbol} expiration_mode={exp_mode} (GTC={supports_gtc}, DAY={supports_day}, SPECIFIED={supports_specified})", flush=True)
+                
+                # Strategy: try the safest mode the symbol supports
+                # The bot's PendingOrderManager handles expiration internally,
+                # so we prefer GTC to avoid broker rejections
+                if supports_gtc:
+                    request["type_time"] = mt5.ORDER_TIME_GTC
+                elif supports_day:
+                    request["type_time"] = mt5.ORDER_TIME_DAY
+                elif supports_specified and expiration:
+                    exp_timestamp = int(expiration.timestamp())
+                    request["type_time"] = mt5.ORDER_TIME_SPECIFIED
+                    request["expiration"] = exp_timestamp
+                else:
+                    # Last resort: try GTC anyway (most common default)
+                    request["type_time"] = mt5.ORDER_TIME_GTC
+                    print(f"[MT5] WARNING: {symbol} expiration_mode={exp_mode} unknown, defaulting to GTC", flush=True)
+            else:
+                request["deviation"] = deviation
+                request["type_time"] = mt5.ORDER_TIME_GTC
+            
+            logger.info(f"Using filling mode: {filling_type}, action: {'PENDING' if is_pending else 'DEAL'} for {symbol}")
+            
+            # Validate and adjust stop loss if needed (prevents "Invalid Stops" error)
+            min_distance = (symbol_info.trade_stops_level + 5) * symbol_info.point
+            
+            # Determine direction from order type (handles both market and pending orders)
+            is_buy_direction = order_type.lower() in ('buy', 'buy_limit', 'buy_stop', 'buy_stop_limit')
+            
+            if stop_loss:
+                if is_buy_direction:
+                    # For BUY direction, stop loss must be BELOW price
+                    max_sl = price - min_distance
+                    if stop_loss > max_sl:
+                        logger.warning(f"Stop loss {stop_loss:.5f} too close to price {price:.5f}")
+                        logger.warning(f"Adjusting SL from {stop_loss:.5f} to {max_sl:.5f} (min distance: {min_distance:.5f})")
+                        stop_loss = max_sl
+                else:
+                    # For SELL direction, stop loss must be ABOVE price
+                    min_sl = price + min_distance
+                    if stop_loss < min_sl:
+                        logger.warning(f"Stop loss {stop_loss:.5f} too close to price {price:.5f}")
+                        logger.warning(f"Adjusting SL from {stop_loss:.5f} to {min_sl:.5f} (min distance: {min_distance:.5f})")
+                        stop_loss = min_sl
+                
+                # Round to symbol digits
+                stop_loss = round(stop_loss, symbol_info.digits)
+                request["sl"] = stop_loss
+            
+            # Validate and adjust take profit if needed
+            if take_profit:
+                # CRITICAL: TP direction validation -- reject trades with TP on wrong side
+                if is_buy_direction and take_profit <= price:
+                    logger.error(
+                        f"[TP-REJECT] BUY TP {take_profit:.{symbol_info.digits}f} is BELOW entry {price:.{symbol_info.digits}f} "
+                        f"-- this is an invalid trade setup. Rejecting order."
+                    )
+                    return {
+                        "success": False,
+                        "error": f"Invalid TP: BUY take_profit ({take_profit}) must be ABOVE entry ({price})"
+                    }
+                elif not is_buy_direction and take_profit >= price:
+                    logger.error(
+                        f"[TP-REJECT] SELL TP {take_profit:.{symbol_info.digits}f} is ABOVE entry {price:.{symbol_info.digits}f} "
+                        f"-- this is an invalid trade setup. Rejecting order."
+                    )
+                    return {
+                        "success": False,
+                        "error": f"Invalid TP: SELL take_profit ({take_profit}) must be BELOW entry ({price})"
+                    }
+                
+                if is_buy_direction:
+                    # For BUY direction, take profit must be ABOVE price with min distance
+                    min_tp = price + min_distance
+                    if take_profit < min_tp:
+                        logger.warning(f"Take profit {take_profit:.5f} too close to price {price:.5f}")
+                        logger.warning(f"Adjusting TP from {take_profit:.5f} to {min_tp:.5f}")
+                        take_profit = min_tp
+                else:
+                    # For SELL direction, take profit must be BELOW price with min distance
+                    max_tp = price - min_distance
+                    if take_profit > max_tp:
+                        logger.warning(f"Take profit {take_profit:.5f} too close to price {price:.5f}")
+                        logger.warning(f"Adjusting TP from {take_profit:.5f} to {max_tp:.5f}")
+                        take_profit = max_tp
+                
+                # Round to symbol digits
+                take_profit = round(take_profit, symbol_info.digits)
+                request["tp"] = take_profit
+            
+            logger.info(f"Order request: {order_type} {symbol} @ {price:.5f}, SL: {stop_loss}, TP: {take_profit}")
+            
+            # T2-5: Retry loop for requotes (10004) and rejections (10006)
+            max_retries = 3
+            for attempt in range(1, max_retries + 1):
+                async with self._lock:
+                    # For market orders, refresh price right before sending to minimize TOCTOU gap
+                    if not is_pending and price is not None:
+                        fresh_info = await asyncio.to_thread(mt5.symbol_info, symbol)
+                        if fresh_info is not None:
+                            fresh_price = fresh_info.ask if is_buy_direction else fresh_info.bid
+                            if fresh_price != request["price"]:
+                                logger.info(f"Refreshed market price: {request['price']:.5f} -> {fresh_price:.5f}")
+                                request["price"] = fresh_price
+                    
+                    try:
+                        result = await asyncio.wait_for(
+                            asyncio.to_thread(mt5.order_send, request),
+                            timeout=30.0  # 30s timeout prevents deadlocking the entire bot
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(f"MT5 order_send TIMED OUT after 30s (attempt {attempt}/{max_retries})")
+                        result = None
+                
+                if result is None:
+                    async with self._lock:
+                        last_error = await asyncio.to_thread(mt5.last_error)
+                    logger.error(f"MT5 order_send returned None! Last MT5 error: {last_error}")
+                    logger.error(f"Order request was: {request}")
+                    logger.error("Possible causes: AutoTrading disabled, MT5 not responding, account restrictions")
+                    return {
+                        "success": False,
+                        "error": f"MT5 not responding: {last_error}",
+                        "retcode": None
+                    }
+                
+                if result.retcode == mt5.TRADE_RETCODE_DONE or (is_pending and result.retcode == mt5.TRADE_RETCODE_PLACED):
+                    # For pending orders, the ticket is result.order (deal may be 0)
+                    ticket = result.deal if not is_pending else (result.order or result.deal)
+                    # Partial fill detection
+                    fill_volume = result.volume if result.volume else volume
+                    if abs(fill_volume - volume) > 0.001:
+                        logger.warning(
+                            f"PARTIAL FILL: requested {volume} lots, filled {fill_volume} lots "
+                            f"(slippage: {volume - fill_volume:.3f} lots)"
+                        )
+                    logger.info(f"Order successful: ticket={ticket}, order={result.order}, deal={result.deal}, price={result.price}, filled={fill_volume}")
+                    return {
+                        "success": True,
+                        "order_id": result.order,
+                        "ticket": ticket,
+                        "price": result.price,
+                        "volume": fill_volume,
+                        "requested_volume": volume,
+                        "partial_fill": abs(fill_volume - volume) > 0.001
+                    }
+                elif result.retcode in (10004, 10006) and attempt < max_retries:
+                    # 10004 = requote, 10006 = rejected - retry with refreshed price
+                    logger.warning(
+                        f"Order attempt {attempt}/{max_retries} got retcode {result.retcode} "
+                        f"({result.comment}) - retrying in 500ms"
+                    )
+                    await asyncio.sleep(0.5)
+                    
+                    # Only refresh price for market orders — pending orders keep their target price
+                    if not is_pending:
+                        async with self._lock:
+                            tick = await asyncio.to_thread(mt5.symbol_info_tick, symbol)
+                        if tick:
+                            if order_type.lower() == 'buy':
+                                request["price"] = tick.ask
+                            else:
+                                request["price"] = tick.bid
+                            logger.info(f"Refreshed price for retry: {request['price']:.5f}")
+                    continue
+                else:
+                    # Log detailed error info
+                    logger.error(f"Order REJECTED by MT5: retcode={result.retcode}, comment='{result.comment}'")
+                    logger.error(f"Order request was: {request}")
+                    return {
+                        "success": False,
+                        "error": f"MT5 rejected: {result.comment} (code: {result.retcode})",
+                        "retcode": result.retcode
+                    }
+            
+            # All retries exhausted (shouldn't reach here, but safety net)
+            logger.error(f"Order failed after {max_retries} attempts: retcode={result.retcode}")
+            return {
+                "success": False,
+                "error": f"Failed after {max_retries} retries: {result.comment} (code: {result.retcode})",
+                "retcode": result.retcode
+            }
+            
+        except Exception as e:
+            logger.error(f"Error placing order: {e}")
+            return {"success": False, "error": str(e)}
+    
+    async def modify_position(
+        self,
+        ticket: int,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """
+        Modify an existing position's SL/TP.
+        
+        Args:
+            ticket: Position ticket
+            stop_loss: New stop loss
+            take_profit: New take profit
+            
+        Returns:
+            Dict with modification result
+        """
+        try:
+            logger.info(f"Modifying position {ticket}")
+            
+            if self._use_simulation:
+                return {"success": True, "simulated": True}
+            
+            # Real MT5 call (non-blocking)
+            mt5 = self._mcp_client
+            
+            async with self._lock:
+                # Get position info
+                position = await asyncio.to_thread(mt5.positions_get, ticket=ticket)
+                if not position:
+                    return {"success": False, "error": "Position not found"}
+                
+                position = position[0]
+                
+                request = {
+                    "action": mt5.TRADE_ACTION_SLTP,
+                    "symbol": position.symbol,
+                    "position": ticket,
+                }
+                
+                # TRADE_ACTION_SLTP requires BOTH sl and tp in the request.
+                # If only one is provided, use the position's current value for the other
+                # to avoid accidentally clearing it.
+                request["sl"] = stop_loss if stop_loss is not None else position.sl
+                request["tp"] = take_profit if take_profit is not None else position.tp
+                
+                result = await asyncio.to_thread(mt5.order_send, request)
+            
+            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                return {"success": True}
+            else:
+                return {
+                    "success": False,
+                    "error": result.comment if result else "Modification failed"
+                }
+            
+        except Exception as e:
+            logger.error(f"Error modifying position: {e}")
+            return {"success": False, "error": str(e)}
+    
+    async def modify_order(
+        self,
+        ticket: int,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        price: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """
+        Modify an order (alias for modify_position for OrderManager compatibility).
+        
+        Args:
+            ticket: Order/position ticket
+            stop_loss: New stop loss
+            take_profit: New take profit
+            price: New price (for pending orders, not implemented yet)
+            
+        Returns:
+            Dict with modification result
+        """
+        # For now, delegate to modify_position
+        # In the future, can add support for modifying pending order prices
+        return await self.modify_position(ticket, stop_loss, take_profit)
+    
+    async def get_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Get pending orders.
+        
+        Args:
+            symbol: Filter by symbol (optional)
+            
+        Returns:
+            List of pending orders
+        """
+        try:
+            if self._use_simulation:
+                return []  # No pending orders in simulation
+            
+            mt5 = self._mcp_client
+            
+            async with self._lock:
+                if symbol:
+                    orders = await asyncio.to_thread(mt5.orders_get, symbol=symbol)
+                else:
+                    orders = await asyncio.to_thread(mt5.orders_get)
+            
+            if orders is None:
+                return []
+            
+            return [
+                {
+                    "ticket": int(o.ticket),
+                    "symbol": str(o.symbol),
+                    "type": int(o.type),
+                    "volume": float(o.volume_current),
+                    "price_open": float(o.price_open),
+                    "sl": float(o.sl) if o.sl else None,
+                    "tp": float(o.tp) if o.tp else None,
+                    "time_setup": o.time_setup,
+                    "comment": str(o.comment) if o.comment else ""
+                }
+                for o in orders
+            ]
+        except Exception as e:
+            logger.error(f"Error getting orders: {e}")
+            return []
+    
+    async def close_position(
+        self,
+        ticket: int,
+        volume: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """
+        Close a position.
+        
+        Args:
+            ticket: Position ticket
+            volume: Volume to close (partial close if less than position)
+            
+        Returns:
+            Dict with close result
+        """
+        try:
+            logger.info(f"Closing position {ticket}")
+            
+            # Guard: prevent concurrent close of the same ticket
+            if ticket in self._closing_tickets:
+                logger.warning(f"Position {ticket} close already in progress — skipping duplicate")
+                return {"success": False, "error": "Close already in progress for this position"}
+            self._closing_tickets.add(ticket)
+            
+            if self._use_simulation:
+                self._closing_tickets.discard(ticket)
+                # Use a non-hardcoded simulated close price
+                return {
+                    "success": True,
+                    "price": 0.0,  # Caller should use current market price
+                    "profit": 0.0,  # Actual P&L calculated by position manager
+                    "simulated": True
+                }
+            
+            # Real MT5 call (non-blocking)
+            mt5 = self._mcp_client
+            
+            async with self._lock:
+                # Get position info
+                position = await asyncio.to_thread(mt5.positions_get, ticket=ticket)
+                if not position:
+                    self._closing_tickets.discard(ticket)
+                    return {"success": False, "error": "Position not found"}
+                
+                position = position[0]
+                close_volume = volume if volume else position.volume
+                
+                # Determine close type (opposite of position type)
+                if position.type == mt5.ORDER_TYPE_BUY:
+                    close_type = mt5.ORDER_TYPE_SELL
+                    tick = await asyncio.to_thread(mt5.symbol_info_tick, position.symbol)
+                    price = tick.bid
+                else:
+                    close_type = mt5.ORDER_TYPE_BUY
+                    tick = await asyncio.to_thread(mt5.symbol_info_tick, position.symbol)
+                    price = tick.ask
+                
+                # Get symbol info for proper filling mode
+                sym_info = await asyncio.to_thread(mt5.symbol_info, position.symbol)
+                filling_type = self._get_filling_type(sym_info) if sym_info else 1
+                
+                request = {
+                    "action": mt5.TRADE_ACTION_DEAL,
+                    "symbol": position.symbol,
+                    "volume": close_volume,
+                    "type": close_type,
+                    "position": ticket,
+                    "price": price,
+                    "deviation": 30,  # Higher deviation for closes — must succeed
+                    "magic": position.magic,
+                    "comment": "Close by ICT_Bot",
+                    "type_time": mt5.ORDER_TIME_GTC,
+                    "type_filling": filling_type,
+                }
+            
+            # Retry loop for closes (requotes are common during volatility)
+            max_retries = 3
+            for attempt in range(1, max_retries + 1):
+                async with self._lock:
+                    try:
+                        result = await asyncio.wait_for(
+                            asyncio.to_thread(mt5.order_send, request),
+                            timeout=30.0
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(f"MT5 close order_send TIMED OUT after 30s (attempt {attempt}/{max_retries})")
+                        result = None
+                
+                if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                    self._closing_tickets.discard(ticket)
+                    return {
+                        "success": True,
+                        "price": result.price,
+                        "profit": position.profit
+                    }
+                elif result and result.retcode in (10004, 10006) and attempt < max_retries:
+                    # Requote or rejected — refresh price and retry
+                    logger.warning(f"Close requote (attempt {attempt}/{max_retries}), retrying...")
+                    await asyncio.sleep(0.3)
+                    async with self._lock:
+                        tick = await asyncio.to_thread(mt5.symbol_info_tick, request["symbol"])
+                    if tick:
+                        if request["type"] == mt5.ORDER_TYPE_SELL:
+                            request["price"] = tick.bid
+                        else:
+                            request["price"] = tick.ask
+                else:
+                    break
+            
+            self._closing_tickets.discard(ticket)
+            return {
+                "success": False,
+                "error": result.comment if result else "Close failed"
+            }
+            
+        except Exception as e:
+            self._closing_tickets.discard(ticket)
+            logger.error(f"Error closing position: {e}")
+            return {"success": False, "error": str(e)}
+    
+    async def get_positions(
+        self,
+        symbol: Optional[str] = None
+    ) -> List[Position]:
+        """
+        Get open positions.
+        
+        Args:
+            symbol: Optional symbol filter
+            
+        Returns:
+            List of Position objects
+        """
+        try:
+            if self._use_simulation:
+                return []  # No positions in simulation
+            
+            # Real MT5 call (non-blocking)
+            mt5 = self._mcp_client
+            
+            async with self._lock:
+                if symbol:
+                    result = await asyncio.to_thread(mt5.positions_get, symbol=symbol)
+                else:
+                    result = await asyncio.to_thread(mt5.positions_get)
+            
+            positions = []
+            for pos in (result or []):
+                positions.append(Position(
+                    ticket=pos.ticket,
+                    symbol=pos.symbol,
+                    type='buy' if pos.type == 0 else 'sell',
+                    volume=pos.volume,
+                    price_open=pos.price_open,
+                    price_current=pos.price_current,
+                    sl=pos.sl,
+                    tp=pos.tp,
+                    profit=pos.profit,
+                    magic=pos.magic,
+                    comment=pos.comment,
+                    time=datetime.fromtimestamp(pos.time)
+                ))
+            
+            return positions
+            
+        except Exception as e:
+            logger.error(f"Error getting positions: {e}")
+            return []
+    
+    async def get_pending_orders(
+        self,
+        symbol: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Get pending orders.
+        
+        Args:
+            symbol: Optional symbol filter
+            
+        Returns:
+            List of order dicts
+        """
+        try:
+            if self._use_simulation:
+                return []
+            
+            # Real MCP call
+            if symbol:
+                result = self._mcp_client.order.get_orders(symbol=symbol)
+            else:
+                result = self._mcp_client.order.get_orders()
+            
+            return result or []
+            
+        except Exception as e:
+            logger.error(f"Error getting orders: {e}")
+            return []
+    
+    async def cancel_order(self, ticket: int) -> Dict[str, Any]:
+        """
+        Cancel a pending order.
+        
+        Args:
+            ticket: Order ticket
+            
+        Returns:
+            Dict with cancellation result
+        """
+        try:
+            logger.info(f"Cancelling order {ticket}")
+            
+            if self._use_simulation:
+                return {"success": True, "simulated": True}
+            
+            # Real MCP call
+            result = self._mcp_client.order.cancel_order(ticket=ticket)
+            
+            if result and result.get('retcode') == 10009:
+                return {"success": True}
+            else:
+                return {
+                    "success": False,
+                    "error": result.get('comment', 'Cancel failed')
+                }
+            
+        except Exception as e:
+            logger.error(f"Error cancelling order: {e}")
+            return {"success": False, "error": str(e)}
+    
+    async def get_history(
+        self,
+        start_time: datetime,
+        end_time: datetime,
+        symbol: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Get trade history (closed deals).
+        
+        Args:
+            start_time: Start of history period
+            end_time: End of history period
+            symbol: Optional symbol filter
+            
+        Returns:
+            List of historical trade dicts
+        """
+        try:
+            if self._use_simulation:
+                return []
+            
+            mt5 = self._mcp_client
+            
+            # Use MT5's history_deals_get function (non-blocking)
+            async with self._lock:
+                if symbol:
+                    deals = await asyncio.to_thread(mt5.history_deals_get, start_time, end_time, group=f"*{symbol}*")
+                else:
+                    deals = await asyncio.to_thread(mt5.history_deals_get, start_time, end_time)
+            
+            if deals is None or len(deals) == 0:
+                logger.info(f"No deals found in history from {start_time} to {end_time}")
+                return []
+            
+            # Convert to list of dicts
+            result = []
+            for deal in deals:
+                deal_dict = {
+                    'ticket': deal.ticket,
+                    'deal': deal.deal if hasattr(deal, 'deal') else deal.ticket,
+                    'order': deal.order,
+                    'time': datetime.fromtimestamp(deal.time),
+                    'type': 'buy' if deal.type == 0 else 'sell' if deal.type == 1 else str(deal.type),
+                    'entry': deal.entry,  # 0=in, 1=out, 2=inout, 3=state
+                    'position_id': deal.position_id,
+                    'symbol': deal.symbol,
+                    'volume': deal.volume,
+                    'price': deal.price,
+                    'commission': deal.commission,
+                    'swap': deal.swap,
+                    'profit': deal.profit,
+                    'fee': deal.fee if hasattr(deal, 'fee') else 0,
+                    'comment': deal.comment,
+                    'magic': deal.magic,
+                    'reason': deal.reason,
+                    'external_id': deal.external_id if hasattr(deal, 'external_id') else ''
+                }
+                result.append(deal_dict)
+            
+            logger.info(f"Retrieved {len(result)} deals from MT5 history")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error getting history: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+    
+    async def health_check(self) -> Dict[str, Any]:
+        """
+        Check MT5 connection health.
+        
+        Returns:
+            Dict with health status
+        """
+        try:
+            account = await self.get_account_info()
+            
+            return {
+                "connected": self._connected,
+                "simulation_mode": self._use_simulation,
+                "account_accessible": account is not None,
+                "balance": account.balance if account else 0,
+                "server": self.server
+            }
+            
+        except Exception as e:
+            return {
+                "connected": False,
+                "simulation_mode": self._use_simulation,
+                "error": str(e)
+            }
