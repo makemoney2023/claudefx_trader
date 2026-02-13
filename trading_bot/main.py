@@ -64,7 +64,7 @@ except ImportError:
 
 # Import database for trade persistence
 try:
-    from .api.database import async_session, TradeModel
+    from .api.database import async_session, TradeModel, AnalysisLogModel
     DB_AVAILABLE = True
 except ImportError:
     DB_AVAILABLE = False
@@ -81,9 +81,23 @@ async def save_trade_to_db(
     take_profit: float,
     position_size: float,
     confidence: float,
-    reasoning: str = ""
+    reasoning: str = "",
+    # Judge analysis
+    judge_verdict: str = None,
+    judge_reason: str = None,
+    judge_risk_flags: list = None,
+    # Trade classification & context
+    trade_type: str = None,
+    order_type: str = None,
+    amd_phase: str = None,
+    market_structure: str = None,
+    confluence_factors: list = None,
+    confluence_count: int = None,
+    ict_concepts: dict = None,
+    timeframe: str = "M15",
+    session_name: str = "",
 ):
-    """Save an executed trade to the database."""
+    """Save an executed trade to the database with full analysis context."""
     if not DB_AVAILABLE:
         logger.warning("Database not available - trade not persisted")
         return
@@ -95,8 +109,8 @@ async def save_trade_to_db(
                 timestamp=datetime.utcnow(),
                 symbol=symbol,
                 direction=direction,
-                timeframe="M15",
-                session="",
+                timeframe=timeframe,
+                session=session_name,
                 entry_price=entry_price,
                 entry_time=datetime.utcnow(),
                 entry_reason=reasoning[:500] if reasoning else f"ICT Signal - Confidence: {confidence:.0%}",
@@ -105,13 +119,80 @@ async def save_trade_to_db(
                 position_size=position_size,
                 risk_amount=0.0,
                 claude_confidence=confidence,
-                claude_reasoning=reasoning[:1000] if reasoning else ""
+                claude_reasoning=reasoning[:2000] if reasoning else "",
+                # Judge analysis
+                judge_verdict=judge_verdict,
+                judge_reason=judge_reason[:1000] if judge_reason else None,
+                judge_risk_flags=judge_risk_flags,
+                # Trade classification
+                trade_type=trade_type,
+                order_type=order_type,
+                amd_phase=amd_phase,
+                market_structure=market_structure or "",
+                ict_concepts=ict_concepts,
+                confluence_factors=confluence_factors,
+                confluence_count=confluence_count,
             )
             session.add(trade)
             await session.commit()
-            logger.info(f"Trade {ticket} saved to database")
+            logger.info(f"Trade {ticket} saved to database (judge={judge_verdict}, type={trade_type}, confluence={confluence_count})")
     except Exception as e:
         logger.error(f"Failed to save trade to database: {e}")
+
+
+async def save_signal_to_db(
+    symbol: str,
+    direction: str,
+    confidence: float,
+    entry_price: float = None,
+    stop_loss: float = None,
+    take_profit: float = None,
+    reasoning: str = "",
+    # Judge analysis
+    judge_verdict: str = None,
+    judge_reason: str = None,
+    judge_risk_flags: list = None,
+    # Context
+    trade_type: str = None,
+    market_structure: str = None,
+    confluence_factors: list = None,
+    confluence_count: int = None,
+    trade_id: int = None,
+):
+    """Save every signal (approved, demoted, rejected) to analysis_logs for correlation analysis."""
+    if not DB_AVAILABLE:
+        return
+    
+    try:
+        async with async_session() as session:
+            log = AnalysisLogModel(
+                timestamp=datetime.utcnow(),
+                symbol=symbol,
+                timeframe="M15",
+                session="",
+                market_structure=market_structure or "",
+                trend="",
+                signal_direction=direction,
+                confidence=confidence,
+                entry_price=entry_price,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                analysis_data=None,
+                reasoning=reasoning[:2000] if reasoning else "",
+                warnings=None,
+                judge_verdict=judge_verdict,
+                judge_reason=judge_reason[:1000] if judge_reason else None,
+                judge_risk_flags=judge_risk_flags,
+                confluence_factors=confluence_factors,
+                confluence_count=confluence_count,
+                trade_type=trade_type,
+                trade_id=trade_id,
+            )
+            session.add(log)
+            await session.commit()
+            logger.debug(f"Signal logged to DB: {symbol} {direction} — judge={judge_verdict}")
+    except Exception as e:
+        logger.warning(f"Failed to save signal to analysis_logs: {e}")
 
 
 class TradingBot:
@@ -3013,6 +3094,24 @@ class TradingBot:
                         flush=True
                     )
                     
+                    # Save rejected signal to DB for correlation (did we miss a winner?)
+                    await save_signal_to_db(
+                        symbol=symbol,
+                        direction=trade_signal.direction,
+                        confidence=trade_signal.confidence,
+                        entry_price=trade_signal.entry_price or current_price,
+                        stop_loss=trade_signal.stop_loss,
+                        take_profit=trade_signal.take_profit,
+                        reasoning=trade_signal.reasoning if hasattr(trade_signal, 'reasoning') else "",
+                        judge_verdict="REJECT",
+                        judge_reason=reason,
+                        judge_risk_flags=flags,
+                        trade_type=getattr(trade_signal, 'trade_type', 'intraday'),
+                        market_structure=getattr(trade_signal, 'market_structure', ''),
+                        confluence_factors=confluence_factors if confluence_factors else None,
+                        confluence_count=confluence_count if confluence_count else None,
+                    )
+                    
                     self.daily_trades = max(0, self.daily_trades - 1)
                     logger.info(f"Trade slot released after judge rejection ({self.daily_trades}/{settings.trading.max_daily_trades})")
                     return
@@ -3068,6 +3167,24 @@ class TradingBot:
                         f"| flags: [{flags_str}]",
                         flush=True
                     )
+                    
+                    # Save demoted signal to DB for correlation
+                    await save_signal_to_db(
+                        symbol=symbol,
+                        direction=trade_signal.direction,
+                        confidence=trade_signal.confidence,
+                        entry_price=demoted_entry,
+                        stop_loss=trade_signal.stop_loss,
+                        take_profit=trade_signal.take_profit,
+                        reasoning=trade_signal.reasoning if hasattr(trade_signal, 'reasoning') else "",
+                        judge_verdict="DEMOTE",
+                        judge_reason=reason,
+                        judge_risk_flags=flags,
+                        trade_type=getattr(trade_signal, 'trade_type', 'intraday'),
+                        market_structure=getattr(trade_signal, 'market_structure', ''),
+                        confluence_factors=confluence_factors if confluence_factors else None,
+                        confluence_count=confluence_count if confluence_count else None,
+                    )
                 else:
                     # APPROVE — log for visibility
                     reason = judge_verdict.get('reason', 'Approved')
@@ -3094,6 +3211,24 @@ class TradingBot:
                         f"[JUDGE] ║  APPROVE {symbol} — \"{reason}\"  "
                         f"| flags: [{flags_str}]",
                         flush=True
+                    )
+                    
+                    # Save approved signal to DB for correlation
+                    await save_signal_to_db(
+                        symbol=symbol,
+                        direction=trade_signal.direction,
+                        confidence=trade_signal.confidence,
+                        entry_price=trade_signal.entry_price or current_price,
+                        stop_loss=trade_signal.stop_loss,
+                        take_profit=trade_signal.take_profit,
+                        reasoning=trade_signal.reasoning if hasattr(trade_signal, 'reasoning') else "",
+                        judge_verdict="APPROVE",
+                        judge_reason=reason,
+                        judge_risk_flags=flags,
+                        trade_type=getattr(trade_signal, 'trade_type', 'intraday'),
+                        market_structure=getattr(trade_signal, 'market_structure', ''),
+                        confluence_factors=confluence_factors if confluence_factors else None,
+                        confluence_count=confluence_count if confluence_count else None,
                     )
                 
                 # =============================================
@@ -3276,7 +3411,7 @@ class TradingBot:
                                 }
                             )
                             
-                            # Save to database
+                            # Save to database with full analysis context
                             await save_trade_to_db(
                                 ticket=result.ticket,
                                 symbol=symbol,
@@ -3286,7 +3421,24 @@ class TradingBot:
                                 take_profit=trade_signal.take_profit or 0.0,
                                 position_size=position_size.lots,
                                 confidence=trade_signal.confidence,
-                                reasoning=trade_signal.reasoning if hasattr(trade_signal, 'reasoning') else ""
+                                reasoning=trade_signal.reasoning if hasattr(trade_signal, 'reasoning') else "",
+                                judge_verdict=judge_verdict.get('verdict', 'APPROVE') if judge_verdict else None,
+                                judge_reason=judge_verdict.get('reason', '') if judge_verdict else None,
+                                judge_risk_flags=judge_verdict.get('risk_flags', []) if judge_verdict else None,
+                                trade_type=getattr(trade_signal, 'trade_type', 'intraday'),
+                                order_type=order_type,
+                                amd_phase=getattr(trade_signal, 'amd_phase', 'unknown'),
+                                market_structure=getattr(trade_signal, 'market_structure', ''),
+                                confluence_factors=confluence_factors if confluence_factors else None,
+                                confluence_count=confluence_count if confluence_count else None,
+                                ict_concepts={
+                                    'order_blocks': getattr(trade_signal, 'order_blocks', []),
+                                    'fvg_zones': getattr(trade_signal, 'fvg_zones', []),
+                                    'liquidity_targets': getattr(trade_signal, 'liquidity_targets', []),
+                                    'manipulation_complete': getattr(trade_signal, 'manipulation_complete', False),
+                                },
+                                timeframe="M15",
+                                session_name=self.kill_zone_checker.get_current_session().session_name if self.kill_zone_checker else "",
                             )
                             
                             # Send Telegram notification for pending order
@@ -3378,7 +3530,7 @@ class TradingBot:
                                 }
                             )
                             
-                            # Save trade to database for history tracking
+                            # Save trade to database with full analysis context
                             await save_trade_to_db(
                                 ticket=result.ticket,
                                 symbol=symbol,
@@ -3388,7 +3540,24 @@ class TradingBot:
                                 take_profit=trade_signal.take_profit or 0.0,
                                 position_size=position_size.lots,
                                 confidence=trade_signal.confidence,
-                                reasoning=trade_signal.reasoning if hasattr(trade_signal, 'reasoning') else ""
+                                reasoning=trade_signal.reasoning if hasattr(trade_signal, 'reasoning') else "",
+                                judge_verdict=judge_verdict.get('verdict', 'APPROVE') if judge_verdict else None,
+                                judge_reason=judge_verdict.get('reason', '') if judge_verdict else None,
+                                judge_risk_flags=judge_verdict.get('risk_flags', []) if judge_verdict else None,
+                                trade_type=getattr(trade_signal, 'trade_type', 'intraday'),
+                                order_type=order_type,
+                                amd_phase=getattr(trade_signal, 'amd_phase', 'unknown'),
+                                market_structure=getattr(trade_signal, 'market_structure', ''),
+                                confluence_factors=confluence_factors if confluence_factors else None,
+                                confluence_count=confluence_count if confluence_count else None,
+                                ict_concepts={
+                                    'order_blocks': getattr(trade_signal, 'order_blocks', []),
+                                    'fvg_zones': getattr(trade_signal, 'fvg_zones', []),
+                                    'liquidity_targets': getattr(trade_signal, 'liquidity_targets', []),
+                                    'manipulation_complete': getattr(trade_signal, 'manipulation_complete', False),
+                                },
+                                timeframe="M15",
+                                session_name=self.kill_zone_checker.get_current_session().session_name if self.kill_zone_checker else "",
                             )
                             
                             # Send Telegram notification
@@ -4884,6 +5053,37 @@ Include brief reasoning.
             else:
                 pips = raw_pips   # Long profits when price rises (positive raw_pips)
             
+            # =============================================
+            # UPDATE DATABASE RECORD (so trades page shows it)
+            # =============================================
+            if DB_AVAILABLE:
+                try:
+                    from sqlalchemy import select
+                    async with async_session() as db_sess:
+                        result = await db_sess.execute(
+                            select(TradeModel).where(
+                                TradeModel.trade_id == str(position.ticket)
+                            )
+                        )
+                        trade_record = result.scalar_one_or_none()
+                        if trade_record:
+                            trade_record.exit_price = actual_close_price
+                            trade_record.exit_time = close_time
+                            trade_record.exit_reason = getattr(position, 'close_reason', 'position_closed')
+                            trade_record.profit_loss = profit_loss
+                            trade_record.profit_loss_pips = pips
+                            # R-multiple
+                            if position.stop_loss and position.entry_price:
+                                risk_pips = abs(position.entry_price - position.stop_loss) / pip_size
+                                if risk_pips > 0:
+                                    trade_record.r_multiple = pips / risk_pips
+                            await db_sess.commit()
+                            print(f"[CLOSE] {position.symbol}: DB updated — exit={actual_close_price:.5f}, P/L=${profit_loss:+.2f}", flush=True)
+                        else:
+                            print(f"[CLOSE] {position.symbol}: No DB record found for ticket {position.ticket}", flush=True)
+                except Exception as e:
+                    logger.warning(f"Could not update trade in database: {e}")
+            
             # Update daily P&L tracker
             self.daily_pnl += profit_loss
             
@@ -4963,10 +5163,14 @@ Include brief reasoning.
             
             if should_review and self.claude_client and self.claude_client.api_key:
                 try:
-                    # Retrieve original trade metadata from DB
+                    # Retrieve original trade metadata from DB (including judge/confluence)
                     entry_reason = 'N/A'
                     original_confidence = 0.0
                     trade_timeframe = 'M15'
+                    _db_judge_verdict = None
+                    _db_judge_reason = None
+                    _db_confluence_factors = None
+                    _db_confluence_count = None
                     if DB_AVAILABLE:
                         try:
                             from sqlalchemy import select
@@ -4981,7 +5185,11 @@ Include brief reasoning.
                                     entry_reason = trade_record.entry_reason or 'N/A'
                                     original_confidence = trade_record.claude_confidence or 0.0
                                     trade_timeframe = trade_record.timeframe or 'M15'
-                                    logger.debug(f"Retrieved trade metadata for {position.ticket}: confidence={original_confidence:.0%}, timeframe={trade_timeframe}")
+                                    _db_judge_verdict = getattr(trade_record, 'judge_verdict', None)
+                                    _db_judge_reason = getattr(trade_record, 'judge_reason', None)
+                                    _db_confluence_factors = getattr(trade_record, 'confluence_factors', None)
+                                    _db_confluence_count = getattr(trade_record, 'confluence_count', None)
+                                    logger.debug(f"Retrieved trade metadata for {position.ticket}: confidence={original_confidence:.0%}, judge={_db_judge_verdict}, confluence={_db_confluence_count}")
                         except Exception as e:
                             logger.warning(f"Could not retrieve trade metadata for {position.ticket}: {e}")
                     
@@ -4999,6 +5207,11 @@ Include brief reasoning.
                         'entry_reason': entry_reason,
                         'original_confidence': original_confidence,
                         'timeframe': trade_timeframe,
+                        # Judge & confluence context (for the review)
+                        'judge_verdict': _db_judge_verdict,
+                        'judge_reason': _db_judge_reason,
+                        'confluence_factors': _db_confluence_factors,
+                        'confluence_count': _db_confluence_count,
                     }
                     review = await self.claude_client.review_closed_trade(trade_data)
                     logger.info(f"Claude trade review: Grade {review.get('grade', 'N/A')} - {review.get('analysis', '')[:100]}")
@@ -5025,8 +5238,13 @@ Include brief reasoning.
                             entry_reason=entry_reason,
                             original_confidence=original_confidence,
                             timeframe=trade_timeframe,
+                            # Judge & confluence context for learning correlation
+                            judge_verdict=_db_judge_verdict,
+                            judge_reason=_db_judge_reason,
+                            confluence_factors=_db_confluence_factors,
+                            confluence_count=_db_confluence_count,
                         )
-                        logger.info(f"Trade review stored for learning: {position.ticket}")
+                        logger.info(f"Trade review stored for learning: {position.ticket} (judge={_db_judge_verdict})")
                         
                 except Exception as e:
                     logger.warning(f"Could not get/store Claude trade review: {e}")
@@ -5095,6 +5313,15 @@ Include brief reasoning.
                 logger.info("New trading week - resetting weekly counters")
                 if self.scaling_manager:
                     self.scaling_manager.reset_weekly(current_equity)
+            
+            # Check rejected signal outcomes every day (did we miss winners?)
+            if self.learning_service:
+                try:
+                    updated = await self.learning_service.check_rejected_signal_outcomes(lookback_hours=24)
+                    if updated > 0:
+                        print(f"[LEARNING] Updated {updated} rejected signal outcomes (checking if judge missed winners)", flush=True)
+                except Exception as e:
+                    logger.debug(f"Rejected signal outcome check failed: {e}")
             
             # Weekly consolidation on Sunday (day before week reset)
             if today.weekday() == 6:  # Sunday

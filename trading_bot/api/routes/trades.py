@@ -54,6 +54,24 @@ class TradeResponse(BaseModel):
     r_multiple: Optional[float] = None
     status: str = "open"
     
+    # Claude analysis
+    claude_confidence: Optional[float] = None
+    claude_reasoning: Optional[str] = None
+    
+    # Trade judge analysis (for correlating judge decisions to outcomes)
+    judge_verdict: Optional[str] = None        # APPROVE, DEMOTE, REJECT
+    judge_reason: Optional[str] = None
+    judge_risk_flags: Optional[list] = None
+    
+    # Trade classification & ICT context
+    trade_type: Optional[str] = None           # scalp, intraday, swing
+    order_type: Optional[str] = None           # market, buy_limit, sell_limit, etc.
+    amd_phase: Optional[str] = None            # accumulation, manipulation, distribution
+    market_structure: Optional[str] = None
+    confluence_factors: Optional[list] = None
+    confluence_count: Optional[int] = None
+    ict_concepts: Optional[dict] = None
+    
     class Config:
         from_attributes = True
 
@@ -160,7 +178,19 @@ async def list_trades(
                     profit_loss=trade.profit_loss,
                     profit_loss_pips=trade.profit_loss_pips,
                     r_multiple=trade.r_multiple,
-                    status="closed" if trade.exit_price else "open"
+                    status="closed" if trade.exit_price else "open",
+                    claude_confidence=trade.claude_confidence,
+                    claude_reasoning=trade.claude_reasoning,
+                    judge_verdict=getattr(trade, 'judge_verdict', None),
+                    judge_reason=getattr(trade, 'judge_reason', None),
+                    judge_risk_flags=getattr(trade, 'judge_risk_flags', None),
+                    trade_type=getattr(trade, 'trade_type', None),
+                    order_type=getattr(trade, 'order_type', None),
+                    amd_phase=getattr(trade, 'amd_phase', None),
+                    market_structure=getattr(trade, 'market_structure', None),
+                    confluence_factors=getattr(trade, 'confluence_factors', None),
+                    confluence_count=getattr(trade, 'confluence_count', None),
+                    ict_concepts=getattr(trade, 'ict_concepts', None),
                 ))
             
             return TradeListResponse(
@@ -209,7 +239,10 @@ async def list_trades(
                 profit_loss=trade.profit_loss,
                 profit_loss_pips=trade.profit_loss_pips,
                 r_multiple=trade.r_multiple,
-                status="closed" if trade.exit_price else "open"
+                status="closed" if trade.exit_price else "open",
+                claude_confidence=getattr(trade, 'claude_confidence', None),
+                claude_reasoning=getattr(trade, 'claude_reasoning', None),
+                # New fields default to None when from journal fallback
             ))
         
         return TradeListResponse(
@@ -224,8 +257,52 @@ async def list_trades(
 @router.get("/{trade_id}", response_model=TradeResponse)
 async def get_trade(trade_id: str):
     """
-    Get a specific trade by ID.
+    Get a specific trade by ID (from database with full analysis context).
     """
+    # Try database first for full analysis data
+    try:
+        from ..database import AsyncSessionLocal, TradeModel
+        from sqlalchemy import select
+        
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(TradeModel).where(TradeModel.trade_id == trade_id)
+            )
+            trade = result.scalar_one_or_none()
+            if trade:
+                return TradeResponse(
+                    trade_id=trade.trade_id,
+                    timestamp=trade.timestamp,
+                    symbol=trade.symbol,
+                    direction=trade.direction,
+                    entry_price=trade.entry_price,
+                    entry_time=trade.entry_time,
+                    stop_loss=trade.stop_loss,
+                    take_profit=trade.take_profit,
+                    position_size=trade.position_size,
+                    exit_price=trade.exit_price,
+                    exit_time=trade.exit_time,
+                    profit_loss=trade.profit_loss,
+                    profit_loss_pips=trade.profit_loss_pips,
+                    r_multiple=trade.r_multiple,
+                    status="closed" if trade.exit_price else "open",
+                    claude_confidence=trade.claude_confidence,
+                    claude_reasoning=trade.claude_reasoning,
+                    judge_verdict=getattr(trade, 'judge_verdict', None),
+                    judge_reason=getattr(trade, 'judge_reason', None),
+                    judge_risk_flags=getattr(trade, 'judge_risk_flags', None),
+                    trade_type=getattr(trade, 'trade_type', None),
+                    order_type=getattr(trade, 'order_type', None),
+                    amd_phase=getattr(trade, 'amd_phase', None),
+                    market_structure=getattr(trade, 'market_structure', None),
+                    confluence_factors=getattr(trade, 'confluence_factors', None),
+                    confluence_count=getattr(trade, 'confluence_count', None),
+                    ict_concepts=getattr(trade, 'ict_concepts', None),
+                )
+    except Exception as e:
+        logger.warning(f"Could not fetch trade from database: {e}")
+    
+    # Fallback to journal
     journal = get_trade_journal()
     trade = journal.get_trade(trade_id)
     
@@ -247,7 +324,9 @@ async def get_trade(trade_id: str):
         profit_loss=trade.profit_loss,
         profit_loss_pips=trade.profit_loss_pips,
         r_multiple=trade.r_multiple,
-        status="closed" if trade.exit_price else "open"
+        status="closed" if trade.exit_price else "open",
+        claude_confidence=getattr(trade, 'claude_confidence', None),
+        claude_reasoning=getattr(trade, 'claude_reasoning', None),
     )
 
 

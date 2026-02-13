@@ -2120,18 +2120,17 @@ Respond with JSON:
                 "best_setup": ""
             }
         
-        prompt = f"""You are a trading coach analyzing a week's worth of trade reviews.
+        prompt = f"""You are a trading coach analyzing a week's worth of trade data, including trade reviews AND trade judge performance.
 
-Your task is to identify patterns, consolidate learnings, and generate actionable insights 
-that will help improve future trading decisions.
+Your task is to identify patterns, consolidate learnings, evaluate judge accuracy, and generate actionable insights that will improve future trading decisions.
 
-## Trade Reviews from This Week
+## Weekly Data
 
 {learnings_data}
 
 ## Analysis Required
 
-Analyze all the trade reviews above and identify:
+Analyze ALL the data above (trade reviews AND judge analysis) and identify:
 
 1. **Performance Grade (A-F)**: Overall quality of trading decisions this week
 2. **Recurring Patterns**: Both positive and negative patterns that appear multiple times
@@ -2139,9 +2138,17 @@ Analyze all the trade reviews above and identify:
 4. **Recurring Mistakes**: Common errors to avoid
 5. **Symbol-Specific Insights**: Any symbol-specific patterns or learnings
 6. **Session-Specific Insights**: Performance patterns by trading session
-7. **Top 3 Actionable Recommendations**: Specific improvements for next week
-8. **Focus Area**: The ONE thing to focus on improving next week
-9. **Best Setup**: The setup type that performed best this week
+7. **Judge Accuracy Assessment**: Is the judge approving the right trades and rejecting the right ones? Are there false rejections (rejected signals that would have won)? Should the judge be more or less restrictive?
+8. **Confluence Analysis**: Which confluence factor combinations lead to the best outcomes?
+9. **Top 3 Actionable Recommendations**: Specific improvements for next week
+10. **Focus Area**: The ONE thing to focus on improving next week
+11. **Best Setup**: The setup type that performed best this week
+
+Pay special attention to:
+- APPROVED trades that lost: Was the judge too lenient?
+- REJECTED signals that would have won: Was the judge too strict?
+- DEMOTED trades: Did the limit entry improve the outcome?
+- Confluence count vs win rate: Is there a minimum confluence for profitability?
 
 Be specific and actionable. These insights will be used to improve future trade analysis.
 
@@ -2149,10 +2156,13 @@ Respond with JSON:
 ```json
 {{
     "performance_grade": "A|B|C|D|F",
-    "summary": "<2-3 sentence overall assessment>",
+    "summary": "<2-3 sentence overall assessment including judge performance>",
     "patterns_identified": ["<pattern1>", "<pattern2>", "<pattern3>"],
     "recurring_mistakes": ["<mistake1>", "<mistake2>", "<mistake3>"],
     "winning_patterns": ["<pattern1>", "<pattern2>", "<pattern3>"],
+    "judge_assessment": "<assessment of judge accuracy — too strict, too lenient, or well-calibrated>",
+    "judge_recommendations": ["<specific judge tuning rec1>", "<rec2>"],
+    "confluence_insights": "<what confluence counts/factors correlate with wins>",
     "recommendations": ["<specific actionable rec1>", "<rec2>", "<rec3>"],
     "symbol_insights": {{
         "EURUSD": "<insight if applicable>",

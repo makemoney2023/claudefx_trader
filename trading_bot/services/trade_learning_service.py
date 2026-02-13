@@ -25,7 +25,9 @@ from ..api.database import (
     async_session_maker,
     TradeLearningModel,
     KnowledgeBaseModel,
-    WeeklyReviewModel
+    WeeklyReviewModel,
+    AnalysisLogModel,
+    TradeModel,
 )
 from ..utils.logging import get_logger
 
@@ -72,9 +74,14 @@ class TradeLearningService:
         entry_reason: Optional[str] = None,
         original_confidence: Optional[float] = None,
         timeframe: Optional[str] = None,
+        # Judge & confluence context (for correlating decisions to outcomes)
+        judge_verdict: Optional[str] = None,
+        judge_reason: Optional[str] = None,
+        confluence_factors: Optional[List[str]] = None,
+        confluence_count: Optional[int] = None,
     ) -> Optional[TradeLearningModel]:
         """
-        Store Claude's review of a trade.
+        Store Claude's review of a trade with full judge/analysis context.
         
         Args:
             trade_id: The trade's unique identifier
@@ -88,6 +95,10 @@ class TradeLearningService:
             entry_reason: Original entry reasoning from Claude at trade open
             original_confidence: Claude's original confidence score at trade open
             timeframe: Timeframe used for the trade
+            judge_verdict: APPROVE or DEMOTE
+            judge_reason: Judge's reasoning for the verdict
+            confluence_factors: List of confluence factor names
+            confluence_count: Number of confluence factors
             
         Returns:
             Created TradeLearningModel or None on failure
@@ -112,14 +123,18 @@ class TradeLearningService:
                     what_went_wrong=review.get('what_went_wrong', []),
                     learnings=review.get('learnings', []),
                     improvement_suggestions=review.get('improvement_suggestions', []),
-                    would_take_again=review.get('would_take_again', True)
+                    would_take_again=review.get('would_take_again', True),
+                    judge_verdict=judge_verdict,
+                    judge_reason=judge_reason,
+                    confluence_factors=confluence_factors,
+                    confluence_count=confluence_count,
                 )
                 
                 db_session.add(learning)
                 await db_session.commit()
                 await db_session.refresh(learning)
                 
-                logger.info(f"Stored trade learning for {trade_id} ({symbol}): Grade {learning.grade}")
+                logger.info(f"Stored trade learning for {trade_id} ({symbol}): Grade {learning.grade}, judge={judge_verdict}, confluence={confluence_count}")
                 return learning
                 
         except Exception as e:
@@ -325,6 +340,218 @@ class TradeLearningService:
             return []
     
     # =========================================================================
+    # JUDGE ACCURACY ANALYSIS
+    # =========================================================================
+    
+    async def get_judge_accuracy_stats(self, days_back: int = 30) -> Dict[str, Any]:
+        """
+        Analyze judge accuracy by correlating verdicts with trade outcomes.
+        
+        Returns stats on:
+        - How many APPROVE trades won vs lost
+        - How many DEMOTE trades won vs lost
+        - How many REJECT signals would have won (false rejections)
+        """
+        try:
+            cutoff = datetime.utcnow() - timedelta(days=days_back)
+            
+            async with async_session_maker() as db_session:
+                # --- EXECUTED TRADES (from trades table) ---
+                result = await db_session.execute(
+                    select(TradeModel).where(
+                        and_(
+                            TradeModel.timestamp >= cutoff,
+                            TradeModel.exit_price.isnot(None),
+                            TradeModel.judge_verdict.isnot(None),
+                        )
+                    )
+                )
+                closed_trades = result.scalars().all()
+                
+                approve_wins = 0
+                approve_losses = 0
+                demote_wins = 0
+                demote_losses = 0
+                
+                for t in closed_trades:
+                    is_win = (t.profit_loss or 0) > 0
+                    if t.judge_verdict == 'APPROVE':
+                        if is_win:
+                            approve_wins += 1
+                        else:
+                            approve_losses += 1
+                    elif t.judge_verdict == 'DEMOTE':
+                        if is_win:
+                            demote_wins += 1
+                        else:
+                            demote_losses += 1
+                
+                # --- REJECTED SIGNALS (from analysis_logs) ---
+                result = await db_session.execute(
+                    select(AnalysisLogModel).where(
+                        and_(
+                            AnalysisLogModel.timestamp >= cutoff,
+                            AnalysisLogModel.judge_verdict == 'REJECT',
+                        )
+                    )
+                )
+                rejected_signals = result.scalars().all()
+                
+                reject_would_win = len([s for s in rejected_signals if getattr(s, 'outcome_result', None) == 'would_have_won'])
+                reject_would_lose = len([s for s in rejected_signals if getattr(s, 'outcome_result', None) == 'would_have_lost'])
+                reject_unknown = len(rejected_signals) - reject_would_win - reject_would_lose
+                
+                # --- ALL SIGNALS (total by verdict) ---
+                result = await db_session.execute(
+                    select(AnalysisLogModel).where(
+                        and_(
+                            AnalysisLogModel.timestamp >= cutoff,
+                            AnalysisLogModel.judge_verdict.isnot(None),
+                        )
+                    )
+                )
+                all_signals = result.scalars().all()
+                
+                total_approve = len([s for s in all_signals if s.judge_verdict == 'APPROVE'])
+                total_demote = len([s for s in all_signals if s.judge_verdict == 'DEMOTE'])
+                total_reject = len([s for s in all_signals if s.judge_verdict == 'REJECT'])
+                
+                # --- CONFLUENCE ANALYSIS ---
+                # Which confluence counts lead to wins vs losses?
+                confluence_stats = {}
+                for t in closed_trades:
+                    cc = getattr(t, 'confluence_count', None)
+                    if cc is not None:
+                        if cc not in confluence_stats:
+                            confluence_stats[cc] = {'wins': 0, 'losses': 0}
+                        if (t.profit_loss or 0) > 0:
+                            confluence_stats[cc]['wins'] += 1
+                        else:
+                            confluence_stats[cc]['losses'] += 1
+                
+                return {
+                    'period_days': days_back,
+                    'total_signals': len(all_signals),
+                    'total_approve': total_approve,
+                    'total_demote': total_demote,
+                    'total_reject': total_reject,
+                    'approve_wins': approve_wins,
+                    'approve_losses': approve_losses,
+                    'approve_win_rate': approve_wins / max(1, approve_wins + approve_losses),
+                    'demote_wins': demote_wins,
+                    'demote_losses': demote_losses,
+                    'demote_win_rate': demote_wins / max(1, demote_wins + demote_losses),
+                    'reject_would_have_won': reject_would_win,
+                    'reject_would_have_lost': reject_would_lose,
+                    'reject_unknown': reject_unknown,
+                    'false_rejection_rate': reject_would_win / max(1, reject_would_win + reject_would_lose) if (reject_would_win + reject_would_lose) > 0 else None,
+                    'confluence_stats': confluence_stats,
+                }
+                
+        except Exception as e:
+            logger.error(f"Failed to get judge accuracy stats: {e}")
+            return {}
+    
+    async def check_rejected_signal_outcomes(self, lookback_hours: int = 8) -> int:
+        """
+        Check rejected signals to see if they would have won or lost.
+        
+        Looks at rejected signals from the past N hours that haven't been
+        checked yet, and determines if price hit the TP or SL.
+        
+        Returns: number of signals updated
+        """
+        try:
+            cutoff = datetime.utcnow() - timedelta(hours=lookback_hours)
+            
+            async with async_session_maker() as db_session:
+                result = await db_session.execute(
+                    select(AnalysisLogModel).where(
+                        and_(
+                            AnalysisLogModel.judge_verdict == 'REJECT',
+                            AnalysisLogModel.outcome_result.is_(None),
+                            AnalysisLogModel.timestamp >= cutoff,
+                            AnalysisLogModel.entry_price.isnot(None),
+                            AnalysisLogModel.stop_loss.isnot(None),
+                            AnalysisLogModel.take_profit.isnot(None),
+                        )
+                    )
+                )
+                signals = result.scalars().all()
+                
+                if not signals:
+                    return 0
+                
+                updated = 0
+                
+                # We need MT5 price data to check outcomes
+                try:
+                    import MetaTrader5 as mt5
+                    
+                    for signal in signals:
+                        try:
+                            rates = mt5.copy_rates_from(
+                                signal.symbol, mt5.TIMEFRAME_M5,
+                                signal.timestamp, 100
+                            )
+                            
+                            if rates is None or len(rates) == 0:
+                                continue
+                            
+                            sl = signal.stop_loss
+                            tp = signal.take_profit
+                            direction = signal.signal_direction
+                            
+                            hit_tp = False
+                            hit_sl = False
+                            
+                            for rate in rates:
+                                high = rate[2]  # high
+                                low = rate[3]   # low
+                                
+                                if direction == 'long':
+                                    if low <= sl:
+                                        hit_sl = True
+                                        break
+                                    if high >= tp:
+                                        hit_tp = True
+                                        break
+                                else:  # short
+                                    if high >= sl:
+                                        hit_sl = True
+                                        break
+                                    if low <= tp:
+                                        hit_tp = True
+                                        break
+                            
+                            if hit_tp:
+                                signal.outcome_result = 'would_have_won'
+                                signal.outcome_price = tp
+                                updated += 1
+                            elif hit_sl:
+                                signal.outcome_result = 'would_have_lost'
+                                signal.outcome_price = sl
+                                updated += 1
+                            # else: still in play, leave as None
+                            
+                        except Exception as e:
+                            logger.debug(f"Could not check outcome for signal {signal.id}: {e}")
+                            continue
+                    
+                    await db_session.commit()
+                    
+                except Exception:
+                    logger.debug("MT5 not available for rejected signal outcome tracking")
+                
+                if updated > 0:
+                    logger.info(f"Updated {updated} rejected signal outcomes")
+                return updated
+                
+        except Exception as e:
+            logger.error(f"Failed to check rejected signal outcomes: {e}")
+            return 0
+    
+    # =========================================================================
     # CONTEXT BUILDING
     # =========================================================================
     
@@ -335,6 +562,8 @@ class TradeLearningService:
     ) -> str:
         """
         Build dynamic learning context for Claude's analysis prompt.
+        
+        Includes trade learnings, judge accuracy stats, and confluence patterns.
         
         Args:
             symbol: Trading symbol being analyzed
@@ -356,6 +585,9 @@ class TradeLearningService:
             # Get relevant knowledge base entries
             knowledge = await self.get_knowledge_base()
             symbol_knowledge = [k for k in knowledge if symbol.lower() in k['key'].lower()]
+            
+            # Get judge accuracy stats (30-day rolling)
+            judge_stats = await self.get_judge_accuracy_stats(days_back=30)
             
             # Build context string
             context_parts = []
@@ -381,6 +613,29 @@ class TradeLearningService:
                 context_parts.append(f"\n### {symbol} Insights (High Confidence)")
                 for k in symbol_knowledge[:3]:
                     context_parts.append(f"- {k['insight']} (confidence: {k['confidence']:.0%})")
+            
+            # Judge accuracy section
+            if judge_stats and judge_stats.get('total_signals', 0) > 0:
+                context_parts.append("\n### Trade Judge Performance (Last 30 Days)")
+                context_parts.append(f"- Signals analyzed: {judge_stats.get('total_signals', 0)} (Approved: {judge_stats.get('total_approve', 0)}, Demoted: {judge_stats.get('total_demote', 0)}, Rejected: {judge_stats.get('total_reject', 0)})")
+                
+                if judge_stats.get('approve_wins', 0) + judge_stats.get('approve_losses', 0) > 0:
+                    context_parts.append(f"- Approved trades: {judge_stats['approve_wins']}W / {judge_stats['approve_losses']}L ({judge_stats['approve_win_rate']:.0%} win rate)")
+                
+                if judge_stats.get('demote_wins', 0) + judge_stats.get('demote_losses', 0) > 0:
+                    context_parts.append(f"- Demoted trades: {judge_stats['demote_wins']}W / {judge_stats['demote_losses']}L ({judge_stats['demote_win_rate']:.0%} win rate)")
+                
+                if judge_stats.get('reject_would_have_won', 0) > 0:
+                    context_parts.append(f"- **False rejections (missed winners): {judge_stats['reject_would_have_won']}** — consider being less restrictive")
+                
+                # Confluence insights
+                confluence = judge_stats.get('confluence_stats', {})
+                if confluence:
+                    best_cc = max(confluence.items(), key=lambda x: x[1]['wins'] / max(1, x[1]['wins'] + x[1]['losses']), default=None)
+                    if best_cc:
+                        cc_val, cc_stats = best_cc
+                        cc_wr = cc_stats['wins'] / max(1, cc_stats['wins'] + cc_stats['losses'])
+                        context_parts.append(f"- Best confluence count: {cc_val} factors ({cc_wr:.0%} win rate)")
             
             # Recent mistakes
             if recent_mistakes:
@@ -415,6 +670,9 @@ class TradeLearningService:
         """
         Perform weekly consolidation of learnings with Claude-generated insights.
         
+        Now includes judge accuracy analysis and rejected signal outcomes
+        for comprehensive learning.
+        
         Args:
             claude_client: ClaudeClient instance for generating insights
             
@@ -422,6 +680,9 @@ class TradeLearningService:
             Created WeeklyReviewModel or None on failure
         """
         try:
+            # Check rejected signal outcomes before consolidating
+            await self.check_rejected_signal_outcomes(lookback_hours=168)  # 7 days
+            
             # Get this week's learnings
             week_start = datetime.utcnow() - timedelta(days=7)
             week_end = datetime.utcnow()
@@ -435,8 +696,24 @@ class TradeLearningService:
                 
                 learnings = result.scalars().all()
             
-            if not learnings:
-                logger.info("No learnings to consolidate this week")
+            # Get judge accuracy stats for the week
+            judge_stats = await self.get_judge_accuracy_stats(days_back=7)
+            
+            # Get rejected signals with outcomes
+            async with async_session_maker() as db_session:
+                result = await db_session.execute(
+                    select(AnalysisLogModel).where(
+                        and_(
+                            AnalysisLogModel.timestamp >= week_start,
+                            AnalysisLogModel.judge_verdict == 'REJECT',
+                            AnalysisLogModel.outcome_result.isnot(None),
+                        )
+                    )
+                )
+                rejected_with_outcomes = result.scalars().all()
+            
+            if not learnings and not judge_stats.get('total_signals'):
+                logger.info("No learnings or signals to consolidate this week")
                 return None
             
             # Compile learnings data
@@ -455,13 +732,51 @@ class TradeLearningService:
                     'r_multiple': l.r_multiple,
                     'what_went_right': l.what_went_right or [],
                     'what_went_wrong': l.what_went_wrong or [],
-                    'learnings': l.learnings or []
+                    'learnings': l.learnings or [],
+                    # NEW: judge & confluence context
+                    'judge_verdict': getattr(l, 'judge_verdict', None),
+                    'judge_reason': getattr(l, 'judge_reason', None),
+                    'confluence_factors': getattr(l, 'confluence_factors', None),
+                    'confluence_count': getattr(l, 'confluence_count', None),
                 })
             
-            # Have Claude generate insights
-            insights = await claude_client.generate_weekly_insights(
-                json.dumps(learnings_data, indent=2)
-            )
+            # Compile judge analysis section
+            judge_analysis = {
+                'stats': judge_stats,
+                'false_rejections': [
+                    {
+                        'symbol': s.symbol,
+                        'direction': s.signal_direction,
+                        'confidence': s.confidence,
+                        'entry': s.entry_price,
+                        'tp': s.take_profit,
+                        'sl': s.stop_loss,
+                        'judge_reason': getattr(s, 'judge_reason', 'N/A'),
+                        'outcome': getattr(s, 'outcome_result', 'unknown'),
+                    }
+                    for s in rejected_with_outcomes
+                    if getattr(s, 'outcome_result', None) == 'would_have_won'
+                ],
+                'correct_rejections': [
+                    {
+                        'symbol': s.symbol,
+                        'direction': s.signal_direction,
+                        'confidence': s.confidence,
+                        'judge_reason': getattr(s, 'judge_reason', 'N/A'),
+                    }
+                    for s in rejected_with_outcomes
+                    if getattr(s, 'outcome_result', None) == 'would_have_lost'
+                ],
+            }
+            
+            # Combine everything into one data package for Claude
+            consolidation_data = json.dumps({
+                'trade_reviews': learnings_data,
+                'judge_analysis': judge_analysis,
+            }, indent=2)
+            
+            # Have Claude generate insights (now with judge data)
+            insights = await claude_client.generate_weekly_insights(consolidation_data)
             
             # Calculate statistics
             wins = len([l for l in learnings if l.outcome == 'win'])

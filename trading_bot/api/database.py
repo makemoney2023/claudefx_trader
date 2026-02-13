@@ -74,6 +74,18 @@ class TradeModel(Base):
     claude_confidence: Mapped[float] = mapped_column(Float, default=0)
     claude_reasoning: Mapped[str] = mapped_column(Text, default="")
     
+    # Trade judge analysis (correlate judge decisions to outcomes)
+    judge_verdict: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)   # APPROVE, DEMOTE, REJECT
+    judge_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)           # Judge's reasoning
+    judge_risk_flags: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)      # Risk flags list
+    
+    # Trade classification & ICT context (rich analysis data)
+    trade_type: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)       # scalp, intraday, swing
+    order_type: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)       # market, buy_limit, sell_limit, buy_stop, sell_stop
+    amd_phase: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)        # accumulation, manipulation, distribution
+    confluence_factors: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)    # List of confluence factors
+    confluence_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)    # Number of confluence factors
+    
     # Notes
     notes: Mapped[str] = mapped_column(Text, default="")
     
@@ -111,6 +123,18 @@ class AnalysisLogModel(Base):
     analysis_data: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     reasoning: Mapped[str] = mapped_column(Text, default="")
     warnings: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    
+    # Judge decision (for correlating judge verdicts to market outcomes)
+    judge_verdict: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)   # APPROVE, DEMOTE, REJECT
+    judge_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    judge_risk_flags: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    confluence_factors: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    confluence_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    trade_type: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    
+    # Market outcome after the signal (for rejected/demoted: did price hit TP or SL?)
+    outcome_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    outcome_result: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)  # would_have_won, would_have_lost
     
     # Link to trade if signal was taken (simple FK, no ORM relationship)
     trade_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
@@ -232,6 +256,12 @@ class TradeLearningModel(Base):
     improvement_suggestions: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     would_take_again: Mapped[bool] = mapped_column(Boolean, default=True)
     
+    # Judge & confluence context (for correlating judge decisions to outcomes)
+    judge_verdict: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)   # APPROVE, DEMOTE
+    judge_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    confluence_factors: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    confluence_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -335,6 +365,29 @@ async def init_db():
             ("trade_learnings", "entry_reason", "TEXT"),
             ("trade_learnings", "original_confidence", "FLOAT"),
             ("trade_learnings", "timeframe", "VARCHAR(10)"),
+            # Trade judge & analysis columns (correlate decisions to outcomes)
+            ("trades", "judge_verdict", "VARCHAR(20)"),
+            ("trades", "judge_reason", "TEXT"),
+            ("trades", "judge_risk_flags", "JSON"),
+            ("trades", "trade_type", "VARCHAR(20)"),
+            ("trades", "order_type", "VARCHAR(20)"),
+            ("trades", "amd_phase", "VARCHAR(20)"),
+            ("trades", "confluence_factors", "JSON"),
+            ("trades", "confluence_count", "INTEGER"),
+            # Trade learning judge columns (correlate judge decisions to outcomes)
+            ("trade_learnings", "judge_verdict", "VARCHAR(20)"),
+            ("trade_learnings", "judge_reason", "TEXT"),
+            ("trade_learnings", "confluence_factors", "JSON"),
+            ("trade_learnings", "confluence_count", "INTEGER"),
+            # Analysis log judge columns (track ALL signals for correlation)
+            ("analysis_logs", "judge_verdict", "VARCHAR(20)"),
+            ("analysis_logs", "judge_reason", "TEXT"),
+            ("analysis_logs", "judge_risk_flags", "JSON"),
+            ("analysis_logs", "confluence_factors", "JSON"),
+            ("analysis_logs", "confluence_count", "INTEGER"),
+            ("analysis_logs", "trade_type", "VARCHAR(20)"),
+            ("analysis_logs", "outcome_price", "FLOAT"),
+            ("analysis_logs", "outcome_result", "VARCHAR(20)"),
         ]
         for table, column, col_type in migrations:
             try:
