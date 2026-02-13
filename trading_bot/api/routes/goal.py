@@ -27,7 +27,7 @@ def get_goal_tracker() -> GoalTracker:
     """Get the goal tracker instance."""
     global _goal_tracker
     if _goal_tracker is None:
-        _goal_tracker = GoalTracker(starting_equity=1000, target_equity=100000)
+        _goal_tracker = GoalTracker(starting_equity=1000, target_equity=10000)
     return _goal_tracker
 
 

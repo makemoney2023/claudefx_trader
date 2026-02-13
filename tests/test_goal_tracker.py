@@ -37,20 +37,21 @@ class TestGoalTracker:
         milestones = goal_tracker.get_milestones()
         
         # Should have key milestones
+        assert 250 in milestones  # $250
+        assert 500 in milestones  # $500
+        assert 1000 in milestones  # $1K
         assert 5000 in milestones  # $5K
         assert 10000 in milestones  # $10K
-        assert 25000 in milestones  # $25K
-        assert 50000 in milestones  # $50K
-        assert 100000 in milestones  # $100K
     
     def test_milestone_status(self, goal_tracker):
         """Test which milestones are achieved."""
-        status = goal_tracker.get_milestone_status(current_equity=12000)
+        status = goal_tracker.get_milestone_status(current_equity=3000)
         
-        # Should show 5K and 10K as achieved
-        assert status[5000] == True
-        assert status[10000] == True
-        assert status[25000] == False
+        # Should show $250, $500, $1K, $2.5K as achieved
+        assert status[250] == True
+        assert status[1000] == True
+        assert status[2500] == True
+        assert status[5000] == False
 
 
 class TestGoalProjections:

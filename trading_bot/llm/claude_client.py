@@ -1924,7 +1924,7 @@ A trade analyst has proposed the following trade. Your job is to check it agains
 4. Is the current session appropriate for this symbol and setup?
 
 ## Rules
-- If confidence >= 75% AND no critical risk flags, you MUST verdict APPROVE. We are in data collection mode.
+- If confidence >= 90% AND no critical risk flags, you MUST verdict APPROVE. High-confidence setups with clean structure should not be second-guessed.
 - Verdict DEMOTE if you find a concrete, specific problem with entry price — not vague concerns.
 - Verdict REJECT only for CRITICAL issues (e.g., SL/TP on wrong side, already at max daily trades). Do NOT reject for truncated reasoning or stylistic concerns.
 - NOTE: Reasoning may be truncated for display - this is NOT a reason to reject. Judge the trade on its merits.

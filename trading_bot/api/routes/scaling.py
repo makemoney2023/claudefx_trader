@@ -133,7 +133,7 @@ async def calculate_position_size(request: PositionSizeRequest):
 @router.get("/projection")
 async def get_growth_projection(
     starting_equity: float = 1000,
-    target_equity: float = 100000,
+    target_equity: float = 10000,
     monthly_return: float = 0.15,
     win_rate: float = 0.55
 ):

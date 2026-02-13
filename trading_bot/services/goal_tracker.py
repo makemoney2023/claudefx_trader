@@ -24,7 +24,7 @@ class EquitySnapshot:
 
 class GoalTracker:
     """
-    Tracks equity goal progress from $1,000 to $100,000.
+    Tracks equity goal progress toward target equity.
     
     Features:
     - Progress calculation
@@ -33,12 +33,12 @@ class GoalTracker:
     - Compound growth calculations
     """
     
-    DEFAULT_MILESTONES = [1000, 2500, 5000, 10000, 25000, 50000, 75000, 100000]
+    DEFAULT_MILESTONES = [250, 500, 750, 1000, 2500, 5000, 10000]
     
     def __init__(
         self,
         starting_equity: float = 1000,
-        target_equity: float = 100000
+        target_equity: float = 10000
     ):
         """
         Initialize goal tracker.

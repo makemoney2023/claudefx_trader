@@ -447,7 +447,7 @@ class TradingBot:
             starting_equity = account.equity if account else (account.balance if account else 1000.0)
             self.goal_tracker = GoalTracker(
                 starting_equity=starting_equity,
-                target_equity=100000.0
+                target_equity=10000.0
             )
             
             # Silver Analyzer - special handling for XAGUSD
@@ -477,7 +477,7 @@ class TradingBot:
             logger.info("Initializing scaling manager...")
             self.scaling_manager = ScalingManager(
                 starting_equity=starting_equity,
-                target_equity=100000.0,
+                target_equity=10000.0,
                 max_daily_drawdown=settings.trading.max_daily_drawdown,  # 3% from config
                 max_weekly_drawdown=settings.trading.max_weekly_drawdown,  # 6% from config
             )
@@ -498,8 +498,8 @@ class TradingBot:
                 risk_manager=self.risk_manager,
                 position_manager=self.position_manager,
                 claude_client=self.claude_client,
-                max_concurrent_positions=8,  # Raised from 5 to allow more crypto positions
-                max_exposure_percent=0.40  # 40% of equity as max margin exposure (crypto-friendly)
+                max_concurrent_positions=3,  # Reduced for capital preservation on small accounts
+                max_exposure_percent=0.30  # 30% of equity as max margin exposure
             )
             
             # Pending Order Manager - track and manage pending orders
@@ -579,7 +579,7 @@ class TradingBot:
                 logger.info("✅ Telegram notifications enabled")
                 await notify(
                     NotificationType.INFO,
-                    f"🤖 ICT Trading Bot started!\nEquity: ${starting_equity:,.2f}\nGoal: $100,000"
+                    f"🤖 ICT Trading Bot started!\nEquity: ${starting_equity:,.2f}\nGoal: $10,000"
                 )
             else:
                 logger.warning("⚠️ Telegram notifications disabled (missing credentials)")
@@ -614,7 +614,7 @@ class TradingBot:
             
             print("[INIT] ALL DONE - initialization successful!", flush=True)
             logger.info("Trading bot initialized successfully!")
-            logger.info(f"Goal: ${starting_equity:.2f} -> $100,000.00")
+            logger.info(f"Goal: ${starting_equity:.2f} -> $10,000.00")
             return True
             
         except Exception as e:
@@ -4523,12 +4523,12 @@ class TradingBot:
                 logger.info(f"   Remaining: ${progress['remaining']:.2f}")
                 
                 if progress['progress_percent'] >= 100:
-                    logger.info("🎉 GOAL REACHED! $100,000 equity achieved!")
+                    logger.info("🎉 GOAL REACHED! $10,000 equity achieved!")
                     
                     from .api.routes.activity import add_activity
                     add_activity(
                         "goal_reached",
-                        "🎉 $100,000 EQUITY GOAL REACHED!",
+                        "🎉 $10,000 EQUITY GOAL REACHED!",
                         None,
                         progress
                     )
@@ -5396,7 +5396,7 @@ Include brief reasoning.
         if not self.goal_tracker:
             return
         
-        milestones = [2500, 5000, 10000, 25000, 50000, 75000, 100000]
+        milestones = [250, 500, 750, 1000, 2500, 5000, 10000]
         
         for milestone in milestones:
             # Check if we just crossed this milestone
