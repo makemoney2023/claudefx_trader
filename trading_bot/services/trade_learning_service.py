@@ -52,6 +52,13 @@ class TradeLearningService:
     to continuously improve trading performance.
     """
     
+    @staticmethod
+    def _sanitize_r(val: float) -> float:
+        """Cap unreasonable R-multiples at +/-10R."""
+        if val is None:
+            return 0.0
+        return val if abs(val) <= 10 else 0.0
+    
     def __init__(self):
         """Initialize the trade learning service."""
         self._docs_path = Path(__file__).parent.parent / "docs" / "trading_learnings.md"
@@ -188,7 +195,7 @@ class TradeLearningService:
                         'session': l.session,
                         'outcome': l.outcome,
                         'grade': l.grade,
-                        'r_multiple': l.r_multiple,
+                        'r_multiple': self._sanitize_r(l.r_multiple),
                         'analysis': l.analysis,
                         'learnings': l.learnings or [],
                         'would_take_again': l.would_take_again
@@ -279,7 +286,7 @@ class TradeLearningService:
                     if learning.what_went_right:
                         for pattern in learning.what_went_right:
                             if isinstance(pattern, str):
-                                patterns.append(f"[{learning.symbol}] {pattern} ({learning.r_multiple:.1f}R)")
+                                patterns.append(f"[{learning.symbol}] {pattern} ({self._sanitize_r(learning.r_multiple):.1f}R)")
                             if len(patterns) >= limit:
                                 break
                     if len(patterns) >= limit:
@@ -732,7 +739,7 @@ class TradeLearningService:
                     'timeframe': l.timeframe or 'N/A',
                     'outcome': l.outcome,
                     'grade': l.grade,
-                    'r_multiple': l.r_multiple,
+                    'r_multiple': self._sanitize_r(l.r_multiple),
                     'what_went_right': l.what_went_right or [],
                     'what_went_wrong': l.what_went_wrong or [],
                     'learnings': l.learnings or [],
@@ -796,7 +803,7 @@ class TradeLearningService:
             wins = len([l for l in learnings if l.outcome == 'win'])
             losses = len([l for l in learnings if l.outcome == 'loss'])
             total_pnl = sum(l.profit_loss for l in learnings)
-            total_r = sum(l.r_multiple for l in learnings)
+            total_r = sum(self._sanitize_r(l.r_multiple) for l in learnings)
             
             # Create weekly review
             async with async_session_maker() as db_session:
@@ -869,7 +876,7 @@ class TradeLearningService:
                         sample_size = len(symbol_learnings)
                         wins = len([l for l in symbol_learnings if l.outcome == 'win'])
                         win_rate = wins / sample_size if sample_size > 0 else 0
-                        avg_r = sum(l.r_multiple for l in symbol_learnings) / sample_size if sample_size > 0 else 0
+                        avg_r = sum(self._sanitize_r(l.r_multiple) for l in symbol_learnings) / sample_size if sample_size > 0 else 0
                         
                         if existing:
                             existing.insight = insight

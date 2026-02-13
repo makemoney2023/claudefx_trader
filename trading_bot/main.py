@@ -4828,11 +4828,14 @@ Include brief reasoning.
                 else:
                     today_start = datetime.combine(datetime.now().date(), datetime.min.time())
                     today_deals = await self.mt5_client.get_history(today_start, datetime.now())
-                    # Count only entry deals (entry=0 is trade-in)
-                    entry_deals = [d for d in today_deals if d.get('entry') == 0 and d.get('volume', 0) > 0]
+                    # Count only entry deals (entry=0 is trade-in) placed by THIS bot (magic=12345)
+                    entry_deals = [
+                        d for d in today_deals
+                        if d.get('entry') == 0 and d.get('volume', 0) > 0 and d.get('magic') == 12345
+                    ]
                     if entry_deals:
                         self.daily_trades = len(entry_deals)
-                        logger.info(f"Initialized daily_trades from MT5 history: {self.daily_trades} trades today")
+                        logger.info(f"Initialized daily_trades from MT5 history: {self.daily_trades} bot trades today")
             except Exception as e:
                 logger.warning(f"Could not initialize daily trades from history: {e}")
             
@@ -4863,12 +4866,35 @@ Include brief reasoning.
         This catches trades that were closed while the bot was offline
         and ensures our analytics and goal tracking are accurate.
         
+        Only syncs trades placed by this bot (magic=12345) to prevent
+        manual trades or trades from other EAs from contaminating analytics.
+        
         Args:
             days_back: Number of days of history to sync (default 1, startup uses 30)
         """
         if not self.mt5_client or self.mt5_client.is_simulation:
             logger.debug("Skipping trade history sync - simulation mode or no MT5")
             return
+        
+        # Skip history sync on fresh start (empty trades table)
+        # This prevents old trades from a previous account setup from contaminating
+        # our clean database when switching accounts
+        if DB_AVAILABLE:
+            try:
+                async with async_session() as session:
+                    from sqlalchemy import select, func
+                    trade_count = await session.execute(
+                        select(func.count(TradeModel.id))
+                    )
+                    if trade_count.scalar() == 0:
+                        logger.info(
+                            "Fresh database detected (0 trades) - skipping MT5 history sync "
+                            "to prevent contamination from old account trades"
+                        )
+                        self._last_history_sync = datetime.now()
+                        return
+            except Exception as e:
+                logger.warning(f"Could not check trade count for fresh DB detection: {e}")
         
         try:
             end_time = datetime.now()
@@ -4885,6 +4911,7 @@ Include brief reasoning.
                 return
             
             synced_count = 0
+            skipped_non_bot = 0
             
             for deal in deals:
                 # Skip if already synced
@@ -4895,6 +4922,15 @@ Include brief reasoning.
                 # Only sync actual trades (not deposits/withdrawals)
                 deal_type = deal.get('type', '')
                 if deal_type not in ['buy', 'sell', 'DEAL_TYPE_BUY', 'DEAL_TYPE_SELL']:
+                    continue
+                
+                # Only sync trades placed by this bot (magic=12345)
+                # This prevents manual trades or trades from other EAs from
+                # contaminating our analytics and trade history
+                deal_magic = deal.get('magic', 0)
+                if deal_magic != 12345:
+                    skipped_non_bot += 1
+                    self._synced_deal_ids.add(deal_id)  # Mark as seen so we don't re-check
                     continue
                 
                 # Extract trade data
@@ -4970,7 +5006,7 @@ Include brief reasoning.
             self._last_history_sync = datetime.now()
             
             if synced_count > 0:
-                logger.info(f"Synced {synced_count} trades from MT5 history")
+                logger.info(f"Synced {synced_count} bot trades from MT5 history (skipped {skipped_non_bot} non-bot trades)")
                 
                 # Update bot state for dashboard visibility
                 if bot_state:
@@ -4982,10 +5018,13 @@ Include brief reasoning.
                     "info",
                     f"Synced {synced_count} historical trades from MT5",
                     None,
-                    {"synced_count": synced_count, "days_back": days_back}
+                    {"synced_count": synced_count, "days_back": days_back, "skipped_non_bot": skipped_non_bot}
                 )
             else:
-                logger.debug("No new trades to sync from MT5 history")
+                if skipped_non_bot > 0:
+                    logger.info(f"No bot trades to sync (skipped {skipped_non_bot} non-bot trades)")
+                else:
+                    logger.debug("No new trades to sync from MT5 history")
             
         except Exception as e:
             logger.error(f"Error syncing trade history: {e}")

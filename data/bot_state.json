@@ -3,34 +3,21 @@
     "win_streak": 0,
     "loss_streak": 0
   },
-  "last_saved": "2026-02-13T10:29:46.687607",
+  "last_saved": null,
   "daily_stats": {
     "trades": 0,
     "pnl": 0.0,
-    "date": "2026-02-13"
+    "date": ""
   },
   "skip_mt5_trade_recount": false,
-  "notified_milestones": [
-    "milestone_100000",
-    "milestone_5000",
-    "milestone_2500",
-    "milestone_50000",
-    "milestone_10000",
-    "milestone_25000",
-    "milestone_75000"
-  ],
+  "notified_milestones": [],
   "scaling_manager": {
     "recent_trades": [],
-    "daily_high_equity": 100000.0,
-    "weekly_high_equity": 100000.0,
+    "daily_high_equity": 0,
+    "weekly_high_equity": 0,
     "current_mode": "normal"
   },
   "goal_tracker": {
-    "snapshots": [
-      {
-        "equity": 98701.29,
-        "timestamp": "2026-02-12T21:16:25.022780"
-      }
-    ]
+    "snapshots": []
   }
 }
