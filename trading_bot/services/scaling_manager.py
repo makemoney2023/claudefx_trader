@@ -51,9 +51,9 @@ MODE_CONFIGS = {
     TradingMode.CONSERVATIVE: ModeConfig(
         risk_multiplier=0.5,
         setup_filter='A_and_B',
-        confidence_threshold=0.85,
+        confidence_threshold=0.80,
         max_daily_trades=15,
-        description="Half risk, A+ and A setups only (drawdown recovery)"
+        description="Half risk, A+ and A setups only (Mon/Fri caution)"
     ),
     TradingMode.DEFENSIVE: ModeConfig(
         risk_multiplier=0.25,

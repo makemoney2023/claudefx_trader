@@ -84,20 +84,20 @@ class TestRaisedConfidenceThresholds:
         )
         assert should_trade is True
 
-    # ----- CONSERVATIVE mode: 0.85 threshold -----
+    # ----- CONSERVATIVE mode: 0.80 threshold (same as NORMAL, but with 0.5x risk) -----
 
-    def test_conservative_threshold_is_085(self):
-        """CONSERVATIVE mode confidence threshold should be 0.85."""
+    def test_conservative_threshold_is_080(self):
+        """CONSERVATIVE mode confidence threshold should be 0.80."""
         config = MODE_CONFIGS[TradingMode.CONSERVATIVE]
-        assert config.confidence_threshold == 0.85
+        assert config.confidence_threshold == 0.80
 
-    def test_conservative_rejects_080_confidence(self):
-        """CONSERVATIVE mode should reject trades with 0.80 confidence (below 0.85)."""
+    def test_conservative_rejects_075_confidence(self):
+        """CONSERVATIVE mode should reject trades with 0.75 confidence (below 0.80)."""
         manager = self._create_manager()
         manager.current_mode = TradingMode.CONSERVATIVE
         should_trade, reason = manager.should_take_trade(
             setup_grade='A+',
-            confidence=0.80,
+            confidence=0.75,
             daily_trades=0
         )
         assert should_trade is False
