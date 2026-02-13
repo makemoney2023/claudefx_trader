@@ -680,8 +680,11 @@ class TradeLearningService:
             Created WeeklyReviewModel or None on failure
         """
         try:
-            # Check rejected signal outcomes before consolidating
-            await self.check_rejected_signal_outcomes(lookback_hours=168)  # 7 days
+            # Check rejected signal outcomes before consolidating (non-critical)
+            try:
+                await self.check_rejected_signal_outcomes(lookback_hours=168)  # 7 days
+            except Exception as e:
+                logger.debug(f"Rejected signal outcome check skipped: {e}")
             
             # Get this week's learnings
             week_start = datetime.utcnow() - timedelta(days=7)
@@ -770,10 +773,21 @@ class TradeLearningService:
             }
             
             # Combine everything into one data package for Claude
-            consolidation_data = json.dumps({
+            # Sanitize data to ensure JSON-safe types (handles mock objects in tests)
+            def _sanitize_for_json(obj):
+                if isinstance(obj, dict):
+                    return {str(k): _sanitize_for_json(v) for k, v in obj.items()}
+                elif isinstance(obj, (list, tuple)):
+                    return [_sanitize_for_json(i) for i in obj]
+                elif isinstance(obj, (str, int, float, bool)) or obj is None:
+                    return obj
+                else:
+                    return str(obj)
+            
+            consolidation_data = json.dumps(_sanitize_for_json({
                 'trade_reviews': learnings_data,
                 'judge_analysis': judge_analysis,
-            }, indent=2)
+            }), indent=2)
             
             # Have Claude generate insights (now with judge data)
             insights = await claude_client.generate_weekly_insights(consolidation_data)
