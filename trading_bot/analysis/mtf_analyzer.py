@@ -136,6 +136,12 @@ class MTFAnalyzer:
         Returns:
             MTFAnalysisResult with bias and alignment info
         """
+        # Update pip_value on sub-analyzers for this symbol
+        from ..config import get_symbol_spec
+        _sym_pip = get_symbol_spec(symbol).pip_size
+        if hasattr(self.fvg_detector, 'pip_value'):
+            self.fvg_detector.pip_value = _sym_pip
+        
         # Fetch data if not provided and mt5_client available
         if self.mt5_client:
             if d1_data is None:

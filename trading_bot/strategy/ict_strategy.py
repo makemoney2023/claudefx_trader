@@ -179,6 +179,14 @@ class ICTStrategy:
         """
         logger.info(f"Analyzing {symbol} for ICT setup")
         
+        # Update pip_value on detectors for this symbol
+        from ..config import get_symbol_spec
+        _sym_pip = get_symbol_spec(symbol).pip_size
+        if hasattr(self.fvg_detector, 'pip_value'):
+            self.fvg_detector.pip_value = _sym_pip
+        if hasattr(self.liquidity_mapper, 'pip_value'):
+            self.liquidity_mapper.pip_value = _sym_pip
+        
         # Step 1: Check if we're in a valid session
         session_info = self.kill_zone_checker.get_current_session()
         if not session_info.is_tradeable:

@@ -250,8 +250,36 @@ class TradingBot:
                 if account:
                     logger.info(f"MT5 connected: Account {account.login}, Balance: {account.balance} {account.currency}")
             
+            # =============================================
+            # SYNC SYMBOL SPECS FROM MT5 (actual broker values)
+            # This MUST happen before any position sizing / P/L calculations
+            # =============================================
+            print("[INIT] MT5 done, syncing symbol specs from broker...", flush=True)
+            from .config import update_symbol_spec_from_mt5
+            for _sym in settings.trading.symbols:
+                try:
+                    _sym_info = await self.mt5_client.get_symbol_info(_sym)
+                    if _sym_info:
+                        update_symbol_spec_from_mt5(
+                            symbol=_sym,
+                            trade_contract_size=_sym_info.trade_contract_size,
+                            point=_sym_info.point,
+                            digits=_sym_info.digits,
+                            tick_value=_sym_info.trade_tick_value,
+                            volume_min=_sym_info.volume_min,
+                            volume_max=_sym_info.volume_max,
+                            volume_step=_sym_info.volume_step,
+                            swap_long=_sym_info.swap_long,
+                            swap_short=_sym_info.swap_short,
+                        )
+                        print(f"[INIT] {_sym}: contract={_sym_info.trade_contract_size}, tick_val={_sym_info.trade_tick_value}, vol={_sym_info.volume_min}/{_sym_info.volume_max}/{_sym_info.volume_step}, swap={_sym_info.swap_long}/{_sym_info.swap_short}", flush=True)
+                    else:
+                        print(f"[INIT] {_sym}: Could not get MT5 info, using defaults", flush=True)
+                except Exception as e:
+                    logger.warning(f"Could not sync spec for {_sym}: {e}")
+            
             # Initialize data fetcher with MT5 client
-            print("[INIT] MT5 done, creating DataFetcher...", flush=True)
+            print("[INIT] Creating DataFetcher...", flush=True)
             self.data_fetcher = DataFetcher(self.mt5_client)
             
             # Initialize Claude client
@@ -1055,11 +1083,13 @@ class TradingBot:
             if bot_state:
                 bot_state.running_technical_analysis(symbol)
             
-            # Core ICT analysis
+            # Core ICT analysis (use symbol-specific pip_value)
+            from .config import get_symbol_spec as _get_spec
+            _core_pip = _get_spec(symbol).pip_size
             market_structure_analyzer = MarketStructureAnalyzer()
-            fvg_detector = FVGDetector()
+            fvg_detector = FVGDetector(pip_value=_core_pip)
             ob_detector = OrderBlockDetector()
-            liquidity_mapper = LiquidityMapper()
+            liquidity_mapper = LiquidityMapper(pip_value=_core_pip)
             volume_analyzer = VolumeAnalyzer()
             
             analysis_results = {
@@ -1097,6 +1127,19 @@ class TradingBot:
             # =============================================
             
             print(f"[ANALYSIS] Core ICT done for {symbol}. Running expanded analysis...", flush=True)
+            
+            # Update pip_value on all analyzers for this symbol
+            from .config import get_symbol_spec
+            _sym_spec = get_symbol_spec(symbol)
+            _sym_pip = _sym_spec.pip_size
+            if self.amd_analyzer:
+                self.amd_analyzer.pip_value = _sym_pip
+            if self.displacement_detector:
+                self.displacement_detector.pip_value = _sym_pip
+            if self.ipda_tracker:
+                self.ipda_tracker.pip_value = _sym_pip
+            if self.nwog_tracker:
+                self.nwog_tracker.pip_value = _sym_pip
             
             # 1. AMD Cycle Analysis - Power of Three
             amd_state = None
@@ -1522,6 +1565,8 @@ class TradingBot:
             current_equity = account_info.equity if account_info else 1000.0
             
             # Prepare market data for Claude (ENHANCED with all integrated services)
+            from .config import get_symbol_spec as _gss
+            _sym_spec = _gss(symbol)
             market_data = {
                 "current_price": current_price,
                 "bid": current_price - 0.00005,
@@ -1532,6 +1577,19 @@ class TradingBot:
                 "scaling_tier": self.position_sizer.get_tier_name(current_equity) if self.position_sizer else "Unknown",
                 "trading_mode": self.scaling_manager.current_mode.value if self.scaling_manager else "normal",
                 "goal_progress": self.scaling_manager.calculate_goal_progress(current_equity) if self.scaling_manager else 0,
+                # Swap/overnight cost awareness
+                "swap_long": _sym_spec.swap_long,
+                "swap_short": _sym_spec.swap_short,
+                "swap_info": (
+                    f"Overnight swap costs per lot: Long={_sym_spec.swap_long}, Short={_sym_spec.swap_short}. "
+                    f"{'Positive swap favors longs.' if _sym_spec.swap_long > 0 and _sym_spec.swap_short < 0 else ''}"
+                    f"{'Positive swap favors shorts.' if _sym_spec.swap_short > 0 and _sym_spec.swap_long < 0 else ''}"
+                    f"{'Both directions have negative swap (costly to hold overnight).' if _sym_spec.swap_long < 0 and _sym_spec.swap_short < 0 else ''}"
+                ) if (_sym_spec.swap_long != 0 or _sym_spec.swap_short != 0) else "Swap data not available.",
+                # Volume constraints for position sizing
+                "volume_min": _sym_spec.volume_min,
+                "volume_max": _sym_spec.volume_max,
+                "volume_step": _sym_spec.volume_step,
             }
             
             # Add recent performance context
@@ -2164,14 +2222,20 @@ class TradingBot:
                     confluence_factors.append("OTE Zone")
             
             logger.info(f"Confluence factors for {symbol}: {confluence_count} ({', '.join(confluence_factors) if confluence_factors else 'none'})")
+            print(f"[CONFLUENCE] {symbol}: {confluence_count} factors ({', '.join(confluence_factors) if confluence_factors else 'none'}), confidence={trade_signal.confidence:.0%}", flush=True)
             
-            # Require minimum 2 confluence factors for all trades
-            if confluence_count < 2:
+            # Require minimum confluence factors for trades
+            # In AGGRESSIVE mode (data collection), lower the bar to 1 factor at 65%+ confidence
+            min_confluence = 1 if (self.scaling_manager and self.scaling_manager.current_mode.value == 'aggressive') else 2
+            confidence_override = 0.65 if (self.scaling_manager and self.scaling_manager.current_mode.value == 'aggressive') else 0.80
+            
+            if confluence_count < min_confluence:
                 # Allow Claude high-confidence signals through even with low confluence
-                if trade_signal.confidence < 0.80:
+                if trade_signal.confidence < confidence_override:
+                    print(f"[FILTERED] {symbol}: Only {confluence_count} confluence factors (min {min_confluence}), confidence {trade_signal.confidence:.0%} < {confidence_override:.0%}", flush=True)
                     logger.info(
                         f"Trade signal filtered for {symbol}: Only {confluence_count} confluence "
-                        f"factors (min 2 required). Confidence {trade_signal.confidence:.0%} too low to override."
+                        f"factors (min {min_confluence} required). Confidence {trade_signal.confidence:.0%} too low to override."
                     )
                     if bot_state:
                         bot_state.trade_decision(symbol, "filtered", f"Low confluence ({confluence_count} factors)")
@@ -2183,6 +2247,7 @@ class TradingBot:
             # ============================================
             # SCALING MANAGER: Check if trade is allowed
             # ============================================
+            print(f"[SCALING] {symbol}: Checking scaling manager...", flush=True)
             if self.scaling_manager:
                 # Determine current mode based on performance
                 # Use balance (realized P/L) for drawdown-related mode decisions
@@ -2190,21 +2255,28 @@ class TradingBot:
                 current_balance = account_info.balance if account_info else 1000.0
                 
                 # Let Claude help with mode decision if available
+                # OVERRIDE: In AGGRESSIVE mode (data collection), ignore Claude's mode recommendation
+                # to prevent it from downgrading to defensive/conservative during demo testing
                 claude_mode = None
-                if self.claude_client and self.claude_client.api_key:
-                    try:
-                        scaling_decision = await self.claude_client.assess_scaling_decision(
-                            current_equity=current_balance,
-                            current_tier=self.position_sizer.get_tier_name(current_balance) if self.position_sizer else "Unknown",
-                            recent_performance=self.scaling_manager.get_recent_performance(),
-                            goal_progress=self.scaling_manager.calculate_goal_progress(current_balance)
-                        )
-                        claude_mode = scaling_decision.get('recommended_mode')
-                    except Exception as e:
-                        logger.debug(f"Could not get Claude scaling decision: {e}")
+                if self.scaling_manager.current_mode != TradingMode.AGGRESSIVE:
+                    if self.claude_client and self.claude_client.api_key:
+                        try:
+                            scaling_decision = await self.claude_client.assess_scaling_decision(
+                                current_equity=current_balance,
+                                current_tier=self.position_sizer.get_tier_name(current_balance) if self.position_sizer else "Unknown",
+                                recent_performance=self.scaling_manager.get_recent_performance(),
+                                goal_progress=self.scaling_manager.calculate_goal_progress(current_balance)
+                            )
+                            claude_mode = scaling_decision.get('recommended_mode')
+                            print(f"[SCALING] {symbol}: Claude recommended mode: {claude_mode}", flush=True)
+                        except Exception as e:
+                            logger.debug(f"Could not get Claude scaling decision: {e}")
+                else:
+                    print(f"[SCALING] {symbol}: AGGRESSIVE mode locked (data collection) — skipping Claude mode assessment", flush=True)
                 
                 # Determine current trading mode (uses balance for drawdown watermarks)
                 mode = self.scaling_manager.determine_mode(current_balance, claude_mode)
+                print(f"[SCALING] {symbol}: Mode={mode.value}, balance={current_balance}", flush=True)
                 if mode != self.scaling_manager.current_mode:
                     self.scaling_manager.current_mode = mode
                     logger.info(f"Trading mode changed to: {mode.value}")
@@ -2226,7 +2298,10 @@ class TradingBot:
                     daily_trades=self.daily_trades
                 )
                 
+                print(f"[SCALING] {symbol}: should_trade={should_trade}, grade={setup_grade_str}, reason={rejection_reason}", flush=True)
+                
                 if not should_trade:
+                    print(f"[BLOCKED] {symbol}: Scaling manager rejected - {rejection_reason}", flush=True)
                     logger.info(f"Trade signal rejected by scaling manager for {symbol}: {rejection_reason}")
                     if bot_state:
                         bot_state.trade_decision(symbol, "rejected", rejection_reason)
@@ -2310,6 +2385,7 @@ class TradingBot:
             # Gap 21: Check for duplicate signals (prevent same trade within 1 hour)
             signal_hash = self._get_signal_hash(symbol, trade_signal.direction, trade_signal.entry_price or current_price)
             if signal_hash in self._recent_signal_hashes:
+                print(f"[BLOCKED] {symbol}: Duplicate signal (same setup recently)", flush=True)
                 logger.info(f"Duplicate signal ignored for {symbol} (same setup recently)")
                 return
             
@@ -2321,6 +2397,7 @@ class TradingBot:
                     symbol, direction=trade_signal.direction
                 )
                 if should_block:
+                    print(f"[BLOCKED] {symbol}: Correlation block - {block_reason}", flush=True)
                     logger.warning(f"⚠️ CORRELATION BLOCK: {symbol} - {block_reason}")
                     if bot_state:
                         bot_state.trade_decision(symbol, "blocked", f"Correlation: {block_reason}")
@@ -2413,7 +2490,8 @@ class TradingBot:
                 final_lots = size_result.lots
                 if is_crypto and self.crypto_analyzer:
                     crypto_adj = self.crypto_analyzer.get_position_size_adjustment(symbol, final_lots)
-                    final_lots = max(0.01, round(crypto_adj, 2))
+                    from .config import normalize_lots
+                    final_lots = normalize_lots(symbol, crypto_adj)
                     logger.info(f"🪙 Crypto volatility adjustment: {size_result.lots} -> {final_lots} lots")
                 
                 # Create position size object
@@ -2430,6 +2508,7 @@ class TradingBot:
                     logger.info(f"   • {adj}")
                 
                 # Validate trade with risk manager
+                print(f"[VALIDATE] {symbol}: Running risk validation...", flush=True)
                 validation = self.risk_manager.validate_trade(
                     entry_price=trade_signal.entry_price or current_price,
                     stop_loss=trade_signal.stop_loss,
@@ -2441,6 +2520,7 @@ class TradingBot:
                 )
                 
                 if not validation.is_valid:
+                    print(f"[BLOCKED] {symbol}: Validation failed - {validation.errors}", flush=True)
                     logger.warning(f"Trade validation failed for {symbol}: {validation.errors}")
                     self.daily_trades = max(0, self.daily_trades - 1)
                     logger.info(f"Trade slot released after validation failure ({self.daily_trades}/{settings.trading.max_daily_trades})")
@@ -2484,7 +2564,8 @@ class TradingBot:
                         )
                         # Reduce position size by 50% instead of blocking
                         original_lots = position_size.lots
-                        position_size.lots = max(0.01, round(position_size.lots * 0.5, 2))
+                        from .config import normalize_lots as _nl
+                        position_size.lots = _nl(symbol, position_size.lots * 0.5)
                         logger.info(f"📉 Reduced size due to DXY conflict: {original_lots} -> {position_size.lots} lots")
                     else:
                         logger.info(f"✅ DXY confirms {trade_signal.direction.upper()} bias for {symbol}")
@@ -2808,8 +2889,9 @@ class TradingBot:
                         if take_profit_levels.get('tp2'):
                             # Calculate distance to ensure it's worth it
                             tp2_distance = abs(take_profit_levels['tp2'] - _entry_ref)
-                            pip_value = 0.0001 if 'JPY' not in symbol else 0.01
-                            tp2_pips = tp2_distance / pip_value
+                            from .config import get_symbol_spec
+                            _tp_spec = get_symbol_spec(symbol)
+                            tp2_pips = tp2_distance / _tp_spec.pip_size
                             
                             if tp2_pips >= 50:  # At least 50 pips for extended target
                                 trade_signal.take_profit = take_profit_levels['tp2']
@@ -2900,6 +2982,7 @@ class TradingBot:
                 # =============================================
                 # TRADE JUDGE (pre-execution validation)
                 # =============================================
+                print(f"[JUDGE] {symbol}: Sending to trade judge (confidence={trade_signal.confidence:.0%}, dir={trade_signal.direction}, lots={position_size.lots})...", flush=True)
                 judge_verdict = await self._run_trade_judge(
                     symbol, trade_signal, position_size, current_price
                 )
@@ -3056,10 +3139,15 @@ class TradingBot:
                     )
                 elif order_type in ['buy_limit', 'sell_limit', 'buy_stop', 'sell_stop']:
                     # Use pending order at Claude's specified entry price
-                    # Get session remaining time for expiration
-                    session = self.kill_zone_checker.get_current_session() if self.kill_zone_checker else None
-                    expiration_minutes = int(getattr(session, 'minutes_remaining', 120)) if session else 120
-                    expiration_minutes = min(expiration_minutes, 180)  # Max 3 hours
+                    # Crypto trades 24/7, so give longer expiration
+                    if is_crypto:
+                        expiration_minutes = 480  # 8 hours for crypto
+                    else:
+                        # For forex, use session remaining but with a minimum of 60 minutes
+                        session = self.kill_zone_checker.get_current_session() if self.kill_zone_checker else None
+                        session_remaining = int(getattr(session, 'minutes_remaining', 240)) if session else 240
+                        expiration_minutes = max(session_remaining, 60)  # At least 1 hour
+                        expiration_minutes = min(expiration_minutes, 480)  # Max 8 hours
                     
                     logger.info(
                         f"⏳ Placing PENDING {order_type} order @ {entry_price}, "
@@ -3147,7 +3235,9 @@ class TradingBot:
                     elif is_pending_order:
                         logger.info(f"  ⏳ Pending order placed — will verify when filled")
                     
-                    # Track position
+                    # Track position — but ONLY for market orders (immediately filled)
+                    # Pending orders (buy_limit, sell_limit, etc.) are tracked by pending_order_manager
+                    # and will be picked up by sync_with_mt5 when they fill
                     if result.ticket:
                         # Validate SL/TP are real values before tracking
                         tracked_sl = trade_signal.stop_loss if trade_signal.stop_loss and trade_signal.stop_loss > 0 else None
@@ -3157,103 +3247,163 @@ class TradingBot:
                         if not tracked_tp:
                             logger.warning(f"Position {result.ticket} has no TP set: trade_signal.take_profit={trade_signal.take_profit}")
                         
-                        position = Position(
-                            ticket=result.ticket,
-                            symbol=symbol,
-                            direction=trade_signal.direction,
-                            volume=position_size.lots,
-                            entry_price=result.fill_price or current_price,
-                            stop_loss=tracked_sl or (result.fill_price or current_price),  # Fallback to entry (0 risk) rather than 0.0
-                            take_profit=tracked_tp or 0.0,
-                            open_time=datetime.now(),
-                            trade_type=getattr(trade_signal, 'trade_type', 'intraday') or 'intraday',
-                        )
-                        
-                        # Set multi-TP levels for partial close management
-                        # Scalps: single TP — close full position, no partials
-                        # Intraday/Swing: multi-TP with partial close management
-                        _pos_trade_type = getattr(trade_signal, 'trade_type', 'intraday') or 'intraday'
-                        
-                        if _pos_trade_type == 'scalp':
-                            # Scalps: single TP, full close. No multi-TP complexity.
-                            position.tp1 = position.take_profit
-                            position.tp2 = 0.0
-                            position.tp3 = 0.0
-                            logger.info(f"  SCALP: Single TP at {position.tp1:.5f} (full close)")
-                        elif take_profit_levels:
-                            position.tp1 = take_profit_levels.get('tp1', 0.0) or 0.0
-                            position.tp2 = take_profit_levels.get('tp2', 0.0) or 0.0
-                            position.tp3 = take_profit_levels.get('tp3', 0.0) or 0.0
-                            logger.info(
-                                f"  Multi-TP set: TP1={position.tp1}, TP2={position.tp2}, TP3={position.tp3}"
+                        if is_pending_order:
+                            # =============================================
+                            # PENDING ORDER: Do NOT add to position_manager!
+                            # MT5's get_positions() doesn't return pending orders,
+                            # so sync_with_mt5 would falsely detect them as "closed".
+                            # They're already tracked by pending_order_manager.
+                            # When they fill, sync_with_mt5 will pick them up as new positions.
+                            # =============================================
+                            print(f"[PENDING] {symbol}: Pending {order_type} placed (ticket={result.ticket}, entry={entry_price:.5f}, SL={trade_signal.stop_loss}, TP={trade_signal.take_profit})", flush=True)
+                            logger.info(f"Pending order {result.ticket} tracked by pending_order_manager (NOT position_manager)")
+                            
+                            # Add to activity feed as pending order (not "trade opened")
+                            from .api.routes.activity import add_activity
+                            add_activity(
+                                "pending_order_placed",
+                                f"Pending {order_type.upper()} {trade_signal.direction.upper()} {symbol} @ {entry_price:.5f}",
+                                symbol,
+                                {
+                                    "ticket": result.ticket,
+                                    "order_type": order_type,
+                                    "direction": trade_signal.direction,
+                                    "entry_price": entry_price,
+                                    "stop_loss": trade_signal.stop_loss,
+                                    "take_profit": trade_signal.take_profit,
+                                    "lots": position_size.lots,
+                                    "confidence": trade_signal.confidence
+                                }
                             )
-                        elif trade_signal.stop_loss and trade_signal.take_profit:
-                            # Fallback: auto-calculate TP levels from SL/TP
-                            _entry = result.fill_price or current_price
-                            _sl_dist = abs(_entry - trade_signal.stop_loss)
-                            if trade_signal.direction == 'long':
-                                position.tp1 = _entry + (_sl_dist * 1.0)   # 1R
-                                position.tp2 = _entry + (_sl_dist * 2.0)   # 2R
-                                position.tp3 = _entry + (_sl_dist * 3.0)   # 3R
-                            else:
-                                position.tp1 = _entry - (_sl_dist * 1.0)   # 1R
-                                position.tp2 = _entry - (_sl_dist * 2.0)   # 2R
-                                position.tp3 = _entry - (_sl_dist * 3.0)   # 3R
-                            logger.info(
-                                f"  Multi-TP (auto): TP1={position.tp1:.5f}, TP2={position.tp2:.5f}, TP3={position.tp3:.5f}"
+                            
+                            # Save to database
+                            await save_trade_to_db(
+                                ticket=result.ticket,
+                                symbol=symbol,
+                                direction=trade_signal.direction,
+                                entry_price=entry_price,
+                                stop_loss=trade_signal.stop_loss or 0.0,
+                                take_profit=trade_signal.take_profit or 0.0,
+                                position_size=position_size.lots,
+                                confidence=trade_signal.confidence,
+                                reasoning=trade_signal.reasoning if hasattr(trade_signal, 'reasoning') else ""
                             )
-                        
-                        self.position_manager.add_position(position)
-                        
-                        # Track in correlation service
-                        if self.correlation_service:
-                            self.correlation_service.set_open_position(
-                                symbol, position_size.lots, trade_signal.direction
+                            
+                            # Send Telegram notification for pending order
+                            await notify(
+                                NotificationType.TRADE_OPENED,
+                                f"Pending order placed: {symbol}",
+                                symbol=symbol,
+                                direction=trade_signal.direction,
+                                entry_price=entry_price,
+                                stop_loss=trade_signal.stop_loss or 0.0,
+                                take_profit=trade_signal.take_profit or 0.0,
+                                lots=position_size.lots,
+                                confidence=trade_signal.confidence,
+                                ticket=result.ticket
                             )
-                        
-                        # Add to activity feed
-                        from .api.routes.activity import add_activity
-                        add_activity(
-                            "trade_opened",
-                            f"Opened {trade_signal.direction.upper()} {symbol} @ {result.fill_price or current_price:.5f}",
-                            symbol,
-                            {
-                                "ticket": result.ticket,
-                                "direction": trade_signal.direction,
-                                "entry_price": result.fill_price or current_price,
-                                "stop_loss": trade_signal.stop_loss,
-                                "take_profit": trade_signal.take_profit,
-                                "lots": position_size.lots,
-                                "confidence": trade_signal.confidence
-                            }
-                        )
-                        
-                        # Save trade to database for history tracking
-                        await save_trade_to_db(
-                            ticket=result.ticket,
-                            symbol=symbol,
-                            direction=trade_signal.direction,
-                            entry_price=result.fill_price or current_price,
-                            stop_loss=trade_signal.stop_loss or 0.0,
-                            take_profit=trade_signal.take_profit or 0.0,
-                            position_size=position_size.lots,
-                            confidence=trade_signal.confidence,
-                            reasoning=trade_signal.reasoning if hasattr(trade_signal, 'reasoning') else ""
-                        )
-                        
-                        # Send Telegram notification
-                        await notify(
-                            NotificationType.TRADE_OPENED,
-                            f"Trade opened: {symbol}",
-                            symbol=symbol,
-                            direction=trade_signal.direction,
-                            entry_price=result.fill_price or current_price,
-                            stop_loss=trade_signal.stop_loss or 0.0,
-                            take_profit=trade_signal.take_profit or 0.0,
-                            lots=position_size.lots,
-                            confidence=trade_signal.confidence,
-                            ticket=result.ticket
-                        )
+                        else:
+                            # =============================================
+                            # MARKET ORDER: Immediately filled, add to position_manager
+                            # =============================================
+                            position = Position(
+                                ticket=result.ticket,
+                                symbol=symbol,
+                                direction=trade_signal.direction,
+                                volume=position_size.lots,
+                                entry_price=result.fill_price or current_price,
+                                stop_loss=tracked_sl or (result.fill_price or current_price),  # Fallback to entry (0 risk) rather than 0.0
+                                take_profit=tracked_tp or 0.0,
+                                open_time=datetime.now(),
+                                trade_type=getattr(trade_signal, 'trade_type', 'intraday') or 'intraday',
+                            )
+                            
+                            # Set multi-TP levels for partial close management
+                            # Scalps: single TP — close full position, no partials
+                            # Intraday/Swing: multi-TP with partial close management
+                            _pos_trade_type = getattr(trade_signal, 'trade_type', 'intraday') or 'intraday'
+                            
+                            if _pos_trade_type == 'scalp':
+                                # Scalps: single TP, full close. No multi-TP complexity.
+                                position.tp1 = position.take_profit
+                                position.tp2 = 0.0
+                                position.tp3 = 0.0
+                                logger.info(f"  SCALP: Single TP at {position.tp1:.5f} (full close)")
+                            elif take_profit_levels:
+                                position.tp1 = take_profit_levels.get('tp1', 0.0) or 0.0
+                                position.tp2 = take_profit_levels.get('tp2', 0.0) or 0.0
+                                position.tp3 = take_profit_levels.get('tp3', 0.0) or 0.0
+                                logger.info(
+                                    f"  Multi-TP set: TP1={position.tp1}, TP2={position.tp2}, TP3={position.tp3}"
+                                )
+                            elif trade_signal.stop_loss and trade_signal.take_profit:
+                                # Fallback: auto-calculate TP levels from SL/TP
+                                _entry = result.fill_price or current_price
+                                _sl_dist = abs(_entry - trade_signal.stop_loss)
+                                if trade_signal.direction == 'long':
+                                    position.tp1 = _entry + (_sl_dist * 1.0)   # 1R
+                                    position.tp2 = _entry + (_sl_dist * 2.0)   # 2R
+                                    position.tp3 = _entry + (_sl_dist * 3.0)   # 3R
+                                else:
+                                    position.tp1 = _entry - (_sl_dist * 1.0)   # 1R
+                                    position.tp2 = _entry - (_sl_dist * 2.0)   # 2R
+                                    position.tp3 = _entry - (_sl_dist * 3.0)   # 3R
+                                logger.info(
+                                    f"  Multi-TP (auto): TP1={position.tp1:.5f}, TP2={position.tp2:.5f}, TP3={position.tp3:.5f}"
+                                )
+                            
+                            self.position_manager.add_position(position)
+                            print(f"[TRADE] {symbol}: Market order filled (ticket={result.ticket}, fill={result.fill_price})", flush=True)
+                            
+                            # Track in correlation service
+                            if self.correlation_service:
+                                self.correlation_service.set_open_position(
+                                    symbol, position_size.lots, trade_signal.direction
+                                )
+                            
+                            # Add to activity feed
+                            from .api.routes.activity import add_activity
+                            add_activity(
+                                "trade_opened",
+                                f"Opened {trade_signal.direction.upper()} {symbol} @ {result.fill_price or current_price:.5f}",
+                                symbol,
+                                {
+                                    "ticket": result.ticket,
+                                    "direction": trade_signal.direction,
+                                    "entry_price": result.fill_price or current_price,
+                                    "stop_loss": trade_signal.stop_loss,
+                                    "take_profit": trade_signal.take_profit,
+                                    "lots": position_size.lots,
+                                    "confidence": trade_signal.confidence
+                                }
+                            )
+                            
+                            # Save trade to database for history tracking
+                            await save_trade_to_db(
+                                ticket=result.ticket,
+                                symbol=symbol,
+                                direction=trade_signal.direction,
+                                entry_price=result.fill_price or current_price,
+                                stop_loss=trade_signal.stop_loss or 0.0,
+                                take_profit=trade_signal.take_profit or 0.0,
+                                position_size=position_size.lots,
+                                confidence=trade_signal.confidence,
+                                reasoning=trade_signal.reasoning if hasattr(trade_signal, 'reasoning') else ""
+                            )
+                            
+                            # Send Telegram notification
+                            await notify(
+                                NotificationType.TRADE_OPENED,
+                                f"Trade opened: {symbol}",
+                                symbol=symbol,
+                                direction=trade_signal.direction,
+                                entry_price=result.fill_price or current_price,
+                                stop_loss=trade_signal.stop_loss or 0.0,
+                                take_profit=trade_signal.take_profit or 0.0,
+                                lots=position_size.lots,
+                                confidence=trade_signal.confidence,
+                                ticket=result.ticket
+                            )
                 else:
                     # Release the reserved trade slot since execution failed
                     self.daily_trades = max(0, self.daily_trades - 1)
@@ -3294,12 +3444,14 @@ class TradingBot:
             if df is None or df.empty:
                 return
             
-            # Run technical analysis
+            # Run technical analysis (symbol-specific pip_value)
+            from .config import get_symbol_spec as _get_spec2
+            _ao_pip = _get_spec2(symbol).pip_size
             analysis_results = {
                 "market_structure": MarketStructureAnalyzer().analyze(df),
-                "fvg": FVGDetector().detect(df),
+                "fvg": FVGDetector(pip_value=_ao_pip).detect(df),
                 "order_blocks": OrderBlockDetector().detect(df),
-                "liquidity": LiquidityMapper().analyze(df)
+                "liquidity": LiquidityMapper(pip_value=_ao_pip).analyze(df)
             }
             
             # Volume analysis (simulation mode)
@@ -4677,38 +4829,53 @@ Include brief reasoning.
             # Get closing details from MT5 (if available)
             close_time = datetime.now()
             
-            # Calculate P&L — try to get actual close price from MT5 history
+            # =============================================
+            # GET ACTUAL P/L FROM MT5 HISTORY (authoritative)
+            # The broker's deal.profit is the real P/L including
+            # correct contract sizes, commissions, and swap.
+            # Our manual calculation with config.py specs was WRONG
+            # for crypto/metals where contract_size varies by broker.
+            # =============================================
             from .config import get_symbol_spec
             _spec = get_symbol_spec(position.symbol)
             actual_close_price = position.current_price  # fallback
+            profit_loss = None  # Will be set from MT5 if possible
+            mt5_profit_found = False
             
             if hasattr(self, 'mt5_client') and self.mt5_client and not self.mt5_client.is_simulation:
                 try:
                     from datetime import timedelta
                     history = await self.mt5_client.get_history(
-                        close_time - timedelta(minutes=5), close_time + timedelta(minutes=1)
+                        close_time - timedelta(minutes=10), close_time + timedelta(minutes=1)
                     )
                     # Find the close deal for this ticket
                     for deal in history:
                         if deal.get('position_id') == position.ticket and deal.get('entry') == 1:
                             actual_close_price = deal.get('price', position.current_price)
-                            logger.info(f"  Actual close price from MT5: {actual_close_price:.5f}")
+                            # Use MT5's authoritative profit (includes commission + swap)
+                            mt5_profit = deal.get('profit', None)
+                            mt5_commission = deal.get('commission', 0) or 0
+                            mt5_swap = deal.get('swap', 0) or 0
+                            if mt5_profit is not None:
+                                profit_loss = mt5_profit + mt5_commission + mt5_swap
+                                mt5_profit_found = True
+                                print(f"[CLOSE] {position.symbol}: MT5 actual P/L = ${profit_loss:.2f} (profit={mt5_profit}, commission={mt5_commission}, swap={mt5_swap})", flush=True)
+                            logger.info(f"  Actual close price from MT5: {actual_close_price:.5f}, profit: {mt5_profit}")
                             break
                 except Exception as e:
-                    logger.debug(f"Could not fetch close price from MT5 history: {e}")
+                    logger.warning(f"Could not fetch close details from MT5 history: {e}")
             
-            if position.direction == 'long':
-                profit_loss = (actual_close_price - position.entry_price) * position.volume * _spec.contract_size
-            else:
-                profit_loss = (position.entry_price - actual_close_price) * position.volume * _spec.contract_size
+            # Fallback: manual calculation if MT5 history unavailable
+            if profit_loss is None:
+                from .config import calculate_pl
+                if position.direction == 'long':
+                    profit_loss = calculate_pl(position.symbol, actual_close_price - position.entry_price, position.volume)
+                else:
+                    profit_loss = calculate_pl(position.symbol, position.entry_price - actual_close_price, position.volume)
+                print(f"[CLOSE] {position.symbol}: Fallback P/L = ${profit_loss:.2f} (tick_value={_spec.tick_value}, contract_size={_spec.contract_size})", flush=True)
             
-            # Calculate pips using actual close price
-            pip_size = 0.01 if "JPY" in position.symbol else 0.0001
-            # For crypto and metals, pip_size may need adjustment
-            if _spec.category == 'crypto':
-                pip_size = _spec.pip_size
-            elif _spec.category == 'metal' or position.symbol in ('XAUUSD', 'XAGUSD'):
-                pip_size = _spec.pip_size
+            # Calculate pips using actual close price and symbol spec
+            pip_size = _spec.pip_size
             
             raw_pips = (actual_close_price - position.entry_price) / pip_size
             

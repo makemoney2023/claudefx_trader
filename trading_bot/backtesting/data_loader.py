@@ -14,6 +14,7 @@ from typing import Optional, List, Dict, Any
 import pandas as pd
 import numpy as np
 
+from ..config import get_symbol_spec
 from ..utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -234,7 +235,7 @@ class DataLoader:
         }
         
         base_price = base_prices.get(config.symbol.upper(), 1.0)
-        pip_value = 0.01 if "JPY" in config.symbol or config.symbol == "XAUUSD" else 0.0001
+        pip_value = get_symbol_spec(config.symbol).pip_size
         
         # Generate price data with realistic characteristics
         np.random.seed(42)  # For reproducibility

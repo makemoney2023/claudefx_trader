@@ -36,29 +36,29 @@ class ModeConfig:
 MODE_CONFIGS = {
     TradingMode.AGGRESSIVE: ModeConfig(
         risk_multiplier=1.15,
-        setup_filter='A_and_B',
-        confidence_threshold=0.75,
+        setup_filter='all',
+        confidence_threshold=0.65,
         max_daily_trades=30,
         description="Slightly increased risk for strong momentum, high-conviction entries only"
     ),
     TradingMode.NORMAL: ModeConfig(
         risk_multiplier=1.0,
         setup_filter='A_and_B',
-        confidence_threshold=0.80,
+        confidence_threshold=0.70,
         max_daily_trades=25,
         description="Standard risk, requires strong conviction (swing validation + confluence)"
     ),
     TradingMode.CONSERVATIVE: ModeConfig(
         risk_multiplier=0.5,
-        setup_filter='A_only',
-        confidence_threshold=0.85,
+        setup_filter='A_and_B',
+        confidence_threshold=0.75,
         max_daily_trades=15,
         description="Half risk, A+ and A setups only (drawdown recovery)"
     ),
     TradingMode.DEFENSIVE: ModeConfig(
         risk_multiplier=0.25,
         setup_filter='A_only',
-        confidence_threshold=0.90,
+        confidence_threshold=0.80,
         max_daily_trades=8,
         description="Quarter risk, only A+ setups, 3:1+ R:R required (severe drawdown)"
     )
@@ -98,7 +98,7 @@ class ScalingManager:
         self.max_weekly_drawdown = max_weekly_drawdown
         
         # Current state
-        self.current_mode = TradingMode.NORMAL
+        self.current_mode = TradingMode.AGGRESSIVE
         self.daily_high_equity = starting_equity
         self.weekly_high_equity = starting_equity
         self.last_mode_change = datetime.now()
@@ -288,15 +288,23 @@ class ScalingManager:
         goal_progress = self.calculate_goal_progress(current_equity)
         performance = self.get_recent_performance()
         
-        # Rule 1: Weekly drawdown - pause trading
+        # AGGRESSIVE LOCK: If manually set to AGGRESSIVE (data collection mode),
+        # only allow drawdown rules to override — NOT performance/streak rules
+        aggressive_locked = (self.current_mode == TradingMode.AGGRESSIVE)
+        
+        # Rule 1: Weekly drawdown - pause trading (always respected, even in aggressive lock)
         if weekly_dd >= self.max_weekly_drawdown:
             logger.warning(f"Weekly drawdown {weekly_dd:.1%} exceeds limit - DEFENSIVE mode")
             return TradingMode.DEFENSIVE
         
-        # Rule 2: Daily drawdown - go defensive
+        # Rule 2: Daily drawdown - go defensive (always respected)
         if daily_dd >= self.max_daily_drawdown:
             logger.warning(f"Daily drawdown {daily_dd:.1%} exceeds limit - DEFENSIVE mode")
             return TradingMode.DEFENSIVE
+        
+        # If aggressive locked, skip all other mode-changing rules
+        if aggressive_locked:
+            return TradingMode.AGGRESSIVE
         
         # Rule 3: Use Claude's recommendation if available
         if claude_recommendation:
@@ -336,7 +344,7 @@ class ScalingManager:
             return TradingMode.CONSERVATIVE
         
         # Default: Normal mode
-        return TradingMode.NORMAL
+        return TradingMode.AGGRESSIVE
     
     def get_mode_config(self, mode: Optional[TradingMode] = None) -> ModeConfig:
         """Get configuration for a mode."""

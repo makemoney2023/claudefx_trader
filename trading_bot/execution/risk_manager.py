@@ -70,10 +70,11 @@ class RiskManager:
     a consistent percentage of account equity.
     """
     
-    # Standard lot sizes
-    STANDARD_LOT = 100000
-    MINI_LOT = 10000
-    MICRO_LOT = 1000
+    # Legacy lot size constants - NOT USED in calculations.
+    # Actual contract sizes now come from get_symbol_spec() / MT5 runtime specs.
+    STANDARD_LOT = 100000  # Reference only
+    MINI_LOT = 10000       # Reference only
+    MICRO_LOT = 1000       # Reference only
     
     # Legacy PIP_VALUES kept for reference - actual values now come from get_symbol_spec()
     PIP_VALUES = {
@@ -154,21 +155,21 @@ class RiskManager:
         else:
             lots = 0.0
         
-        # Round to standard lot increments (0.01 for micro)
-        lots = round(lots, 2)
-        lots = max(0.01, lots)  # Minimum 0.01 lot
+        # Normalize to broker-valid lot size (uses volume_min/max/step from MT5)
+        from ..config import normalize_lots, settings
+        lots = normalize_lots(symbol, lots)
         
-        # Gap 25: Enforce maximum position size from settings
-        from ..config import settings
+        # Gap 25: Enforce maximum position size from settings (may be lower than broker max)
         max_position_size = getattr(settings.trading, 'max_position_size', 1.0)
         if lots > max_position_size:
             logger.warning(
-                f"Position size {lots} lots exceeds max {max_position_size} lots - capping"
+                f"Position size {lots} lots exceeds config max {max_position_size} lots - capping"
             )
             lots = max_position_size
         
-        # Calculate units
-        units = int(lots * self.STANDARD_LOT)
+        # Calculate units using actual contract size
+        spec = get_symbol_spec(symbol)
+        units = int(lots * spec.contract_size)
         
         # Calculate actual pip value for this position
         actual_pip_value = lots * pip_value_per_lot

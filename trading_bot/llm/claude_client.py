@@ -1878,7 +1878,7 @@ Respond with JSON:
         take_profit = signal.get('take_profit', 0)
         order_type = signal.get('order_type', 'market')
         trade_type = signal.get('trade_type', 'intraday')
-        reasoning = str(signal.get('reasoning', ''))[:300]
+        reasoning = str(signal.get('reasoning', ''))[:1000]
         
         # R:R expectations per trade type
         _rr_expectations = {'scalp': '1.5:1', 'intraday': '2:1', 'swing': '3:1'}
@@ -1924,9 +1924,10 @@ A trade analyst has proposed the following trade. Your job is to check it agains
 4. Is the current session appropriate for this symbol and setup?
 
 ## Rules
-- If confidence >= 90% AND no critical risk flags, you MUST verdict APPROVE.
+- If confidence >= 75% AND no critical risk flags, you MUST verdict APPROVE. We are in data collection mode.
 - Verdict DEMOTE if you find a concrete, specific problem with entry price — not vague concerns.
-- Verdict REJECT only for serious, deal-breaking issues (e.g., opposing HTF trend with no reversal confirmation, absurd R:R, already at max daily trades, critical risk flag).
+- Verdict REJECT only for CRITICAL issues (e.g., SL/TP on wrong side, already at max daily trades). Do NOT reject for truncated reasoning or stylistic concerns.
+- NOTE: Reasoning may be truncated for display - this is NOT a reason to reject. Judge the trade on its merits.
 - DEMOTE means: convert to a pending limit order at a better entry price (tighter).
   - For LONG: suggested_entry should be BELOW current entry (buy cheaper).
   - For SHORT: suggested_entry should be ABOVE current entry (sell higher).
@@ -1947,7 +1948,7 @@ Respond ONLY with JSON:
         try:
             message = await self.async_client.messages.create(
                 model=self.model,
-                max_tokens=500,
+                max_tokens=800,
                 temperature=0.1,
                 messages=[{"role": "user", "content": prompt}]
             )

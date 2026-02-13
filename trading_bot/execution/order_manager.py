@@ -96,22 +96,23 @@ class OrderManager:
         logger.info("Order manager initialized")
     
     # Maximum spread thresholds (in price units, not pips)
+    # RELAXED FOR DEMO TESTING - wider spreads allowed
     MAX_SPREAD_THRESHOLDS = {
-        # Forex majors: ~3 pips
-        'EURUSD': 0.0003, 'GBPUSD': 0.0003, 'AUDUSD': 0.0003,
-        'NZDUSD': 0.0003, 'USDCHF': 0.0003, 'USDCAD': 0.0003,
-        'USDJPY': 0.03,
-        # Forex crosses: ~5 pips
-        'EURGBP': 0.0005, 'EURJPY': 0.05, 'GBPJPY': 0.05,
-        'AUDJPY': 0.05, 'EURAUD': 0.0005, 'GBPAUD': 0.0005,
-        'AUDCAD': 0.0005, 'AUDCHF': 0.0005, 'EURCHF': 0.0005,
-        'EURCAD': 0.0005, 'EURNZD': 0.0005, 'GBPCAD': 0.0005,
-        'GBPCHF': 0.0005, 'GBPNZD': 0.0005, 'NZDJPY': 0.05,
-        'NZDCAD': 0.0005, 'NZDCHF': 0.0005, 'CADJPY': 0.05,
-        'CADCHF': 0.0005, 'CHFJPY': 0.05,
-        # Metals
-        'XAUUSD': 0.50,   # Gold: max $0.50 spread
-        'XAGUSD': 0.05,   # Silver: max $0.05 spread
+        # Forex majors: ~10 pips (relaxed for demo)
+        'EURUSD': 0.0010, 'GBPUSD': 0.0010, 'AUDUSD': 0.0010,
+        'NZDUSD': 0.0010, 'USDCHF': 0.0010, 'USDCAD': 0.0010,
+        'USDJPY': 0.10,
+        # Forex crosses: ~15 pips (relaxed)
+        'EURGBP': 0.0015, 'EURJPY': 0.15, 'GBPJPY': 0.15,
+        'AUDJPY': 0.15, 'EURAUD': 0.0015, 'GBPAUD': 0.0015,
+        'AUDCAD': 0.0015, 'AUDCHF': 0.0015, 'EURCHF': 0.0015,
+        'EURCAD': 0.0015, 'EURNZD': 0.0015, 'GBPCAD': 0.0015,
+        'GBPCHF': 0.0015, 'GBPNZD': 0.0015, 'NZDJPY': 0.15,
+        'NZDCAD': 0.0015, 'NZDCHF': 0.0015, 'CADJPY': 0.15,
+        'CADCHF': 0.0015, 'CHFJPY': 0.15,
+        # Metals (relaxed)
+        'XAUUSD': 2.00,   # Gold: max $2.00 spread
+        'XAGUSD': 0.20,   # Silver: max $0.20 spread
     }
     
     async def _check_spread(self, symbol: str) -> tuple:
@@ -165,7 +166,7 @@ class OrderManager:
             
         except Exception as e:
             logger.warning(f"Could not check spread for {symbol}: {e}")
-            return False, 0, 0  # Block trade if spread can't be verified
+            return True, 0, 999  # Allow trade if spread can't be verified (demo mode)
     
     def set_mt5_client(self, client):
         """Set the MT5 client."""

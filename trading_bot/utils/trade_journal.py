@@ -73,12 +73,21 @@ class TradeRecord:
         if self.exit_price is None:
             return
         
+        # Use actual broker specs if available
+        from ..config import get_symbol_spec, calculate_pl
+        _spec = get_symbol_spec(self.symbol)
+        pip_value = _spec.pip_size
+        
         if self.direction == 'long':
             self.profit_loss_pips = (self.exit_price - self.entry_price) / pip_value
         else:
             self.profit_loss_pips = (self.entry_price - self.exit_price) / pip_value
         
-        self.profit_loss = self.profit_loss_pips * self.position_size * pip_value * 100000
+        # Use tick_value-based P/L when available (accurate for cross-currency pairs)
+        if self.direction == 'long':
+            self.profit_loss = calculate_pl(self.symbol, self.exit_price - self.entry_price, self.position_size)
+        else:
+            self.profit_loss = calculate_pl(self.symbol, self.entry_price - self.exit_price, self.position_size)
         
         # Calculate R multiple
         risk_pips = abs(self.entry_price - self.stop_loss) / pip_value

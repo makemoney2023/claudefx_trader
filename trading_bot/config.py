@@ -29,6 +29,13 @@ class SymbolSpec:
     pip_value: float       # USD value per pip per standard lot
     min_sl_pips: float     # Minimum recommended SL in pips
     category: str          # Symbol category: forex, metal, crypto, index
+    # Broker-provided fields (populated from MT5 at runtime, safe defaults otherwise)
+    tick_value: float = 0.0       # trade_tick_value from MT5 (0 = use fallback formula)
+    volume_min: float = 0.01      # Minimum lot size allowed by broker
+    volume_max: float = 100.0     # Maximum lot size allowed by broker
+    volume_step: float = 0.01     # Lot size increment
+    swap_long: float = 0.0        # Overnight swap cost for long positions (per lot per night)
+    swap_short: float = 0.0       # Overnight swap cost for short positions (per lot per night)
 
 
 # Default symbol specifications
@@ -90,13 +97,103 @@ SYMBOL_SPECS: Dict[str, SymbolSpec] = {
 # Default spec for unknown symbols - conservative forex-like
 _DEFAULT_SYMBOL_SPEC = SymbolSpec(100000, 0.0001, 10.0, 10, 'forex')
 
+# =============================================
+# RUNTIME MT5 SPEC CACHE
+# Populated at startup with actual broker values.
+# get_symbol_spec() checks this FIRST before falling back to hardcoded defaults.
+# =============================================
+_MT5_RUNTIME_SPECS: Dict[str, SymbolSpec] = {}
+
+
+def update_symbol_spec_from_mt5(
+    symbol: str,
+    trade_contract_size: float,
+    point: float,
+    digits: int,
+    tick_value: float = 0.0,
+    volume_min: float = 0.01,
+    volume_max: float = 100.0,
+    volume_step: float = 0.01,
+    swap_long: float = 0.0,
+    swap_short: float = 0.0,
+):
+    """
+    Update a symbol's spec with actual values from MT5 broker.
+    
+    Called during bot initialization for each tradeable symbol.
+    This ensures P/L, position sizing, and risk calculations
+    use the broker's actual contract_size, not hardcoded defaults.
+    
+    Args:
+        symbol: Trading symbol
+        trade_contract_size: MT5's trade_contract_size for this symbol
+        point: MT5's point value (smallest price increment)
+        digits: MT5's price digits (decimal places)
+        tick_value: MT5's trade_tick_value (value of one tick in deposit currency)
+        volume_min: Minimum lot size allowed by broker
+        volume_max: Maximum lot size allowed by broker
+        volume_step: Lot size increment
+        swap_long: Overnight swap for long positions (per lot per night)
+        swap_short: Overnight swap for short positions (per lot per night)
+    """
+    symbol = symbol.upper()
+    
+    # Start with existing spec (hardcoded defaults) and override contract_size
+    base_spec = SYMBOL_SPECS.get(symbol, _DEFAULT_SYMBOL_SPEC)
+    
+    # Determine pip_size from MT5 digits/point
+    # For 5-digit forex (e.g. EURUSD 1.18685): pip = 0.0001 (10 * point)
+    # For 3-digit JPY (e.g. USDJPY 152.876): pip = 0.01 (10 * point)
+    # For 2-digit metals (e.g. XAUUSD 2850.50): pip = 0.01
+    # For crypto: pip = point (varies by broker)
+    if base_spec.category == 'crypto':
+        mt5_pip_size = point  # Use broker's point directly for crypto
+    elif base_spec.category == 'metal':
+        mt5_pip_size = point  # Use broker's point for metals
+    elif digits == 5 or digits == 3:
+        mt5_pip_size = point * 10  # Standard forex: pip = 10 * point
+    else:
+        mt5_pip_size = point
+    
+    # Calculate pip_value: value of 1 pip per 1 lot
+    # For USD-quoted pairs: pip_value = pip_size * contract_size
+    # This is approximate; exact pip_value depends on quote currency
+    mt5_pip_value = mt5_pip_size * trade_contract_size
+    # Cap at reasonable values (some calcs break with very large pip_values)
+    if mt5_pip_value > 1000:
+        mt5_pip_value = base_spec.pip_value  # Keep default if unreasonable
+    
+    _MT5_RUNTIME_SPECS[symbol] = SymbolSpec(
+        contract_size=trade_contract_size,
+        pip_size=mt5_pip_size if mt5_pip_size > 0 else base_spec.pip_size,
+        pip_value=mt5_pip_value if mt5_pip_value > 0 else base_spec.pip_value,
+        min_sl_pips=base_spec.min_sl_pips,
+        category=base_spec.category,
+        tick_value=tick_value,
+        volume_min=volume_min if volume_min > 0 else 0.01,
+        volume_max=volume_max if volume_max > 0 else 100.0,
+        volume_step=volume_step if volume_step > 0 else 0.01,
+        swap_long=swap_long,
+        swap_short=swap_short,
+    )
+    
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(
+        f"MT5 spec updated: {symbol} contract_size={trade_contract_size}, "
+        f"pip_size={mt5_pip_size}, pip_value={mt5_pip_value}, "
+        f"tick_value={tick_value}, point={point}, digits={digits}, "
+        f"vol_min={volume_min}, vol_max={volume_max}, vol_step={volume_step}, "
+        f"swap_long={swap_long}, swap_short={swap_short}"
+    )
+
 
 def get_symbol_spec(symbol: str) -> SymbolSpec:
     """
     Get the specification for a trading symbol.
     
-    Falls back to intelligent defaults based on symbol name patterns
-    if the exact symbol isn't in the map.
+    Checks MT5 runtime cache FIRST (actual broker values),
+    then falls back to hardcoded defaults.
     
     Args:
         symbol: Trading symbol (e.g., 'EURUSD', 'XAUUSD')
@@ -106,7 +203,11 @@ def get_symbol_spec(symbol: str) -> SymbolSpec:
     """
     symbol = symbol.upper()
     
-    # Direct lookup first
+    # Check MT5 runtime cache first (actual broker values)
+    if symbol in _MT5_RUNTIME_SPECS:
+        return _MT5_RUNTIME_SPECS[symbol]
+    
+    # Direct lookup in hardcoded defaults
     if symbol in SYMBOL_SPECS:
         return SYMBOL_SPECS[symbol]
     
@@ -122,6 +223,67 @@ def get_symbol_spec(symbol: str) -> SymbolSpec:
     
     # Default to standard forex
     return _DEFAULT_SYMBOL_SPEC
+
+
+def calculate_pl(symbol: str, price_diff: float, volume: float) -> float:
+    """
+    Calculate profit/loss using broker-provided tick_value when available.
+    
+    Uses the formula: P/L = (price_diff / point) * volume * tick_value
+    Falls back to: P/L = price_diff * volume * contract_size
+    
+    Args:
+        symbol: Trading symbol
+        price_diff: Price difference (exit - entry for long, entry - exit for short)
+        volume: Position size in lots
+        
+    Returns:
+        Profit/loss in account deposit currency
+    """
+    spec = get_symbol_spec(symbol)
+    
+    if spec.tick_value > 0:
+        # Use broker-provided tick_value for accurate cross-currency P/L
+        # tick_value = value of 1 point move per 1 lot in deposit currency
+        # P/L = (price_diff / point) * volume * tick_value
+        # We need point (smallest price increment) — derive from pip_size and category
+        if spec.category == 'forex':
+            point = spec.pip_size / 10  # 5-digit forex: pip=0.0001, point=0.00001
+        else:
+            point = spec.pip_size  # Crypto/metals: point = pip_size
+        
+        if point > 0:
+            ticks = price_diff / point
+            return ticks * volume * spec.tick_value
+    
+    # Fallback: direct calculation with contract_size
+    return price_diff * volume * spec.contract_size
+
+
+def normalize_lots(symbol: str, lots: float) -> float:
+    """
+    Normalize lot size to broker-valid values using volume_min/max/step from MT5.
+    
+    Snaps to the nearest valid step, clamps to broker min/max.
+    
+    Args:
+        symbol: Trading symbol
+        lots: Desired lot size
+        
+    Returns:
+        Broker-valid lot size
+    """
+    spec = get_symbol_spec(symbol)
+    
+    # Snap to volume_step
+    if spec.volume_step > 0:
+        lots = round(lots / spec.volume_step) * spec.volume_step
+    
+    # Clamp to broker min/max
+    lots = max(spec.volume_min, min(lots, spec.volume_max))
+    
+    # Clean float rounding artifacts (e.g. 0.010000000000000002 -> 0.01)
+    return round(lots, 8)
 
 
 class MT5Settings(BaseSettings):

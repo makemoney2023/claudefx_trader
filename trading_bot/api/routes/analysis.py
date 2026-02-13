@@ -361,11 +361,13 @@ async def get_symbol_analysis(
         df = fetcher._generate_sample_data(200)
         logger.info(f"Using sample data for {symbol} (MT5 not connected or in simulation)")
     
-    # Run analyzers
+    # Run analyzers (symbol-specific pip_value)
+    from ...config import get_symbol_spec
+    _api_pip = get_symbol_spec(symbol).pip_size
     structure_analyzer = MarketStructureAnalyzer()
-    fvg_detector = FVGDetector()
+    fvg_detector = FVGDetector(pip_value=_api_pip)
     ob_detector = OrderBlockDetector()
-    liquidity_mapper = LiquidityMapper()
+    liquidity_mapper = LiquidityMapper(pip_value=_api_pip)
     fib_analyzer = FibonacciAnalyzer()
     amd_analyzer = PowerOfThreeAnalyzer()
     session_checker = KillZoneChecker(allowed_sessions=settings.trading.allowed_sessions)

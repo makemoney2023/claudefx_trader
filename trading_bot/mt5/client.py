@@ -60,6 +60,9 @@ class SymbolInfo:
     volume_max: float
     volume_step: float
     trade_stops_level: int = 0  # Minimum stop distance in points
+    trade_tick_value: float = 0.0  # Value of one tick in deposit currency
+    swap_long: float = 0.0        # Overnight swap for long positions
+    swap_short: float = 0.0       # Overnight swap for short positions
     
     def to_dict(self) -> dict:
         return {
@@ -70,7 +73,13 @@ class SymbolInfo:
             "digits": self.digits,
             "point": self.point,
             "contract_size": self.trade_contract_size,
-            "stops_level": self.trade_stops_level
+            "stops_level": self.trade_stops_level,
+            "tick_value": self.trade_tick_value,
+            "swap_long": self.swap_long,
+            "swap_short": self.swap_short,
+            "volume_min": self.volume_min,
+            "volume_max": self.volume_max,
+            "volume_step": self.volume_step
         }
     
     def get_min_stop_distance(self) -> float:
@@ -458,7 +467,10 @@ class MT5Client:
                     volume_min=result.volume_min,
                     volume_max=result.volume_max,
                     volume_step=result.volume_step,
-                    trade_stops_level=stops_level
+                    trade_stops_level=stops_level,
+                    trade_tick_value=getattr(result, 'trade_tick_value', 0.0),
+                    swap_long=getattr(result, 'swap_long', 0.0),
+                    swap_short=getattr(result, 'swap_short', 0.0),
                 )
             
             return None
@@ -484,8 +496,25 @@ class MT5Client:
         }
         
         bid, ask = prices.get(symbol.upper(), (1.0000, 1.0002))
-        digits = 3 if "JPY" in symbol else (2 if symbol == "XAUUSD" else 5)
-        point = 0.001 if "JPY" in symbol else (0.01 if symbol == "XAUUSD" else 0.00001)
+        # Use centralized symbol spec for digits and point instead of hardcoded JPY checks
+        from ..config import get_symbol_spec
+        _sim_spec = get_symbol_spec(symbol)
+        # Derive digits from pip_size (e.g. 0.0001 -> 5 digits, 0.01 -> 3 digits for forex, 2 for metals)
+        if _sim_spec.category == 'crypto':
+            # Crypto: pip_size is point, digits based on price magnitude
+            point = _sim_spec.pip_size
+            digits = max(2, len(str(_sim_spec.pip_size).rstrip('0').split('.')[-1]))
+        elif _sim_spec.category == 'metal':
+            point = _sim_spec.pip_size  # For metals, point = pip_size
+            digits = 2 if _sim_spec.pip_size >= 0.01 else 3
+        elif _sim_spec.pip_size >= 0.01:
+            # JPY pairs: pip = 0.01, point = 0.001, digits = 3
+            point = _sim_spec.pip_size / 10
+            digits = 3
+        else:
+            # Standard forex: pip = 0.0001, point = 0.00001, digits = 5
+            point = _sim_spec.pip_size / 10
+            digits = 5
         
         # Default stops level varies by instrument type
         # Crypto and metals typically need larger stop distances
@@ -503,12 +532,22 @@ class MT5Client:
             spread=int((ask - bid) / point),
             digits=digits,
             point=point,
-            trade_contract_size=100000 if symbol != "XAUUSD" else 100,
-            volume_min=0.01,
-            volume_max=100.0,
-            volume_step=0.01,
-            trade_stops_level=stops_level
+            trade_contract_size=self._get_sim_contract_size(symbol),
+            volume_min=_sim_spec.volume_min,
+            volume_max=_sim_spec.volume_max,
+            volume_step=_sim_spec.volume_step,
+            trade_stops_level=stops_level,
+            trade_tick_value=0.0,  # Not available in simulation
+            swap_long=0.0,
+            swap_short=0.0,
         )
+    
+    @staticmethod
+    def _get_sim_contract_size(symbol: str) -> float:
+        """Get contract size for simulation mode."""
+        from ..config import get_symbol_spec
+        spec = get_symbol_spec(symbol.upper())
+        return spec.contract_size
     
     async def calc_margin(self, symbol: str, volume: float, order_type: str = "buy") -> Optional[float]:
         """
@@ -531,7 +570,10 @@ class MT5Client:
                 info = await self.get_symbol_info(symbol)
                 if info:
                     price = info.ask if order_type == "buy" else info.bid
-                    return (volume * info.trade_contract_size * price) / 100  # Assume 1:100 leverage
+                    # Use simulated account leverage (default 100) instead of hardcoded value
+                    sim_account = self._get_simulated_account()
+                    leverage = sim_account.leverage if sim_account.leverage else 100
+                    return (volume * info.trade_contract_size * price) / leverage
                 return None
             
             mt5 = self._mcp_client

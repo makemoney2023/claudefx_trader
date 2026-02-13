@@ -14,6 +14,7 @@ from typing import Optional, List, Dict, Any
 from enum import Enum
 import uuid
 
+from ..config import get_symbol_spec
 from ..utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -158,7 +159,8 @@ class OrderSimulator:
             Created position or None if failed
         """
         # Calculate fill price with spread and slippage
-        pip_value = 0.01 if "JPY" in symbol or symbol == "XAUUSD" else 0.0001
+        _spec = get_symbol_spec(symbol)
+        pip_value = _spec.pip_size
         spread = self.spread_pips * pip_value
         slippage = self.slippage_pips * pip_value
         
@@ -211,7 +213,8 @@ class OrderSimulator:
             List of closed positions
         """
         closed = []
-        pip_value = 0.01 if "JPY" in symbol or symbol == "XAUUSD" else 0.0001
+        _spec = get_symbol_spec(symbol)
+        pip_value = _spec.pip_size
         
         for position in list(self.positions):
             if position.symbol != symbol:
@@ -241,12 +244,12 @@ class OrderSimulator:
             
             if exit_price:
                 position = self._close_position(
-                    position, exit_price, timestamp, exit_reason, pip_value
+                    position, exit_price, timestamp, exit_reason, pip_value, _spec.contract_size
                 )
                 closed.append(position)
         
         # Update equity
-        self._update_equity(close, pip_value)
+        self._update_equity(close, symbol)
         
         return closed
     
@@ -260,9 +263,10 @@ class OrderSimulator:
         closed = []
         
         for position in list(self.positions):
-            pip_value = 0.01 if "JPY" in position.symbol or position.symbol == "XAUUSD" else 0.0001
+            _spec = get_symbol_spec(position.symbol)
+            pip_value = _spec.pip_size
             position = self._close_position(
-                position, price, timestamp, reason, pip_value
+                position, price, timestamp, reason, pip_value, _spec.contract_size
             )
             closed.append(position)
         
@@ -274,7 +278,8 @@ class OrderSimulator:
         exit_price: float,
         exit_time: datetime,
         exit_reason: str,
-        pip_value: float
+        pip_value: float,
+        contract_size: float = 100000
     ) -> SimulatedPosition:
         """Close a position and calculate P/L."""
         position.exit_price = exit_price
@@ -288,8 +293,12 @@ class OrderSimulator:
         else:
             position.profit_loss_pips = (position.entry_price - exit_price) / pip_value
         
-        # Calculate profit/loss in currency (assuming standard lot = 100,000 units)
-        position.profit_loss = position.profit_loss_pips * position.volume * pip_value * 100000
+        # Calculate profit/loss in currency using tick_value when available
+        from ..config import calculate_pl
+        if position.direction == "long":
+            position.profit_loss = calculate_pl(position.symbol, exit_price - position.entry_price, position.volume)
+        else:
+            position.profit_loss = calculate_pl(position.symbol, position.entry_price - exit_price, position.volume)
         
         # Calculate R multiple
         risk_pips = abs(position.entry_price - position.stop_loss) / pip_value
@@ -311,17 +320,17 @@ class OrderSimulator:
         
         return position
     
-    def _update_equity(self, current_price: float, pip_value: float):
+    def _update_equity(self, current_price: float, symbol: str = ""):
         """Update equity based on open positions."""
+        from ..config import calculate_pl
         unrealized_pnl = 0
         
         for position in self.positions:
+            pos_sym = position.symbol or symbol
             if position.direction == "long":
-                pips = (current_price - position.entry_price) / pip_value
+                unrealized_pnl += calculate_pl(pos_sym, current_price - position.entry_price, position.volume)
             else:
-                pips = (position.entry_price - current_price) / pip_value
-            
-            unrealized_pnl += pips * position.volume * pip_value * 100000
+                unrealized_pnl += calculate_pl(pos_sym, position.entry_price - current_price, position.volume)
         
         self.equity = self.balance + unrealized_pnl
     

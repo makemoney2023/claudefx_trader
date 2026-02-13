@@ -432,15 +432,21 @@ class TradeRepository:
         trade.exit_time = exit_time
         trade.exit_reason = exit_reason
         
-        # Calculate P/L
-        pip_value = 0.0001 if "JPY" not in trade.symbol else 0.01
+        # Calculate P/L using actual broker specs (tick_value when available)
+        from ..config import get_symbol_spec, calculate_pl
+        _spec = get_symbol_spec(trade.symbol)
+        pip_value = _spec.pip_size
         
         if trade.direction == "long":
             trade.profit_loss_pips = (exit_price - trade.entry_price) / pip_value
         else:
             trade.profit_loss_pips = (trade.entry_price - exit_price) / pip_value
         
-        trade.profit_loss = trade.profit_loss_pips * trade.position_size * pip_value * 100000
+        # Use tick_value-based P/L when available (accurate for cross-currency pairs)
+        if trade.direction == "long":
+            trade.profit_loss = calculate_pl(trade.symbol, exit_price - trade.entry_price, trade.position_size)
+        else:
+            trade.profit_loss = calculate_pl(trade.symbol, trade.entry_price - exit_price, trade.position_size)
         
         # Calculate R multiple
         risk_pips = abs(trade.entry_price - trade.stop_loss) / pip_value

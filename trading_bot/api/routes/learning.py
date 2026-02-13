@@ -337,7 +337,9 @@ async def review_historical_trades(
                         if trade.stop_loss and trade.entry_price and trade.profit_loss:
                             risk = abs(trade.entry_price - trade.stop_loss)
                             if risk > 0:
-                                r_multiple = trade.profit_loss / (risk * trade.position_size * 100000)  # Approximate
+                                from ...config import get_symbol_spec
+                                _spec = get_symbol_spec(trade.symbol)
+                                r_multiple = trade.profit_loss / (risk * trade.position_size * _spec.contract_size)
                         
                         # Store the learning
                         await service.store_trade_review(

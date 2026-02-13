@@ -384,8 +384,9 @@ class ScalingPositionSizer:
             claude_adjusted = True
             adjustments.append(f"Claude adjustment: {old_lots:.2f} -> {lots:.2f} lots ({claude_adj:.2f}x)")
         
-        # Final rounding to lot step
-        lots = max(self.min_lot_size, round(lots / self.lot_step) * self.lot_step)
+        # Final normalization to broker-valid lot size (uses volume_min/max/step from MT5)
+        from ..config import normalize_lots
+        lots = normalize_lots(symbol, lots)
         
         # Calculate actual risk
         risk_amount = equity * tier.risk_percent * (lots / tier.base_lots if tier.base_lots > 0 else 1)

@@ -135,6 +135,18 @@ class TelegramNotifier:
         tp_dist = abs(take_profit - entry_price) if take_profit else 0
         rr = f"{tp_dist / sl_dist:.1f}" if sl_dist > 0 else "N/A"
         
+        # Get swap cost info from symbol spec
+        swap_line = ""
+        try:
+            from ..config import get_symbol_spec
+            _spec = get_symbol_spec(symbol)
+            swap_rate = _spec.swap_long if direction.lower() == "long" else _spec.swap_short
+            if swap_rate != 0:
+                swap_cost = swap_rate * lots
+                swap_line = f"\n<b>Swap/night:</b> ${swap_cost:+.2f} ({swap_rate:+.2f}/lot)"
+        except Exception:
+            pass
+        
         message = f"""
 {emoji} <b>Trade Opened</b>
 
@@ -146,7 +158,7 @@ class TelegramNotifier:
 <b>R:R:</b> 1:{rr}
 <b>Size:</b> {lots} lots
 <b>Confidence:</b> {confidence:.0%}
-{f'<b>Ticket:</b> {ticket}' if ticket else ''}
+{f'<b>Ticket:</b> {ticket}' if ticket else ''}{swap_line}
 """
         return await self.send_message(message.strip())
     

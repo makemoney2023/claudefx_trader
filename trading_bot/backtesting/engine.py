@@ -25,6 +25,7 @@ from ..analysis import (
     FibonacciAnalyzer,
     PowerOfThreeAnalyzer
 )
+from ..config import get_symbol_spec
 from ..utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -310,6 +311,13 @@ class Backtester:
         4. Not at major liquidity
         """
         try:
+            # Update analyzer pip_values for this symbol
+            _spec = get_symbol_spec(self.config.symbol)
+            if hasattr(self.fvg_detector, 'pip_value'):
+                self.fvg_detector.pip_value = _spec.pip_size
+            if hasattr(self.liquidity_mapper, 'pip_value'):
+                self.liquidity_mapper.pip_value = _spec.pip_size
+            
             # Run analysis
             structure = self.structure_analyzer.analyze(df)
             fvg_result = self.fvg_detector.detect(df)
@@ -340,7 +348,8 @@ class Backtester:
                 return None
             
             # Calculate SL/TP
-            pip_value = 0.01 if "JPY" in self.config.symbol else 0.0001
+            _spec = get_symbol_spec(self.config.symbol)
+            pip_value = _spec.pip_size
             atr = self._calculate_atr(df, 14)
             
             if direction == "long":
@@ -420,7 +429,8 @@ class Backtester:
         stop_loss: float
     ) -> float:
         """Calculate position size based on risk."""
-        pip_value = 0.01 if "JPY" in self.config.symbol else 0.0001
+        _spec = get_symbol_spec(self.config.symbol)
+        pip_value = _spec.pip_size
         
         risk_amount = self.simulator.balance * self.config.risk_per_trade
         risk_pips = abs(entry_price - stop_loss) / pip_value
@@ -428,13 +438,13 @@ class Backtester:
         if risk_pips == 0:
             return 0.01  # Minimum lot
         
-        # Position size = Risk Amount / (Risk in Pips * Pip Value * 100000)
-        pip_value_per_lot = pip_value * 100000
+        # Position size = Risk Amount / (Risk in Pips * Pip Value per Lot)
+        pip_value_per_lot = _spec.pip_value
         position_size = risk_amount / (risk_pips * pip_value_per_lot)
         
-        # Round to 2 decimal places and apply limits
-        position_size = round(position_size, 2)
-        position_size = max(0.01, min(position_size, 10.0))  # 0.01 to 10 lots
+        # Normalize to broker-valid lot size (uses volume_min/max/step from MT5)
+        from ..config import normalize_lots
+        position_size = normalize_lots(self.config.symbol, position_size)
         
         return position_size
     

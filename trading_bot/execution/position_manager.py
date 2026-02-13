@@ -292,11 +292,27 @@ class PositionManager:
             # MT5 Position is a dataclass - access attributes directly
             mt5_tickets = {p.ticket for p in mt5_positions}
             
+            # Also get pending orders to avoid falsely closing them
+            pending_tickets = set()
+            try:
+                pending_orders = await mt5_client.get_orders()
+                if pending_orders:
+                    for order in pending_orders:
+                        if isinstance(order, dict):
+                            pending_tickets.add(order.get('ticket', 0))
+                        else:
+                            pending_tickets.add(getattr(order, 'ticket', 0))
+            except Exception as e:
+                logger.debug(f"Could not fetch pending orders for sync: {e}")
+            
+            # Combined: all tickets that are still alive in MT5 (positions + pending)
+            all_mt5_tickets = mt5_tickets | pending_tickets
+            
             closed_positions = []
             
-            # Check for positions that closed
+            # Check for positions that closed (not in open positions AND not pending)
             for ticket in list(self.positions.keys()):
-                if ticket not in mt5_tickets:
+                if ticket not in all_mt5_tickets:
                     closed_pos = self.positions[ticket]
                     closed_positions.append(closed_pos)
                     logger.info(f"Position {ticket} closed (detected via MT5 sync)")
@@ -374,12 +390,11 @@ class PositionManager:
             pos.current_price = current_price
             
             # Calculate unrealized P&L using symbol-aware contract size
-            from ..config import get_symbol_spec
-            _spec = get_symbol_spec(pos.symbol)
+            from ..config import calculate_pl
             if pos.direction == 'long':
-                pos.unrealized_pnl = (current_price - pos.entry_price) * pos.volume * _spec.contract_size
+                pos.unrealized_pnl = calculate_pl(pos.symbol, current_price - pos.entry_price, pos.volume)
             else:
-                pos.unrealized_pnl = (pos.entry_price - current_price) * pos.volume * _spec.contract_size
+                pos.unrealized_pnl = calculate_pl(pos.symbol, pos.entry_price - current_price, pos.volume)
     
     async def manage_positions(self, price_data: Dict[str, float]) -> List[Dict[str, Any]]:
         """
@@ -495,16 +510,17 @@ class PositionManager:
         """
         Execute TP1: Close 40% of position and move SL to break-even.
         """
-        close_volume = round(position.initial_volume * self.tp1_close_percent, 2)
-        close_volume = max(0.01, close_volume)  # Minimum lot
+        from ..config import normalize_lots, get_symbol_spec
+        _vol_min = get_symbol_spec(position.symbol).volume_min
+        close_volume = normalize_lots(position.symbol, position.initial_volume * self.tp1_close_percent)
         
-        # Don't close more than what's open — ALWAYS leave at least 0.01 for runner
+        # Don't close more than what's open — ALWAYS leave at least volume_min for runner
         if close_volume >= position.volume:
-            remaining_after_close = round(position.volume - 0.01, 2)
-            if remaining_after_close >= 0.01:
+            remaining_after_close = normalize_lots(position.symbol, position.volume - _vol_min)
+            if remaining_after_close >= _vol_min:
                 close_volume = remaining_after_close
             else:
-                close_volume = 0.01  # Minimum possible close
+                close_volume = _vol_min  # Minimum possible close
         
         logger.info(
             f"TP1 HIT on {position.ticket} ({position.symbol}): "
@@ -564,13 +580,14 @@ class PositionManager:
         """
         Execute TP2: Close 30% of original volume (next partial).
         """
-        close_volume = round(position.initial_volume * self.tp2_close_percent, 2)
-        close_volume = max(0.01, close_volume)
+        from ..config import normalize_lots, get_symbol_spec
+        _vol_min = get_symbol_spec(position.symbol).volume_min
+        close_volume = normalize_lots(position.symbol, position.initial_volume * self.tp2_close_percent)
         
-        # Don't close more than what's open — ALWAYS leave at least 0.01 runner
+        # Don't close more than what's open — ALWAYS leave at least volume_min runner
         if close_volume >= position.volume:
-            remaining_after_close = round(position.volume - 0.01, 2)
-            if remaining_after_close >= 0.01:
+            remaining_after_close = normalize_lots(position.symbol, position.volume - _vol_min)
+            if remaining_after_close >= _vol_min:
                 close_volume = remaining_after_close
             else:
                 # Position too small to split — skip TP2 partial, just activate trailing

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 from enum import Enum
 
+from ..config import get_symbol_spec
 from ..utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -158,8 +159,11 @@ class ClaudeTradeManager:
                 # FALLBACK: Manual calculation using ACTUAL contract size from symbol info
                 leverage = account.leverage if hasattr(account, 'leverage') and account.leverage else 100
                 
-                # Use real contract size from symbol info, NOT hardcoded 100000
-                contract_size = symbol_info.trade_contract_size if symbol_info else 100000
+                # Use real contract size from symbol info, fallback to get_symbol_spec
+                if symbol_info:
+                    contract_size = symbol_info.trade_contract_size
+                else:
+                    contract_size = get_symbol_spec(symbol).contract_size
                 
                 # Get current price
                 if hasattr(symbol_info, 'bid') and hasattr(symbol_info, 'ask'):
@@ -396,10 +400,12 @@ class ClaudeTradeManager:
                 margin_check.max_lots_available,
                 exposure_check["available_lots"]
             )
-            recommended_lots = max(0.01, round(recommended_lots, 2))
+            from ..config import normalize_lots
+            recommended_lots = normalize_lots(symbol, recommended_lots)
             
-            # If recommended lots is 0 or very small, block
-            if recommended_lots < 0.01:
+            # If recommended lots is below broker minimum, block
+            _vol_min = get_symbol_spec(symbol).volume_min
+            if recommended_lots < _vol_min:
                 blockers.append("Position size too small after constraints")
                 recommended_lots = 0
             
@@ -536,7 +542,8 @@ class ClaudeTradeManager:
         direction: str,
         entry_price: float,
         current_price: float,
-        amd_phase: str = "unknown"
+        amd_phase: str = "unknown",
+        symbol: str = ""
     ) -> str:
         """
         Determine the appropriate order type based on price and AMD phase.
@@ -546,12 +553,15 @@ class ClaudeTradeManager:
             entry_price: Desired entry price
             current_price: Current market price
             amd_phase: Current AMD cycle phase
+            symbol: Trading symbol (for pip_size calculation)
             
         Returns:
             Order type string: 'market', 'buy_limit', 'sell_limit', 'buy_stop', 'sell_stop'
         """
+        # Use symbol-specific pip_size for "at current price" threshold
+        pip_threshold = get_symbol_spec(symbol).pip_size if symbol else 0.0001
         # If in distribution phase or entry at current price, use market order
-        if amd_phase == "distribution" or abs(entry_price - current_price) < 0.0001:
+        if amd_phase == "distribution" or abs(entry_price - current_price) < pip_threshold:
             return "market"
         
         if direction == "long":

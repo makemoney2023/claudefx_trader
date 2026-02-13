@@ -54,8 +54,12 @@ export default function ScalingPage() {
   useEffect(() => {
     async function fetchData() {
       try {
-        // Try to get scaling status with default equity
-        const statusData = await api.getScalingStatus(10000).catch(() => ({
+        // Get actual account equity first
+        const accountInfo = await api.getAccountInfo().catch(() => ({ equity: 1000 }))
+        const currentEquity = accountInfo?.equity || 1000
+        
+        // Try to get scaling status with actual equity
+        const statusData = await api.getScalingStatus(currentEquity).catch(() => ({
           current_mode: 'normal',
           mode_description: 'Standard trading mode',
           risk_multiplier: 1.0,
@@ -70,7 +74,7 @@ export default function ScalingPage() {
           weekly_pnl: 0
         }))
         
-        const tierData = await api.getScalingTier(10000).catch(() => ({
+        const tierData = await api.getScalingTier(currentEquity).catch(() => ({
           current_tier: '$1,000-$2,500',
           progress_percent: 0,
           base_lots: 0.01,

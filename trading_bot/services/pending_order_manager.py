@@ -155,15 +155,19 @@ class PendingOrderManager:
             PendingOrder object
         """
         # Calculate expiration time
-        # If kill zone checker available, use end of current session
-        if self.kill_zone_checker:
+        # Crypto symbols trade 24/7 - always use full expiration, don't shorten by session
+        CRYPTO_SYMBOLS = {'BTCUSD', 'ETHUSD', 'XRPUSD', 'ADAUSD', 'SOLUSD', 'DOGEUSD'}
+        is_crypto = symbol in CRYPTO_SYMBOLS
+        
+        if not is_crypto and self.kill_zone_checker:
             try:
                 session = self.kill_zone_checker.get_current_session()
                 # SessionInfo is a dataclass — use getattr, not .get()
                 session_remaining = getattr(session, 'minutes_remaining', 0) if session else 0
-                if session_remaining > 0:
+                if session_remaining > 30:  # Only shorten if session has meaningful time left
                     expiration = datetime.now() + timedelta(minutes=min(session_remaining, expiration_minutes))
                 else:
+                    # Session ending soon — use full expiration to survive into next session
                     expiration = datetime.now() + timedelta(minutes=expiration_minutes)
             except Exception as e:
                 logger.warning(f"Could not get session for expiration: {e}")
@@ -225,6 +229,9 @@ class PendingOrderManager:
         failed = []
         
         for ticket in expired:
+            order = self.pending_orders.get(ticket)
+            if order:
+                print(f"[PENDING-EXPIRE] Cancelling expired order {ticket} ({order.symbol} {order.order_type} @ {order.price}, expired {order.minutes_remaining:.0f}min ago)", flush=True)
             result = await self.cancel_order(ticket, reason="expired")
             if result:
                 cancelled.append(ticket)
@@ -343,6 +350,7 @@ class PendingOrderManager:
                         cancelled.append(ticket)
                         self.order_history.append(order)
                         del self.pending_orders[ticket]
+                        print(f"[PENDING-SYNC] Order {ticket} ({order.symbol}) not found in MT5 orders or positions — marked as externally cancelled", flush=True)
                         logger.info(f"Order {ticket} was cancelled externally")
             
             return {
