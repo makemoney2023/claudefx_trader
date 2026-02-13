@@ -162,9 +162,14 @@ async def get_performance_stats(
             total_trades = len(trades)
             wins = [t for t in trades if t.profit_loss and t.profit_loss > 0]
             losses = [t for t in trades if t.profit_loss and t.profit_loss < 0]
+            decided_trades = len(wins) + len(losses)  # Exclude breakeven/scratch trades from win rate
             
             total_profit = sum(t.profit_loss or 0 for t in trades)
-            total_r = sum(t.r_multiple or 0 for t in trades)
+            # Sanitize R-multiples: cap unreasonable values (bad SL data) to 0
+            def _sanitize_r(r) -> float:
+                val = r or 0.0
+                return val if abs(val) <= 10 else 0.0
+            total_r = sum(_sanitize_r(t.r_multiple) for t in trades)
             
             win_profits = [t.profit_loss for t in wins if t.profit_loss]
             loss_profits = [t.profit_loss for t in losses if t.profit_loss]
@@ -173,7 +178,7 @@ async def get_performance_stats(
                 total_trades=total_trades,
                 wins=len(wins),
                 losses=len(losses),
-                win_rate=(len(wins) / total_trades) if total_trades > 0 else 0.0,  # Return as decimal (0.52), frontend multiplies by 100
+                win_rate=(len(wins) / decided_trades) if decided_trades > 0 else 0.0,  # Return as decimal (0.52), frontend multiplies by 100 — excludes breakeven trades
                 total_profit=total_profit,
                 total_r=total_r,
                 avg_r=(total_r / total_trades) if total_trades > 0 else 0.0,

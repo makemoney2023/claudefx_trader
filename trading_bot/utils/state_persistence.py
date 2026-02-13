@@ -172,24 +172,9 @@ def save_full_state(bot) -> bool:
                 'current_mode': bot.scaling_manager.current_mode.value
             })
         
-        # Save session analytics
-        if bot.session_analytics:
-            persistence.save_session_analytics({
-                'trade_history': bot.session_analytics.trade_history,
-                'session_stats': {
-                    session.value: {
-                        'total_trades': stats.total_trades,
-                        'wins': stats.wins,
-                        'losses': stats.losses,
-                        'total_pnl': stats.total_pnl,
-                        'total_r': stats.total_r,
-                        'best_trade_r': stats.best_trade_r,
-                        'worst_trade_r': stats.worst_trade_r,
-                        'symbols_traded': stats.symbols_traded
-                    }
-                    for session, stats in bot.session_analytics.session_stats.items()
-                }
-            })
+        # Session analytics: No longer persisted to JSON.
+        # Data is loaded from the SQLite database on startup via
+        # SessionAnalytics._load_from_database() which is the single source of truth.
         
         # Save goal tracker snapshots
         if bot.goal_tracker:
@@ -280,27 +265,13 @@ def load_full_state(bot) -> bool:
             bot.scaling_manager.daily_high_equity = saved_daily
             bot.scaling_manager.weekly_high_equity = saved_weekly
         
-        # Load session analytics
-        session_data = persistence.load_session_analytics()
-        if session_data and bot.session_analytics:
-            bot.session_analytics.trade_history = session_data.get('trade_history', [])
-            # Restore session stats
-            for session_name, stats in session_data.get('session_stats', {}).items():
-                from ..services.session_analytics import TradingSession
-                try:
-                    session = TradingSession(session_name)
-                    if session in bot.session_analytics.session_stats:
-                        s = bot.session_analytics.session_stats[session]
-                        s.total_trades = stats.get('total_trades', 0)
-                        s.wins = stats.get('wins', 0)
-                        s.losses = stats.get('losses', 0)
-                        s.total_pnl = stats.get('total_pnl', 0.0)
-                        s.total_r = stats.get('total_r', 0.0)
-                        s.best_trade_r = stats.get('best_trade_r', 0.0)
-                        s.worst_trade_r = stats.get('worst_trade_r', 0.0)
-                        s.symbols_traded = stats.get('symbols_traded', {})
-                except:
-                    pass
+        # Session analytics: Do NOT restore from JSON.
+        # SessionAnalytics._load_from_database() is the single source of truth —
+        # it reads closed bot trades directly from the SQLite database on init.
+        # The old JSON state contained corrupted data from MT5 history sync
+        # (e.g. inflated P/L from synced deals that weren't bot trades).
+        if bot.session_analytics:
+            logger.info("Session analytics loaded from database (not from JSON state file)")
         
         logger.info("Bot state loaded successfully")
         return True

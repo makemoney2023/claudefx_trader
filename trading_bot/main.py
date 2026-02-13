@@ -951,13 +951,16 @@ class TradingBot:
             _now_est = datetime.now(_est)
             _weekday = _now_est.weekday()  # 0=Monday, 4=Friday
             
+            self._day_of_week_mode_locked = False  # Reset each cycle
             if _weekday == 0:  # Monday - manipulation day
                 if self.scaling_manager:
                     self.scaling_manager.current_mode = TradingMode.CONSERVATIVE
+                    self._day_of_week_mode_locked = True
                     logger.info("Monday: CONSERVATIVE mode (manipulation day, A+ setups only)")
             elif _weekday == 4:  # Friday - profit-taking day
                 if self.scaling_manager:
                     self.scaling_manager.current_mode = TradingMode.CONSERVATIVE
+                    self._day_of_week_mode_locked = True
                     logger.info("Friday: CONSERVATIVE mode (profit-taking day)")
             else:
                 # Tuesday-Thursday and weekends (crypto trading) - use normal mode determination
@@ -1092,6 +1095,8 @@ class TradingBot:
                         logger.error(f"Error analyzing {sym}: {e}")
                 
                 await asyncio.gather(*[_process_symbol(sym) for sym in batch])
+                # Yield control to event loop between batches so API can serve requests
+                await asyncio.sleep(0.1)
             
             # Mark cycle complete
             if bot_state:
@@ -2335,32 +2340,44 @@ class TradingBot:
                 account_info = await self.mt5_client.get_account_info()
                 current_balance = account_info.balance if account_info else 1000.0
                 
-                # Let Claude help with mode decision if available
-                # OVERRIDE: In AGGRESSIVE mode (data collection), ignore Claude's mode recommendation
-                # to prevent it from downgrading to defensive/conservative during demo testing
-                claude_mode = None
-                if self.scaling_manager.current_mode != TradingMode.AGGRESSIVE:
-                    if self.claude_client and self.claude_client.api_key:
-                        try:
-                            scaling_decision = await self.claude_client.assess_scaling_decision(
-                                current_equity=current_balance,
-                                current_tier=self.position_sizer.get_tier_name(current_balance) if self.position_sizer else "Unknown",
-                                recent_performance=self.scaling_manager.get_recent_performance(),
-                                goal_progress=self.scaling_manager.calculate_goal_progress(current_balance)
-                            )
-                            claude_mode = scaling_decision.get('recommended_mode')
-                            print(f"[SCALING] {symbol}: Claude recommended mode: {claude_mode}", flush=True)
-                        except Exception as e:
-                            logger.debug(f"Could not get Claude scaling decision: {e}")
+                # Skip per-symbol mode recalculation if day-of-week override is active
+                # (Monday=CONSERVATIVE, Friday=CONSERVATIVE) — only drawdown can override
+                if getattr(self, '_day_of_week_mode_locked', False):
+                    # Still check drawdown even on locked days
+                    daily_dd = self.scaling_manager.calculate_daily_drawdown(current_balance)
+                    weekly_dd = self.scaling_manager.calculate_weekly_drawdown(current_balance)
+                    if weekly_dd >= self.scaling_manager.max_weekly_drawdown or daily_dd >= self.scaling_manager.max_daily_drawdown:
+                        self.scaling_manager.current_mode = TradingMode.DEFENSIVE
+                        print(f"[SCALING] {symbol}: DEFENSIVE (drawdown override on locked day), balance={current_balance}", flush=True)
+                    else:
+                        print(f"[SCALING] {symbol}: Mode={self.scaling_manager.current_mode.value} (day-of-week locked), balance={current_balance}", flush=True)
                 else:
-                    print(f"[SCALING] {symbol}: AGGRESSIVE mode locked (data collection) — skipping Claude mode assessment", flush=True)
-                
-                # Determine current trading mode (uses balance for drawdown watermarks)
-                mode = self.scaling_manager.determine_mode(current_balance, claude_mode)
-                print(f"[SCALING] {symbol}: Mode={mode.value}, balance={current_balance}", flush=True)
-                if mode != self.scaling_manager.current_mode:
-                    self.scaling_manager.current_mode = mode
-                    logger.info(f"Trading mode changed to: {mode.value}")
+                    # Let Claude help with mode decision if available
+                    # OVERRIDE: In AGGRESSIVE mode (data collection), ignore Claude's mode recommendation
+                    # to prevent it from downgrading to defensive/conservative during demo testing
+                    claude_mode = None
+                    if self.scaling_manager.current_mode != TradingMode.AGGRESSIVE:
+                        if self.claude_client and self.claude_client.api_key:
+                            try:
+                                scaling_decision = await self.claude_client.assess_scaling_decision(
+                                    current_equity=current_balance,
+                                    current_tier=self.position_sizer.get_tier_name(current_balance) if self.position_sizer else "Unknown",
+                                    recent_performance=self.scaling_manager.get_recent_performance(),
+                                    goal_progress=self.scaling_manager.calculate_goal_progress(current_balance)
+                                )
+                                claude_mode = scaling_decision.get('recommended_mode')
+                                print(f"[SCALING] {symbol}: Claude recommended mode: {claude_mode}", flush=True)
+                            except Exception as e:
+                                logger.debug(f"Could not get Claude scaling decision: {e}")
+                    else:
+                        print(f"[SCALING] {symbol}: AGGRESSIVE mode locked (data collection) — skipping Claude mode assessment", flush=True)
+                    
+                    # Determine current trading mode (uses balance for drawdown watermarks)
+                    mode = self.scaling_manager.determine_mode(current_balance, claude_mode)
+                    print(f"[SCALING] {symbol}: Mode={mode.value}, balance={current_balance}", flush=True)
+                    if mode != self.scaling_manager.current_mode:
+                        self.scaling_manager.current_mode = mode
+                        logger.info(f"Trading mode changed to: {mode.value}")
                 
                 # Determine setup grade from confidence
                 if trade_signal.confidence >= 0.85:
@@ -3704,13 +3721,17 @@ class TradingBot:
             logger.error(f"Error in analysis-only mode for {symbol}: {e}")
     
     async def _generate_chart_image(self, df, symbol: str, timeframe: Optional[str] = None) -> Optional[str]:
-        """Generate a chart image and return as base64."""
+        """Generate a chart image and return as base64.
+        
+        Runs in a thread pool to avoid blocking the event loop (matplotlib is sync/CPU-bound).
+        """
         try:
             from .utils.chart_screenshot import create_simple_chart
             if create_simple_chart:
                 tf_label = timeframe or settings.timeframes.execution_tf
-                # create_simple_chart already returns base64 encoded string
-                chart_base64 = create_simple_chart(
+                # Run in thread pool so chart generation doesn't block the API event loop
+                chart_base64 = await asyncio.to_thread(
+                    create_simple_chart,
                     df, 
                     symbol, 
                     tf_label
@@ -3965,7 +3986,7 @@ class TradingBot:
                 
                 # Notify on Telegram
                 await notify(
-                    NotificationType.TRADE,
+                    NotificationType.TRADE_CLOSED,
                     f"♻️ POSITION REPLACED\n\n"
                     f"Closed: {pos.symbol} (stagnant, {weakest['r_mult']:.2f}R, "
                     f"P&L ${weakest['pnl']:.2f})\n"
@@ -4933,18 +4954,9 @@ Include brief reasoning.
                 # Mark as synced
                 self._synced_deal_ids.add(deal_id)
                 
-                # Update analytics with synced trade
-                if self.session_analytics and profit != 0:
-                    try:
-                        self.session_analytics.record_trade(
-                            symbol=symbol,
-                            direction=direction,
-                            profit_loss=profit,
-                            r_multiple=0.0,
-                            entry_time=close_time if isinstance(close_time, datetime) else datetime.now()
-                        )
-                    except Exception as e:
-                        logger.debug(f"Could not update session analytics for synced trade: {e}")
+                # NOTE: Do NOT feed MT5 history sync into session_analytics.
+                # Session analytics should only track trades placed by this bot,
+                # not all historical MT5 deals (which inflates P/L and trade counts).
                 
                 # Update goal tracker
                 if self.goal_tracker and profit != 0:

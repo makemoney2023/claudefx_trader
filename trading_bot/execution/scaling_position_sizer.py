@@ -359,18 +359,16 @@ class ScalingPositionSizer:
             lots *= correlation_multiplier
             adjustments.append(f"Correlation: {correlation_multiplier}x")
         
-        # Adjustment 5: Exposure Limit (using symbol-aware contract size)
-        from ..config import get_symbol_spec
-        _spec = get_symbol_spec(symbol)
-        # Normalize exposure to USD-equivalent lots using contract size
-        notional_per_lot = entry_price * _spec.contract_size
-        max_notional = equity * tier.max_exposure_percent
-        max_exposure_lots = max_notional / notional_per_lot if notional_per_lot > 0 else 0
-        available_exposure = max(0, max_exposure_lots - current_exposure_lots)
-        
-        if lots > available_exposure:
+        # Adjustment 5: Exposure Limit
+        # NOTE: The detailed margin-based exposure check is done by ClaudeTradeManager.precheck_trade()
+        # which uses live MT5 margin data. Here we only apply a simple sanity cap:
+        # total lots across all positions for this symbol shouldn't exceed tier max_lots * 3.
+        # This prevents runaway sizing without the broken notional-value calculation
+        # that was clamping everything to 0.01 on leveraged forex pairs.
+        max_symbol_lots = tier.max_lots * 3
+        if current_exposure_lots > 0 and lots + current_exposure_lots > max_symbol_lots:
             old_lots = lots
-            lots = available_exposure
+            lots = max(0, max_symbol_lots - current_exposure_lots)
             adjustments.append(f"Exposure limit: {old_lots:.2f} -> {lots:.2f}")
         
         # Adjustment 6: Claude Override (if provided, clamped to 0.5x-1.5x of calculated size)

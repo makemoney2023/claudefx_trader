@@ -39,10 +39,11 @@ class SessionStats:
     
     @property
     def win_rate(self) -> float:
-        """Calculate win rate."""
-        if self.total_trades == 0:
+        """Calculate win rate (excluding breakeven/scratch trades)."""
+        decided = self.wins + self.losses
+        if decided == 0:
             return 0.0
-        return (self.wins / self.total_trades) * 100
+        return (self.wins / decided) * 100
     
     @property
     def avg_r(self) -> float:
@@ -108,7 +109,77 @@ class SessionAnalytics:
         # Trade history with session info
         self.trade_history: List[Dict[str, Any]] = []
         
+        # Load historical data from database
+        self._load_from_database()
+        
         logger.info("Session analytics initialized")
+    
+    def _load_from_database(self):
+        """Load closed bot trades from database to populate session stats on startup."""
+        try:
+            import sqlite3
+            import os
+            
+            db_path = os.path.join(os.getcwd(), "trading_bot.db")
+            if not os.path.exists(db_path):
+                logger.debug("No database found, starting with empty session analytics")
+                return
+            
+            conn = sqlite3.connect(db_path)
+            cur = conn.cursor()
+            
+            # Only load trades that have exit_price (closed trades) AND were placed by the bot
+            # (not synced from MT5 history - those have entry_reason='Synced from MT5 history')
+            cur.execute("""
+                SELECT symbol, direction, profit_loss, r_multiple, entry_time, stop_loss, entry_price
+                FROM trades
+                WHERE exit_price IS NOT NULL
+                  AND profit_loss IS NOT NULL
+                  AND entry_reason != 'Synced from MT5 history'
+            """)
+            
+            rows = cur.fetchall()
+            conn.close()
+            
+            loaded = 0
+            for row in rows:
+                symbol, direction, profit_loss, r_multiple, entry_time_str, stop_loss, entry_price = row
+                
+                # Skip trades with zero P/L (not real closes)
+                if profit_loss is None or profit_loss == 0:
+                    continue
+                
+                # Parse entry time
+                entry_time = None
+                if entry_time_str:
+                    try:
+                        entry_time = datetime.fromisoformat(str(entry_time_str))
+                    except (ValueError, TypeError):
+                        entry_time = datetime.utcnow()
+                else:
+                    entry_time = datetime.utcnow()
+                
+                # Use stored r_multiple, but sanity-check it
+                r_mult = float(r_multiple) if r_multiple else 0.0
+                if abs(r_mult) > 10:
+                    # R-multiple is unreasonable (bad SL data), zero it out
+                    r_mult = 0.0
+                
+                self.record_trade(
+                    symbol=symbol or "UNKNOWN",
+                    direction=direction or "long",
+                    profit_loss=float(profit_loss),
+                    r_multiple=r_mult,
+                    entry_time=entry_time
+                )
+                loaded += 1
+            
+            total_pnl = sum(s.total_pnl for s in self.session_stats.values())
+            print(f"[SESSION] Loaded {loaded} bot trades from DB (total P/L: ${total_pnl:.2f})", flush=True)
+            logger.info(f"Session analytics loaded {loaded} historical bot trades from database (P/L: ${total_pnl:.2f})")
+        except Exception as e:
+            print(f"[SESSION] ERROR loading from DB: {e}", flush=True)
+            logger.warning(f"Could not load session analytics from database: {e}")
     
     def get_current_session(self, utc_time: Optional[datetime] = None) -> TradingSession:
         """
@@ -171,8 +242,9 @@ class SessionAnalytics:
         
         if profit_loss > 0:
             stats.wins += 1
-        else:
+        elif profit_loss < 0:
             stats.losses += 1
+        # Breakeven (profit_loss == 0) counted in total_trades but not as win or loss
         
         # Track best/worst
         if r_multiple > stats.best_trade_r:

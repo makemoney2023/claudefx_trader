@@ -127,12 +127,13 @@ def calculate_metrics(
     
     # Basic calculations
     wins = [p for p in positions if p.profit_loss > 0]
-    losses = [p for p in positions if p.profit_loss <= 0]
+    losses = [p for p in positions if p.profit_loss < 0]
     
     total_trades = len(positions)
     num_wins = len(wins)
     num_losses = len(losses)
-    win_rate = num_wins / total_trades if total_trades > 0 else 0
+    decided_trades = num_wins + num_losses  # Exclude breakeven from win rate
+    win_rate = num_wins / decided_trades if decided_trades > 0 else 0
     
     total_profit = sum(p.profit_loss for p in wins)
     total_loss = abs(sum(p.profit_loss for p in losses))
