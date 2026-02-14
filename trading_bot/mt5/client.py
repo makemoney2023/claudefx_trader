@@ -522,6 +522,10 @@ class MT5Client:
             stops_level = 100  # Crypto needs larger stops
         elif any(x in symbol.upper() for x in ['XAU', 'XAG', 'GOLD', 'SILVER']):
             stops_level = 50   # Metals
+        elif any(x in symbol.upper() for x in ['US30', 'DJ30', 'NAS100', 'USTEC', 'US500', 'SP500']):
+            stops_level = 50   # Indices
+        elif any(x in symbol.upper() for x in ['OIL', 'WTI', 'BRENT', 'XTI', 'XBR']):
+            stops_level = 30   # Oil
         else:
             stops_level = 10   # Forex
         

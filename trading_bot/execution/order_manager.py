@@ -113,6 +113,20 @@ class OrderManager:
         # Metals (relaxed)
         'XAUUSD': 2.00,   # Gold: max $2.00 spread
         'XAGUSD': 0.20,   # Silver: max $0.20 spread
+        # Oil / Energy
+        'USOIL': 0.10,    # WTI Crude: max $0.10 spread
+        'WTIUSD': 0.10,
+        'XTIUSD': 0.10,
+        'BRENT': 0.10,
+        'UKOIL': 0.10,
+        'XBRUSD': 0.10,
+        # Indices
+        'US30': 5.0,      # Dow Jones: max 5 points spread
+        'DJ30': 5.0,
+        'NAS100': 3.0,    # Nasdaq 100: max 3 points spread
+        'USTEC': 3.0,
+        'US500': 1.5,     # S&P 500: max 1.5 points spread
+        'SP500': 1.5,
     }
     
     async def _check_spread(self, symbol: str) -> tuple:

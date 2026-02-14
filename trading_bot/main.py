@@ -285,6 +285,17 @@ class TradingBot:
         # Precious metals symbols
         self.PRECIOUS_METALS = ['XAUUSD', 'XAGUSD']
         
+        # Index symbols
+        self.INDEX_SYMBOLS = [
+            'US30', 'NAS100', 'US500', 'DJ30', 'USTEC', 'SP500',
+            'US30CASH', 'NAS100CASH', 'US500CASH',
+        ]
+        
+        # Oil / Energy symbols
+        self.OIL_SYMBOLS = [
+            'USOIL', 'WTIUSD', 'XTIUSD', 'BRENT', 'UKOIL', 'XBRUSD',
+        ]
+        
         # Trade history sync tracking
         self._last_history_sync: Optional[datetime] = None
         self._history_sync_interval = timedelta(minutes=5)
@@ -575,13 +586,24 @@ class TradingBot:
             print("[INIT] Telegram notifier...", flush=True)
             logger.info("Initializing Telegram notifications...")
             notifier = get_notifier()
+            print(f"[INIT] Telegram enabled={notifier.enabled}, token={'SET' if notifier.bot_token else 'MISSING'}, chat_id={'SET' if notifier.chat_id else 'MISSING'}", flush=True)
             if notifier.enabled:
                 logger.info("✅ Telegram notifications enabled")
-                await notify(
-                    NotificationType.INFO,
-                    f"🤖 ICT Trading Bot started!\nEquity: ${starting_equity:,.2f}\nGoal: $10,000"
-                )
+                try:
+                    symbols_str = ", ".join(settings.trading.symbols) if settings.trading.symbols else "None"
+                    sent = await notify(
+                        NotificationType.INFO,
+                        f"🤖 ICT Trading Bot started!\n\n"
+                        f"💰 Equity: ${starting_equity:,.2f}\n"
+                        f"🎯 Goal: $10,000\n"
+                        f"📊 Symbols: {symbols_str}\n"
+                        f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    )
+                    print(f"[INIT] Telegram startup notification sent: {sent}", flush=True)
+                except Exception as e:
+                    print(f"[INIT] Telegram startup notification FAILED: {e}", flush=True)
             else:
+                print("[INIT] Telegram notifications DISABLED (missing credentials)", flush=True)
                 logger.warning("⚠️ Telegram notifications disabled (missing credentials)")
             
             # Load persisted state from previous session
@@ -2948,7 +2970,7 @@ class TradingBot:
                         # SANITY CHECK: Validate IPDA TP levels are in a reasonable price range
                         # Max TP should be within 10% of current price for forex, 20% for crypto/metals
                         _entry_ref = trade_signal.entry_price or current_price
-                        _max_tp_pct = 0.20 if symbol in self.CRYPTO_SYMBOLS or symbol in ('XAUUSD', 'XAGUSD') else 0.10
+                        _max_tp_pct = 0.20 if symbol in self.CRYPTO_SYMBOLS or symbol in self.PRECIOUS_METALS or symbol in self.INDEX_SYMBOLS or symbol in self.OIL_SYMBOLS else 0.10
                         
                         def _is_sane_tp(tp_price):
                             """Check if a TP price is within reasonable range of entry."""
@@ -3057,7 +3079,7 @@ class TradingBot:
                 
                 if _gate_tp and _gate_entry > 0:
                     _tp_deviation = abs(_gate_tp - _gate_entry) / _gate_entry
-                    _max_deviation = 0.20 if symbol in self.CRYPTO_SYMBOLS or symbol in ('XAUUSD', 'XAGUSD') else 0.10
+                    _max_deviation = 0.20 if symbol in self.CRYPTO_SYMBOLS or symbol in self.PRECIOUS_METALS or symbol in self.INDEX_SYMBOLS or symbol in self.OIL_SYMBOLS else 0.10
                     
                     if _tp_deviation > _max_deviation:
                         # TP is insanely far — fall back to R:R based TP
@@ -4851,8 +4873,14 @@ Include brief reasoning.
             
             logger.info(f"Position sync complete: tracking {len(self.position_manager.positions)} positions")
             
-            # Also sync recent trade history on startup
-            await self._sync_trade_history(days_back=30)
+            # Check if any bot-placed trades in our DB closed on MT5 while we were offline.
+            # This ONLY updates existing DB records (matched by ticket) — it does NOT import
+            # new trades from MT5 history, which would contaminate the DB with old account trades.
+            try:
+                await self._sync_trade_history(days_back=7)
+                print("[INIT] Trade close sync done (checked open DB trades against MT5 history)", flush=True)
+            except Exception as e:
+                print(f"[INIT] Trade close sync error (non-fatal): {e}", flush=True)
             
         except Exception as e:
             logger.error(f"Error syncing positions on startup: {e}")
@@ -4863,168 +4891,105 @@ Include brief reasoning.
         """
         Sync closed trade history from MT5 to database.
         
-        This catches trades that were closed while the bot was offline
-        and ensures our analytics and goal tracking are accurate.
+        IMPORTANT: This only updates EXISTING trades in the DB that were opened
+        by this bot but closed while the bot was briefly offline (e.g., TP/SL hit).
+        It does NOT import new trades from MT5 history — that would contaminate the
+        DB with old account trades that all share magic=12345.
         
-        Only syncs trades placed by this bot (magic=12345) to prevent
-        manual trades or trades from other EAs from contaminating analytics.
+        The bot records its own trades to the DB when it places them. This sync
+        only fills in exit data (exit_price, exit_time, profit_loss) for trades
+        that the bot opened but didn't see close.
         
         Args:
-            days_back: Number of days of history to sync (default 1, startup uses 30)
+            days_back: Number of days of history to check (default 1)
         """
         if not self.mt5_client or self.mt5_client.is_simulation:
             logger.debug("Skipping trade history sync - simulation mode or no MT5")
             return
         
-        # Skip history sync on fresh start (empty trades table)
-        # This prevents old trades from a previous account setup from contaminating
-        # our clean database when switching accounts
-        if DB_AVAILABLE:
-            try:
-                async with async_session() as session:
-                    from sqlalchemy import select, func
-                    trade_count = await session.execute(
-                        select(func.count(TradeModel.id))
-                    )
-                    if trade_count.scalar() == 0:
-                        logger.info(
-                            "Fresh database detected (0 trades) - skipping MT5 history sync "
-                            "to prevent contamination from old account trades"
-                        )
-                        self._last_history_sync = datetime.now()
-                        return
-            except Exception as e:
-                logger.warning(f"Could not check trade count for fresh DB detection: {e}")
+        if not DB_AVAILABLE:
+            self._last_history_sync = datetime.now()
+            return
         
         try:
+            # Find trades in our DB that are still open (no exit_price)
+            open_trade_tickets = set()
+            async with async_session() as session:
+                from sqlalchemy import select
+                result = await session.execute(
+                    select(TradeModel).where(
+                        TradeModel.exit_price.is_(None) | (TradeModel.exit_price == 0)
+                    )
+                )
+                open_db_trades = result.scalars().all()
+                for t in open_db_trades:
+                    if t.trade_id:
+                        open_trade_tickets.add(str(t.trade_id))
+            
+            if not open_trade_tickets:
+                logger.debug("No open trades in DB to check for MT5 closes")
+                self._last_history_sync = datetime.now()
+                return
+            
             end_time = datetime.now()
             start_time = end_time - timedelta(days=days_back)
-            
-            logger.info(f"Syncing trade history from {start_time} to {end_time}")
             
             # Get closed deals from MT5
             deals = await self.mt5_client.get_history(start_time, end_time)
             
             if not deals:
-                logger.debug("No trade history to sync")
                 self._last_history_sync = datetime.now()
                 return
             
-            synced_count = 0
-            skipped_non_bot = 0
+            updated_count = 0
             
             for deal in deals:
-                # Skip if already synced
                 deal_id = str(deal.get('ticket', deal.get('deal', 0)))
-                if deal_id in self._synced_deal_ids:
+                
+                # Only process deals that match trades WE opened
+                if deal_id not in open_trade_tickets:
                     continue
                 
-                # Only sync actual trades (not deposits/withdrawals)
                 deal_type = deal.get('type', '')
                 if deal_type not in ['buy', 'sell', 'DEAL_TYPE_BUY', 'DEAL_TYPE_SELL']:
                     continue
                 
-                # Only sync trades placed by this bot (magic=12345)
-                # This prevents manual trades or trades from other EAs from
-                # contaminating our analytics and trade history
-                deal_magic = deal.get('magic', 0)
-                if deal_magic != 12345:
-                    skipped_non_bot += 1
-                    self._synced_deal_ids.add(deal_id)  # Mark as seen so we don't re-check
-                    continue
-                
-                # Extract trade data
-                symbol = deal.get('symbol', '')
-                if not symbol:
-                    continue
-                
-                direction = 'long' if 'buy' in str(deal_type).lower() else 'short'
                 profit = float(deal.get('profit', 0))
-                volume = float(deal.get('volume', 0))
                 price = float(deal.get('price', 0))
                 close_time = deal.get('time', datetime.now())
                 
-                # Save to database if not exists
-                if DB_AVAILABLE:
-                    try:
-                        async with async_session() as session:
-                            # Check if trade already exists
-                            from sqlalchemy import select
-                            existing = await session.execute(
-                                select(TradeModel).where(TradeModel.trade_id == deal_id)
-                            )
-                            if existing.scalar_one_or_none():
-                                self._synced_deal_ids.add(deal_id)
-                                continue
-                            
-                            # Create new trade record
-                            trade = TradeModel(
-                                trade_id=deal_id,
-                                timestamp=close_time if isinstance(close_time, datetime) else datetime.now(),
-                                symbol=symbol,
-                                direction=direction,
-                                timeframe="M15",
-                                session="",
-                                entry_price=price,
-                                entry_time=close_time if isinstance(close_time, datetime) else datetime.now(),
-                                exit_price=price,
-                                exit_time=close_time if isinstance(close_time, datetime) else datetime.now(),
-                                entry_reason="Synced from MT5 history",
-                                exit_reason="Synced from MT5 history",
-                                stop_loss=0.0,
-                                take_profit=0.0,
-                                position_size=volume,
-                                profit_loss=profit,
-                                risk_amount=0.0,
-                                r_multiple=0.0,
-                                claude_confidence=0.0,
-                                claude_reasoning="Historical trade synced from MT5"
-                            )
-                            session.add(trade)
+                # Update existing trade record with close info
+                try:
+                    async with async_session() as session:
+                        result = await session.execute(
+                            select(TradeModel).where(TradeModel.trade_id == deal_id)
+                        )
+                        trade = result.scalar_one_or_none()
+                        if trade and (trade.exit_price is None or trade.exit_price == 0):
+                            trade.exit_price = price
+                            trade.exit_time = close_time if isinstance(close_time, datetime) else datetime.now()
+                            trade.profit_loss = profit
+                            trade.exit_reason = "Closed on MT5 (TP/SL/manual)"
                             await session.commit()
-                            synced_count += 1
-                            
-                    except Exception as e:
-                        logger.warning(f"Could not save deal {deal_id} to database: {e}")
-                
-                # Mark as synced
-                self._synced_deal_ids.add(deal_id)
-                
-                # NOTE: Do NOT feed MT5 history sync into session_analytics.
-                # Session analytics should only track trades placed by this bot,
-                # not all historical MT5 deals (which inflates P/L and trade counts).
-                
-                # Update goal tracker
-                if self.goal_tracker and profit != 0:
-                    try:
-                        account = await self.mt5_client.get_account_info()
-                        if account:
-                            self.goal_tracker.add_snapshot(account.equity)
-                    except Exception as e:
-                        logger.debug(f"Could not update goal tracker for synced trade: {e}")
+                            updated_count += 1
+                            logger.info(f"Updated trade {deal_id} with MT5 close data: P/L=${profit:.2f}")
+                except Exception as e:
+                    logger.warning(f"Could not update trade {deal_id}: {e}")
             
             self._last_history_sync = datetime.now()
             
-            if synced_count > 0:
-                logger.info(f"Synced {synced_count} bot trades from MT5 history (skipped {skipped_non_bot} non-bot trades)")
+            if updated_count > 0:
+                logger.info(f"Updated {updated_count} trades with MT5 close data")
                 
-                # Update bot state for dashboard visibility
-                if bot_state:
-                    bot_state.error(None, f"Synced {synced_count} historical trades from MT5")
-                
-                # Add to activity feed
                 from .api.routes.activity import add_activity
                 add_activity(
                     "info",
-                    f"Synced {synced_count} historical trades from MT5",
+                    f"Updated {updated_count} trades with close data from MT5",
                     None,
-                    {"synced_count": synced_count, "days_back": days_back, "skipped_non_bot": skipped_non_bot}
+                    {"updated_count": updated_count, "days_back": days_back}
                 )
             else:
-                if skipped_non_bot > 0:
-                    logger.info(f"No bot trades to sync (skipped {skipped_non_bot} non-bot trades)")
-                else:
-                    logger.debug("No new trades to sync from MT5 history")
+                logger.debug("No open bot trades needed MT5 close updates")
             
         except Exception as e:
             logger.error(f"Error syncing trade history: {e}")

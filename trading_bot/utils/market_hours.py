@@ -18,6 +18,8 @@ class MarketType(Enum):
     FOREX = "forex"
     CRYPTO = "crypto"
     METALS = "metals"
+    INDICES = "indices"
+    OIL = "oil"
 
 
 # Market hours in UTC
@@ -41,7 +43,25 @@ MARKET_HOURS = {
         "close_time": time(22, 0),
         "daily_break_start": time(22, 0),
         "daily_break_end": time(23, 0),
-    }
+    },
+    MarketType.INDICES: {
+        # US indices: Sunday 23:00 UTC to Friday 22:00 UTC, daily break 22:00-23:00
+        "open_day": 6,  # Sunday
+        "open_time": time(23, 0),
+        "close_day": 4,  # Friday
+        "close_time": time(22, 0),
+        "daily_break_start": time(22, 0),
+        "daily_break_end": time(23, 0),
+    },
+    MarketType.OIL: {
+        # Oil: Sunday 23:00 UTC to Friday 22:00 UTC, daily break 22:00-23:00
+        "open_day": 6,  # Sunday
+        "open_time": time(23, 0),
+        "close_day": 4,  # Friday
+        "close_time": time(22, 0),
+        "daily_break_start": time(22, 0),
+        "daily_break_end": time(23, 0),
+    },
 }
 
 
@@ -67,6 +87,20 @@ def get_market_type(symbol: str) -> MarketType:
     # Metals
     if symbol in ['XAUUSD', 'XAGUSD', 'GOLD', 'SILVER']:
         return MarketType.METALS
+    
+    # Oil / Energy
+    oil_symbols = ['USOIL', 'WTIUSD', 'CRUDEOIL', 'BRENT', 'UKOIL', 'XTIUSD', 'XBRUSD']
+    if symbol in oil_symbols or 'OIL' in symbol or 'WTI' in symbol or 'BRENT' in symbol:
+        return MarketType.OIL
+    
+    # Indices
+    index_symbols = [
+        'US30', 'NAS100', 'US500', 'DJ30', 'USTEC', 'SP500',
+        'US30CASH', 'NAS100CASH', 'US500CASH',
+        'DE30', 'UK100', 'JP225', 'AU200', 'FR40', 'EU50',
+    ]
+    if symbol in index_symbols or symbol.startswith('US30') or symbol.startswith('NAS') or symbol.startswith('US500') or symbol.startswith('SP500'):
+        return MarketType.INDICES
     
     return MarketType.FOREX
 
@@ -107,8 +141,8 @@ def is_market_open(symbol: str, current_time: Optional[datetime] = None) -> Tupl
         if current_t >= hours["close_time"]:
             return False, "Market closed - Friday after close"
     
-    # Check daily break for metals (Mon-Thu only, NOT on Sunday open)
-    if market_type == MarketType.METALS:
+    # Check daily break for metals, indices, and oil (Mon-Thu only, NOT on Sunday open)
+    if market_type in (MarketType.METALS, MarketType.INDICES, MarketType.OIL):
         break_start = hours.get("daily_break_start")
         break_end = hours.get("daily_break_end")
         if break_start and break_end:

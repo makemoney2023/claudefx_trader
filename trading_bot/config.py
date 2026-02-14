@@ -92,6 +92,20 @@ SYMBOL_SPECS: Dict[str, SymbolSpec] = {
     'ZECUSD': SymbolSpec(1, 0.01, 0.01, 200, 'crypto'),        # $2 min SL
     'DASHUSD': SymbolSpec(1, 0.01, 0.01, 200, 'crypto'),       # $2 min SL
     'IOTAUSD': SymbolSpec(1, 0.0001, 0.0001, 300, 'crypto'),   # $0.03 min SL
+    # Oil / Energy (contract sizes vary by broker — MT5 sync overrides these)
+    'USOIL': SymbolSpec(1000, 0.01, 10.0, 50, 'oil'),          # WTI Crude: 1000 barrels/lot
+    'WTIUSD': SymbolSpec(1000, 0.01, 10.0, 50, 'oil'),         # WTI alternate name
+    'XTIUSD': SymbolSpec(1000, 0.01, 10.0, 50, 'oil'),         # WTI alternate name
+    'BRENT': SymbolSpec(1000, 0.01, 10.0, 50, 'oil'),          # Brent Crude
+    'UKOIL': SymbolSpec(1000, 0.01, 10.0, 50, 'oil'),          # Brent alternate name
+    'XBRUSD': SymbolSpec(1000, 0.01, 10.0, 50, 'oil'),         # Brent alternate name
+    # Indices (contract sizes vary by broker — MT5 sync overrides these)
+    'US30': SymbolSpec(1, 1.0, 1.0, 50, 'index'),              # Dow Jones
+    'DJ30': SymbolSpec(1, 1.0, 1.0, 50, 'index'),              # Dow Jones alternate
+    'NAS100': SymbolSpec(1, 0.1, 0.1, 50, 'index'),            # Nasdaq 100
+    'USTEC': SymbolSpec(1, 0.1, 0.1, 50, 'index'),             # Nasdaq alternate
+    'US500': SymbolSpec(1, 0.1, 0.1, 30, 'index'),             # S&P 500
+    'SP500': SymbolSpec(1, 0.1, 0.1, 30, 'index'),             # S&P 500 alternate
 }
 
 # Default spec for unknown symbols - conservative forex-like
@@ -146,10 +160,8 @@ def update_symbol_spec_from_mt5(
     # For 3-digit JPY (e.g. USDJPY 152.876): pip = 0.01 (10 * point)
     # For 2-digit metals (e.g. XAUUSD 2850.50): pip = 0.01
     # For crypto: pip = point (varies by broker)
-    if base_spec.category == 'crypto':
-        mt5_pip_size = point  # Use broker's point directly for crypto
-    elif base_spec.category == 'metal':
-        mt5_pip_size = point  # Use broker's point for metals
+    if base_spec.category in ('crypto', 'metal', 'oil', 'index'):
+        mt5_pip_size = point  # Use broker's point directly for non-forex
     elif digits == 5 or digits == 3:
         mt5_pip_size = point * 10  # Standard forex: pip = 10 * point
     else:
@@ -216,6 +228,10 @@ def get_symbol_spec(symbol: str) -> SymbolSpec:
         return SYMBOL_SPECS.get('XAUUSD', SymbolSpec(100, 0.01, 1.0, 30, 'metal'))
     elif symbol.startswith('XAG') or 'SILVER' in symbol:
         return SYMBOL_SPECS.get('XAGUSD', SymbolSpec(5000, 0.001, 5.0, 20, 'metal'))
+    elif 'OIL' in symbol or 'WTI' in symbol or 'BRENT' in symbol or symbol.startswith('XTI') or symbol.startswith('XBR'):
+        return SYMBOL_SPECS.get('USOIL', SymbolSpec(1000, 0.01, 10.0, 50, 'oil'))
+    elif any(idx in symbol for idx in ['US30', 'DJ30', 'NAS100', 'USTEC', 'US500', 'SP500', 'DE30', 'UK100', 'JP225']):
+        return SYMBOL_SPECS.get('US30', SymbolSpec(1, 1.0, 1.0, 50, 'index'))
     elif 'JPY' in symbol:
         return SymbolSpec(100000, 0.01, 9.0, 15, 'forex')
     elif any(crypto in symbol for crypto in ['BTC', 'ETH', 'XRP', 'ADA', 'LTC', 'DOGE', 'SOL', 'DOT', 'EOS', 'NEO', 'ETC', 'XMR', 'ZEC', 'DASH', 'IOTA']):
