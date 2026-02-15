@@ -2736,7 +2736,8 @@ class TradingBot:
                     direction=_val_dir,
                     symbol=symbol,
                     account_balance=account_info.balance,
-                    actual_risk_pct=size_result.risk_percent  # Use actual scaled risk, not default
+                    actual_risk_pct=size_result.risk_percent,  # Use actual scaled risk, not default
+                    trade_type=getattr(trade_signal, 'trade_type', 'intraday')
                 )
                 
                 if not validation.is_valid:
@@ -3427,6 +3428,31 @@ class TradingBot:
                         f"⏳ Placing PENDING {order_type} order @ {entry_price}, "
                         f"expires in {expiration_minutes}min"
                     )
+                    
+                    # Cancel existing pending orders for the same symbol+direction to prevent pile-up
+                    existing_orders = [
+                        o for o in self.pending_order_manager.get_active_orders(symbol=symbol)
+                        if o.direction == trade_signal.direction
+                    ]
+                    for old_order in existing_orders:
+                        old_success = await self.pending_order_manager.cancel_order(
+                            old_order.ticket, reason="replaced_by_newer"
+                        )
+                        if old_success:
+                            self.daily_trades = max(0, self.daily_trades - 1)
+                            # Reclaim risk budget for the old order
+                            if hasattr(self, 'risk_manager') and self.risk_manager:
+                                _risk_pct = self.risk_manager.risk_per_trade
+                                self.risk_manager.update_daily_risk(-_risk_pct)
+                            # Clear old signal hash
+                            old_hash = self._get_signal_hash(symbol, old_order.direction, old_order.price)
+                            self._recent_signal_hashes.discard(old_hash)
+                            self._signal_hash_expiry.pop(old_hash, None)
+                            print(
+                                f"[PENDING] Cancelled old #{old_order.ticket} {symbol} {old_order.direction} "
+                                f"@ {old_order.price} — replaced by newer signal @ {entry_price}",
+                                flush=True
+                            )
                     
                     result = await self.order_manager.place_pending_order(
                         symbol=symbol,
@@ -4918,6 +4944,19 @@ Include brief reasoning.
                                         flush=True
                                     )
                                 
+                                # Free the daily trade slot (pending never filled)
+                                self.daily_trades = max(0, self.daily_trades - 1)
+                                print(
+                                    f"[TRADES] {symbol}: Trade slot freed, "
+                                    f"daily_trades={self.daily_trades}/{settings.trading.max_daily_trades}",
+                                    flush=True
+                                )
+                                
+                                # Clear signal hash so Claude can re-enter this setup
+                                old_hash = self._get_signal_hash(symbol, order_direction, order.price)
+                                self._recent_signal_hashes.discard(old_hash)
+                                self._signal_hash_expiry.pop(old_hash, None)
+                                
                                 # Log to activity feed
                                 from .api.routes.activity import add_activity
                                 add_activity(
@@ -5055,6 +5094,19 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                                     flush=True
                                 )
                             
+                            # Free the daily trade slot (pending never filled)
+                            self.daily_trades = max(0, self.daily_trades - 1)
+                            print(
+                                f"[TRADES] {symbol}: Trade slot freed, "
+                                f"daily_trades={self.daily_trades}/{settings.trading.max_daily_trades}",
+                                flush=True
+                            )
+                            
+                            # Clear signal hash so Claude can re-enter this setup
+                            old_hash = self._get_signal_hash(symbol, order_direction, order.price)
+                            self._recent_signal_hashes.discard(old_hash)
+                            self._signal_hash_expiry.pop(old_hash, None)
+                            
                             from .api.routes.activity import add_activity
                             add_activity(
                                 "pending_order_cancelled",
@@ -5074,6 +5126,8 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                     
                 except Exception as e:
                     logger.error(f"Error re-evaluating pending order {order.ticket}: {e}")
+                    print(f"[PENDING-REEVAL] ERROR #{order.ticket} {symbol}: {e}", flush=True)
+                    kept_count += 1
             
             if cancelled_count > 0 or kept_count > 0:
                 print(

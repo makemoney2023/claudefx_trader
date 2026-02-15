@@ -191,7 +191,8 @@ class RiskManager:
         direction: str,
         symbol: str,
         account_balance: float,
-        actual_risk_pct: Optional[float] = None
+        actual_risk_pct: Optional[float] = None,
+        trade_type: Optional[str] = None
     ) -> TradeValidation:
         """
         Validate a trade setup against risk rules.
@@ -204,6 +205,7 @@ class RiskManager:
             symbol: Trading symbol
             account_balance: Current account balance
             actual_risk_pct: The actual risk % being used (from scaling), overrides default
+            trade_type: Trade type ('scalp', 'intraday', 'swing') for R:R thresholds
             
         Returns:
             TradeValidation result
@@ -235,9 +237,17 @@ class RiskManager:
             risk_reward = 0
             errors.append("Invalid stop loss distance")
         
+        # Trade-type-aware minimum R:R thresholds
+        rr_thresholds = {
+            'scalp': 1.5,
+            'intraday': 2.0,
+            'swing': 3.0,
+        }
+        effective_min_rr = rr_thresholds.get((trade_type or '').lower(), self.min_risk_reward)
+        
         # Check minimum R:R (use 0.01 tolerance for floating point comparison)
-        if risk_reward < (self.min_risk_reward - 0.01):
-            errors.append(f"Risk/reward {risk_reward:.2f} below minimum {self.min_risk_reward}")
+        if risk_reward < (effective_min_rr - 0.01):
+            errors.append(f"Risk/reward {risk_reward:.2f} below minimum {effective_min_rr} ({trade_type or 'default'})")
         
         # Check daily risk limit using the actual risk % from scaling if provided
         position_size = self.calculate_position_size(

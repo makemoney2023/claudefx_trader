@@ -1685,15 +1685,24 @@ class MT5Client:
             if self._use_simulation:
                 return {"success": True, "simulated": True}
             
-            # Real MCP call
-            result = self._mcp_client.order.cancel_order(ticket=ticket)
+            mt5 = self._mcp_client
             
-            if result and result.get('retcode') == 10009:
+            request = {
+                "action": mt5.TRADE_ACTION_REMOVE,
+                "order": ticket,
+            }
+            
+            async with self._lock:
+                result = await asyncio.to_thread(mt5.order_send, request)
+            
+            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
                 return {"success": True}
             else:
+                error_msg = getattr(result, 'comment', 'Cancel failed') if result else 'No response from MT5'
+                retcode = getattr(result, 'retcode', 'N/A') if result else 'N/A'
                 return {
                     "success": False,
-                    "error": result.get('comment', 'Cancel failed')
+                    "error": f"{error_msg} (retcode={retcode})"
                 }
             
         except Exception as e:
