@@ -2337,11 +2337,20 @@ class TradingBot:
             # Ensure TP distance >= min_rr * SL distance
             # If Claude gives bad R:R, auto-correct the TP
             # ============================================
-            # Adjust min R:R based on trade type
+            # Adjust min R:R based on trade type AND asset category
+            # Crypto assets need higher R:R because even minimum lot sizes carry
+            # significant dollar risk — a 1.5:1 R:R on ETH/BTC is not worth it.
             _trade_type = getattr(trade_signal, 'trade_type', 'intraday') or 'intraday'
-            _rr_by_type = {'scalp': 1.5, 'intraday': 2.0, 'swing': 3.0}
+            from .config import get_symbol_spec as _get_spec_rr
+            _spec_rr = _get_spec_rr(symbol)
+            
+            if _spec_rr.category == 'crypto':
+                _rr_by_type = {'scalp': 2.0, 'intraday': 2.5, 'swing': 3.5}
+            else:
+                _rr_by_type = {'scalp': 1.5, 'intraday': 2.0, 'swing': 3.0}
+            
             min_rr = _rr_by_type.get(_trade_type, settings.trading.min_risk_reward)
-            logger.info(f"R:R threshold for {symbol} ({_trade_type}): {min_rr:.1f}:1")
+            logger.info(f"R:R threshold for {symbol} ({_trade_type}, {_spec_rr.category}): {min_rr:.1f}:1")
             sl_distance = abs(_entry - _sl)
             tp_distance = abs(_tp - _entry)
             
@@ -2351,23 +2360,94 @@ class TradingBot:
                 actual_rr = 0.0
             
             if actual_rr < min_rr and sl_distance > 0:
-                # TP is too close relative to SL — extend TP to meet minimum R:R
-                required_tp_distance = sl_distance * min_rr
+                # R:R is below minimum. Two tiers:
+                # 1) If R:R is at least 1.0:1 (reward >= risk), let it through
+                #    to the Trade Judge — Claude will evaluate if the setup quality
+                #    justifies the slightly lower R:R. The Judge has full context
+                #    (structure, HTF alignment, liquidity targets) to decide.
+                # 2) If R:R < 1.0:1 (risking MORE than the potential reward),
+                #    hard-reject — no analysis justifies negative expectancy.
+                _hard_floor_rr = 1.0
                 
-                if _dir == 'long':
-                    new_tp = _entry + required_tp_distance
+                if actual_rr < _hard_floor_rr:
+                    # Reward < risk — hard reject regardless of setup quality
+                    logger.warning(
+                        f"[BLOCKED] {symbol}: R:R {actual_rr:.2f}:1 below hard floor {_hard_floor_rr:.1f}:1 "
+                        f"(risk ${sl_distance:.2f} > reward ${tp_distance:.2f}). Rejected."
+                    )
+                    print(
+                        f"[BLOCKED] {symbol}: R:R {actual_rr:.2f}:1 — risking ${sl_distance:.2f} "
+                        f"for only ${tp_distance:.2f} reward. Not worth it.",
+                        flush=True
+                    )
+                    return
                 else:
-                    new_tp = _entry - required_tp_distance
+                    # R:R is between 1.0 and min_rr — borderline.
+                    # Let the Trade Judge decide with full context.
+                    logger.info(
+                        f"[R:R WARNING] {symbol}: R:R {actual_rr:.2f}:1 below target {min_rr:.1f}:1 "
+                        f"but above 1.0 floor. Passing to Trade Judge for evaluation."
+                    )
+                    print(
+                        f"[R:R WARNING] {symbol}: R:R {actual_rr:.2f}:1 (target {min_rr:.1f}:1) — "
+                        f"borderline, letting Trade Judge decide.",
+                        flush=True
+                    )
+            else:
+                logger.info(f"R:R OK for {symbol}: {actual_rr:.2f} (min {min_rr:.1f})")
+            
+            # ============================================
+            # MINIMUM TP DISTANCE FLOOR (A6.5)
+            # Even with good R:R, the absolute TP distance must be
+            # meaningful for the asset. A $100 TP on BTC is worthless.
+            # Tight SL = low risk (good), but TP must still be worth it.
+            # ============================================
+            # Minimum TP distances as % of entry price per asset category
+            # These ensure the profit target justifies the trade's costs/effort
+            _MIN_TP_PCT = {
+                'crypto': 0.005,   # 0.5% — BTC@68k = $340, ETH@2k = $10, SOL@85 = $0.43
+                'metal':  0.004,   # 0.4% — Gold@2800 = $11.2
+                'forex':  0.003,   # 0.3% — EURUSD@1.08 = 32 pips
+                'oil':    0.005,   # 0.5%
+                'index':  0.003,   # 0.3%
+            }
+            # NOTE: This is a SAFETY NET for garbage signals only.
+            # The real TP quality comes from the R:R enforcement above (A6),
+            # which uses Claude's actual SL distance × min_rr multiplier.
+            # Crypto R:R: scalp 2.0:1, intraday 2.5:1, swing 3.5:1
+            from .config import get_symbol_spec as _get_spec_a65
+            _spec_a65 = _get_spec_a65(symbol)
+            _min_tp_pct = _MIN_TP_PCT.get(_spec_a65.category, 0.003)
+            _min_tp_dist = _entry * _min_tp_pct
+            _current_tp_dist = abs(_tp - _entry)
+            
+            if _current_tp_dist < _min_tp_dist:
+                # TP is too small in absolute terms — extend it to the minimum floor
+                if _dir == 'long':
+                    _new_tp_floor = _entry + _min_tp_dist
+                else:
+                    _new_tp_floor = _entry - _min_tp_dist
                 
                 logger.warning(
-                    f"R:R FIX for {symbol}: Original R:R was {actual_rr:.2f} (SL dist: {sl_distance:.5f}, "
-                    f"TP dist: {tp_distance:.5f}). Extending TP from {_tp:.5f} to {new_tp:.5f} "
-                    f"for {min_rr:.1f}:1 R:R"
+                    f"[A6.5] {symbol}: TP distance ${_current_tp_dist:.2f} below minimum "
+                    f"${_min_tp_dist:.2f} ({_min_tp_pct*100:.1f}% of entry). "
+                    f"Extending TP from {_tp:.5f} to {_new_tp_floor:.5f}"
                 )
-                trade_signal.take_profit = new_tp
-                _tp = new_tp
-            elif actual_rr >= min_rr:
-                logger.info(f"R:R OK for {symbol}: {actual_rr:.2f} (min {min_rr:.1f})")
+                print(
+                    f"[TP-FLOOR] {symbol}: TP extended — ${_current_tp_dist:.2f} -> ${_min_tp_dist:.2f} "
+                    f"(entry={_entry:.5f}, old_TP={_tp:.5f}, new_TP={_new_tp_floor:.5f})",
+                    flush=True
+                )
+                trade_signal.take_profit = _new_tp_floor
+                _tp = _new_tp_floor
+                
+                # Recalculate R:R after floor extension (for logging)
+                _new_rr = abs(_tp - _entry) / sl_distance if sl_distance > 0 else 0
+                logger.info(f"[A6.5] {symbol}: New R:R after TP floor: {_new_rr:.1f}:1")
+            else:
+                logger.info(
+                    f"[A6.5] {symbol}: TP distance ${_current_tp_dist:.2f} OK (min ${_min_tp_dist:.2f})"
+                )
             
             # ============================================
             # TRADE QUALITY FILTER (E3)
@@ -2602,12 +2682,18 @@ class TradingBot:
             # Track this signal direction for future flip detection
             self._last_signal_direction[symbol] = (trade_signal.direction, datetime.now())
             
-            # Gap 21: Check for duplicate signals (prevent same trade within 1 hour)
+            # Gap 21: Track signal hashes for dedup, but DON'T hard-block.
+            # Multiple trades per symbol are allowed if the analysis supports it.
+            # The pending order replacement logic downstream already handles
+            # cancelling old orders and placing new ones for the same symbol+direction.
             signal_hash = self._get_signal_hash(symbol, trade_signal.direction, trade_signal.entry_price or current_price)
             if signal_hash in self._recent_signal_hashes:
-                print(f"[BLOCKED] {symbol}: Duplicate signal (same setup recently)", flush=True)
-                logger.info(f"Duplicate signal ignored for {symbol} (same setup recently)")
-                return
+                # Same exact entry price + direction was placed recently.
+                # Allow it to proceed — the downstream logic will either:
+                # (a) replace the pending order with updated TP/SL, or
+                # (b) open a second position if the first already filled.
+                logger.info(f"[DEDUP] {symbol}: Repeat signal (same entry), allowing through for re-evaluation")
+                print(f"[DEDUP] {symbol}: Repeat {trade_signal.direction} signal @ {trade_signal.entry_price or current_price:.2f} — allowing (may update pending order)", flush=True)
             
             # ============================================
             # CHECK CORRELATION BEFORE TRADING
@@ -3162,16 +3248,23 @@ class TradingBot:
                     _final_tp_dist = abs(_final_tp - _final_entry)
                     _final_rr = _final_tp_dist / _final_sl_dist if _final_sl_dist > 0 else 0
                     
-                    if _final_rr < min_rr and _final_sl_dist > 0:
-                        # Auto-correct: extend TP to maintain minimum R:R
-                        _required_tp_dist = _final_sl_dist * min_rr
-                        if _final_dir == 'long':
-                            trade_signal.take_profit = _final_entry + _required_tp_dist
-                        else:
-                            trade_signal.take_profit = _final_entry - _required_tp_dist
+                    if _final_rr < 1.0 and _final_sl_dist > 0:
+                        # R:R below 1.0 after adjustments — hard reject
                         logger.warning(
-                            f"FINAL R:R FIX for {symbol}: {_final_rr:.2f} -> {min_rr:.1f}. "
-                            f"TP adjusted from {_final_tp:.5f} to {trade_signal.take_profit:.5f}"
+                            f"[BLOCKED] FINAL R:R CHECK {symbol}: {_final_rr:.2f}:1 < 1.0:1 "
+                            f"after adjustments. Reward < risk. Trade rejected."
+                        )
+                        print(
+                            f"[BLOCKED] {symbol}: Final R:R {_final_rr:.2f}:1 < 1.0 "
+                            f"after price adjustments. Trade rejected.",
+                            flush=True
+                        )
+                        return
+                    elif _final_rr < min_rr and _final_sl_dist > 0:
+                        # Borderline — log warning, Trade Judge will evaluate
+                        logger.info(
+                            f"[R:R WARNING] FINAL CHECK {symbol}: R:R {_final_rr:.2f}:1 "
+                            f"below target {min_rr:.1f}:1 — Trade Judge will decide."
                         )
                 
                 # =============================================
@@ -3203,6 +3296,35 @@ class TradingBot:
                                 f"SAFETY GATE: TP {_gate_tp} was {_tp_deviation:.0%} from entry. "
                                 f"Reset to {min_rr:.0f}R: {trade_signal.take_profit}"
                             )
+                
+                # =============================================
+                # FINAL TP FLOOR (last chance before judge)
+                # Applies same A6.5 minimum TP distance as a final
+                # catch-all after all TP adjustments / safety gates.
+                # =============================================
+                _final_entry_tp = trade_signal.entry_price or current_price
+                _final_tp_now = trade_signal.take_profit
+                if _final_tp_now and _final_entry_tp > 0:
+                    from .config import get_symbol_spec as _get_spec_final
+                    _spec_final = _get_spec_final(symbol)
+                    _MIN_TP_PCT_FINAL = {
+                        'crypto': 0.005, 'metal': 0.004, 'forex': 0.003,
+                        'oil': 0.005, 'index': 0.003,
+                    }
+                    _min_tp_pct_f = _MIN_TP_PCT_FINAL.get(_spec_final.category, 0.003)
+                    _min_tp_dist_f = _final_entry_tp * _min_tp_pct_f
+                    _final_tp_dist_now = abs(_final_tp_now - _final_entry_tp)
+                    
+                    if _final_tp_dist_now < _min_tp_dist_f:
+                        if trade_signal.direction == 'long':
+                            trade_signal.take_profit = _final_entry_tp + _min_tp_dist_f
+                        else:
+                            trade_signal.take_profit = _final_entry_tp - _min_tp_dist_f
+                        print(
+                            f"[TP-FLOOR-FINAL] {symbol}: TP ${_final_tp_dist_now:.2f} -> ${_min_tp_dist_f:.2f} "
+                            f"(was {_final_tp_now:.5f}, now {trade_signal.take_profit:.5f})",
+                            flush=True
+                        )
                 
                 # =============================================
                 # TRADE JUDGE (pre-execution validation)
@@ -3274,12 +3396,83 @@ class TradingBot:
                         else:
                             demoted_entry = round(current_price * 1.001, 5)  # Sell slightly higher
                     
+                    # ---- Guard: demoted entry must still allow meaningful TP ----
+                    # If the demoted entry is so close to the SL that the resulting TP
+                    # (after R:R extension) would be below the minimum profit floor,
+                    # reject the demotion — the trade isn't worth it.
+                    _sl_for_check = trade_signal.stop_loss or 0
+                    _demote_sl_dist = abs(demoted_entry - _sl_for_check) if _sl_for_check else 0
+                    from .config import get_symbol_spec
+                    _spec = get_symbol_spec(symbol)
+                    
+                    # Use same min TP % as A6.5 block
+                    _MIN_TP_PCT_DEMOTE = {
+                        'crypto': 0.005, 'metal': 0.004, 'forex': 0.003,
+                        'oil': 0.005, 'index': 0.003,
+                    }
+                    _min_tp_pct_d = _MIN_TP_PCT_DEMOTE.get(_spec.category, 0.003)
+                    _min_tp_dist_d = demoted_entry * _min_tp_pct_d
+                    
+                    # What would the TP distance be after R:R auto-correction?
+                    # Use same category-aware R:R as A6 block
+                    if _spec.category == 'crypto':
+                        _rr_by_type_d = {'scalp': 2.0, 'intraday': 2.5, 'swing': 3.5}
+                    else:
+                        _rr_by_type_d = {'scalp': 1.5, 'intraday': 2.0, 'swing': 3.0}
+                    _tt = getattr(trade_signal, 'trade_type', 'intraday') or 'intraday'
+                    _min_rr_d = _rr_by_type_d.get(_tt, 2.0)
+                    _projected_tp_dist = max(
+                        abs((trade_signal.take_profit or 0) - demoted_entry),
+                        _demote_sl_dist * _min_rr_d  # R:R extension
+                    )
+                    
+                    # If even the best-case TP is below the floor, reject
+                    if _projected_tp_dist < _min_tp_dist_d and _demote_sl_dist > 0:
+                        logger.warning(
+                            f"[JUDGE] DEMOTE REJECTED for {symbol}: demoted entry {demoted_entry:.5f} "
+                            f"would give TP dist ${_projected_tp_dist:.2f} (min=${_min_tp_dist_d:.2f}). "
+                            f"SL dist=${_demote_sl_dist:.2f}. Trade not worth it."
+                        )
+                        print(
+                            f"[JUDGE] DEMOTE REJECTED {symbol}: TP dist=${_projected_tp_dist:.2f} "
+                            f"< min=${_min_tp_dist_d:.2f} (entry={demoted_entry:.5f}, SL={_sl_for_check:.5f})",
+                            flush=True
+                        )
+                        # Release trade slot
+                        self.daily_trades = max(0, self.daily_trades - 1)
+                        logger.info(f"Trade slot released after demote rejection ({self.daily_trades}/{settings.trading.max_daily_trades})")
+                        return
+                    
                     # Override to pending limit order
                     if trade_signal.direction == 'long':
                         trade_signal.order_type = 'buy_limit'
                     else:
                         trade_signal.order_type = 'sell_limit'
                     trade_signal.entry_price = demoted_entry
+                    
+                    # ---- Guard: SL must remain on the correct side of the demoted entry ----
+                    _sl_check = trade_signal.stop_loss or 0
+                    if _sl_check > 0:
+                        _sl_wrong_side = False
+                        if trade_signal.direction == 'long' and _sl_check >= demoted_entry:
+                            _sl_wrong_side = True
+                        elif trade_signal.direction == 'short' and _sl_check <= demoted_entry:
+                            _sl_wrong_side = True
+                        
+                        if _sl_wrong_side:
+                            logger.warning(
+                                f"[JUDGE] DEMOTE REJECTED {symbol}: SL ({_sl_check:.5f}) is on wrong side "
+                                f"of demoted entry ({demoted_entry:.5f}) for {trade_signal.direction}. "
+                                f"Demotion pushed entry past the SL."
+                            )
+                            print(
+                                f"[JUDGE] DEMOTE REJECTED {symbol}: SL {_sl_check:.5f} is on WRONG SIDE "
+                                f"of entry {demoted_entry:.5f} ({trade_signal.direction}). Skipping.",
+                                flush=True
+                            )
+                            self.daily_trades = max(0, self.daily_trades - 1)
+                            logger.info(f"Trade slot released after SL-side rejection ({self.daily_trades}/{settings.trading.max_daily_trades})")
+                            return
                     
                     reason = judge_verdict.get('reason', 'Judge demoted')
                     flags = judge_verdict.get('risk_flags', [])
@@ -3609,19 +3802,10 @@ class TradingBot:
                                 session_name=self.kill_zone_checker.get_current_session().session_name if self.kill_zone_checker else "",
                             )
                             
-                            # Send Telegram notification for pending order
-                            await notify(
-                                NotificationType.TRADE_OPENED,
-                                f"Pending order placed: {symbol}",
-                                symbol=symbol,
-                                direction=trade_signal.direction,
-                                entry_price=entry_price,
-                                stop_loss=trade_signal.stop_loss or 0.0,
-                                take_profit=trade_signal.take_profit or 0.0,
-                                lots=position_size.lots,
-                                confidence=trade_signal.confidence,
-                                ticket=result.ticket
-                            )
+                            # Pending orders: do NOT send Telegram notification.
+                            # These get cancelled/replaced frequently and would spam
+                            # the user. Only notify when a trade actually fills.
+                            logger.info(f"Pending order placed for {symbol} — Telegram notification deferred until fill")
                         else:
                             # =============================================
                             # MARKET ORDER: Immediately filled, add to position_manager
@@ -4401,11 +4585,15 @@ class TradingBot:
                     pass
             
             position_size_pct = 0.0
+            _lots = getattr(position_size, 'lots', 0.01)
+            _at_broker_minimum = False
             if account_balance > 0 and sl_distance > 0:
                 from .config import get_symbol_spec
                 spec = get_symbol_spec(symbol)
-                risk_amount = sl_distance * getattr(position_size, 'lots', 0.01) * spec.contract_size
+                risk_amount = sl_distance * _lots * spec.contract_size
                 position_size_pct = risk_amount / account_balance
+                # Check if we're at the broker's minimum lot size
+                _at_broker_minimum = (_lots <= spec.volume_min)
             
             # Get current session
             session_name = ""
@@ -4426,9 +4614,13 @@ class TradingBot:
                 'drawdown_pct': drawdown_pct,
                 'risk_reward': risk_reward,
                 'position_size_pct': position_size_pct,
+                'at_broker_minimum_lots': _at_broker_minimum,
                 'trades_today': self.daily_trades,
                 'max_daily_trades': settings.trading.max_daily_trades if hasattr(settings, 'trading') else 5,
                 'session': session_name,
+                'symbol_category': spec.category if spec else 'unknown',
+                'sl_distance': sl_distance,
+                'tp_distance': abs((trade_signal.take_profit or 0) - (trade_signal.entry_price or current_price)),
             }
             
             # Get learning context (past mistakes and winning patterns)
@@ -5061,6 +5253,33 @@ Include brief reasoning.
                                 sl_ok = current_price < order.stop_loss
                         
                         if move_pct >= 0.5 and tp_ok and sl_ok:
+                            # Check if we already have an open position for this symbol+direction
+                            # to avoid stacking duplicate positions from old pending orders
+                            existing_positions = [
+                                p for p in self.position_manager.get_all_positions()
+                                if p.symbol == symbol and p.direction == order_direction
+                            ]
+                            if existing_positions:
+                                # Already have a position — just cancel the stale limit, don't open another
+                                cancel_ok = await self.pending_order_manager.cancel_order(
+                                    order.ticket, reason=f"duplicate_position (already have {symbol} {order_direction})"
+                                )
+                                if cancel_ok:
+                                    cancelled_count += 1
+                                    self.daily_trades = max(0, self.daily_trades - 1)
+                                    if hasattr(self, 'risk_manager') and self.risk_manager:
+                                        _risk_pct = self.risk_manager.risk_per_trade
+                                        self.risk_manager.update_daily_risk(-_risk_pct)
+                                    old_hash = self._get_signal_hash(symbol, order_direction, order.price)
+                                    self._recent_signal_hashes.discard(old_hash)
+                                    self._signal_hash_expiry.pop(old_hash, None)
+                                    print(
+                                        f"[PENDING-REEVAL] CANCEL #{order.ticket} {symbol} {order.order_type} "
+                                        f"— already have open {order_direction} position, skipping upgrade",
+                                        flush=True
+                                    )
+                                continue
+                            
                             print(
                                 f"[PENDING-REEVAL] UPGRADE #{order.ticket} {symbol} {order.order_type} → MARKET "
                                 f"| price ran {move_pct:.1f}% favorably (limit={order.price:.5f}, now={current_price:.5f}) "
@@ -5345,7 +5564,20 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                     self.position_manager.positions[ticket] = db_match
                     logger.info(f"Restored position {ticket} from database")
                 else:
-                    # New position not in database - create and track
+                    # Only import positions that were placed by this bot
+                    # (identified by "ICT_Bot" in the comment field).
+                    # This prevents phantom close notifications for manual or
+                    # third-party trades that the bot never opened.
+                    mt5_comment = getattr(mt5_pos, 'comment', '') or ''
+                    if 'ICT_Bot' not in mt5_comment:
+                        print(
+                            f"[INIT] Skipping MT5 position {ticket} ({mt5_pos.symbol}) — "
+                            f"not bot-placed (comment='{mt5_comment}')",
+                            flush=True
+                        )
+                        continue
+                    
+                    # New bot position not in database - create and track
                     # MT5 Position has: type='buy'/'sell', price_open, sl, tp
                     # PositionManager Position expects: direction='long'/'short', entry_price, stop_loss, take_profit
                     position = Position(
@@ -5359,7 +5591,7 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                         open_time=datetime.now()
                     )
                     self.position_manager.add_position(position)
-                    logger.info(f"Added MT5 position {ticket} to tracking")
+                    logger.info(f"Added MT5 bot position {ticket} to tracking (comment='{mt5_comment}')")
             
             # Initialize daily_trades from MT5 history to prevent counter drift after restart
             # But skip if a manual reset was requested (skip_mt5_trade_recount flag)
@@ -5441,13 +5673,25 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
             return
         
         try:
-            # Find trades in our DB that are still open (no exit_price)
+            # Find trades in our DB that need close data:
+            # 1. Truly open trades (no exit_price)
+            # 2. Trades wrongly marked as cancelled (exit_price == entry_price, profit_loss == 0)
+            #    These happen when manual close removes position before sync detects the close.
+            from sqlalchemy import or_, and_
             open_trade_tickets = {}  # trade_id -> TradeModel data
             async with async_session() as session:
                 from sqlalchemy import select
                 result = await session.execute(
                     select(TradeModel).where(
-                        TradeModel.exit_price.is_(None) | (TradeModel.exit_price == 0)
+                        or_(
+                            TradeModel.exit_price.is_(None),
+                            TradeModel.exit_price == 0,
+                            # Wrongly cancelled: exit == entry and P/L is zero
+                            and_(
+                                TradeModel.profit_loss == 0,
+                                TradeModel.exit_price == TradeModel.entry_price,
+                            )
+                        )
                     )
                 )
                 open_db_trades = result.scalars().all()
@@ -5528,7 +5772,15 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                                 select(TradeModel).where(TradeModel.trade_id == trade_id)
                             )
                             trade = result.scalar_one_or_none()
-                            if trade and (trade.exit_price is None or trade.exit_price == 0):
+                            # Update if: no exit data, or wrongly marked as cancelled (exit==entry, P/L=0)
+                            _needs_update = (
+                                trade and (
+                                    trade.exit_price is None or 
+                                    trade.exit_price == 0 or
+                                    (trade.profit_loss == 0 and trade.exit_price == trade.entry_price)
+                                )
+                            )
+                            if _needs_update:
                                 trade.exit_price = price
                                 trade.exit_time = close_time if isinstance(close_time, datetime) else datetime.now()
                                 trade.profit_loss = total_pnl
@@ -5628,6 +5880,11 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
         Called when a position is detected as closed.
         """
         try:
+            print(
+                f"[CLOSE] Detected close: #{position.ticket} {position.symbol} "
+                f"{position.direction} vol={position.volume} entry={position.entry_price}",
+                flush=True
+            )
             logger.info(f"Position {position.ticket} closed, updating journal...")
             
             # Get closing details from MT5 (if available)
@@ -5748,18 +6005,28 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                 }
             )
             
-            # Send Telegram notification with actual close price and correct P/L
-            await notify(
-                NotificationType.TRADE_CLOSED,
-                f"Trade closed: {position.symbol}",
-                symbol=position.symbol,
-                direction=position.direction,
-                entry_price=position.entry_price,
-                exit_price=actual_close_price,
-                profit_loss=profit_loss,
-                pips=pips,
-                ticket=position.ticket
-            )
+            # Send Telegram notification ONLY if we confirmed the close via MT5 history.
+            # If MT5 didn't return a matching close deal, the position may have
+            # disappeared due to a cancelled pending order or sync glitch — don't
+            # send a misleading WIN/LOSS notification.
+            if mt5_profit_found:
+                await notify(
+                    NotificationType.TRADE_CLOSED,
+                    f"Trade closed: {position.symbol}",
+                    symbol=position.symbol,
+                    direction=position.direction,
+                    entry_price=position.entry_price,
+                    exit_price=actual_close_price,
+                    profit_loss=profit_loss,
+                    pips=pips,
+                    ticket=position.ticket
+                )
+            else:
+                print(
+                    f"[CLOSE] {position.symbol}: Telegram notification SKIPPED — "
+                    f"no confirmed close deal in MT5 history (may be cancelled order or sync glitch)",
+                    flush=True
+                )
             
             # Remove from correlation tracking
             if self.correlation_service:

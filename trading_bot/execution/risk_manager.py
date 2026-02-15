@@ -266,7 +266,8 @@ class RiskManager:
         min_sl_pips = self._get_min_sl_pips(symbol)
         
         if (sl_distance / pip_size) < min_sl_pips:
-            warnings.append(f"Stop loss may be too tight ({sl_distance / pip_size:.1f} pips)")
+            # Tight SL = low risk = acceptable. Just warn, don't reject.
+            warnings.append(f"Stop loss is tight ({sl_distance / pip_size:.1f} pips vs recommended {min_sl_pips:.0f})")
         
         # Check if trade size is reasonable
         if position_size.lots > 10:

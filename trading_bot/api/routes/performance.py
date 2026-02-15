@@ -141,8 +141,21 @@ async def get_performance_stats(
         from sqlalchemy import select, func
         
         async with AsyncSessionLocal() as session:
-            # Build query for closed trades (those with profit_loss)
-            query = select(TradeModel).where(TradeModel.profit_loss.isnot(None))
+            # Build query for REAL EXECUTED trades only.
+            # Exclude: cancelled pending orders (P/L=0), commission-only artifacts (P/L=-0.06),
+            # and expired orders. Only count trades with meaningful P/L (>= $0.10).
+            from sqlalchemy import and_, or_, func as sa_func
+            
+            query = select(TradeModel).where(
+                and_(
+                    TradeModel.profit_loss.isnot(None),
+                    # abs(profit_loss) >= 0.10 — excludes cancelled ($0) and commission artifacts
+                    or_(
+                        TradeModel.profit_loss >= 0.10,
+                        TradeModel.profit_loss <= -0.10,
+                    )
+                )
+            )
             
             if period_days:
                 cutoff = datetime.utcnow() - timedelta(days=period_days)

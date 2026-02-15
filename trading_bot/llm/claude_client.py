@@ -930,6 +930,20 @@ IMPORTANT: If you see ACTIVE DISPLACEMENT (strong candles with follow-through), 
 - SL: Beyond the H1/H4 structure level
 - R:R: Minimum 3:1
 
+⚠️ **R:R IS NON-NEGOTIABLE**: Your TP MUST be at least the minimum R:R × your SL distance.
+If your SL is $82 from entry, your TP must be at least $164 away (2:1 for intraday).
+If you cannot find a structural target that far away, either:
+1. TIGHTEN YOUR SL — use M5/M1 structure instead of M15 to reduce risk distance
+2. Return no_trade — the setup doesn't have enough room to run
+NEVER submit a trade where TP distance < SL distance. That is negative expectancy.
+
+⚠️ **CRYPTO R:R REQUIREMENTS** (higher minimums due to significant dollar risk):
+- Crypto SCALP: Minimum 2.0:1 R:R
+- Crypto INTRADAY: Minimum 2.5:1 R:R  
+- Crypto SWING: Minimum 3.5:1 R:R
+For BTC/ETH especially: prefer TIGHT SLs using M1/M5 structure to keep risk small,
+then target meaningful structural levels (IPDA, PDH/PDL, PWH/PWL) for TP.
+
 ⚠️ SCALP OPPORTUNITY RULE: When D1/H4 are ranging/unclear but M5/M1 shows
 a textbook ICT setup (clean sweep of liquidity + displacement + FVG/OB retest),
 you SHOULD signal a SCALP trade. Do NOT default to no_trade just because
@@ -1924,10 +1938,11 @@ A trade analyst has proposed the following trade. Your job is to check it agains
 - Account Balance: ${risk_metrics.get('account_balance', 0):.2f}
 - Daily P&L: ${risk_metrics.get('daily_pnl', 0):+.2f}
 - Current Drawdown: {risk_metrics.get('drawdown_pct', 0):.1%}
-- Risk-Reward Ratio: {risk_metrics.get('risk_reward', 0):.1f}R
-- Position Size: {risk_metrics.get('position_size_pct', 0):.1%} of equity
+- Risk-Reward Ratio: {risk_metrics.get('risk_reward', 0):.2f}:1 (SL dist: ${risk_metrics.get('sl_distance', 0):.2f}, TP dist: ${risk_metrics.get('tp_distance', 0):.2f})
+- Position Size: {risk_metrics.get('position_size_pct', 0):.1%} of equity{' **[AT BROKER MINIMUM LOT SIZE — cannot go smaller]**' if risk_metrics.get('at_broker_minimum_lots') else ''}
 - Trades Today: {risk_metrics.get('trades_today', 0)} / {risk_metrics.get('max_daily_trades', 5)}
 - Session: {risk_metrics.get('session', 'unknown')}
+- Asset Category: {risk_metrics.get('symbol_category', 'unknown')}
 
 ## Past Learning Context
 {learning_context if learning_context else "No historical learnings available yet."}
@@ -1942,6 +1957,7 @@ A trade analyst has proposed the following trade. Your job is to check it agains
 - If confidence >= 90% AND no critical risk flags, you MUST verdict APPROVE. High-confidence setups with clean structure should not be second-guessed.
 - Verdict DEMOTE if you find a concrete, specific problem with entry price — not vague concerns.
 - Verdict REJECT only for CRITICAL issues (e.g., SL/TP on wrong side, already at max daily trades). Do NOT reject for stylistic concerns.
+- **NEVER reject a trade solely because of position size % when the position is AT BROKER MINIMUM LOT SIZE.** The trader cannot go smaller — this is the smallest possible position. Evaluate purely on technical merit (setup quality, HTF alignment, known patterns). The trader accepts the elevated risk on minimum-lot symbols because the reward potential justifies it.
 - DEMOTE means: convert to a pending limit order at a better entry price (tighter).
   - For LONG: suggested_entry should be BELOW current entry (buy cheaper).
   - For SHORT: suggested_entry should be ABOVE current entry (sell higher).

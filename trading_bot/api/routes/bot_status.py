@@ -529,6 +529,18 @@ async def close_position(ticket: int, reason: str = "Manual close"):
         result = await bot.order_manager.close_position(ticket)
         
         if result.success:
+            # Set close reason on the position so the callback can use it
+            position.close_reason = reason
+            
+            # Trigger the position close callback BEFORE removing from tracking.
+            # This records the trade in the DB with proper exit price, P/L from MT5,
+            # and sends Telegram notification — just like a TP/SL hit.
+            if bot.position_manager.on_position_close:
+                try:
+                    await bot.position_manager.on_position_close(position)
+                except Exception as cb_err:
+                    logger.warning(f"Position close callback error for {ticket}: {cb_err}")
+            
             bot.position_manager.remove_position(ticket)
             
             from .activity import add_activity
