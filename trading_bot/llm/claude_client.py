@@ -81,7 +81,7 @@ TRADE_SIGNAL_TOOL = {
             "order_type": {
                 "type": "string",
                 "enum": ["market", "buy_limit", "sell_limit", "buy_stop", "sell_stop"],
-                "description": "CRITICAL: Use 'market' ONLY when displacement is confirmed and price is at your entry level NOW. Use 'buy_limit' to buy at a LOWER price (OB/FVG fill), 'sell_limit' to sell at a HIGHER price (OB/FVG fill), 'buy_stop' to buy above current price (breakout), 'sell_stop' to sell below current price (breakdown). PREFER pending orders (limit/stop) over market orders for better risk:reward entries."
+                "description": "Use 'market' when displacement is confirmed and momentum is strong — do NOT miss moves waiting for pullbacks. Use 'buy_limit' to buy at a LOWER price (OB/FVG fill when price is approaching), 'sell_limit' to sell at a HIGHER price (OB/FVG fill), 'buy_stop' to buy above current price (breakout), 'sell_stop' to sell below current price (breakdown). Match order type to market conditions: limit orders in ranging markets, market orders during active displacement."
             },
             "amd_phase": {
                 "type": "string",
@@ -719,13 +719,13 @@ changed on the chart, either maintain your previous direction or return no_trade
 Flipping direction without citing a confirmed change is NOT allowed.
 """
             prompt += """
-**ENTRY STRATEGY REMINDER -- PREFER PENDING ORDERS**:
-When you identify a trade setup, PREFER pending orders over market orders for better entries:
-- Use buy_limit/sell_limit at Order Blocks, FVGs, sweep-and-reclaim zones, or prominent wicks
+**ENTRY STRATEGY REMINDER -- CHOOSE THE RIGHT ORDER TYPE**:
+Match your order type to market conditions:
+- Use buy_limit/sell_limit at Order Blocks, FVGs, sweep-and-reclaim zones, or prominent wicks WHEN price is still approaching the level
 - Use buy_stop/sell_stop for breakout entries above/below key levels
+- Use 'market' when displacement is confirmed, momentum is strong, and price is AT or NEAR your ideal level — do NOT wait for a pullback that may never come during strong moves
 - Set entry_price to the EXACT level you want to enter at
-- Only use 'market' order_type when displacement is confirmed AND price is at your ideal level NOW
-If you see a potential setup developing but price hasn't reached the ideal entry yet, use a pending order at your target level rather than a market order.
+IMPORTANT: If you see ACTIVE DISPLACEMENT (strong candles with follow-through), use a MARKET order. Limit orders during strong momentum moves will miss the entry entirely. Only use limit orders when price is clearly ranging or approaching a level you expect it to test.
 """
             # Enhanced context from integrated services
             if market_data.get('account_equity'):
@@ -947,8 +947,8 @@ You MUST use M5/M1 to:
 Use M5/M1 context to refine your entry level and assess momentum exhaustion.
 If M5/M1 shows structure aligning with your trade thesis, boost confidence.
 If M5/M1 shows structure AGAINST your thesis (e.g., bearish M1 for a long), reduce confidence.
-ALWAYS prefer PENDING ORDERS (buy_limit/sell_limit/buy_stop/sell_stop) at key levels
-over market orders for better risk:reward.
+Use PENDING ORDERS (buy_limit/sell_limit/buy_stop/sell_stop) at key levels when price is ranging or approaching.
+Use MARKET orders when displacement is confirmed and momentum is strong — do NOT miss moves by waiting for pullbacks that never come.
 
 ## MANDATORY ANALYSIS WORKFLOW (follow this order)
 
@@ -1022,7 +1022,7 @@ Unicorn/Breaker setups, buy_stop/sell_stop breakouts):
 
 - If the breakout follows 4+ swings of accumulation + a sweep = HIGHEST confidence (0.85+).
 - If displacement is confirmed but swing count is low, trade can proceed but cap confidence at 0.75.
-- Still PREFER pending orders (buy_stop/sell_stop at breakout level) over market orders.
+- Use buy_stop/sell_stop at breakout level if price hasn't broken yet; use market if displacement is already underway.
 - Rounding pattern before the breakout = extra confluence, boost confidence.
 """
             
@@ -1287,7 +1287,7 @@ If you cannot point to at least two of these as ALREADY HAPPENED, you MUST retur
 ## Important Rules -- PATIENCE IS THE EDGE:
 - **Do NOT force a trade.** If the setup is not textbook (swing validation, confluence, clear levels), return no_trade. It is ALWAYS better to miss a move than to enter poorly and draw down.
 - **Quality over quantity.** One perfect entry with circular price action confirmation is worth more than five mediocre entries. Wait for the setup to come to you.
-- **PREFER PENDING ORDERS** at key levels identified on M1/M5 over market orders. Use buy_limit/sell_limit for reversal entries at sweep-and-reclaim zones, OBs, FVGs, or prominent wicks. Use buy_stop/sell_stop for breakout entries.
+- **Use the right order type for the situation.** Use buy_limit/sell_limit for reversal entries at sweep-and-reclaim zones, OBs, FVGs, or prominent wicks when price is approaching. Use buy_stop/sell_stop for breakout entries. Use MARKET when displacement is underway and momentum is strong — a limit order during a strong move will miss the entry.
 - **Confidence must reflect CONFIRMED evidence, not conviction in a direction.** Use this scale:
   - 0.60-0.69: One confirmation present, setup developing but incomplete
   - 0.70-0.79: Two confirmations present, valid but not ideal

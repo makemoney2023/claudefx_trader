@@ -258,6 +258,10 @@ class TradingBot:
         self._recent_signal_hashes: set = set()
         self._signal_hash_expiry: Dict[str, datetime] = {}
         
+        # Position re-eval throttle: {ticket: {"decision": str, "time": datetime}}
+        # HOLD decisions trigger a cooldown before next re-eval (saves API calls, reduces log spam)
+        self._position_reeval_state: Dict[int, Dict] = {}
+        
         # Cycle-to-cycle signal memory (per symbol) for reactive context
         self._last_signal_per_symbol: Dict[str, Dict[str, Any]] = {}
         
@@ -3264,11 +3268,11 @@ class TradingBot:
                     if suggested is not None and suggested > 0:
                         demoted_entry = suggested
                     else:
-                        # Default: 0.2% improvement from current price
+                        # Default: 0.1% improvement from current price (tight enough to fill)
                         if trade_signal.direction == 'long':
-                            demoted_entry = round(current_price * 0.998, 5)  # Buy cheaper
+                            demoted_entry = round(current_price * 0.999, 5)  # Buy slightly cheaper
                         else:
-                            demoted_entry = round(current_price * 1.002, 5)  # Sell higher
+                            demoted_entry = round(current_price * 1.001, 5)  # Sell slightly higher
                     
                     # Override to pending limit order
                     if trade_signal.direction == 'long':
@@ -4702,8 +4706,33 @@ class TradingBot:
             
             logger.info(f"Claude re-evaluating {len(positions)} open positions...")
             
+            # Clean up stale entries for positions that no longer exist
+            active_tickets = {p.ticket for p in positions}
+            stale = [t for t in self._position_reeval_state if t not in active_tickets]
+            for t in stale:
+                del self._position_reeval_state[t]
+            
             for position in positions:
                 try:
+                    # Throttle: if last decision was HOLD and cooldown hasn't elapsed, skip
+                    # This prevents spamming Claude API and flooding activity feed with
+                    # repetitive HOLD messages every 60 seconds.
+                    # Cooldown tiers: <2h open → 5min, 2-8h → 10min, >8h → 15min
+                    last_state = self._position_reeval_state.get(position.ticket)
+                    if last_state and last_state.get("decision") == "HOLD":
+                        since_last = (datetime.now() - last_state["time"]).total_seconds()
+                        # Determine cooldown based on how long the position has been open
+                        _hrs = last_state.get("hours_open", 0)
+                        if _hrs > 8:
+                            cooldown_secs = 900   # 15 min for mature positions
+                        elif _hrs > 2:
+                            cooldown_secs = 600   # 10 min for established positions
+                        else:
+                            cooldown_secs = 300   # 5 min for fresh positions
+                        
+                        if since_last < cooldown_secs:
+                            continue  # Skip — recent HOLD, no need to ask Claude again
+                    
                     # Get current chart for this position
                     df = await self.data_fetcher.get_ohlcv(
                         symbol=position.symbol,
@@ -4818,6 +4847,13 @@ Include brief reasoning.
                         decision = "TIGHTEN"
                     else:
                         decision = "HOLD"
+                    
+                    # Record the re-eval state for throttling (cooldown before next call)
+                    self._position_reeval_state[position.ticket] = {
+                        "decision": decision,
+                        "time": datetime.now(),
+                        "hours_open": hours_open,
+                    }
                     
                     # Log Claude re-evaluation to bot_state for frontend display
                     # Build a concise summary line (avoids repetitive raw Claude text)
@@ -4983,20 +5019,13 @@ Include brief reasoning.
                                 print(f"[PENDING-REEVAL] FAILED to cancel #{order.ticket} {symbol} via MT5", flush=True)
                             continue
                     
-                    # ── TIER 2: Claude re-eval for aged orders (1+ hour old) ──
+                    # ── TIER 1.5: "Price ran away" — cancel stale limit & enter at market ──
+                    # If we placed a buy_limit below market hoping for a dip, but price
+                    # ran UP and our thesis was right, the limit will never fill. Detect
+                    # this and convert to a market entry while the move is still live.
                     age_minutes = (datetime.now() - order.created_at).total_seconds() / 60
                     
-                    if age_minutes < 60:
-                        # Order is fresh — skip Claude check, keep it
-                        kept_count += 1
-                        continue
-                    
-                    # Order has been sitting for over 1 hour — ask Claude
-                    if not self.claude_client or not self.claude_client.api_key:
-                        kept_count += 1
-                        continue
-                    
-                    # Get current price
+                    # Get current price (needed for both Tier 1.5 and Tier 2)
                     current_price = 0.0
                     try:
                         df = await self.data_fetcher.get_ohlcv(
@@ -5006,6 +5035,114 @@ Include brief reasoning.
                             current_price = float(df['close'].iloc[-1])
                     except Exception:
                         pass
+                    
+                    if current_price > 0 and age_minutes >= 10:
+                        # Calculate how far price has moved AWAY from our limit
+                        # (favorably — in the direction of the trade)
+                        if order_direction == 'long' and order.order_type in ('buy_limit',):
+                            # Buy limit is below market; price moved UP away from our limit
+                            move_pct = (current_price - order.price) / order.price * 100
+                        elif order_direction == 'short' and order.order_type in ('sell_limit',):
+                            # Sell limit is above market; price moved DOWN away from our limit
+                            move_pct = (order.price - current_price) / order.price * 100
+                        else:
+                            move_pct = 0  # buy_stop/sell_stop — not relevant
+                        
+                        # If price moved >0.5% favorably past our limit AND the trade
+                        # thesis is still valid (TP hasn't been hit, SL hasn't been hit)
+                        tp_ok = True
+                        sl_ok = True
+                        if order.take_profit and order.stop_loss:
+                            if order_direction == 'long':
+                                tp_ok = current_price < order.take_profit  # haven't reached TP yet
+                                sl_ok = current_price > order.stop_loss    # above SL
+                            else:
+                                tp_ok = current_price > order.take_profit
+                                sl_ok = current_price < order.stop_loss
+                        
+                        if move_pct >= 0.5 and tp_ok and sl_ok:
+                            print(
+                                f"[PENDING-REEVAL] UPGRADE #{order.ticket} {symbol} {order.order_type} → MARKET "
+                                f"| price ran {move_pct:.1f}% favorably (limit={order.price:.5f}, now={current_price:.5f}) "
+                                f"| age={age_minutes:.0f}min",
+                                flush=True
+                            )
+                            
+                            # Cancel the stale pending order
+                            cancel_ok = await self.pending_order_manager.cancel_order(
+                                order.ticket, reason=f"upgrade_to_market (price ran {move_pct:.1f}% away)"
+                            )
+                            
+                            if cancel_ok:
+                                cancelled_count += 1
+                                
+                                # Free the trade slot and risk (will be re-used by the market order)
+                                self.daily_trades = max(0, self.daily_trades - 1)
+                                _risk_pct = 0
+                                if hasattr(self, 'risk_manager') and self.risk_manager:
+                                    _risk_pct = self.risk_manager.risk_per_trade
+                                    self.risk_manager.update_daily_risk(-_risk_pct)
+                                old_hash = self._get_signal_hash(symbol, order_direction, order.price)
+                                self._recent_signal_hashes.discard(old_hash)
+                                self._signal_hash_expiry.pop(old_hash, None)
+                                
+                                # Place market order to catch the move
+                                try:
+                                    market_result = await self.order_manager.place_market_order(
+                                        symbol=symbol,
+                                        direction=order_direction,
+                                        volume=order.volume,
+                                        stop_loss=order.stop_loss,
+                                        take_profit=order.take_profit,
+                                        comment="ICT_Bot_Upgrade"
+                                    )
+                                    
+                                    if market_result.success:
+                                        # Re-reserve the trade slot and risk
+                                        self.daily_trades += 1
+                                        if hasattr(self, 'risk_manager') and self.risk_manager and _risk_pct > 0:
+                                            self.risk_manager.update_daily_risk(_risk_pct)
+                                        
+                                        fill_ticket = market_result.ticket or market_result.order_id
+                                        print(
+                                            f"[PENDING-REEVAL] MARKET FILL #{fill_ticket} {symbol} {order_direction.upper()} "
+                                            f"@ market (was limit @ {order.price:.5f})",
+                                            flush=True
+                                        )
+                                        
+                                        from .api.routes.activity import add_activity
+                                        add_activity(
+                                            "pending_upgraded_to_market",
+                                            f"Upgraded {symbol} {order_direction} to market — price ran {move_pct:.1f}% past limit",
+                                            symbol,
+                                            {
+                                                "old_ticket": order.ticket,
+                                                "new_ticket": fill_ticket,
+                                                "limit_price": order.price,
+                                                "market_price": current_price,
+                                                "move_pct": round(move_pct, 2),
+                                            }
+                                        )
+                                    else:
+                                        print(
+                                            f"[PENDING-REEVAL] MARKET ENTRY FAILED for {symbol}: {getattr(market_result, 'error', 'unknown')}",
+                                            flush=True
+                                        )
+                                except Exception as mkt_err:
+                                    print(f"[PENDING-REEVAL] MARKET ENTRY ERROR for {symbol}: {mkt_err}", flush=True)
+                            
+                            continue  # Done with this order
+                    
+                    # ── TIER 2: Claude re-eval for aged orders (1+ hour old) ──
+                    if age_minutes < 60:
+                        # Order is fresh — skip Claude check, keep it
+                        kept_count += 1
+                        continue
+                    
+                    # Order has been sitting for over 1 hour — ask Claude
+                    if not self.claude_client or not self.claude_client.api_key:
+                        kept_count += 1
+                        continue
                     
                     # Distance from current price to order entry
                     if current_price > 0:
