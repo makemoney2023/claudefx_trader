@@ -521,6 +521,18 @@ class TradingBot:
                 kill_zone_checker=self.kill_zone_checker
             )
             
+            # Import any existing MT5 pending orders into the tracker
+            # so they survive restarts and can be re-evaluated by Claude
+            try:
+                import_result = await self.pending_order_manager.import_from_mt5()
+                _imported = import_result.get('imported', 0)
+                if _imported > 0:
+                    print(f"[INIT] Imported {_imported} pending order(s) from MT5 into tracker", flush=True)
+                else:
+                    print(f"[INIT] No pending orders to import from MT5", flush=True)
+            except Exception as e:
+                logger.warning(f"Error importing pending orders from MT5: {e}")
+            
             # =============================================
             # NEW: 100-PIP EXPANSION ANALYSIS COMPONENTS
             # =============================================
@@ -705,6 +717,7 @@ class TradingBot:
         
         # Track cycles for Claude re-evaluation frequency
         pos_mgr_cycle = 0
+        pending_reeval_cycle = 0
         
         while self.running:
             try:
@@ -718,7 +731,20 @@ class TradingBot:
                             print(f"[POS-MGR] Detected {len(sync_result['new_positions'])} new position(s) from MT5 (e.g. filled pending orders)", flush=True)
                             logger.info(f"POS-MGR: New positions detected: {sync_result['new_positions']}")
                         if sync_result.get('closed'):
-                            logger.info(f"POS-MGR: {len(sync_result['closed'])} position(s) closed externally")
+                            closed_list = sync_result['closed']
+                            for cp in closed_list:
+                                _sym = getattr(cp, 'symbol', '?')
+                                _tkt = getattr(cp, 'ticket', '?')
+                                _dir = getattr(cp, 'direction', '?')
+                                print(f"[POS-MGR] Position CLOSED externally: #{_tkt} {_sym} {_dir}", flush=True)
+                            logger.info(f"POS-MGR: {len(closed_list)} position(s) closed externally")
+                            
+                            # Trigger immediate trade history sync to update DB
+                            try:
+                                await self._sync_trade_history(days_back=1)
+                                print(f"[POS-MGR] Trade history synced after close detection", flush=True)
+                            except Exception as e:
+                                logger.warning(f"POS-MGR: Post-close history sync error: {e}")
                         logger.debug(f"POS-MGR MT5 sync: {sync_result}")
                     except Exception as e:
                         logger.warning(f"POS-MGR MT5 sync error: {e}")
@@ -781,6 +807,25 @@ class TradingBot:
                             asyncio.create_task(_run_claude_reeval())
                         else:
                             logger.debug("POS-MGR: Skipping Claude re-eval (previous still running)")
+                    
+                
+                # Pending order re-evaluation every 12 cycles (~2 minutes)
+                # Runs regardless of whether there are open positions
+                pending_reeval_cycle += 1
+                if pending_reeval_cycle >= 12:
+                    pending_reeval_cycle = 0
+                    if not getattr(self, '_pending_reeval_running', False):
+                        self._pending_reeval_running = True
+                        async def _run_pending_reeval():
+                            try:
+                                await self._claude_reevaluate_pending_orders()
+                            except Exception as e:
+                                logger.warning(f"POS-MGR Pending order re-eval error: {e}")
+                            finally:
+                                self._pending_reeval_running = False
+                        asyncio.create_task(_run_pending_reeval())
+                    else:
+                        logger.debug("POS-MGR: Skipping pending re-eval (previous still running)")
                 
                 # Sync pending orders with MT5
                 if hasattr(self, 'pending_order_manager') and self.pending_order_manager:
@@ -2103,7 +2148,7 @@ class TradingBot:
                 "confidence": trade_signal.confidence,
                 "trade_type": getattr(trade_signal, 'trade_type', 'intraday'),
                 "timestamp": datetime.now().isoformat(),
-                "reasoning": (trade_signal.reasoning or "")[:200],
+                "reasoning": trade_signal.reasoning or "",
             }
             
             # Log Claude's response
@@ -2153,6 +2198,34 @@ class TradingBot:
             
             # Check 1 & 2: SL/TP must be on the correct side of entry
             # Instead of immediately rejecting, try to auto-correct swapped SL/TP first
+            
+            # Step 0: Handle SL == Entry (zero risk distance).
+            # Claude sometimes outputs SL at the same price as entry.
+            # Derive a sensible SL using the key support/resistance level or a default offset.
+            if _sl and _entry and abs(_sl - _entry) < _entry * 0.0001:  # Within 0.01%
+                _key_levels = getattr(claude_result, 'key_levels', {}) or {}
+                _key_s1 = _key_levels.get('support_1')
+                _key_r1 = _key_levels.get('resistance_1')
+                
+                if _dir == 'long':
+                    # Use S1 if available and below entry, otherwise use 1% below entry
+                    if _key_s1 and _key_s1 < _entry:
+                        _sl = _key_s1
+                    else:
+                        _sl = _entry * 0.99  # 1% below
+                elif _dir == 'short':
+                    if _key_r1 and _key_r1 > _entry:
+                        _sl = _key_r1
+                    else:
+                        _sl = _entry * 1.01  # 1% above
+                
+                trade_signal.stop_loss = _sl
+                logger.warning(
+                    f"SL=ENTRY AUTO-FIX for {symbol} ({_dir}): "
+                    f"SL was at entry {_entry}, corrected to {_sl}"
+                )
+                print(f"[A5-FIX] {symbol}: SL was at entry, corrected to {_sl}", flush=True)
+            
             sl_wrong = False
             tp_wrong = False
             
@@ -2196,6 +2269,27 @@ class TradingBot:
                     tp_wrong = True
                 if _dir == 'short' and _tp >= _entry:
                     tp_wrong = True
+            
+            # After swap, SL may still equal entry — apply the SL=entry fix again
+            if _sl and _entry and abs(_sl - _entry) < _entry * 0.0001:
+                _key_levels2 = getattr(claude_result, 'key_levels', {}) or {}
+                _key_s1_2 = _key_levels2.get('support_1')
+                _key_r1_2 = _key_levels2.get('resistance_1')
+                
+                if _dir == 'long':
+                    if _key_s1_2 and _key_s1_2 < _entry:
+                        _sl = _key_s1_2
+                    else:
+                        _sl = _entry * 0.99
+                elif _dir == 'short':
+                    if _key_r1_2 and _key_r1_2 > _entry:
+                        _sl = _key_r1_2
+                    else:
+                        _sl = _entry * 1.01
+                trade_signal.stop_loss = _sl
+                sl_wrong = False
+                logger.warning(f"SL=ENTRY POST-SWAP FIX for {symbol}: corrected SL to {_sl}")
+                print(f"[A5-FIX] {symbol}: Post-swap SL=entry fix, SL now {_sl}", flush=True)
             
             # After auto-fix attempt, reject if still wrong
             if sl_wrong:
@@ -2358,21 +2452,23 @@ class TradingBot:
             print(f"[SCALING] {symbol}: Checking scaling manager...", flush=True)
             if self.scaling_manager:
                 # Determine current mode based on performance
-                # Use balance (realized P/L) for drawdown-related mode decisions
+                # Use EQUITY (includes unrealized P/L) for drawdown-related mode decisions
+                # Using balance alone ignores floating profits from open positions,
+                # causing false DEFENSIVE downgrades when open trades dip temporarily.
                 account_info = await self.mt5_client.get_account_info()
-                current_balance = account_info.balance if account_info else 1000.0
+                current_equity = account_info.equity if account_info else 1000.0
                 
                 # Skip per-symbol mode recalculation if day-of-week override is active
                 # (Monday=CONSERVATIVE, Friday=CONSERVATIVE) — only drawdown can override
                 if getattr(self, '_day_of_week_mode_locked', False):
                     # Still check drawdown even on locked days
-                    daily_dd = self.scaling_manager.calculate_daily_drawdown(current_balance)
-                    weekly_dd = self.scaling_manager.calculate_weekly_drawdown(current_balance)
+                    daily_dd = self.scaling_manager.calculate_daily_drawdown(current_equity)
+                    weekly_dd = self.scaling_manager.calculate_weekly_drawdown(current_equity)
                     if weekly_dd >= self.scaling_manager.max_weekly_drawdown or daily_dd >= self.scaling_manager.max_daily_drawdown:
                         self.scaling_manager.current_mode = TradingMode.DEFENSIVE
-                        print(f"[SCALING] {symbol}: DEFENSIVE (drawdown override on locked day), balance={current_balance}", flush=True)
+                        print(f"[SCALING] {symbol}: DEFENSIVE (drawdown override on locked day), equity={current_equity}", flush=True)
                     else:
-                        print(f"[SCALING] {symbol}: Mode={self.scaling_manager.current_mode.value} (day-of-week locked), balance={current_balance}", flush=True)
+                        print(f"[SCALING] {symbol}: Mode={self.scaling_manager.current_mode.value} (day-of-week locked), equity={current_equity}", flush=True)
                 else:
                     # Let Claude help with mode decision if available
                     # OVERRIDE: In AGGRESSIVE mode (data collection), ignore Claude's mode recommendation
@@ -2382,10 +2478,10 @@ class TradingBot:
                         if self.claude_client and self.claude_client.api_key:
                             try:
                                 scaling_decision = await self.claude_client.assess_scaling_decision(
-                                    current_equity=current_balance,
-                                    current_tier=self.position_sizer.get_tier_name(current_balance) if self.position_sizer else "Unknown",
+                                    current_equity=current_equity,
+                                    current_tier=self.position_sizer.get_tier_name(current_equity) if self.position_sizer else "Unknown",
                                     recent_performance=self.scaling_manager.get_recent_performance(),
-                                    goal_progress=self.scaling_manager.calculate_goal_progress(current_balance)
+                                    goal_progress=self.scaling_manager.calculate_goal_progress(current_equity)
                                 )
                                 claude_mode = scaling_decision.get('recommended_mode')
                                 print(f"[SCALING] {symbol}: Claude recommended mode: {claude_mode}", flush=True)
@@ -2394,9 +2490,9 @@ class TradingBot:
                     else:
                         print(f"[SCALING] {symbol}: AGGRESSIVE mode locked (data collection) — skipping Claude mode assessment", flush=True)
                     
-                    # Determine current trading mode (uses balance for drawdown watermarks)
-                    mode = self.scaling_manager.determine_mode(current_balance, claude_mode)
-                    print(f"[SCALING] {symbol}: Mode={mode.value}, balance={current_balance}", flush=True)
+                    # Determine current trading mode (uses equity for drawdown watermarks)
+                    mode = self.scaling_manager.determine_mode(current_equity, claude_mode)
+                    print(f"[SCALING] {symbol}: Mode={mode.value}, equity={current_equity}", flush=True)
                     if mode != self.scaling_manager.current_mode:
                         self.scaling_manager.current_mode = mode
                         logger.info(f"Trading mode changed to: {mode.value}")
@@ -2628,12 +2724,16 @@ class TradingBot:
                     logger.info(f"   • {adj}")
                 
                 # Validate trade with risk manager
-                print(f"[VALIDATE] {symbol}: Running risk validation...", flush=True)
+                _val_entry = trade_signal.entry_price or current_price
+                _val_sl = trade_signal.stop_loss
+                _val_tp = trade_signal.take_profit
+                _val_dir = trade_signal.direction
+                print(f"[VALIDATE] {symbol}: Running risk validation (entry={_val_entry}, SL={_val_sl}, TP={_val_tp}, dir={_val_dir})...", flush=True)
                 validation = self.risk_manager.validate_trade(
-                    entry_price=trade_signal.entry_price or current_price,
-                    stop_loss=trade_signal.stop_loss,
-                    take_profit=trade_signal.take_profit,
-                    direction=trade_signal.direction,
+                    entry_price=_val_entry,
+                    stop_loss=_val_sl,
+                    take_profit=_val_tp,
+                    direction=_val_dir,
                     symbol=symbol,
                     account_balance=account_info.balance,
                     actual_risk_pct=size_result.risk_percent  # Use actual scaled risk, not default
@@ -3370,13 +3470,12 @@ class TradingBot:
                     # Trade slot was already reserved above (daily_trades incremented)
                     
                     # Update daily risk tracking so the risk limit is enforced
+                    # Use the scaling manager's risk_percent (the intended risk per trade),
+                    # NOT a manual price-based calculation which can be wildly wrong for crypto/indices.
                     if hasattr(self, 'risk_manager') and self.risk_manager:
-                        _sl_dist = abs((trade_signal.entry_price or current_price) - trade_signal.stop_loss) if trade_signal.stop_loss else 0
-                        from .config import get_symbol_spec
-                        _spec = get_symbol_spec(symbol)
-                        _risk_pct = (position_size.lots * _sl_dist * _spec.contract_size) / (account_info.balance if account_info.balance > 0 else 1)
+                        _risk_pct = size_result.risk_percent if hasattr(size_result, 'risk_percent') else self.risk_manager.risk_per_trade
                         self.risk_manager.update_daily_risk(_risk_pct)
-                        logger.info(f"Daily risk updated: +{_risk_pct*100:.2f}%, total: {self.risk_manager.daily_risk_used*100:.2f}%")
+                        print(f"[RISK] {symbol}: Daily risk +{_risk_pct*100:.1f}%, total: {self.risk_manager.daily_risk_used*100:.1f}%/{self.risk_manager.max_daily_risk*100:.0f}%", flush=True)
                     
                     # Gap 21: Track signal hash to prevent duplicates
                     self._recent_signal_hashes.add(signal_hash)
@@ -4359,10 +4458,9 @@ class TradingBot:
                 )
                 return True
             
-            # Calculate daily P&L using BALANCE (realized P/L only)
-            # Using equity here would cause unrealized dips on open trades to
-            # trigger the kill switch prematurely — we only want to stop when
-            # actual closed-trade losses exceed the drawdown limit.
+            # Track daily start balance for daily drawdown reference point.
+            # The actual drawdown comparison below uses equity (includes floating P/L)
+            # to prevent false kill-switches when open positions dip temporarily.
             if not hasattr(self, '_daily_start_balance'):
                 self._daily_start_balance = account.balance
             
@@ -4378,19 +4476,24 @@ class TradingBot:
             max_daily_dd = settings.trading.max_daily_drawdown  # Default 3%
             max_weekly_dd = settings.trading.max_weekly_drawdown  # Default 6%
             
+            # Use EQUITY (includes floating P/L) not balance for drawdown checks.
+            # Balance ignores unrealized profits from open trades, causing false
+            # kill-switch triggers when open positions dip temporarily.
+            current_value = account.equity
+            
             daily_drawdown = 0.0
             if self._daily_start_balance > 0:
-                daily_drawdown = (self._daily_start_balance - account.balance) / self._daily_start_balance
+                daily_drawdown = (self._daily_start_balance - current_value) / self._daily_start_balance
+                daily_drawdown = max(0.0, daily_drawdown)  # Clamp: profit is not drawdown
             
             weekly_drawdown = 0.0
             if self.scaling_manager:
-                # Use BALANCE (realized P/L only) not equity
-                weekly_drawdown = self.scaling_manager.calculate_weekly_drawdown(account.balance)
+                weekly_drawdown = self.scaling_manager.calculate_weekly_drawdown(current_value)
             
             # Log drawdown values for debugging (only when significant)
             if daily_drawdown > 0.01 or weekly_drawdown > 0.01:
                 logger.info(
-                    f"Drawdown check (REALIZED only): balance=${account.balance:.2f}, equity=${account.equity:.2f}, "
+                    f"Drawdown check (EQUITY): balance=${account.balance:.2f}, equity=${account.equity:.2f}, "
                     f"daily_start=${self._daily_start_balance:.2f}, weekly_high=${self.scaling_manager.weekly_high_equity:.2f}, "
                     f"daily_dd={daily_drawdown:.2%}, weekly_dd={weekly_drawdown:.2%}"
                 )
@@ -4658,7 +4761,7 @@ Include brief reasoning.
                         response = await asyncio.wait_for(
                             self.claude_client.async_client.messages.create(
                                 model=self.claude_client.model,
-                                max_tokens=200,
+                                max_tokens=300,
                                 messages=[{
                                     "role": "user",
                                     "content": position_context
@@ -4691,11 +4794,15 @@ Include brief reasoning.
                         decision = "HOLD"
                     
                     # Log Claude re-evaluation to bot_state for frontend display
+                    # Build a concise summary line (avoids repetitive raw Claude text)
+                    direction_arrow = "LONG" if position.direction == "long" else "SHORT"
+                    summary = f"{decision} #{position.ticket} {position.symbol} {direction_arrow} | {r_mult:+.1f}R ${pnl:+.2f} | {hours_open:.1f}h"
+                    
                     from .api.routes.bot_status import bot_state
                     bot_state._add_log(
                         "claude_reeval",
                         position.symbol,
-                        f"Claude re-eval #{position.ticket}: {decision} — {recommendation[:80]}",
+                        summary,
                         {
                             "decision": decision,
                             "ticket": position.ticket,
@@ -4704,7 +4811,7 @@ Include brief reasoning.
                             "r_multiple": round(r_mult, 2),
                             "pnl": round(pnl, 2),
                             "hours_open": round(hours_open, 1),
-                            "reasoning": recommendation[:200],
+                            "reasoning": recommendation,
                         }
                     )
                     
@@ -4749,6 +4856,234 @@ Include brief reasoning.
                     
         except Exception as e:
             logger.error(f"Error in Claude re-evaluation: {e}")
+    
+    async def _claude_reevaluate_pending_orders(self):
+        """
+        Re-evaluate pending orders against current market conditions.
+        
+        Two-tier approach:
+        1. FAST CHECK: If the latest signal direction for a symbol has flipped
+           vs the pending order direction, cancel immediately (no Claude call).
+        2. CLAUDE CHECK: If the order has been sitting for over 1 hour without
+           filling and direction still matches, ask Claude whether to KEEP or CANCEL.
+        """
+        try:
+            if not hasattr(self, 'pending_order_manager') or not self.pending_order_manager:
+                return
+            
+            active_orders = self.pending_order_manager.get_active_orders()
+            if not active_orders:
+                return
+            
+            logger.info(f"Re-evaluating {len(active_orders)} pending order(s)...")
+            
+            cancelled_count = 0
+            kept_count = 0
+            
+            for order in active_orders:
+                try:
+                    symbol = order.symbol
+                    order_direction = order.direction  # 'long' or 'short'
+                    
+                    # ── TIER 1: Direction flip check (instant, no Claude call) ──
+                    latest_signal = self._last_signal_per_symbol.get(symbol)
+                    
+                    if latest_signal and latest_signal.get('direction') not in (None, 'no_trade'):
+                        latest_direction = latest_signal['direction']
+                        latest_confidence = latest_signal.get('confidence', 0)
+                        
+                        if latest_direction != order_direction:
+                            # Direction has flipped — cancel immediately
+                            print(
+                                f"[PENDING-REEVAL] CANCEL #{order.ticket} {symbol} {order.order_type} "
+                                f"— direction flipped: order={order_direction.upper()}, "
+                                f"latest signal={latest_direction.upper()} ({latest_confidence:.0%})",
+                                flush=True
+                            )
+                            
+                            success = await self.pending_order_manager.cancel_order(
+                                order.ticket, reason=f"reeval_direction_flip ({order_direction}->{latest_direction})"
+                            )
+                            
+                            if success:
+                                cancelled_count += 1
+                                
+                                # Reclaim daily risk budget
+                                if hasattr(self, 'risk_manager') and self.risk_manager:
+                                    _risk_pct = self.risk_manager.risk_per_trade
+                                    self.risk_manager.update_daily_risk(-_risk_pct)
+                                    print(
+                                        f"[RISK] {symbol}: Daily risk reclaimed -{_risk_pct*100:.1f}%, "
+                                        f"total: {self.risk_manager.daily_risk_used*100:.1f}%/{self.risk_manager.max_daily_risk*100:.0f}%",
+                                        flush=True
+                                    )
+                                
+                                # Log to activity feed
+                                from .api.routes.activity import add_activity
+                                add_activity(
+                                    "pending_order_cancelled",
+                                    f"Cancelled {order.order_type} {symbol} #{order.ticket} — direction flipped to {latest_direction.upper()}",
+                                    symbol,
+                                    {
+                                        "ticket": order.ticket,
+                                        "reason": "direction_flip",
+                                        "order_direction": order_direction,
+                                        "latest_direction": latest_direction,
+                                    }
+                                )
+                                
+                                # Log to bot_state
+                                from .api.routes.bot_status import bot_state
+                                bot_state._add_log(
+                                    "pending_reeval",
+                                    symbol,
+                                    f"CANCEL #{order.ticket} {symbol} {order_direction.upper()} — flipped to {latest_direction.upper()}",
+                                    {"ticket": order.ticket, "decision": "CANCEL", "reason": "direction_flip"}
+                                )
+                            else:
+                                print(f"[PENDING-REEVAL] FAILED to cancel #{order.ticket} {symbol} via MT5", flush=True)
+                            continue
+                    
+                    # ── TIER 2: Claude re-eval for aged orders (1+ hour old) ──
+                    age_minutes = (datetime.now() - order.created_at).total_seconds() / 60
+                    
+                    if age_minutes < 60:
+                        # Order is fresh — skip Claude check, keep it
+                        kept_count += 1
+                        continue
+                    
+                    # Order has been sitting for over 1 hour — ask Claude
+                    if not self.claude_client or not self.claude_client.api_key:
+                        kept_count += 1
+                        continue
+                    
+                    # Get current price
+                    current_price = 0.0
+                    try:
+                        df = await self.data_fetcher.get_ohlcv(
+                            symbol=symbol, timeframe="M5", count=1
+                        )
+                        if df is not None and not df.empty:
+                            current_price = float(df['close'].iloc[-1])
+                    except Exception:
+                        pass
+                    
+                    # Distance from current price to order entry
+                    if current_price > 0:
+                        distance_pct = abs(order.price - current_price) / current_price * 100
+                    else:
+                        distance_pct = 0
+                    
+                    prompt = f"""## Pending Order Re-evaluation
+
+- Symbol: {symbol}
+- Order Type: {order.order_type} ({order_direction.upper()})
+- Entry Price: {order.price}
+- Stop Loss: {order.stop_loss}
+- Take Profit: {order.take_profit}
+- Current Price: {current_price}
+- Distance to Entry: {distance_pct:.2f}%
+- Age: {age_minutes:.0f} minutes (placed at {order.created_at.strftime('%H:%M')})
+- Latest Signal: {latest_signal.get('direction', 'unknown').upper() if latest_signal else 'N/A'} @ {latest_signal.get('confidence', 0):.0%} confidence
+
+## Question
+This pending order has been waiting {age_minutes:.0f} minutes without filling.
+Should we KEEP it or CANCEL it?
+
+- KEEP: The setup is still valid, price may still reach the entry level.
+- CANCEL: Market has moved away, structure has changed, or the opportunity has passed.
+
+Consider: Is price moving TOWARD or AWAY from the entry? Has the entry zone been invalidated?
+Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
+"""
+                    
+                    try:
+                        response = await asyncio.wait_for(
+                            self.claude_client.async_client.messages.create(
+                                model=self.claude_client.model,
+                                max_tokens=200,
+                                messages=[{"role": "user", "content": prompt}]
+                            ),
+                            timeout=20
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Pending order re-eval timed out for {symbol}")
+                        kept_count += 1
+                        continue
+                    except Exception as api_err:
+                        logger.warning(f"Pending order re-eval API error for {symbol}: {api_err}")
+                        kept_count += 1
+                        continue
+                    
+                    if not response or not hasattr(response, 'content') or not response.content:
+                        kept_count += 1
+                        continue
+                    
+                    recommendation = response.content[0].text.strip().upper()
+                    decision = "CANCEL" if recommendation.startswith("CANCEL") else "KEEP"
+                    
+                    # Log to bot_state
+                    from .api.routes.bot_status import bot_state
+                    bot_state._add_log(
+                        "pending_reeval",
+                        symbol,
+                        f"{decision} #{order.ticket} {symbol} {order_direction.upper()} | age={age_minutes:.0f}m dist={distance_pct:.1f}%",
+                        {"ticket": order.ticket, "decision": decision, "age_minutes": round(age_minutes), "reasoning": recommendation}
+                    )
+                    
+                    if decision == "CANCEL":
+                        print(
+                            f"[PENDING-REEVAL] CANCEL #{order.ticket} {symbol} {order.order_type} "
+                            f"— Claude: {recommendation[:80]}",
+                            flush=True
+                        )
+                        
+                        success = await self.pending_order_manager.cancel_order(
+                            order.ticket, reason=f"reeval_claude ({recommendation[:60]})"
+                        )
+                        
+                        if success:
+                            cancelled_count += 1
+                            
+                            # Reclaim daily risk budget
+                            if hasattr(self, 'risk_manager') and self.risk_manager:
+                                _risk_pct = self.risk_manager.risk_per_trade
+                                self.risk_manager.update_daily_risk(-_risk_pct)
+                                print(
+                                    f"[RISK] {symbol}: Daily risk reclaimed -{_risk_pct*100:.1f}%, "
+                                    f"total: {self.risk_manager.daily_risk_used*100:.1f}%/{self.risk_manager.max_daily_risk*100:.0f}%",
+                                    flush=True
+                                )
+                            
+                            from .api.routes.activity import add_activity
+                            add_activity(
+                                "pending_order_cancelled",
+                                f"Claude cancelled {order.order_type} {symbol} #{order.ticket} — {recommendation[:80]}",
+                                symbol,
+                                {"ticket": order.ticket, "reason": "claude_reeval", "recommendation": recommendation[:200]}
+                            )
+                        else:
+                            print(f"[PENDING-REEVAL] FAILED to cancel #{order.ticket} {symbol} via MT5", flush=True)
+                    else:
+                        kept_count += 1
+                        print(
+                            f"[PENDING-REEVAL] KEEP #{order.ticket} {symbol} {order.order_type} "
+                            f"— Claude: {recommendation[:80]}",
+                            flush=True
+                        )
+                    
+                except Exception as e:
+                    logger.error(f"Error re-evaluating pending order {order.ticket}: {e}")
+            
+            if cancelled_count > 0 or kept_count > 0:
+                print(
+                    f"[PENDING-REEVAL] Done: {cancelled_count} cancelled, {kept_count} kept "
+                    f"(of {len(active_orders)} active orders)",
+                    flush=True
+                )
+                
+        except Exception as e:
+            logger.error(f"Error in pending order re-evaluation: {e}")
     
     async def emergency_close_all(self, reason: str = "Emergency"):
         """
@@ -4900,6 +5235,9 @@ Include brief reasoning.
         only fills in exit data (exit_price, exit_time, profit_loss) for trades
         that the bot opened but didn't see close.
         
+        It also detects pending orders that no longer exist on MT5 (deleted/expired)
+        and marks them as cancelled in the DB.
+        
         Args:
             days_back: Number of days of history to check (default 1)
         """
@@ -4913,7 +5251,7 @@ Include brief reasoning.
         
         try:
             # Find trades in our DB that are still open (no exit_price)
-            open_trade_tickets = set()
+            open_trade_tickets = {}  # trade_id -> TradeModel data
             async with async_session() as session:
                 from sqlalchemy import select
                 result = await session.execute(
@@ -4924,69 +5262,159 @@ Include brief reasoning.
                 open_db_trades = result.scalars().all()
                 for t in open_db_trades:
                     if t.trade_id:
-                        open_trade_tickets.add(str(t.trade_id))
+                        open_trade_tickets[str(t.trade_id)] = {
+                            'symbol': t.symbol,
+                            'direction': t.direction,
+                        }
             
             if not open_trade_tickets:
                 logger.debug("No open trades in DB to check for MT5 closes")
                 self._last_history_sync = datetime.now()
                 return
             
+            print(f"[SYNC] Checking {len(open_trade_tickets)} open DB trades against MT5...", flush=True)
+            
             end_time = datetime.now()
             start_time = end_time - timedelta(days=days_back)
             
-            # Get closed deals from MT5
+            # Get closed deals from MT5 history
             deals = await self.mt5_client.get_history(start_time, end_time)
             
-            if not deals:
-                self._last_history_sync = datetime.now()
-                return
-            
             updated_count = 0
+            matched_tickets = set()
             
-            for deal in deals:
-                deal_id = str(deal.get('ticket', deal.get('deal', 0)))
+            if deals:
+                # Build lookup maps: deals indexed by multiple keys for flexible matching
+                # MT5 deals have: ticket (deal ID), order (order ticket), position_id (position ticket)
+                # Our DB stores the ORDER ticket as trade_id (for both market and pending orders)
+                deals_by_position = {}
+                deals_by_order = {}
                 
-                # Only process deals that match trades WE opened
-                if deal_id not in open_trade_tickets:
-                    continue
+                for deal in deals:
+                    deal_entry = deal.get('entry', 0)
+                    # entry=1 means "out" (closing deal), which is what we want
+                    if deal_entry == 1:
+                        pos_id = str(deal.get('position_id', 0))
+                        order_id = str(deal.get('order', 0))
+                        if pos_id != '0':
+                            deals_by_position[pos_id] = deal
+                        if order_id != '0':
+                            deals_by_order[order_id] = deal
                 
-                deal_type = deal.get('type', '')
-                if deal_type not in ['buy', 'sell', 'DEAL_TYPE_BUY', 'DEAL_TYPE_SELL']:
-                    continue
+                # Try to match each open DB trade against MT5 close deals
+                for trade_id in list(open_trade_tickets.keys()):
+                    # Try matching by: position_id, order ticket, or deal ticket
+                    close_deal = (
+                        deals_by_position.get(trade_id) or
+                        deals_by_order.get(trade_id) or
+                        None
+                    )
+                    
+                    # Also try direct deal ticket match (original logic)
+                    if not close_deal:
+                        for deal in deals:
+                            if str(deal.get('ticket', 0)) == trade_id:
+                                close_deal = deal
+                                break
+                    
+                    if not close_deal:
+                        continue
+                    
+                    deal_type = close_deal.get('type', '')
+                    if deal_type not in ['buy', 'sell', 'DEAL_TYPE_BUY', 'DEAL_TYPE_SELL']:
+                        continue
+                    
+                    profit = float(close_deal.get('profit', 0))
+                    commission = float(close_deal.get('commission', 0))
+                    swap = float(close_deal.get('swap', 0))
+                    total_pnl = profit + commission + swap
+                    price = float(close_deal.get('price', 0))
+                    close_time = close_deal.get('time', datetime.now())
+                    
+                    try:
+                        async with async_session() as session:
+                            result = await session.execute(
+                                select(TradeModel).where(TradeModel.trade_id == trade_id)
+                            )
+                            trade = result.scalar_one_or_none()
+                            if trade and (trade.exit_price is None or trade.exit_price == 0):
+                                trade.exit_price = price
+                                trade.exit_time = close_time if isinstance(close_time, datetime) else datetime.now()
+                                trade.profit_loss = total_pnl
+                                trade.exit_reason = "Closed on MT5 (TP/SL/manual)"
+                                await session.commit()
+                                updated_count += 1
+                                matched_tickets.add(trade_id)
+                                print(f"[SYNC] Updated trade {trade_id} ({open_trade_tickets[trade_id]['symbol']}): P/L=${total_pnl:.2f}", flush=True)
+                                logger.info(f"Updated trade {trade_id} with MT5 close data: P/L=${total_pnl:.2f}")
+                    except Exception as e:
+                        logger.warning(f"Could not update trade {trade_id}: {e}")
+            
+            # ── STEP 2: Detect pending orders that no longer exist on MT5 ──
+            # These were deleted/expired externally — mark them as cancelled in the DB
+            unmatched_tickets = set(open_trade_tickets.keys()) - matched_tickets
+            cancelled_count = 0
+            
+            if unmatched_tickets:
+                # Get current open positions and pending orders from MT5
+                current_positions = set()
+                current_orders = set()
                 
-                profit = float(deal.get('profit', 0))
-                price = float(deal.get('price', 0))
-                close_time = deal.get('time', datetime.now())
-                
-                # Update existing trade record with close info
                 try:
-                    async with async_session() as session:
-                        result = await session.execute(
-                            select(TradeModel).where(TradeModel.trade_id == deal_id)
-                        )
-                        trade = result.scalar_one_or_none()
-                        if trade and (trade.exit_price is None or trade.exit_price == 0):
-                            trade.exit_price = price
-                            trade.exit_time = close_time if isinstance(close_time, datetime) else datetime.now()
-                            trade.profit_loss = profit
-                            trade.exit_reason = "Closed on MT5 (TP/SL/manual)"
-                            await session.commit()
-                            updated_count += 1
-                            logger.info(f"Updated trade {deal_id} with MT5 close data: P/L=${profit:.2f}")
-                except Exception as e:
-                    logger.warning(f"Could not update trade {deal_id}: {e}")
+                    positions = await self.mt5_client.get_positions()
+                    if positions:
+                        for p in positions:
+                            current_positions.add(str(p.ticket))
+                except Exception:
+                    pass
+                
+                try:
+                    import MetaTrader5 as mt5
+                    orders = await asyncio.to_thread(mt5.orders_get)
+                    if orders:
+                        for o in orders:
+                            current_orders.add(str(o.ticket))
+                except Exception:
+                    pass
+                
+                cancelled_count = 0
+                for trade_id in unmatched_tickets:
+                    # If this trade_id is neither an open position nor a pending order on MT5,
+                    # it was deleted/cancelled externally
+                    if trade_id not in current_positions and trade_id not in current_orders:
+                        try:
+                            async with async_session() as session:
+                                result = await session.execute(
+                                    select(TradeModel).where(TradeModel.trade_id == trade_id)
+                                )
+                                trade = result.scalar_one_or_none()
+                                if trade and (trade.exit_price is None or trade.exit_price == 0):
+                                    trade.exit_price = trade.entry_price  # Cancelled = no fill
+                                    trade.exit_time = datetime.utcnow()
+                                    trade.profit_loss = 0.0
+                                    trade.exit_reason = "Cancelled/deleted (not found on MT5)"
+                                    await session.commit()
+                                    cancelled_count += 1
+                                    print(f"[SYNC] Marked trade {trade_id} ({open_trade_tickets[trade_id]['symbol']}) as cancelled (not on MT5)", flush=True)
+                        except Exception as e:
+                            logger.warning(f"Could not mark trade {trade_id} as cancelled: {e}")
+                
+                if cancelled_count > 0:
+                    logger.info(f"Marked {cancelled_count} orphaned trades as cancelled")
             
             self._last_history_sync = datetime.now()
             
-            if updated_count > 0:
-                logger.info(f"Updated {updated_count} trades with MT5 close data")
+            total_updates = updated_count + cancelled_count
+            if total_updates > 0:
+                logger.info(f"Trade sync: {updated_count} closed, {cancelled_count} cancelled")
+                print(f"[SYNC] Done: {updated_count} trades updated with close data, {cancelled_count} cancelled/orphaned", flush=True)
                 
                 from .api.routes.activity import add_activity
                 add_activity(
                     "info",
-                    f"Updated {updated_count} trades with close data from MT5",
+                    f"Trade sync: {updated_count} closed, {cancelled_count} cancelled",
                     None,
-                    {"updated_count": updated_count, "days_back": days_back}
+                    {"updated_count": updated_count, "cancelled": cancelled_count, "days_back": days_back}
                 )
             else:
                 logger.debug("No open bot trades needed MT5 close updates")
@@ -5436,6 +5864,55 @@ Include brief reasoning.
             )
         except Exception as e:
             logger.error(f"Failed to send error notification: {e}")
+    
+    def get_status_summary(self) -> dict:
+        """
+        Get a summary dict of bot state for the Telegram command handler.
+        
+        Returns a dict with key bot attributes for the /status command.
+        """
+        # Current session
+        session = "unknown"
+        if self.session_analytics:
+            try:
+                current = self.session_analytics.get_current_session()
+                session = current.value
+            except Exception:
+                pass
+        
+        # Open positions count
+        open_positions = 0
+        if self.position_manager:
+            open_positions = len(self.position_manager.positions)
+        
+        # Pending orders count
+        pending_orders = 0
+        if self.pending_order_manager:
+            pending_orders = len(self.pending_order_manager.get_active_orders())
+        
+        # Uptime
+        uptime = "N/A"
+        if self.last_reset_date:
+            delta = datetime.now().date() - self.last_reset_date
+            if delta.days > 0:
+                uptime = f"{delta.days}d"
+            else:
+                uptime = "today"
+        
+        from .config import settings
+        
+        return {
+            'running': self.running,
+            'session': session,
+            'symbols': settings.trading.symbols,
+            'open_positions': open_positions,
+            'pending_orders': pending_orders,
+            'win_streak': self.win_streak,
+            'loss_streak': self.loss_streak,
+            'daily_pnl': self.daily_pnl,
+            'daily_trades': self.daily_trades,
+            'uptime': uptime,
+        }
     
     async def shutdown(self):
         """Gracefully shutdown the bot."""

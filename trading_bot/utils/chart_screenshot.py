@@ -10,6 +10,7 @@ import base64
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 
+import warnings
 import pandas as pd
 import numpy as np
 import matplotlib
@@ -17,6 +18,9 @@ matplotlib.use('Agg')  # Non-GUI backend - prevents tkinter threading crashes
 import mplfinance as mpf
 import matplotlib.pyplot as plt
 from PIL import Image
+
+# Suppress noisy mplfinance warnings when plotting flat/single-tick data
+warnings.filterwarnings("ignore", message=".*Attempting to set identical.*", category=UserWarning)
 
 from .logging import get_logger
 

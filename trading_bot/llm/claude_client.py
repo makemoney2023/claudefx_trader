@@ -54,11 +54,11 @@ TRADE_SIGNAL_TOOL = {
             },
             "stop_loss": {
                 "type": ["number", "null"],
-                "description": "Stop loss price"
+                "description": "Stop loss price — MUST be a different price from entry_price. For LONG: SL must be BELOW entry (place beyond the nearest structure low/OB). For SHORT: SL must be ABOVE entry (place beyond the nearest structure high/OB). NEVER set SL equal to entry."
             },
             "take_profit": {
                 "type": ["number", "null"],
-                "description": "Take profit price"
+                "description": "Take profit price — For LONG: TP must be ABOVE entry. For SHORT: TP must be BELOW entry."
             },
             "risk_reward": {
                 "type": ["number", "null"],
@@ -702,7 +702,7 @@ class ClaudeClient:
             if last_signal:
                 last_dir = last_signal.get('direction', 'unknown').upper()
                 last_conf = last_signal.get('confidence', 0)
-                last_reason = last_signal.get('reasoning', '')[:150]
+                last_reason = last_signal.get('reasoning', '')
                 last_ts = last_signal.get('timestamp', '')
                 prompt += f"""
 ## YOUR LAST SIGNAL FOR THIS SYMBOL
@@ -1193,7 +1193,7 @@ Unicorn/Breaker setups, buy_stop/sell_stop breakouts):
                 prompt += f"""
 ## 🎯 OPTIONS FLOW
 - Flow Bias: {opts.get('flow', 'neutral').upper()}
-- Magnet Levels: {', '.join(str(l) for l in opts.get('magnet_levels', [])[:3])}
+- Magnet Levels: {', '.join(str(l) for l in opts.get('magnet_levels', []))}
 - ⚠️ Price tends to be attracted to magnet levels (large option expiries)
 - ⚠️ Options flow bullish = Institutional buying calls/selling puts
 """
@@ -1297,6 +1297,7 @@ If you cannot point to at least two of these as ALREADY HAPPENED, you MUST retur
 - Only recommend trades with minimum 1:2 risk-reward ratio
 - Consider the current session (kill zone timing) -- outside kill zones, reduce confidence but still analyze
 - Identify specific price levels for entry, SL, and TP using M1/M5 precision
+- **CRITICAL: SL must NEVER equal entry price.** For LONG trades, SL must be placed BELOW entry (beyond the nearest swing low or OB). For SHORT trades, SL must be placed ABOVE entry (beyond the nearest swing high or OB). A zero-distance SL is invalid and will be rejected.
 - If genuinely no setup exists (ranging, no structure, no POI nearby), recommend "no_trade" with your reasoning
 - RESPECT news blackouts - recommend no_trade or reduce confidence
 - Consider recent performance and current streak when setting confidence
@@ -1396,32 +1397,46 @@ If you cannot point to at least two of these as ALREADY HAPPENED, you MUST retur
             sl = tool_input.get('stop_loss')
             tp = tool_input.get('take_profit')
             
-            # Detect swapped SL/TP: for longs SL should be below entry and TP above;
-            # for shorts SL should be above entry and TP below.
-            sl_wrong_side = (direction == 'long' and sl >= entry) or (direction == 'short' and sl <= entry)
-            tp_wrong_side = (direction == 'long' and tp <= entry) or (direction == 'short' and tp >= entry)
-            
-            if sl_wrong_side and tp_wrong_side:
-                # Both are on the wrong side — swap them
+            # ── SL == ENTRY FIX ──────────────────────────────────────
+            # Claude sometimes outputs SL at the exact same price as entry.
+            # This must be handled BEFORE the swap logic, otherwise the swap
+            # logic misidentifies it as "SL on wrong side" and swaps SL↔TP,
+            # which makes BOTH wrong.
+            sl_at_entry = abs(sl - entry) < entry * 0.0001  # Within 0.01%
+            if sl_at_entry:
                 logger.warning(
-                    f"SL/TP SWAP DETECTED for {direction}: SL={sl}, TP={tp}, Entry={entry}. "
-                    f"Both on wrong side — swapping SL<->TP"
+                    f"SL=ENTRY DETECTED for {direction}: SL={sl} == Entry={entry}. "
+                    f"Leaving SL as-is for main.py A5 auto-fix to correct using key levels."
                 )
-                tool_input['stop_loss'], tool_input['take_profit'] = tp, sl
-            elif sl_wrong_side and not tp_wrong_side:
-                # Only SL is wrong — SL might actually be the TP value
-                logger.warning(
-                    f"SL WRONG SIDE for {direction}: SL={sl}, TP={tp}, Entry={entry}. "
-                    f"Swapping SL<->TP"
-                )
-                tool_input['stop_loss'], tool_input['take_profit'] = tp, sl
-            elif tp_wrong_side and not sl_wrong_side:
-                # Only TP is wrong — TP might actually be the SL value
-                logger.warning(
-                    f"TP WRONG SIDE for {direction}: SL={sl}, TP={tp}, Entry={entry}. "
-                    f"Swapping SL<->TP"
-                )
-                tool_input['stop_loss'], tool_input['take_profit'] = tp, sl
+                # Do NOT swap — main.py's A5 block will derive a proper SL
+                # from key levels (support_1 / resistance_1) or a % fallback.
+            else:
+                # Detect swapped SL/TP: for longs SL should be below entry and TP above;
+                # for shorts SL should be above entry and TP below.
+                sl_wrong_side = (direction == 'long' and sl >= entry) or (direction == 'short' and sl <= entry)
+                tp_wrong_side = (direction == 'long' and tp <= entry) or (direction == 'short' and tp >= entry)
+                
+                if sl_wrong_side and tp_wrong_side:
+                    # Both are on the wrong side — swap them
+                    logger.warning(
+                        f"SL/TP SWAP DETECTED for {direction}: SL={sl}, TP={tp}, Entry={entry}. "
+                        f"Both on wrong side — swapping SL<->TP"
+                    )
+                    tool_input['stop_loss'], tool_input['take_profit'] = tp, sl
+                elif sl_wrong_side and not tp_wrong_side:
+                    # Only SL is wrong — SL might actually be the TP value
+                    logger.warning(
+                        f"SL WRONG SIDE for {direction}: SL={sl}, TP={tp}, Entry={entry}. "
+                        f"Swapping SL<->TP"
+                    )
+                    tool_input['stop_loss'], tool_input['take_profit'] = tp, sl
+                elif tp_wrong_side and not sl_wrong_side:
+                    # Only TP is wrong — TP might actually be the SL value
+                    logger.warning(
+                        f"TP WRONG SIDE for {direction}: SL={sl}, TP={tp}, Entry={entry}. "
+                        f"Swapping SL<->TP"
+                    )
+                    tool_input['stop_loss'], tool_input['take_profit'] = tp, sl
             
             # Final R:R check: warn if SL distance > TP distance (bad R:R)
             # Don't swap here — main.py's R:R enforcement will auto-extend TP to meet min R:R
@@ -1516,7 +1531,7 @@ If you cannot point to at least two of these as ALREADY HAPPENED, you MUST retur
             return AnalysisResult(
                 signal=signal,
                 raw_response=json.dumps(tool_input, indent=2),
-                analysis_summary=tool_input.get('reasoning', '')[:500],
+                analysis_summary=tool_input.get('reasoning', ''),
                 key_levels=tool_input.get('key_levels', {}),
                 warnings=tool_input.get('warnings', [])
             )
@@ -1573,7 +1588,7 @@ If you cannot point to at least two of these as ALREADY HAPPENED, you MUST retur
                 return AnalysisResult(
                     signal=signal,
                     raw_response=response_text,
-                    analysis_summary=data.get('reasoning', '')[:500],
+                    analysis_summary=data.get('reasoning', ''),
                     key_levels=data.get('key_levels', {}),
                     warnings=data.get('warnings', [])
                 )
@@ -1600,7 +1615,7 @@ If you cannot point to at least two of these as ALREADY HAPPENED, you MUST retur
             stop_loss=None,
             take_profit=None,
             risk_reward=None,
-            reasoning=response_text[:1000],
+            reasoning=response_text,
             order_type='market',
             amd_phase='unknown',
             manipulation_complete=False
@@ -1609,7 +1624,7 @@ If you cannot point to at least two of these as ALREADY HAPPENED, you MUST retur
         return AnalysisResult(
             signal=signal,
             raw_response=response_text,
-            analysis_summary=response_text[:500],
+            analysis_summary=response_text,
             key_levels={},
             warnings=["Could not parse structured response - manual review recommended"]
         )
@@ -1758,7 +1773,7 @@ Respond with JSON:
                 return json.loads(json_match.group(1))
             
             # Fallback
-            return {"recommended_lots": base_lots, "reasoning": response_text[:200], "risk_assessment": "medium"}
+            return {"recommended_lots": base_lots, "reasoning": response_text, "risk_assessment": "medium"}
             
         except Exception as e:
             logger.error(f"Error getting position size recommendation: {e}")
@@ -1878,7 +1893,7 @@ Respond with JSON:
         take_profit = signal.get('take_profit', 0)
         order_type = signal.get('order_type', 'market')
         trade_type = signal.get('trade_type', 'intraday')
-        reasoning = str(signal.get('reasoning', ''))[:1000]
+        reasoning = str(signal.get('reasoning', ''))
         
         # R:R expectations per trade type
         _rr_expectations = {'scalp': '1.5:1', 'intraday': '2:1', 'swing': '3:1'}
@@ -1926,8 +1941,7 @@ A trade analyst has proposed the following trade. Your job is to check it agains
 ## Rules
 - If confidence >= 90% AND no critical risk flags, you MUST verdict APPROVE. High-confidence setups with clean structure should not be second-guessed.
 - Verdict DEMOTE if you find a concrete, specific problem with entry price — not vague concerns.
-- Verdict REJECT only for CRITICAL issues (e.g., SL/TP on wrong side, already at max daily trades). Do NOT reject for truncated reasoning or stylistic concerns.
-- NOTE: Reasoning may be truncated for display - this is NOT a reason to reject. Judge the trade on its merits.
+- Verdict REJECT only for CRITICAL issues (e.g., SL/TP on wrong side, already at max daily trades). Do NOT reject for stylistic concerns.
 - DEMOTE means: convert to a pending limit order at a better entry price (tighter).
   - For LONG: suggested_entry should be BELOW current entry (buy cheaper).
   - For SHORT: suggested_entry should be ABOVE current entry (sell higher).
@@ -2037,7 +2051,7 @@ Respond ONLY with JSON:
 
 ## Trade Breakdown
 """
-        for i, trade in enumerate(trades[:10], 1):  # Limit to 10 trades
+        for i, trade in enumerate(trades[:25], 1):  # Limit to 25 trades
             prompt += f"{i}. {trade.get('symbol', '?')} {trade.get('direction', '?')}: {trade.get('profit_loss', 0):+.2f} ({trade.get('r_multiple', 0):.1f}R)\n"
         
         if session_stats:
@@ -2198,7 +2212,7 @@ Respond with JSON:
             # Fallback if JSON not found
             return {
                 "performance_grade": "C",
-                "summary": response_text[:500],
+                "summary": response_text,
                 "patterns_identified": [],
                 "recurring_mistakes": [],
                 "winning_patterns": [],
@@ -2297,7 +2311,7 @@ Respond with JSON:
             if json_match:
                 return json.loads(json_match.group(1))
             
-            return {"mode": "normal", "reasoning": response_text[:200]}
+            return {"mode": "normal", "reasoning": response_text}
             
         except Exception as e:
             logger.error(f"Error assessing scaling: {e}")

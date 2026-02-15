@@ -109,11 +109,51 @@ class TelegramNotifier:
                         return True
                     else:
                         error = await response.text()
+                        print(f"[TELEGRAM] send_message FAILED ({response.status}): {error[:300]}", flush=True)
                         logger.error(f"Telegram API error: {error}")
                         return False
         except Exception as e:
+            print(f"[TELEGRAM] send_message EXCEPTION: {e}", flush=True)
             logger.error(f"Error sending Telegram message: {e}")
             return False
+    
+    async def get_updates(self, offset: int = 0, timeout: int = 1) -> list:
+        """
+        Get incoming updates (messages) from Telegram using long polling.
+        
+        Args:
+            offset: Update ID offset (to acknowledge previous updates)
+            timeout: Long poll timeout in seconds
+            
+        Returns:
+            List of update dicts from Telegram API
+        """
+        if not self.enabled:
+            return []
+        
+        url = f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
+        payload = {"timeout": timeout, "allowed_updates": ["message"]}
+        if offset:
+            payload["offset"] = offset
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=timeout + 10)) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        results = data.get("result", [])
+                        if results:
+                            logger.debug(f"getUpdates: received {len(results)} update(s)")
+                        return results
+                    else:
+                        error_text = await response.text()
+                        logger.warning(f"getUpdates HTTP {response.status}: {error_text[:200]}")
+                        return []
+        except asyncio.TimeoutError:
+            return []  # Normal for long polling
+        except Exception as e:
+            logger.debug(f"getUpdates error: {e}")
+            return []
     
     async def notify_trade_opened(
         self,

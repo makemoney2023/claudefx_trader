@@ -272,8 +272,12 @@ class PendingOrderManager:
             if self.order_manager:
                 result = await self.order_manager.cancel_order(ticket)
                 if not result.success:
+                    print(f"[PENDING-CANCEL] MT5 cancel failed for #{ticket}: {result.message}", flush=True)
                     logger.error(f"Failed to cancel order {ticket}: {result.message}")
                     return False
+            else:
+                print(f"[PENDING-CANCEL] No order_manager — cannot cancel #{ticket} on MT5", flush=True)
+                return False
             
             # Update local tracking
             order.status = PendingOrderStatus.CANCELLED if reason != "expired" else PendingOrderStatus.EXPIRED
@@ -364,6 +368,100 @@ class PendingOrderManager:
         except Exception as e:
             logger.error(f"Error syncing with MT5: {e}")
             return {"error": str(e)}
+    
+    async def import_from_mt5(self) -> Dict[str, Any]:
+        """
+        Import existing MT5 pending orders into the tracker on startup.
+        
+        This ensures orders placed in previous sessions survive restarts
+        and can be re-evaluated by the pending order re-eval logic.
+        
+        Returns:
+            Summary with count of imported orders
+        """
+        if not self.mt5_client:
+            return {"imported": 0, "error": "MT5 client not available"}
+        
+        try:
+            mt5_orders = await self.mt5_client.get_orders()
+            if not mt5_orders:
+                logger.info("No MT5 pending orders to import")
+                return {"imported": 0}
+            
+            # MT5 order types: 2=buy_limit, 3=sell_limit, 4=buy_stop, 5=sell_stop
+            _type_map = {2: 'buy_limit', 3: 'sell_limit', 4: 'buy_stop', 5: 'sell_stop'}
+            _dir_map = {2: 'long', 3: 'short', 4: 'long', 5: 'short'}
+            
+            imported = 0
+            skipped = 0
+            for o in mt5_orders:
+                ticket = o.get('ticket')
+                if not ticket or ticket in self.pending_orders:
+                    continue  # Already tracked
+                
+                # Only import orders placed by this bot (comment contains "ICT_Bot")
+                comment = o.get('comment', '')
+                if 'ICT_Bot' not in comment:
+                    skipped += 1
+                    continue
+                
+                order_type_int = o.get('type', -1)
+                if order_type_int not in _type_map:
+                    continue  # Not a pending order type
+                
+                # Parse creation time
+                # MT5 time_setup is a UTC epoch — but the broker server clock may
+                # differ from local time, so clamp to no later than now.
+                time_setup = o.get('time_setup')
+                if time_setup:
+                    try:
+                        created_at = datetime.fromtimestamp(time_setup)
+                        # Clamp: if MT5 server is ahead of local clock, use now()
+                        if created_at > datetime.now():
+                            created_at = datetime.now()
+                    except Exception:
+                        created_at = datetime.now()
+                else:
+                    created_at = datetime.now()
+                
+                # Default expiration: 8 hours from creation (max kill-zone window)
+                default_expiry = created_at + timedelta(hours=8)
+                # If already past that, set expiry to 2 hours from now
+                # so Claude re-eval has a chance to evaluate before they auto-expire
+                if default_expiry < datetime.now():
+                    default_expiry = datetime.now() + timedelta(hours=2)
+                
+                order = PendingOrder(
+                    ticket=ticket,
+                    symbol=o.get('symbol', ''),
+                    order_type=_type_map[order_type_int],
+                    direction=_dir_map[order_type_int],
+                    volume=o.get('volume', 0.01),
+                    price=o.get('price_open', 0.0),
+                    stop_loss=o.get('sl'),
+                    take_profit=o.get('tp'),
+                    created_at=created_at,
+                    expiration=default_expiry,
+                    status=PendingOrderStatus.ACTIVE
+                )
+                
+                self.pending_orders[ticket] = order
+                imported += 1
+                print(
+                    f"[PENDING-IMPORT] #{ticket} {order.symbol} {order.order_type} "
+                    f"@ {order.price} (age: {(datetime.now() - created_at).total_seconds()/60:.0f}min, "
+                    f"expires in {order.minutes_remaining:.0f}min)",
+                    flush=True
+                )
+            
+            if skipped > 0:
+                logger.info(f"Skipped {skipped} non-bot pending orders (no ICT_Bot comment)")
+            logger.info(f"Imported {imported} pending orders from MT5")
+            return {"imported": imported, "skipped": skipped}
+            
+        except Exception as e:
+            logger.error(f"Error importing orders from MT5: {e}")
+            return {"imported": 0, "error": str(e)}
     
     def get_active_orders(self, symbol: Optional[str] = None) -> List[PendingOrder]:
         """Get all active pending orders."""

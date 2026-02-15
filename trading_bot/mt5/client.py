@@ -1462,6 +1462,7 @@ class MT5Client:
                     "sl": float(o.sl) if o.sl else None,
                     "tp": float(o.tp) if o.tp else None,
                     "time_setup": o.time_setup,
+                    "magic": int(o.magic) if hasattr(o, 'magic') else 0,
                     "comment": str(o.comment) if o.comment else ""
                 }
                 for o in orders

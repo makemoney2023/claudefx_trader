@@ -45,6 +45,7 @@ _trade_journal = None
 _bot_task: Optional[asyncio.Task] = None
 _firecrawl_service = None
 _intelligence_task: Optional[asyncio.Task] = None
+_command_handler = None
 
 
 @asynccontextmanager
@@ -126,6 +127,16 @@ async def lifespan(app: FastAPI):
     logger.info("Starting trading bot as background task...")
     _bot_task = asyncio.create_task(_run_bot_background())
     
+    # Start Telegram command handler (polling for /commands)
+    global _command_handler
+    try:
+        from ..utils.telegram_commands import TelegramCommandHandler
+        _command_handler = TelegramCommandHandler(bot_instance=None)  # bot set after init
+        await _command_handler.start_polling()
+        logger.info("Telegram command handler started")
+    except Exception as e:
+        logger.warning(f"Telegram command handler failed to start: {e}")
+    
     # Log API key for protected endpoints
     api_key = get_api_key()
     logger.info("=" * 50)
@@ -150,6 +161,10 @@ async def lifespan(app: FastAPI):
             await _bot_task
         except asyncio.CancelledError:
             pass
+    
+    # Stop Telegram command handler
+    if _command_handler:
+        _command_handler.stop()
     
     # Stop intelligence refresh task
     if _intelligence_task:
@@ -336,6 +351,11 @@ async def _run_bot_background():
         
         # CRITICAL: Share bot's services with API routes
         _sync_bot_services_to_api(_bot_instance)
+        
+        # Give Telegram command handler access to the bot instance
+        if _command_handler:
+            _command_handler.set_bot_instance(_bot_instance)
+            print("[BOT] Telegram command handler linked to bot instance", flush=True)
         
         _bot_instance.running = True
         

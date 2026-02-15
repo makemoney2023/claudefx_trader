@@ -249,6 +249,7 @@ class RiskManager:
         
         if self.daily_risk_used + effective_risk_pct > self.max_daily_risk:
             errors.append(f"Would exceed daily risk limit ({self.max_daily_risk * 100}%)")
+            print(f"[RISK] {symbol}: daily_risk_used={self.daily_risk_used*100:.1f}% + this_trade={effective_risk_pct*100:.1f}% = {(self.daily_risk_used+effective_risk_pct)*100:.1f}% > max={self.max_daily_risk*100:.0f}%", flush=True)
         
         # Check if SL is too tight (less than spread + buffer)
         pip_size = self._get_pip_size(symbol)
@@ -317,8 +318,11 @@ class RiskManager:
         return adjusted_entry, adjusted_sl, adjusted_tp
     
     def update_daily_risk(self, risk_used: float):
-        """Update the daily risk counter."""
+        """Update the daily risk counter. Accepts negative values to reclaim risk budget."""
         self.daily_risk_used += risk_used
+        # Clamp to >= 0 (can go negative if reclaiming more than was tracked)
+        if self.daily_risk_used < 0:
+            self.daily_risk_used = 0.0
         logger.debug(f"Daily risk updated: {self.daily_risk_used * 100:.2f}%")
     
     def reset_daily_risk(self):
