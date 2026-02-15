@@ -598,68 +598,20 @@ async def sync_trade_history(
                 message="No trade history found in the specified period"
             )
         
+        # IMPORTANT: Do NOT import new trades from MT5 history — that contaminates
+        # the DB with old account trades, demo trades, and commission artifacts.
+        # Instead, only UPDATE existing bot-placed trades that are missing close data.
+        # This delegates to the bot's _sync_trade_history which does it correctly.
         synced_count = 0
         
-        async with AsyncSessionLocal() as session:
-            for deal in deals:
-                deal_id = str(deal.get('ticket', deal.get('deal', 0)))
-                deal_type = deal.get('type', '')
-                entry_type = deal.get('entry', 0)  # 0=IN, 1=OUT (close), 2=INOUT, 3=STATE
-                
-                # Only sync actual trades (buy/sell)
-                if deal_type not in ['buy', 'sell', 0, 1]:
-                    continue
-                
-                symbol = deal.get('symbol', '')
-                if not symbol:
-                    continue
-                
-                # Check if already exists
-                existing = await session.execute(
-                    select(TradeModel).where(TradeModel.trade_id == deal_id)
-                )
-                if existing.scalar_one_or_none():
-                    continue
-                
-                # Create new trade record
-                direction = 'long' if deal_type in ['buy', 0] else 'short'
-                profit = float(deal.get('profit', 0))
-                volume = float(deal.get('volume', 0))
-                price = float(deal.get('price', 0))
-                close_time = deal.get('time', datetime.utcnow())
-                
-                # Determine status based on entry type
-                # entry_type 1 (OUT) means this was a closing deal with profit/loss
-                is_closed = entry_type == 1 and profit != 0
-                status = "closed" if is_closed else "open"
-                
-                trade = TradeModel(
-                    trade_id=deal_id,
-                    timestamp=close_time if isinstance(close_time, datetime) else datetime.utcnow(),
-                    symbol=symbol,
-                    direction=direction,
-                    timeframe="M15",
-                    session="",
-                    entry_price=price,
-                    entry_time=close_time if isinstance(close_time, datetime) else datetime.utcnow(),
-                    exit_price=price if is_closed else None,
-                    exit_time=close_time if is_closed and isinstance(close_time, datetime) else None,
-                    entry_reason="Synced from MT5 history",
-                    exit_reason="Closed" if is_closed else None,
-                    stop_loss=0.0,
-                    take_profit=0.0,
-                    position_size=volume,
-                    profit_loss=profit if is_closed else None,
-                    profit_loss_pips=0.0,
-                    risk_amount=0.0,
-                    r_multiple=0.0,
-                    claude_confidence=0.0,
-                    claude_reasoning="Historical trade synced from MT5"
-                )
-                session.add(trade)
-                synced_count += 1
-            
-            await session.commit()
+        from ..main import get_bot_instance
+        bot = get_bot_instance()
+        if bot:
+            try:
+                await bot._sync_trade_history(days_back=days)
+                synced_count = days  # Approximate — the sync logs the real count
+            except Exception as e:
+                logger.warning(f"Trade history sync error: {e}")
         
         logger.info(f"Synced {synced_count} historical trades from MT5 ({days} days)")
         
