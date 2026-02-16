@@ -1085,16 +1085,16 @@ class TestTradeJudgePerformance:
             f"Demoted R:R ({demoted_rr:.2f}) should be >= original ({original_rr:.2f})"
         )
     
-    def test_judge_does_not_demote_high_confidence_instruction(self):
-        """The judge prompt should instruct APPROVE for >= 90% confidence unless critical flags."""
+    def test_judge_evaluates_on_merit(self):
+        """The judge prompt should evaluate trades on their own merit, not force-approve at any confidence."""
         import inspect
         from trading_bot.llm.claude_client import ClaudeClient
         
         source = inspect.getsource(ClaudeClient.judge_trade)
-        assert '90%' in source or '0.90' in source or '>= 90' in source, \
-            "Judge prompt should mention 90% confidence threshold for auto-approve"
-        assert 'MUST' in source, \
-            "Judge prompt should use strong language (MUST) for high-confidence auto-approve"
+        assert 'on its own merit' in source or 'merit' in source, \
+            "Judge prompt should evaluate trades on merit"
+        assert 'confidence alone does not guarantee' in source or 'strong consideration' in source, \
+            "Judge should consider confidence but not force-approve based on it alone"
     
     def test_judge_prompt_includes_learning_context(self):
         """The judge prompt should include the learning_context parameter."""

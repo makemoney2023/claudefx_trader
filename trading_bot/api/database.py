@@ -216,6 +216,14 @@ class PositionStateModel(Base):
     tp2_hit: Mapped[bool] = mapped_column(Boolean, default=False)
     initial_volume: Mapped[float] = mapped_column(Float, default=0)
     
+    # Peak profit tracking (aggressive profit protection — survives restart)
+    peak_r_multiple: Mapped[float] = mapped_column(Float, default=0)
+    peak_unrealized_pnl: Mapped[float] = mapped_column(Float, default=0)
+    near_tp_reached: Mapped[bool] = mapped_column(Boolean, default=False)
+    
+    # Close reason (for reversal re-entry logic across restarts)
+    close_reason: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, default=None)
+    
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -388,6 +396,8 @@ async def init_db():
             ("analysis_logs", "trade_type", "VARCHAR(20)"),
             ("analysis_logs", "outcome_price", "FLOAT"),
             ("analysis_logs", "outcome_result", "VARCHAR(20)"),
+            # Persist close_reason for reversal re-entry across restarts
+            ("position_states", "close_reason", "VARCHAR(100)"),
         ]
         for table, column, col_type in migrations:
             try:

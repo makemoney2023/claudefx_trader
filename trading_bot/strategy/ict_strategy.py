@@ -82,7 +82,7 @@ class TradeSetup:
     def is_valid(self) -> bool:
         """Check if setup meets minimum criteria."""
         return (
-            self.risk_reward >= settings.trading.min_risk_reward and
+            self.risk_reward >= 1.0 and
             self.confidence >= 0.6 and
             self.stop_loss > 0 and
             self.optimal_entry > 0

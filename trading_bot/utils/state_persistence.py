@@ -111,17 +111,45 @@ class StatePersistence:
         """Load notified milestones."""
         return set(self.get('notified_milestones', []))
     
-    def save_daily_stats(self, daily_trades: int, daily_pnl: float, date: str):
-        """Save daily statistics."""
+    def save_daily_stats(self, daily_trades: int, daily_pnl: float, date: str,
+                         daily_risk_used: float = 0.0):
+        """Save daily statistics including risk accumulator."""
         self.set('daily_stats', {
             'trades': daily_trades,
             'pnl': daily_pnl,
-            'date': date
+            'date': date,
+            'daily_risk_used': daily_risk_used,
         })
     
     def load_daily_stats(self) -> Dict[str, Any]:
         """Load daily statistics."""
-        return self.get('daily_stats', {'trades': 0, 'pnl': 0.0, 'date': ''})
+        return self.get('daily_stats', {
+            'trades': 0, 'pnl': 0.0, 'date': '', 'daily_risk_used': 0.0
+        })
+    
+    def save_signal_hashes(self, hashes_with_expiry: Dict[str, str]):
+        """Save signal dedup hashes with their expiry timestamps (ISO format)."""
+        self.set('signal_hashes', hashes_with_expiry)
+    
+    def load_signal_hashes(self) -> Dict[str, str]:
+        """Load signal dedup hashes. Returns {hash: expiry_iso_string}."""
+        return self.get('signal_hashes', {})
+    
+    def save_reversal_cooldowns(self, cooldowns: Dict[str, str]):
+        """Save reversal cooldowns. Keys=symbols, values=ISO timestamp strings."""
+        self.set('reversal_cooldowns', cooldowns)
+    
+    def load_reversal_cooldowns(self) -> Dict[str, str]:
+        """Load reversal cooldowns."""
+        return self.get('reversal_cooldowns', {})
+    
+    def save_pending_order_metadata(self, metadata: Dict[str, Any]):
+        """Save pending order metadata (ticket -> expiration, etc.) for restart recovery."""
+        self.set('pending_orders', metadata)
+    
+    def load_pending_order_metadata(self) -> Dict[str, Any]:
+        """Load pending order metadata."""
+        return self.get('pending_orders', {})
 
 
 # Global instance
@@ -152,11 +180,15 @@ def save_full_state(bot) -> bool:
         # Save streaks
         persistence.save_streaks(bot.win_streak, bot.loss_streak)
         
-        # Save daily stats
+        # Save daily stats (including daily_risk_used)
+        daily_risk = 0.0
+        if hasattr(bot, 'risk_manager') and bot.risk_manager:
+            daily_risk = bot.risk_manager.daily_risk_used
         persistence.save_daily_stats(
             bot.daily_trades,
             bot.daily_pnl,
-            bot.last_reset_date.isoformat() if bot.last_reset_date else ''
+            bot.last_reset_date.isoformat() if bot.last_reset_date else '',
+            daily_risk_used=daily_risk,
         )
         
         # Save notified milestones
@@ -185,6 +217,36 @@ def save_full_state(bot) -> bool:
                 ]
             })
         
+        # Save signal dedup hashes with expiry
+        if hasattr(bot, '_signal_hash_expiry') and bot._signal_hash_expiry:
+            hashes = {
+                h: ts.isoformat()
+                for h, ts in bot._signal_hash_expiry.items()
+            }
+            persistence.save_signal_hashes(hashes)
+        
+        # Save reversal cooldowns
+        if hasattr(bot, '_reversal_cooldowns') and bot._reversal_cooldowns:
+            cooldowns = {
+                symbol: ts.isoformat()
+                for symbol, ts in bot._reversal_cooldowns.items()
+            }
+            persistence.save_reversal_cooldowns(cooldowns)
+        
+        # Save pending order metadata (expiration times)
+        if hasattr(bot, 'pending_order_manager') and bot.pending_order_manager:
+            po_meta = {}
+            for ticket, order in bot.pending_order_manager.pending_orders.items():
+                if order.is_active:
+                    po_meta[str(ticket)] = {
+                        'expiration': order.expiration.isoformat(),
+                        'symbol': order.symbol,
+                        'direction': order.direction,
+                        'order_type': order.order_type,
+                        'price': order.price,
+                    }
+            persistence.save_pending_order_metadata(po_meta)
+        
         logger.info("Bot state saved successfully")
         return True
         
@@ -211,15 +273,31 @@ def load_full_state(bot) -> bool:
         bot.win_streak = win_streak
         bot.loss_streak = loss_streak
         
-        # Load daily stats
+        # Load daily stats (including daily_risk_used)
         daily_stats = persistence.load_daily_stats()
         if daily_stats.get('date'):
             from datetime import date
             try:
-                bot.last_reset_date = date.fromisoformat(daily_stats['date'])
-                bot.daily_trades = daily_stats.get('trades', 0)
-                bot.daily_pnl = daily_stats.get('pnl', 0.0)
-            except:
+                saved_date = date.fromisoformat(daily_stats['date'])
+                bot.last_reset_date = saved_date
+                # Only restore if same day -- risk resets daily
+                if saved_date == date.today():
+                    bot.daily_trades = daily_stats.get('trades', 0)
+                    bot.daily_pnl = daily_stats.get('pnl', 0.0)
+                    # Restore daily risk used
+                    saved_risk = daily_stats.get('daily_risk_used', 0.0)
+                    if hasattr(bot, 'risk_manager') and bot.risk_manager and saved_risk > 0:
+                        bot.risk_manager.daily_risk_used = saved_risk
+                        logger.info(
+                            f"Restored daily_risk_used: {saved_risk*100:.1f}% "
+                            f"(from same-day state)"
+                        )
+                else:
+                    logger.info(
+                        f"State date {saved_date} != today {date.today()}, "
+                        f"daily stats reset to zero"
+                    )
+            except Exception:
                 pass
         
         # Load notified milestones
@@ -272,6 +350,43 @@ def load_full_state(bot) -> bool:
         # (e.g. inflated P/L from synced deals that weren't bot trades).
         if bot.session_analytics:
             logger.info("Session analytics loaded from database (not from JSON state file)")
+        
+        # Load signal dedup hashes (filter expired)
+        if hasattr(bot, '_recent_signal_hashes') and hasattr(bot, '_signal_hash_expiry'):
+            saved_hashes = persistence.load_signal_hashes()
+            if saved_hashes:
+                now = datetime.now()
+                restored = 0
+                for h, ts_str in saved_hashes.items():
+                    try:
+                        ts = datetime.fromisoformat(ts_str)
+                        # Keep hashes from the last 30 minutes only
+                        if (now - ts).total_seconds() < 1800:
+                            bot._recent_signal_hashes.add(h)
+                            bot._signal_hash_expiry[h] = ts
+                            restored += 1
+                    except (ValueError, TypeError):
+                        pass
+                if restored > 0:
+                    logger.info(f"Restored {restored} signal dedup hashes")
+        
+        # Load reversal cooldowns (filter expired >1 hour)
+        if hasattr(bot, '_reversal_cooldowns'):
+            saved_cooldowns = persistence.load_reversal_cooldowns()
+            if saved_cooldowns:
+                now = datetime.now()
+                for symbol, ts_str in saved_cooldowns.items():
+                    try:
+                        ts = datetime.fromisoformat(ts_str)
+                        if (now - ts).total_seconds() < 3600:
+                            bot._reversal_cooldowns[symbol] = ts
+                    except (ValueError, TypeError):
+                        pass
+                if bot._reversal_cooldowns:
+                    logger.info(
+                        f"Restored reversal cooldowns for: "
+                        f"{list(bot._reversal_cooldowns.keys())}"
+                    )
         
         logger.info("Bot state loaded successfully")
         return True

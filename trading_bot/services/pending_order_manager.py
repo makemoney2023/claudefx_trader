@@ -298,8 +298,13 @@ class PendingOrderManager:
         """
         Sync pending orders with MT5 to detect filled/cancelled orders.
         
+        Checks three sources in order:
+        1. Current pending orders (still active)
+        2. Current open positions (filled and still open)
+        3. Deal history (filled then already closed -- e.g. hit SL/TP fast)
+        
         Returns:
-            Sync results with filled, cancelled, and active counts
+            Sync results with filled, cancelled, filled_closed, and active counts
         """
         if not self.mt5_client:
             return {"error": "MT5 client not available"}
@@ -313,6 +318,7 @@ class PendingOrderManager:
             mt5_positions = await self.mt5_client.get_positions()
             
             filled = []
+            filled_closed = []
             cancelled = []
             still_active = []
             
@@ -323,51 +329,235 @@ class PendingOrderManager:
                 if ticket in mt5_tickets:
                     # Order still pending in MT5
                     still_active.append(ticket)
-                else:
-                    # Order no longer in MT5 - check if it became a position
-                    position_found = any(
-                        p.ticket == ticket or 
-                        (p.symbol == order.symbol and 
-                         abs(p.price_open - order.price) < 0.0001)
-                        for p in mt5_positions
+                    continue
+                
+                # Order no longer in MT5 pending list -- check if it became a position
+                position_found = any(
+                    p.ticket == ticket or 
+                    (p.symbol == order.symbol and 
+                     abs(p.price_open - order.price) < 0.0001)
+                    for p in mt5_positions
+                )
+                
+                if position_found:
+                    # Order was filled and position is still open
+                    order.status = PendingOrderStatus.FILLED
+                    order.fill_time = datetime.now()
+                    for p in mt5_positions:
+                        if p.symbol == order.symbol:
+                            order.fill_price = p.price_open
+                            break
+                    
+                    filled.append(ticket)
+                    self.order_history.append(order)
+                    del self.pending_orders[ticket]
+                    logger.info(f"Order {ticket} filled at {order.fill_price}")
+                    continue
+                
+                # Not in pending orders, not in open positions.
+                # Check deal history -- the order may have filled AND closed
+                # (e.g. hit SL/TP before our next sync cycle)
+                deal_result = await self._check_deal_history_for_order(ticket, order)
+                
+                if deal_result:
+                    # Order filled then closed
+                    order.status = PendingOrderStatus.FILLED
+                    order.fill_time = deal_result.get('fill_time', datetime.now())
+                    order.fill_price = deal_result.get('fill_price', order.price)
+                    
+                    filled_closed.append(ticket)
+                    self.order_history.append(order)
+                    del self.pending_orders[ticket]
+                    
+                    pnl = deal_result.get('total_pnl', 0)
+                    close_price = deal_result.get('close_price', 0)
+                    print(
+                        f"[PENDING-SYNC] Order {ticket} ({order.symbol}) filled then closed "
+                        f"— entry: {order.fill_price}, exit: {close_price}, P/L: ${pnl:.2f} "
+                        f"(detected via deal history)",
+                        flush=True
+                    )
+                    logger.info(
+                        f"Order {ticket} filled at {order.fill_price} then closed at "
+                        f"{close_price} — P/L: ${pnl:.2f}"
                     )
                     
-                    if position_found:
-                        # Order was filled
-                        order.status = PendingOrderStatus.FILLED
-                        order.fill_time = datetime.now()
-                        # Try to get fill price from position
-                        for p in mt5_positions:
-                            if p.symbol == order.symbol:
-                                order.fill_price = p.price_open
-                                break
-                        
-                        filled.append(ticket)
-                        self.order_history.append(order)
-                        del self.pending_orders[ticket]
-                        logger.info(f"Order {ticket} filled at {order.fill_price}")
-                    else:
-                        # Order was cancelled externally
-                        order.status = PendingOrderStatus.CANCELLED
-                        order.cancel_reason = "external"
-                        
-                        cancelled.append(ticket)
-                        self.order_history.append(order)
-                        del self.pending_orders[ticket]
-                        print(f"[PENDING-SYNC] Order {ticket} ({order.symbol}) not found in MT5 orders or positions — marked as externally cancelled", flush=True)
-                        logger.info(f"Order {ticket} was cancelled externally")
+                    # Update the DB trade record with real P/L
+                    await self._update_trade_db_for_filled_closed(ticket, order, deal_result)
+                else:
+                    # Truly cancelled externally
+                    order.status = PendingOrderStatus.CANCELLED
+                    order.cancel_reason = "external"
+                    
+                    cancelled.append(ticket)
+                    self.order_history.append(order)
+                    del self.pending_orders[ticket]
+                    print(
+                        f"[PENDING-SYNC] Order {ticket} ({order.symbol}) not found in MT5 "
+                        f"orders, positions, or deal history — marked as externally cancelled",
+                        flush=True
+                    )
+                    logger.info(f"Order {ticket} was cancelled externally")
             
             return {
                 "filled": len(filled),
+                "filled_closed": len(filled_closed),
                 "cancelled": len(cancelled),
                 "active": len(still_active),
                 "filled_tickets": filled,
+                "filled_closed_tickets": filled_closed,
                 "cancelled_tickets": cancelled
             }
             
         except Exception as e:
             logger.error(f"Error syncing with MT5: {e}")
             return {"error": str(e)}
+    
+    async def _check_deal_history_for_order(
+        self, ticket: int, order: 'PendingOrder'
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Check MT5 deal history to see if a pending order was filled then closed.
+        
+        In MT5, when a pending order fills:
+        - A deal with entry=0 (IN) is created, with deal.order == original_order_ticket
+        - If the position then closes (SL/TP/manual), a deal with entry=1 (OUT)
+          is created with the same position_id
+        
+        Args:
+            ticket: The original pending order ticket
+            order: The PendingOrder object
+            
+        Returns:
+            Dict with fill/close details if found, None if not filled
+        """
+        try:
+            # Search deals from when the order was created
+            start_time = order.created_at - timedelta(minutes=5)
+            end_time = datetime.now()
+            
+            deals = await self.mt5_client.get_history(
+                start_time, end_time, symbol=order.symbol
+            )
+            
+            if not deals:
+                return None
+            
+            # Look for the opening deal: entry=0 (IN) and order ticket matches
+            opening_deal = None
+            for deal in deals:
+                if deal.get('entry') == 0 and deal.get('order') == ticket:
+                    opening_deal = deal
+                    break
+            
+            if not opening_deal:
+                return None
+            
+            # Found the fill. Now look for the closing deal with same position_id
+            position_id = opening_deal.get('position_id')
+            closing_deal = None
+            
+            if position_id:
+                for deal in deals:
+                    if (deal.get('entry') == 1 and 
+                        deal.get('position_id') == position_id):
+                        closing_deal = deal
+                        break
+            
+            result = {
+                'filled': True,
+                'fill_price': opening_deal.get('price', order.price),
+                'fill_time': opening_deal.get('time', datetime.now()),
+                'position_id': position_id,
+                'opening_deal_ticket': opening_deal.get('ticket'),
+            }
+            
+            if closing_deal:
+                profit = float(closing_deal.get('profit', 0))
+                commission = float(closing_deal.get('commission', 0))
+                swap = float(closing_deal.get('swap', 0))
+                # Also add commission from opening deal (some brokers split it)
+                open_commission = float(opening_deal.get('commission', 0))
+                
+                result.update({
+                    'closed': True,
+                    'close_price': closing_deal.get('price', 0),
+                    'close_time': closing_deal.get('time', datetime.now()),
+                    'profit': profit,
+                    'commission': commission + open_commission,
+                    'swap': swap,
+                    'total_pnl': profit + commission + open_commission + swap,
+                    'closing_deal_ticket': closing_deal.get('ticket'),
+                })
+            else:
+                # Filled but no closing deal found -- position may still be open
+                # under a different ticket. This shouldn't normally happen since
+                # we already checked open positions, but handle gracefully.
+                result['closed'] = False
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error checking deal history for order {ticket}: {e}")
+            return None
+    
+    async def _update_trade_db_for_filled_closed(
+        self, ticket: int, order: 'PendingOrder', deal_result: Dict[str, Any]
+    ) -> None:
+        """
+        Update the TradeModel in the DB when we detect a filled-then-closed order.
+        
+        This prevents the main.py trade sync from later marking it as
+        cancelled with $0 P/L.
+        """
+        try:
+            from ..api.database import async_session, TradeModel
+            from sqlalchemy import select
+            
+            trade_id = str(ticket)
+            
+            async with async_session() as session:
+                result = await session.execute(
+                    select(TradeModel).where(TradeModel.trade_id == trade_id)
+                )
+                trade = result.scalar_one_or_none()
+                
+                if not trade:
+                    logger.warning(
+                        f"No TradeModel found for ticket {ticket} to update "
+                        f"with filled-then-closed data"
+                    )
+                    return
+                
+                close_price = deal_result.get('close_price', 0)
+                total_pnl = deal_result.get('total_pnl', 0)
+                close_time = deal_result.get('close_time', datetime.now())
+                fill_price = deal_result.get('fill_price', order.price)
+                
+                trade.entry_price = fill_price
+                trade.exit_price = close_price
+                trade.profit_loss = total_pnl
+                trade.exit_time = close_time if isinstance(close_time, datetime) else datetime.now()
+                trade.exit_reason = "SL/TP hit (filled-then-closed, detected via deal history)"
+                
+                await session.commit()
+                
+                print(
+                    f"[PENDING-SYNC] Updated DB trade {trade_id} ({order.symbol}): "
+                    f"entry={fill_price}, exit={close_price}, P/L=${total_pnl:.2f}",
+                    flush=True
+                )
+                logger.info(
+                    f"Updated TradeModel {trade_id} with filled-then-closed data: "
+                    f"P/L=${total_pnl:.2f}"
+                )
+                
+        except Exception as e:
+            logger.error(
+                f"Error updating trade DB for filled-then-closed order {ticket}: {e}"
+            )
+            import traceback
+            traceback.print_exc()
     
     async def import_from_mt5(self) -> Dict[str, Any]:
         """

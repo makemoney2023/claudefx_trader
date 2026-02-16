@@ -155,6 +155,9 @@ class TradeSignal:
     amd_phase: str = "unknown"      # accumulation, manipulation, distribution, unknown
     manipulation_complete: bool = False  # True if Judas swing reversal confirmed
     
+    # Reversal re-entry flag (bypasses direction flip cooldown)
+    reversal_reentry: bool = False
+    
     @property
     def is_valid(self) -> bool:
         """Check if signal meets minimum requirements."""
@@ -911,7 +914,7 @@ IMPORTANT: If you see ACTIVE DISPLACEMENT (strong candles with follow-through), 
   D1/H4 are ranging or unclear. Scalps do NOT require full HTF alignment.
 - Requirements: Must have at least 2 confluences on M5/M1 (e.g., OB + FVG, sweep + displacement)
 - SL: Tight — just beyond the M1 structure level (typically 5-15 pips)
-- R:R: Minimum 1.5:1 (lower threshold than intraday since high win-rate setups)
+- R:R: Target 1.5:1 (lower threshold than intraday since high win-rate setups)
 - Confidence: Can be 60%+ with clean M5/M1 structure, no need for 75%+
 
 ### INTRADAY (trade_type = "intraday")
@@ -920,7 +923,7 @@ IMPORTANT: If you see ACTIVE DISPLACEMENT (strong candles with follow-through), 
 - Valid when: H1 structure supports the trade direction, M15 shows entry setup
 - Requirements: H1 bias + M15 setup + M5/M1 entry confirmation
 - SL: Beyond the M15 structure level
-- R:R: Minimum 2:1
+- R:R: Target 2:1
 
 ### SWING (trade_type = "swing")
 - Setup identified on H4/D1 charts, entry on M15/H1
@@ -928,21 +931,23 @@ IMPORTANT: If you see ACTIVE DISPLACEMENT (strong candles with follow-through), 
 - Valid when: D1 and H4 agree on direction with clear structure
 - Requirements: Full D1/H4/H1 alignment + key level confluence
 - SL: Beyond the H1/H4 structure level
-- R:R: Minimum 3:1
+- R:R: Target 3:1
 
-⚠️ **R:R IS NON-NEGOTIABLE**: Your TP MUST be at least the minimum R:R × your SL distance.
-If your SL is $82 from entry, your TP must be at least $164 away (2:1 for intraday).
-If you cannot find a structural target that far away, either:
+⚠️ **R:R GUIDANCE**: Aim for at least the target R:R for each trade type (1.5:1 scalp, 2:1 intraday, 3:1 swing).
+If your R:R is below the target, you need exceptional confluence and high win probability to justify it
+(e.g., confirmed liquidity sweep into a strong OB with displacement on multiple timeframes).
+If you cannot find a structural TP target that provides reasonable reward, either:
 1. TIGHTEN YOUR SL — use M5/M1 structure instead of M15 to reduce risk distance
 2. Return no_trade — the setup doesn't have enough room to run
-NEVER submit a trade where TP distance < SL distance. That is negative expectancy.
+NEVER submit a trade where TP distance < SL distance. That is negative expectancy and will be rejected.
 
-⚠️ **CRYPTO R:R REQUIREMENTS** (higher minimums due to significant dollar risk):
-- Crypto SCALP: Minimum 2.0:1 R:R
-- Crypto INTRADAY: Minimum 2.5:1 R:R  
-- Crypto SWING: Minimum 3.5:1 R:R
+⚠️ **CRYPTO R:R GUIDANCE** (aim higher due to significant dollar risk per pip):
+- Crypto SCALP: Aim for 2.0:1 R:R
+- Crypto INTRADAY: Aim for 2.5:1 R:R
+- Crypto SWING: Aim for 3.5:1 R:R
 For BTC/ETH especially: prefer TIGHT SLs using M1/M5 structure to keep risk small,
 then target meaningful structural levels (IPDA, PDH/PDL, PWH/PWL) for TP.
+Lower R:R is acceptable only with A+ confluence (multiple confirmed ICT factors).
 
 ⚠️ SCALP OPPORTUNITY RULE: When D1/H4 are ranging/unclear but M5/M1 shows
 a textbook ICT setup (clean sweep of liquidity + displacement + FVG/OB retest),
@@ -1308,7 +1313,7 @@ If you cannot point to at least two of these as ALREADY HAPPENED, you MUST retur
   - 0.80-0.89: Three+ confirmations, strong confluence, kill zone timing
   - 0.90-1.00: Full confluence: swing validation + displacement + sweep + FVG/OB + volume
   Do NOT park at exactly 0.75 every time. Your confidence MUST vary based on the actual evidence.
-- Only recommend trades with minimum 1:2 risk-reward ratio
+- Aim for at least 1.5:1 risk-reward on scalps, 2:1 on intraday, 3:1 on swing. Lower R:R is acceptable only with exceptional confluence.
 - Consider the current session (kill zone timing) -- outside kill zones, reduce confidence but still analyze
 - Identify specific price levels for entry, SL, and TP using M1/M5 precision
 - **CRITICAL: SL must NEVER equal entry price.** For LONG trades, SL must be placed BELOW entry (beyond the nearest swing low or OB). For SHORT trades, SL must be placed ABOVE entry (beyond the nearest swing high or OB). A zero-distance SL is invalid and will be rejected.
@@ -1954,9 +1959,9 @@ A trade analyst has proposed the following trade. Your job is to check it agains
 4. Is the current session appropriate for this symbol and setup?
 
 ## Rules
-- If confidence >= 90% AND no critical risk flags, you MUST verdict APPROVE. High-confidence setups with clean structure should not be second-guessed.
+- Evaluate every trade on its own merit — technical setup quality, R:R, structure alignment, and known patterns. High-confidence signals with clean structure deserve strong consideration, but confidence alone does not guarantee approval.
 - Verdict DEMOTE if you find a concrete, specific problem with entry price — not vague concerns.
-- Verdict REJECT only for CRITICAL issues (e.g., SL/TP on wrong side, already at max daily trades). Do NOT reject for stylistic concerns.
+- Verdict REJECT only for CRITICAL issues (e.g., SL/TP on wrong side, already at max daily trades, matches a known losing pattern). Do NOT reject for stylistic concerns.
 - **NEVER reject a trade solely because of position size % when the position is AT BROKER MINIMUM LOT SIZE.** The trader cannot go smaller — this is the smallest possible position. Evaluate purely on technical merit (setup quality, HTF alignment, known patterns). The trader accepts the elevated risk on minimum-lot symbols because the reward potential justifies it.
 - DEMOTE means: convert to a pending limit order at a better entry price (tighter).
   - For LONG: suggested_entry should be BELOW current entry (buy cheaper).

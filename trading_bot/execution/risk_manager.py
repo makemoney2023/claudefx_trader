@@ -237,17 +237,11 @@ class RiskManager:
             risk_reward = 0
             errors.append("Invalid stop loss distance")
         
-        # Trade-type-aware minimum R:R thresholds
-        rr_thresholds = {
-            'scalp': 1.5,
-            'intraday': 2.0,
-            'swing': 3.0,
-        }
-        effective_min_rr = rr_thresholds.get((trade_type or '').lower(), self.min_risk_reward)
-        
-        # Check minimum R:R (use 0.01 tolerance for floating point comparison)
-        if risk_reward < (effective_min_rr - 0.01):
-            errors.append(f"Risk/reward {risk_reward:.2f} below minimum {effective_min_rr} ({trade_type or 'default'})")
+        # Hard floor: R:R must be >= 1.0 (reward must exceed risk).
+        # Borderline R:R (between 1.0 and the target) is handled by the Trade Judge,
+        # not blocked here. No hardcoded category floors — Claude's analysis is trusted.
+        if risk_reward < 0.99:
+            errors.append(f"Risk/reward {risk_reward:.2f} below 1.0 — reward less than risk")
         
         # Check daily risk limit using the actual risk % from scaling if provided
         position_size = self.calculate_position_size(

@@ -532,6 +532,26 @@ class TradingBot:
                 _imported = import_result.get('imported', 0)
                 if _imported > 0:
                     print(f"[INIT] Imported {_imported} pending order(s) from MT5 into tracker", flush=True)
+                    # Restore original expiration times from persisted state
+                    try:
+                        persistence = get_persistence()
+                        po_meta = persistence.load_pending_order_metadata()
+                        if po_meta:
+                            _restored_exp = 0
+                            for ticket, order in self.pending_order_manager.pending_orders.items():
+                                meta = po_meta.get(str(ticket))
+                                if meta and meta.get('expiration'):
+                                    try:
+                                        original_exp = datetime.fromisoformat(meta['expiration'])
+                                        if original_exp > datetime.now():
+                                            order.expiration = original_exp
+                                            _restored_exp += 1
+                                    except (ValueError, TypeError):
+                                        pass
+                            if _restored_exp > 0:
+                                print(f"[INIT] Restored original expiration for {_restored_exp} pending order(s)", flush=True)
+                    except Exception as e:
+                        logger.warning(f"Could not restore pending order metadata: {e}")
                 else:
                     print(f"[INIT] No pending orders to import from MT5", flush=True)
             except Exception as e:
@@ -2396,58 +2416,8 @@ class TradingBot:
             else:
                 logger.info(f"R:R OK for {symbol}: {actual_rr:.2f} (min {min_rr:.1f})")
             
-            # ============================================
-            # MINIMUM TP DISTANCE FLOOR (A6.5)
-            # Even with good R:R, the absolute TP distance must be
-            # meaningful for the asset. A $100 TP on BTC is worthless.
-            # Tight SL = low risk (good), but TP must still be worth it.
-            # ============================================
-            # Minimum TP distances as % of entry price per asset category
-            # These ensure the profit target justifies the trade's costs/effort
-            _MIN_TP_PCT = {
-                'crypto': 0.005,   # 0.5% — BTC@68k = $340, ETH@2k = $10, SOL@85 = $0.43
-                'metal':  0.004,   # 0.4% — Gold@2800 = $11.2
-                'forex':  0.003,   # 0.3% — EURUSD@1.08 = 32 pips
-                'oil':    0.005,   # 0.5%
-                'index':  0.003,   # 0.3%
-            }
-            # NOTE: This is a SAFETY NET for garbage signals only.
-            # The real TP quality comes from the R:R enforcement above (A6),
-            # which uses Claude's actual SL distance × min_rr multiplier.
-            # Crypto R:R: scalp 2.0:1, intraday 2.5:1, swing 3.5:1
-            from .config import get_symbol_spec as _get_spec_a65
-            _spec_a65 = _get_spec_a65(symbol)
-            _min_tp_pct = _MIN_TP_PCT.get(_spec_a65.category, 0.003)
-            _min_tp_dist = _entry * _min_tp_pct
-            _current_tp_dist = abs(_tp - _entry)
-            
-            if _current_tp_dist < _min_tp_dist:
-                # TP is too small in absolute terms — extend it to the minimum floor
-                if _dir == 'long':
-                    _new_tp_floor = _entry + _min_tp_dist
-                else:
-                    _new_tp_floor = _entry - _min_tp_dist
-                
-                logger.warning(
-                    f"[A6.5] {symbol}: TP distance ${_current_tp_dist:.2f} below minimum "
-                    f"${_min_tp_dist:.2f} ({_min_tp_pct*100:.1f}% of entry). "
-                    f"Extending TP from {_tp:.5f} to {_new_tp_floor:.5f}"
-                )
-                print(
-                    f"[TP-FLOOR] {symbol}: TP extended — ${_current_tp_dist:.2f} -> ${_min_tp_dist:.2f} "
-                    f"(entry={_entry:.5f}, old_TP={_tp:.5f}, new_TP={_new_tp_floor:.5f})",
-                    flush=True
-                )
-                trade_signal.take_profit = _new_tp_floor
-                _tp = _new_tp_floor
-                
-                # Recalculate R:R after floor extension (for logging)
-                _new_rr = abs(_tp - _entry) / sl_distance if sl_distance > 0 else 0
-                logger.info(f"[A6.5] {symbol}: New R:R after TP floor: {_new_rr:.1f}:1")
-            else:
-                logger.info(
-                    f"[A6.5] {symbol}: TP distance ${_current_tp_dist:.2f} OK (min ${_min_tp_dist:.2f})"
-                )
+            # Claude's TP is trusted — based on structure, liquidity, IPDA levels.
+            # No hardcoded TP floors or ceilings. R:R enforcement above handles rejection.
             
             # ============================================
             # TRADE QUALITY FILTER (E3)
@@ -2619,9 +2589,9 @@ class TradingBot:
                     bot_state.symbol_complete(symbol, "low_confidence")
                 return
             
-            # R:R was already auto-corrected in the A6 block above (TP extended to meet min R:R).
-            # We do NOT reject based on Claude's self-reported risk_reward field here
-            # because the actual price-based R:R has already been fixed.
+            # R:R was already validated in the A6 block above (rejected if below 1.0,
+            # borderline passed to Trade Judge). Claude's TP/SL are never modified.
+            # We do NOT reject based on Claude's self-reported risk_reward field here.
             # The final validate_trade() call will do the definitive R:R check.
             
             # =============================================
@@ -2630,10 +2600,16 @@ class TradingBot:
             # If Claude just flipped direction on the same symbol within 30 minutes,
             # require higher confidence (85%) to proceed. This prevents the
             # prediction-driven flip-flopping pattern (e.g., LONG 75% -> SHORT 75%).
+            # EXCEPTION: Reversal re-entries bypass this entirely (Claude already confirmed structure).
             flip_cooldown_minutes = 30
             flip_min_confidence = 0.85
             
-            if symbol in self._last_signal_direction:
+            if getattr(trade_signal, 'reversal_reentry', False):
+                logger.info(
+                    f"[FLIP-GUARD] {symbol}: Bypassing cooldown for reversal re-entry "
+                    f"({trade_signal.direction.upper()})"
+                )
+            elif symbol in self._last_signal_direction:
                 last_dir, last_time = self._last_signal_direction[symbol]
                 minutes_since = (datetime.now() - last_time).total_seconds() / 60
                 
@@ -3196,23 +3172,15 @@ class TradingBot:
                                     take_profit_levels['nwog_target'] = nwog_target
                                     logger.info(f"🎯 Added NWOG target @ {nwog_target:.5f}")
                         
-                        # Use TP2 (IPDA level) as primary TP for better 100-pip chance
-                        if take_profit_levels.get('tp2'):
-                            # Calculate distance to ensure it's worth it
-                            tp2_distance = abs(take_profit_levels['tp2'] - _entry_ref)
-                            from .config import get_symbol_spec
-                            _tp_spec = get_symbol_spec(symbol)
-                            tp2_pips = tp2_distance / _tp_spec.pip_size
-                            
-                            if tp2_pips >= 50:  # At least 50 pips for extended target
-                                trade_signal.take_profit = take_profit_levels['tp2']
-                                logger.info(
-                                    f"🎯 Extended TP to IPDA level: {trade_signal.take_profit:.5f} "
-                                    f"({tp2_pips:.0f} pips)"
-                                )
-                            else:
-                                # Keep original or use TP1 (2R)
-                                trade_signal.take_profit = take_profit_levels.get('tp1', original_tp)
+                        # IPDA levels are used for multi-TP management (partial closes),
+                        # but NEVER override Claude's primary TP. Claude's TP is based on
+                        # actual structure/liquidity analysis. IPDA snap was corrupting TP
+                        # (e.g. XAUUSD R:R going from 2.37:1 to 0.02:1).
+                        # Keep Claude's TP as the primary target.
+                        logger.info(
+                            f"IPDA TP levels calculated for {symbol} (multi-TP only, "
+                            f"Claude's TP {trade_signal.take_profit:.5f} preserved as primary)"
+                        )
                         
                         logger.info(f"📊 TP Levels: TP1={take_profit_levels.get('tp1')}, "
                                    f"TP2={take_profit_levels.get('tp2')}, TP3={take_profit_levels.get('tp3')}")
@@ -3252,11 +3220,13 @@ class TradingBot:
                         # R:R below 1.0 after adjustments — hard reject
                         logger.warning(
                             f"[BLOCKED] FINAL R:R CHECK {symbol}: {_final_rr:.2f}:1 < 1.0:1 "
-                            f"after adjustments. Reward < risk. Trade rejected."
+                            f"after adjustments. Reward < risk. Trade rejected. "
+                            f"(entry={_final_entry}, SL={_final_sl}, TP={_final_tp})"
                         )
                         print(
                             f"[BLOCKED] {symbol}: Final R:R {_final_rr:.2f}:1 < 1.0 "
-                            f"after price adjustments. Trade rejected.",
+                            f"after price adjustments. Trade rejected. "
+                            f"(entry={_final_entry}, SL={_final_sl}, TP={_final_tp})",
                             flush=True
                         )
                         return
@@ -3267,64 +3237,9 @@ class TradingBot:
                             f"below target {min_rr:.1f}:1 — Trade Judge will decide."
                         )
                 
-                # =============================================
-                # FINAL PRICE SANITY GATE (absolute protection)
-                # Catches cross-symbol contamination from shared IPDA tracker
-                # =============================================
-                _gate_entry = trade_signal.entry_price or current_price
-                _gate_tp = trade_signal.take_profit
-                _gate_sl = trade_signal.stop_loss
-                
-                if _gate_tp and _gate_entry > 0:
-                    _tp_deviation = abs(_gate_tp - _gate_entry) / _gate_entry
-                    _max_deviation = 0.20 if symbol in self.CRYPTO_SYMBOLS or symbol in self.PRECIOUS_METALS or symbol in self.INDEX_SYMBOLS or symbol in self.OIL_SYMBOLS else 0.10
-                    
-                    if _tp_deviation > _max_deviation:
-                        # TP is insanely far — fall back to R:R based TP
-                        _fallback_sl_dist = abs(_gate_entry - _gate_sl) if _gate_sl else 0
-                        if _fallback_sl_dist > 0:
-                            if trade_signal.direction == 'long':
-                                trade_signal.take_profit = _gate_entry + (_fallback_sl_dist * min_rr)
-                            else:
-                                trade_signal.take_profit = _gate_entry - (_fallback_sl_dist * min_rr)
-                            print(
-                                f"[SAFETY] TP REJECTED for {symbol}: {_gate_tp:.5f} was {_tp_deviation:.0%} from "
-                                f"entry {_gate_entry:.5f}. Reset to {min_rr:.0f}R: {trade_signal.take_profit:.5f}",
-                                flush=True
-                            )
-                            logger.warning(
-                                f"SAFETY GATE: TP {_gate_tp} was {_tp_deviation:.0%} from entry. "
-                                f"Reset to {min_rr:.0f}R: {trade_signal.take_profit}"
-                            )
-                
-                # =============================================
-                # FINAL TP FLOOR (last chance before judge)
-                # Applies same A6.5 minimum TP distance as a final
-                # catch-all after all TP adjustments / safety gates.
-                # =============================================
-                _final_entry_tp = trade_signal.entry_price or current_price
-                _final_tp_now = trade_signal.take_profit
-                if _final_tp_now and _final_entry_tp > 0:
-                    from .config import get_symbol_spec as _get_spec_final
-                    _spec_final = _get_spec_final(symbol)
-                    _MIN_TP_PCT_FINAL = {
-                        'crypto': 0.005, 'metal': 0.004, 'forex': 0.003,
-                        'oil': 0.005, 'index': 0.003,
-                    }
-                    _min_tp_pct_f = _MIN_TP_PCT_FINAL.get(_spec_final.category, 0.003)
-                    _min_tp_dist_f = _final_entry_tp * _min_tp_pct_f
-                    _final_tp_dist_now = abs(_final_tp_now - _final_entry_tp)
-                    
-                    if _final_tp_dist_now < _min_tp_dist_f:
-                        if trade_signal.direction == 'long':
-                            trade_signal.take_profit = _final_entry_tp + _min_tp_dist_f
-                        else:
-                            trade_signal.take_profit = _final_entry_tp - _min_tp_dist_f
-                        print(
-                            f"[TP-FLOOR-FINAL] {symbol}: TP ${_final_tp_dist_now:.2f} -> ${_min_tp_dist_f:.2f} "
-                            f"(was {_final_tp_now:.5f}, now {trade_signal.take_profit:.5f})",
-                            flush=True
-                        )
+                # No hardcoded TP floors or sanity gates — Claude's TP is final.
+                # The FINAL R:R SAFETY NET above handles rejection of bad R:R.
+                # No price fabrication. Accept or reject only.
                 
                 # =============================================
                 # TRADE JUDGE (pre-execution validation)
@@ -3396,51 +3311,27 @@ class TradingBot:
                         else:
                             demoted_entry = round(current_price * 1.001, 5)  # Sell slightly higher
                     
-                    # ---- Guard: demoted entry must still allow meaningful TP ----
-                    # If the demoted entry is so close to the SL that the resulting TP
-                    # (after R:R extension) would be below the minimum profit floor,
-                    # reject the demotion — the trade isn't worth it.
+                    # ---- Guard: R:R must still be >= 1.0 after demotion ----
+                    # No hardcoded TP floors. Just check Claude's TP vs demoted entry.
                     _sl_for_check = trade_signal.stop_loss or 0
                     _demote_sl_dist = abs(demoted_entry - _sl_for_check) if _sl_for_check else 0
-                    from .config import get_symbol_spec
-                    _spec = get_symbol_spec(symbol)
+                    _demote_tp_dist = abs((trade_signal.take_profit or 0) - demoted_entry)
+                    _demote_rr = _demote_tp_dist / _demote_sl_dist if _demote_sl_dist > 0 else 0
                     
-                    # Use same min TP % as A6.5 block
-                    _MIN_TP_PCT_DEMOTE = {
-                        'crypto': 0.005, 'metal': 0.004, 'forex': 0.003,
-                        'oil': 0.005, 'index': 0.003,
-                    }
-                    _min_tp_pct_d = _MIN_TP_PCT_DEMOTE.get(_spec.category, 0.003)
-                    _min_tp_dist_d = demoted_entry * _min_tp_pct_d
-                    
-                    # What would the TP distance be after R:R auto-correction?
-                    # Use same category-aware R:R as A6 block
-                    if _spec.category == 'crypto':
-                        _rr_by_type_d = {'scalp': 2.0, 'intraday': 2.5, 'swing': 3.5}
-                    else:
-                        _rr_by_type_d = {'scalp': 1.5, 'intraday': 2.0, 'swing': 3.0}
-                    _tt = getattr(trade_signal, 'trade_type', 'intraday') or 'intraday'
-                    _min_rr_d = _rr_by_type_d.get(_tt, 2.0)
-                    _projected_tp_dist = max(
-                        abs((trade_signal.take_profit or 0) - demoted_entry),
-                        _demote_sl_dist * _min_rr_d  # R:R extension
-                    )
-                    
-                    # If even the best-case TP is below the floor, reject
-                    if _projected_tp_dist < _min_tp_dist_d and _demote_sl_dist > 0:
+                    if _demote_rr < 1.0 and _demote_sl_dist > 0:
                         logger.warning(
-                            f"[JUDGE] DEMOTE REJECTED for {symbol}: demoted entry {demoted_entry:.5f} "
-                            f"would give TP dist ${_projected_tp_dist:.2f} (min=${_min_tp_dist_d:.2f}). "
-                            f"SL dist=${_demote_sl_dist:.2f}. Trade not worth it."
+                            f"[JUDGE] DEMOTE REJECTED {symbol}: R:R {_demote_rr:.2f}:1 < 1.0 "
+                            f"after demotion to {demoted_entry:.5f}. "
+                            f"SL dist=${_demote_sl_dist:.2f}, TP dist=${_demote_tp_dist:.2f}."
                         )
                         print(
-                            f"[JUDGE] DEMOTE REJECTED {symbol}: TP dist=${_projected_tp_dist:.2f} "
-                            f"< min=${_min_tp_dist_d:.2f} (entry={demoted_entry:.5f}, SL={_sl_for_check:.5f})",
+                            f"[JUDGE] DEMOTE REJECTED {symbol}: R:R {_demote_rr:.2f}:1 < 1.0 "
+                            f"after demotion (entry={demoted_entry:.5f}, SL={_sl_for_check:.5f}, "
+                            f"TP={trade_signal.take_profit:.5f})",
                             flush=True
                         )
-                        # Release trade slot
                         self.daily_trades = max(0, self.daily_trades - 1)
-                        logger.info(f"Trade slot released after demote rejection ({self.daily_trades}/{settings.trading.max_daily_trades})")
+                        logger.info(f"Trade slot released after demote R:R rejection ({self.daily_trades}/{settings.trading.max_daily_trades})")
                         return
                     
                     # Override to pending limit order
@@ -3567,6 +3458,34 @@ class TradingBot:
                         confluence_factors=confluence_factors if confluence_factors else None,
                         confluence_count=confluence_count if confluence_count else None,
                     )
+                
+                # =============================================
+                # OPPOSITE-DIRECTION GUARD: Do not place an
+                # order that conflicts with an existing open
+                # position on the same symbol.
+                # =============================================
+                if self.position_manager:
+                    existing_positions = self.position_manager.get_positions_by_symbol(symbol)
+                    if existing_positions:
+                        opposite_dir = 'short' if trade_signal.direction == 'long' else 'long'
+                        conflicting = [
+                            p for p in existing_positions
+                            if p.direction == opposite_dir
+                        ]
+                        if conflicting:
+                            print(
+                                f"[BLOCKED] {symbol}: Cannot place {trade_signal.direction.upper()} order — "
+                                f"already have {opposite_dir.upper()} position open "
+                                f"(ticket={conflicting[0].ticket}). "
+                                f"Close existing position first or wait for reversal re-entry logic.",
+                                flush=True
+                            )
+                            logger.warning(
+                                f"Blocked {trade_signal.direction} {symbol}: opposite-direction "
+                                f"position exists (ticket={conflicting[0].ticket})"
+                            )
+                            self.daily_trades = max(0, self.daily_trades - 1)
+                            return
                 
                 # =============================================
                 # PENDING ORDER VS MARKET ORDER DECISION
@@ -5088,22 +5007,47 @@ Include brief reasoning.
                     
                     elif decision == "TIGHTEN":
                         logger.info(f"Claude recommends TIGHTENING stop on {position.symbol}")
-                        # Move stop to lock in some profit
-                        if position.current_r_multiple > 0.5:
-                            new_sl = position.entry_price  # At least break-even
-                            if position.direction == 'long':
-                                new_sl = max(position.stop_loss, position.entry_price)
+                        cur_r = position.current_r_multiple
+                        if cur_r > 0.5 and position.risk_pips > 0:
+                            # Lock actual profit based on current R-multiple
+                            if cur_r > 2.0:
+                                lock_pct = 0.75  # Lock 75% of profit
+                            elif cur_r > 1.5:
+                                lock_pct = 0.60  # Lock 60% of profit
+                            elif cur_r > 1.0:
+                                lock_pct = 0.50  # Lock 50% of profit
                             else:
-                                new_sl = min(position.stop_loss, position.entry_price)
+                                lock_pct = 0.0   # Below 1R, just break-even
                             
-                            result = await self.order_manager.modify_order(
-                                ticket=position.ticket,
-                                stop_loss=new_sl
-                            )
+                            profit_distance = cur_r * position.risk_pips
+                            locked_distance = profit_distance * lock_pct
                             
-                            if result.success:
-                                position.stop_loss = new_sl
-                                logger.info(f"Tightened stop on {position.ticket} to {new_sl}")
+                            if position.direction == 'long':
+                                new_sl = position.entry_price + locked_distance
+                                new_sl = max(new_sl, position.stop_loss)  # Only improve SL
+                            else:
+                                new_sl = position.entry_price - locked_distance
+                                new_sl = min(new_sl, position.stop_loss)  # Only improve SL
+                            
+                            if new_sl != position.stop_loss:
+                                result = await self.order_manager.modify_order(
+                                    ticket=position.ticket,
+                                    stop_loss=new_sl
+                                )
+                                
+                                if result.success:
+                                    old_sl = position.stop_loss
+                                    position.stop_loss = new_sl
+                                    logger.info(
+                                        f"[TIGHTEN] {position.ticket} ({position.symbol}): "
+                                        f"SL {old_sl:.5f} -> {new_sl:.5f} "
+                                        f"(locking {lock_pct:.0%} of {cur_r:.2f}R profit)"
+                                    )
+                            else:
+                                logger.info(
+                                    f"[TIGHTEN] {position.ticket}: SL already at or better than "
+                                    f"lock level {new_sl:.5f}"
+                                )
                     
                 except Exception as e:
                     logger.error(f"Error re-evaluating position {position.ticket}: {e}")
@@ -5821,43 +5765,102 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                     pass
                 
                 cancelled_count = 0
+                filled_closed_count = 0
                 for trade_id in unmatched_tickets:
                     # If this trade_id is neither an open position nor a pending order on MT5,
-                    # it was deleted/cancelled externally
+                    # check deal history FIRST before assuming it was cancelled
                     if trade_id not in current_positions and trade_id not in current_orders:
                         try:
+                            # Check deal history to see if the order actually filled then closed
+                            symbol = open_trade_tickets[trade_id]['symbol']
+                            deal_check_start = datetime.now() - timedelta(days=days_back)
+                            deals_for_symbol = await self.mt5_client.get_history(
+                                deal_check_start, datetime.now(), symbol=symbol
+                            )
+                            
+                            # Look for an opening deal (entry=0) with order == trade_id
+                            opening_deal = None
+                            closing_deal = None
+                            ticket_int = int(trade_id) if trade_id.isdigit() else 0
+                            
+                            if deals_for_symbol and ticket_int:
+                                for deal in deals_for_symbol:
+                                    if deal.get('entry') == 0 and deal.get('order') == ticket_int:
+                                        opening_deal = deal
+                                        break
+                                
+                                if opening_deal:
+                                    position_id = opening_deal.get('position_id')
+                                    if position_id:
+                                        for deal in deals_for_symbol:
+                                            if (deal.get('entry') == 1 and 
+                                                deal.get('position_id') == position_id):
+                                                closing_deal = deal
+                                                break
+                            
                             async with async_session() as session:
                                 result = await session.execute(
                                     select(TradeModel).where(TradeModel.trade_id == trade_id)
                                 )
                                 trade = result.scalar_one_or_none()
-                                if trade and (trade.exit_price is None or trade.exit_price == 0):
-                                    trade.exit_price = trade.entry_price  # Cancelled = no fill
-                                    trade.exit_time = datetime.utcnow()
-                                    trade.profit_loss = 0.0
-                                    trade.exit_reason = "Cancelled/deleted (not found on MT5)"
-                                    await session.commit()
-                                    cancelled_count += 1
-                                    print(f"[SYNC] Marked trade {trade_id} ({open_trade_tickets[trade_id]['symbol']}) as cancelled (not on MT5)", flush=True)
+                                if trade and (trade.exit_price is None or trade.exit_price == 0 or
+                                              (trade.profit_loss == 0 and trade.exit_price == trade.entry_price)):
+                                    
+                                    if opening_deal and closing_deal:
+                                        # Order was FILLED then CLOSED -- record real P/L
+                                        fill_price = opening_deal.get('price', trade.entry_price)
+                                        close_price = closing_deal.get('price', 0)
+                                        profit = float(closing_deal.get('profit', 0))
+                                        commission = float(closing_deal.get('commission', 0))
+                                        open_commission = float(opening_deal.get('commission', 0))
+                                        swap = float(closing_deal.get('swap', 0))
+                                        total_pnl = profit + commission + open_commission + swap
+                                        close_time = closing_deal.get('time', datetime.now())
+                                        
+                                        trade.entry_price = fill_price
+                                        trade.exit_price = close_price
+                                        trade.profit_loss = total_pnl
+                                        trade.exit_time = close_time if isinstance(close_time, datetime) else datetime.now()
+                                        trade.exit_reason = "SL/TP hit (filled-then-closed, detected via trade sync)"
+                                        await session.commit()
+                                        filled_closed_count += 1
+                                        print(
+                                            f"[SYNC] Trade {trade_id} ({symbol}) was filled then closed, "
+                                            f"NOT cancelled — P/L: ${total_pnl:.2f} "
+                                            f"(entry={fill_price}, exit={close_price})",
+                                            flush=True
+                                        )
+                                    else:
+                                        # Truly cancelled -- no fill deal found
+                                        trade.exit_price = trade.entry_price
+                                        trade.exit_time = datetime.utcnow()
+                                        trade.profit_loss = 0.0
+                                        trade.exit_reason = "Cancelled/deleted (not found on MT5)"
+                                        await session.commit()
+                                        cancelled_count += 1
+                                        print(f"[SYNC] Marked trade {trade_id} ({symbol}) as cancelled (not on MT5)", flush=True)
                         except Exception as e:
-                            logger.warning(f"Could not mark trade {trade_id} as cancelled: {e}")
+                            logger.warning(f"Could not process trade {trade_id}: {e}")
                 
                 if cancelled_count > 0:
                     logger.info(f"Marked {cancelled_count} orphaned trades as cancelled")
+                if filled_closed_count > 0:
+                    logger.info(f"Detected {filled_closed_count} filled-then-closed trades via deal history")
             
             self._last_history_sync = datetime.now()
             
-            total_updates = updated_count + cancelled_count
+            total_updates = updated_count + cancelled_count + (filled_closed_count if 'filled_closed_count' in dir() else 0)
             if total_updates > 0:
-                logger.info(f"Trade sync: {updated_count} closed, {cancelled_count} cancelled")
-                print(f"[SYNC] Done: {updated_count} trades updated with close data, {cancelled_count} cancelled/orphaned", flush=True)
+                fc = filled_closed_count if 'filled_closed_count' in dir() else 0
+                logger.info(f"Trade sync: {updated_count} closed, {fc} filled-then-closed, {cancelled_count} cancelled")
+                print(f"[SYNC] Done: {updated_count} trades updated with close data, {fc} filled-then-closed, {cancelled_count} cancelled/orphaned", flush=True)
                 
                 from .api.routes.activity import add_activity
                 add_activity(
                     "info",
-                    f"Trade sync: {updated_count} closed, {cancelled_count} cancelled",
+                    f"Trade sync: {updated_count} closed, {fc} filled-then-closed, {cancelled_count} cancelled",
                     None,
-                    {"updated_count": updated_count, "cancelled": cancelled_count, "days_back": days_back}
+                    {"updated_count": updated_count, "filled_closed": fc, "cancelled": cancelled_count, "days_back": days_back}
                 )
             else:
                 logger.debug("No open bot trades needed MT5 close updates")
@@ -6150,9 +6153,499 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                         
                 except Exception as e:
                     logger.warning(f"Could not get/store Claude trade review: {e}")
+            
+            # =============================================
+            # REVERSAL RE-ENTRY: If closed due to profit protection reversal,
+            # analyze for a new trade in the opposite direction
+            # =============================================
+            reversal_reasons = {"giveback_protection", "near_tp_reversal"}
+            close_reason = getattr(position, 'close_reason', '')
+            if close_reason in reversal_reasons and profit_loss > 0:
+                logger.info(
+                    f"[REVERSAL] {position.symbol}: Closed due to {close_reason} "
+                    f"(P/L=${profit_loss:+.2f}, peak={position.peak_r_multiple:.2f}R). "
+                    f"Spawning reversal analysis..."
+                )
+                print(
+                    f"[REVERSAL] {position.symbol}: Profit protection close ({close_reason}). "
+                    f"Analyzing reversal re-entry in opposite direction...",
+                    flush=True
+                )
+                import asyncio
+                asyncio.create_task(self._analyze_reversal_entry(position))
                     
         except Exception as e:
             logger.error(f"Error handling position close: {e}")
+    
+    async def _analyze_reversal_entry(self, closed_position):
+        """
+        Analyze whether a reversal re-entry trade is warranted after profit protection
+        closed a position. Calls Claude with reversal context, validates the signal,
+        and places the trade through the full pipeline if approved.
+        
+        Args:
+            closed_position: The Position object that was just closed by profit protection
+        """
+        symbol = closed_position.symbol
+        opposite_direction = 'short' if closed_position.direction == 'long' else 'long'
+        
+        try:
+            # ---- Safeguard 1: Per-symbol reversal cooldown (1 hour) ----
+            if not hasattr(self, '_reversal_cooldowns'):
+                self._reversal_cooldowns = {}
+            
+            last_reversal = self._reversal_cooldowns.get(symbol)
+            if last_reversal:
+                minutes_since = (datetime.now() - last_reversal).total_seconds() / 60
+                if minutes_since < 60:
+                    logger.info(
+                        f"[REVERSAL] {symbol}: Skipping — reversal cooldown active "
+                        f"({minutes_since:.0f}min < 60min)"
+                    )
+                    print(
+                        f"[REVERSAL] {symbol}: SKIPPED — reversal cooldown "
+                        f"({minutes_since:.0f}m since last reversal attempt)",
+                        flush=True
+                    )
+                    return
+            
+            # ---- Safeguard 2: No existing position for this symbol ----
+            if self.position_manager:
+                existing = self.position_manager.get_positions_by_symbol(symbol)
+                if existing:
+                    logger.info(
+                        f"[REVERSAL] {symbol}: Skipping — position already exists "
+                        f"(ticket {existing[0].ticket})"
+                    )
+                    return
+            
+            # ---- Safeguard 3: Daily trade limit ----
+            if self.daily_trades >= settings.trading.max_daily_trades:
+                logger.info(
+                    f"[REVERSAL] {symbol}: Skipping — daily trade limit reached "
+                    f"({self.daily_trades}/{settings.trading.max_daily_trades})"
+                )
+                return
+            
+            # ---- Safeguard 4: No scalp reversals ----
+            if getattr(closed_position, 'trade_type', 'intraday') == 'scalp':
+                logger.info(f"[REVERSAL] {symbol}: Skipping — scalp trades don't trigger reversals")
+                return
+            
+            # Record the reversal attempt timestamp
+            self._reversal_cooldowns[symbol] = datetime.now()
+            
+            # ---- Fetch fresh market data ----
+            df = await self.data_fetcher.get_ohlcv(
+                symbol=symbol,
+                timeframe=settings.timeframes.execution_tf,
+                count=settings.timeframes.execution_tf_candles
+            )
+            if df is None or df.empty:
+                logger.warning(f"[REVERSAL] {symbol}: No market data available")
+                return
+            
+            current_price = float(df['close'].iloc[-1])
+            
+            # ---- Generate chart image ----
+            chart_base64 = await self._generate_chart_image(df, symbol)
+            if not chart_base64:
+                logger.warning(f"[REVERSAL] {symbol}: Failed to generate chart")
+                return
+            
+            # ---- Build reversal-specific context ----
+            strategy_context = self.context_builder.get_quick_reference()
+            
+            reversal_context = (
+                f"\n\n## REVERSAL ANALYSIS CONTEXT\n"
+                f"A {closed_position.direction.upper()} trade on {symbol} was just closed "
+                f"by profit protection.\n"
+                f"- Close reason: {closed_position.close_reason}\n"
+                f"- Entry: {closed_position.entry_price:.5f}\n"
+                f"- Exit (approx): {closed_position.current_price:.5f}\n"
+                f"- Peak R-multiple: {closed_position.peak_r_multiple:.2f}R\n"
+                f"- Current R at close: {closed_position.current_r_multiple:.2f}R\n"
+                f"- P/L: ${closed_position.unrealized_pnl:+.2f}\n"
+                f"- Direction: Was {closed_position.direction.upper()}, "
+                f"evaluating {opposite_direction.upper()} reversal\n\n"
+                f"**TASK**: Evaluate if this is a STRUCTURAL reversal worth entering "
+                f"in the {opposite_direction.upper()} direction. Look for:\n"
+                f"- Break of structure (BOS) against the original trade direction\n"
+                f"- Displacement candle(s) confirming the reversal\n"
+                f"- Order blocks or FVGs on the opposite side for entry\n"
+                f"- Liquidity that was swept (the original TP area may have been the target)\n\n"
+                f"If the reversal has structural backing, provide a {opposite_direction.upper()} "
+                f"signal with entry, SL, and TP based on the new structure. "
+                f"If the reversal is NOT structurally backed (just a pullback/retracement), "
+                f"return no_trade.\n"
+            )
+            
+            from .config import get_symbol_spec as _gss
+            _sym_spec = _gss(symbol)
+            
+            market_data = {
+                "current_price": current_price,
+                "bid": current_price - _sym_spec.pip_size,
+                "ask": current_price + _sym_spec.pip_size,
+                "spread": 1.0,
+                "reversal_context": reversal_context,
+            }
+            
+            # Add account info if available
+            try:
+                account_info = await self.mt5_client.get_account_info()
+                if account_info:
+                    market_data["account_equity"] = account_info.equity
+                    market_data["account_balance"] = account_info.balance
+            except Exception:
+                pass
+            
+            # ---- Run ICT analysis on fresh data ----
+            from .config import get_symbol_spec
+            _core_pip = get_symbol_spec(symbol).pip_size
+            market_structure_analyzer = MarketStructureAnalyzer()
+            fvg_detector = FVGDetector(pip_value=_core_pip)
+            ob_detector = OrderBlockDetector()
+            liquidity_mapper = LiquidityMapper(pip_value=_core_pip)
+            
+            analysis_data = {
+                "market_structure": market_structure_analyzer.analyze(df),
+                "fvg": fvg_detector.detect(df),
+                "order_blocks": ob_detector.detect(df),
+                "liquidity": liquidity_mapper.analyze(df),
+            }
+            
+            # Serialize analysis_data for Claude
+            serialized_analysis = {}
+            for key, val in analysis_data.items():
+                try:
+                    if hasattr(val, 'to_dict'):
+                        serialized_analysis[key] = val.to_dict()
+                    elif hasattr(val, '__dict__'):
+                        serialized_analysis[key] = str(val)
+                    else:
+                        serialized_analysis[key] = val
+                except Exception:
+                    serialized_analysis[key] = str(val)
+            
+            # ---- Call Claude for reversal analysis ----
+            logger.info(f"[REVERSAL] {symbol}: Calling Claude for reversal analysis...")
+            
+            claude_result = await self.claude_client.analyze_chart_async(
+                chart_image_base64=chart_base64,
+                symbol=symbol,
+                timeframe=settings.timeframes.execution_tf,
+                strategy_context=strategy_context + reversal_context,
+                market_data=market_data,
+                analysis_data=serialized_analysis,
+            )
+            
+            trade_signal = claude_result.signal
+            
+            # ---- Validate: Must be opposite direction ----
+            if trade_signal.direction == 'no_trade':
+                logger.info(
+                    f"[REVERSAL] {symbol}: Claude says NO TRADE — "
+                    f"reversal not structurally backed. Reasoning: "
+                    f"{(trade_signal.reasoning or 'N/A')[:100]}"
+                )
+                print(
+                    f"[REVERSAL] {symbol}: NO TRADE — Claude doesn't see structural reversal",
+                    flush=True
+                )
+                return
+            
+            if trade_signal.direction != opposite_direction:
+                logger.info(
+                    f"[REVERSAL] {symbol}: Claude signal is {trade_signal.direction.upper()}, "
+                    f"not {opposite_direction.upper()} — same direction as closed trade, skipping"
+                )
+                return
+            
+            # ---- Tag as reversal re-entry (bypasses flip cooldown) ----
+            trade_signal.reversal_reentry = True
+            
+            logger.info(
+                f"[REVERSAL] {symbol}: Claude confirms {opposite_direction.upper()} reversal! "
+                f"Confidence: {trade_signal.confidence:.0%}, "
+                f"Entry: {trade_signal.entry_price}, SL: {trade_signal.stop_loss}, "
+                f"TP: {trade_signal.take_profit}"
+            )
+            print(
+                f"[REVERSAL] {symbol}: Claude confirms {opposite_direction.upper()} reversal "
+                f"({trade_signal.confidence:.0%}). Running through full pipeline...",
+                flush=True
+            )
+            
+            # ---- R:R Check ----
+            if trade_signal.stop_loss and trade_signal.take_profit and trade_signal.entry_price:
+                entry = trade_signal.entry_price
+                sl_dist = abs(entry - trade_signal.stop_loss)
+                tp_dist = abs(trade_signal.take_profit - entry)
+                rr = tp_dist / sl_dist if sl_dist > 0 else 0
+                
+                if rr < 1.0:
+                    logger.warning(
+                        f"[REVERSAL] {symbol}: REJECTED — R:R {rr:.2f}:1 < 1.0"
+                    )
+                    print(
+                        f"[REVERSAL] {symbol}: REJECTED — R:R {rr:.2f}:1 too low",
+                        flush=True
+                    )
+                    return
+            
+            # ---- Risk Manager Validation ----
+            if self.risk_manager:
+                risk_check = self.risk_manager.validate_trade(
+                    symbol=symbol,
+                    direction=trade_signal.direction,
+                    entry_price=trade_signal.entry_price or current_price,
+                    stop_loss=trade_signal.stop_loss or 0,
+                    take_profit=trade_signal.take_profit or 0,
+                    position_size=0.01,
+                    trade_type=getattr(trade_signal, 'trade_type', 'intraday'),
+                )
+                if not risk_check.get('valid', True):
+                    errors = risk_check.get('errors', [])
+                    logger.warning(
+                        f"[REVERSAL] {symbol}: Risk manager rejected — {errors}"
+                    )
+                    print(
+                        f"[REVERSAL] {symbol}: REJECTED by risk manager — {errors}",
+                        flush=True
+                    )
+                    return
+            
+            # ---- Trade Judge ----
+            if self.claude_client and self.claude_client.api_key:
+                try:
+                    judge_signal = {
+                        "symbol": symbol,
+                        "direction": trade_signal.direction,
+                        "confidence": trade_signal.confidence,
+                        "entry_price": trade_signal.entry_price or current_price,
+                        "stop_loss": trade_signal.stop_loss,
+                        "take_profit": trade_signal.take_profit,
+                        "reasoning": trade_signal.reasoning or "",
+                        "trade_type": getattr(trade_signal, 'trade_type', 'intraday'),
+                        "reversal_reentry": True,
+                    }
+                    
+                    risk_metrics = {
+                        "risk_reward": rr if 'rr' in dir() else 0,
+                        "position_size_pct": 1.0,
+                        "daily_trades": self.daily_trades,
+                        "daily_pnl": self.daily_pnl,
+                    }
+                    
+                    learning_context = ""
+                    if self.learning_service:
+                        try:
+                            learning_context = self.learning_service.build_context_for_claude(
+                                symbol=symbol,
+                                direction=trade_signal.direction,
+                                trade_type=getattr(trade_signal, 'trade_type', 'intraday'),
+                            )
+                        except Exception:
+                            pass
+                    
+                    judge_result = await self.claude_client.judge_trade(
+                        signal=judge_signal,
+                        risk_metrics=risk_metrics,
+                        learning_context=learning_context,
+                    )
+                    
+                    verdict = judge_result.get('verdict', 'APPROVE')
+                    reason = judge_result.get('reason', '')
+                    
+                    if verdict == 'REJECT':
+                        logger.info(
+                            f"[REVERSAL] {symbol}: Judge REJECTED — {reason}"
+                        )
+                        print(
+                            f"[REVERSAL] {symbol}: Judge REJECTED reversal — {reason}",
+                            flush=True
+                        )
+                        return
+                    
+                    logger.info(
+                        f"[REVERSAL] {symbol}: Judge verdict: {verdict} — {reason}"
+                    )
+                    
+                except Exception as e:
+                    logger.warning(f"[REVERSAL] Judge call failed, proceeding: {e}")
+            
+            # ---- Position Sizing ----
+            entry_price = trade_signal.entry_price or current_price
+            stop_loss = trade_signal.stop_loss
+            
+            if not stop_loss:
+                logger.warning(f"[REVERSAL] {symbol}: No stop loss provided, aborting")
+                return
+            
+            position_size = 0.01  # Default minimum
+            if self.risk_manager:
+                try:
+                    account_info = await self.mt5_client.get_account_info()
+                    equity = account_info.equity if account_info else 1000.0
+                    sl_distance = abs(entry_price - stop_loss)
+                    
+                    sizing = self.risk_manager.calculate_position_size(
+                        symbol=symbol,
+                        entry_price=entry_price,
+                        stop_loss=stop_loss,
+                        account_equity=equity,
+                    )
+                    if sizing and sizing.get('position_size', 0) > 0:
+                        position_size = sizing['position_size']
+                except Exception as e:
+                    logger.warning(f"[REVERSAL] Position sizing error: {e}")
+            
+            # ---- Place the order ----
+            self.daily_trades += 1
+            
+            order_type = getattr(trade_signal, 'order_type', 'market') or 'market'
+            
+            if order_type == 'market' or order_type.endswith('_market'):
+                result = await self.order_manager.place_market_order(
+                    symbol=symbol,
+                    direction=trade_signal.direction,
+                    volume=position_size,
+                    stop_loss=stop_loss,
+                    take_profit=trade_signal.take_profit,
+                )
+                
+                if result.success:
+                    logger.info(
+                        f"[REVERSAL] {symbol}: Market order PLACED — "
+                        f"{trade_signal.direction.upper()} {position_size} lots @ {entry_price:.5f}"
+                    )
+                    print(
+                        f"[REVERSAL] {symbol}: REVERSAL TRADE PLACED! "
+                        f"{trade_signal.direction.upper()} {position_size} lots "
+                        f"(SL={stop_loss:.5f}, TP={trade_signal.take_profit:.5f})",
+                        flush=True
+                    )
+                    
+                    # Track the new position
+                    if self.position_manager and result.order_id:
+                        from .execution.position_manager import Position as Pos
+                        new_pos = Pos(
+                            ticket=result.order_id,
+                            symbol=symbol,
+                            direction=trade_signal.direction,
+                            volume=position_size,
+                            entry_price=entry_price,
+                            stop_loss=stop_loss,
+                            take_profit=trade_signal.take_profit or 0,
+                            open_time=datetime.now(),
+                            trade_type=getattr(trade_signal, 'trade_type', 'intraday'),
+                        )
+                        # Set up multi-TP levels
+                        sl_dist = abs(entry_price - stop_loss)
+                        if trade_signal.direction == 'long':
+                            new_pos.tp1 = entry_price + sl_dist * 1.0
+                            new_pos.tp2 = entry_price + sl_dist * 2.0
+                            new_pos.tp3 = entry_price + sl_dist * 3.0
+                        else:
+                            new_pos.tp1 = entry_price - sl_dist * 1.0
+                            new_pos.tp2 = entry_price - sl_dist * 2.0
+                            new_pos.tp3 = entry_price - sl_dist * 3.0
+                        
+                        self.position_manager.add_position(new_pos)
+                    
+                    # Store in DB
+                    if DB_AVAILABLE:
+                        try:
+                            async with async_session() as db_sess:
+                                trade_record = TradeModel(
+                                    trade_id=str(result.order_id),
+                                    symbol=symbol,
+                                    direction=trade_signal.direction,
+                                    entry_price=entry_price,
+                                    stop_loss=stop_loss,
+                                    take_profit=trade_signal.take_profit,
+                                    volume=position_size,
+                                    entry_time=datetime.now(),
+                                    entry_reason=f"Reversal re-entry ({closed_position.close_reason})",
+                                    claude_confidence=trade_signal.confidence,
+                                    timeframe=settings.timeframes.execution_tf,
+                                    trade_type=getattr(trade_signal, 'trade_type', 'intraday'),
+                                )
+                                db_sess.add(trade_record)
+                                await db_sess.commit()
+                        except Exception as e:
+                            logger.warning(f"[REVERSAL] DB store error: {e}")
+                    
+                    # Telegram notification
+                    try:
+                        from .notifications import notify, NotificationType
+                        await notify(
+                            NotificationType.TRADE_OPENED,
+                            f"REVERSAL: {trade_signal.direction.upper()} {symbol}",
+                            symbol=symbol,
+                            direction=trade_signal.direction,
+                            entry_price=entry_price,
+                            stop_loss=stop_loss,
+                            take_profit=trade_signal.take_profit,
+                            volume=position_size,
+                            confidence=trade_signal.confidence,
+                        )
+                    except Exception:
+                        pass
+                else:
+                    logger.warning(
+                        f"[REVERSAL] {symbol}: Order placement FAILED — "
+                        f"{getattr(result, 'message', 'unknown error')}"
+                    )
+                    self.daily_trades = max(0, self.daily_trades - 1)
+            else:
+                # Pending order for reversal (limit entry)
+                suggested_entry = trade_signal.entry_price or current_price
+                result = await self.order_manager.place_pending_order(
+                    symbol=symbol,
+                    direction=trade_signal.direction,
+                    order_type=order_type,
+                    price=suggested_entry,
+                    volume=position_size,
+                    stop_loss=stop_loss,
+                    take_profit=trade_signal.take_profit,
+                )
+                
+                if result.success:
+                    logger.info(
+                        f"[REVERSAL] {symbol}: Pending {order_type} PLACED — "
+                        f"{trade_signal.direction.upper()} @ {suggested_entry:.5f}"
+                    )
+                    print(
+                        f"[REVERSAL] {symbol}: REVERSAL PENDING ORDER! "
+                        f"{order_type} {trade_signal.direction.upper()} @ {suggested_entry:.5f}",
+                        flush=True
+                    )
+                    
+                    # Track pending order
+                    if hasattr(self, 'pending_order_manager') and self.pending_order_manager:
+                        self.pending_order_manager.track_order(
+                            ticket=result.order_id,
+                            symbol=symbol,
+                            direction=trade_signal.direction,
+                            order_type=order_type,
+                            price=suggested_entry,
+                            stop_loss=stop_loss,
+                            take_profit=trade_signal.take_profit,
+                            volume=position_size,
+                        )
+                else:
+                    logger.warning(
+                        f"[REVERSAL] {symbol}: Pending order FAILED — "
+                        f"{getattr(result, 'message', 'unknown error')}"
+                    )
+                    self.daily_trades = max(0, self.daily_trades - 1)
+        
+        except Exception as e:
+            logger.error(f"[REVERSAL] Error analyzing reversal for {symbol}: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _get_signal_hash(self, symbol: str, direction: str, entry_price: float) -> str:
         """

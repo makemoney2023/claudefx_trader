@@ -399,6 +399,386 @@ class TestExpirationHandling:
         assert "minutes_remaining" in data
 
 
+class TestSyncWithMT5:
+    """Tests for sync_with_mt5() including filled-then-closed detection."""
+    
+    def _make_order(self, ticket=12345, symbol="BTCUSD", price=67500.0):
+        """Helper to create a PendingOrder for testing."""
+        from trading_bot.services.pending_order_manager import PendingOrder, PendingOrderStatus
+        return PendingOrder(
+            ticket=ticket,
+            symbol=symbol,
+            order_type="sell_limit",
+            direction="short",
+            volume=0.01,
+            price=price,
+            stop_loss=price + 100,
+            take_profit=price - 500,
+            created_at=datetime.now() - timedelta(minutes=30),
+            expiration=datetime.now() + timedelta(hours=1),
+            status=PendingOrderStatus.ACTIVE
+        )
+    
+    @pytest.mark.asyncio
+    async def test_sync_order_still_pending(self):
+        """Order still in MT5 pending list -> stays active."""
+        from trading_bot.services.pending_order_manager import PendingOrderManager, PendingOrderStatus
+        
+        mock_mt5 = AsyncMock()
+        mock_mt5.get_orders.return_value = [{'ticket': 12345}]
+        mock_mt5.get_positions.return_value = []
+        
+        manager = PendingOrderManager(mt5_client=mock_mt5)
+        manager.pending_orders[12345] = self._make_order(12345)
+        
+        result = await manager.sync_with_mt5()
+        
+        assert result['active'] == 1
+        assert result['filled'] == 0
+        assert result['cancelled'] == 0
+        assert 12345 in manager.pending_orders
+    
+    @pytest.mark.asyncio
+    async def test_sync_order_filled_position_open(self):
+        """Order filled and position still open -> marked as filled."""
+        from trading_bot.services.pending_order_manager import PendingOrderManager, PendingOrderStatus
+        
+        mock_mt5 = AsyncMock()
+        mock_mt5.get_orders.return_value = []  # No longer pending
+        
+        # Position is open with matching symbol and price
+        mock_position = MagicMock()
+        mock_position.ticket = 99999  # Different ticket
+        mock_position.symbol = "BTCUSD"
+        mock_position.price_open = 67500.0
+        mock_mt5.get_positions.return_value = [mock_position]
+        
+        manager = PendingOrderManager(mt5_client=mock_mt5)
+        manager.pending_orders[12345] = self._make_order(12345)
+        
+        result = await manager.sync_with_mt5()
+        
+        assert result['filled'] == 1
+        assert 12345 not in manager.pending_orders
+        assert len(manager.order_history) == 1
+        assert manager.order_history[0].status == PendingOrderStatus.FILLED
+    
+    @pytest.mark.asyncio
+    async def test_sync_order_filled_then_closed_detected_via_deals(self):
+        """Order filled then position closed (SL/TP) before sync -> detected via deal history."""
+        from trading_bot.services.pending_order_manager import PendingOrderManager, PendingOrderStatus
+        
+        mock_mt5 = AsyncMock()
+        mock_mt5.get_orders.return_value = []  # No longer pending
+        mock_mt5.get_positions.return_value = []  # No open position
+        
+        # Deal history shows the order filled then closed
+        mock_mt5.get_history.return_value = [
+            {
+                'ticket': 90001,
+                'order': 12345,  # Matches our pending order ticket
+                'entry': 0,  # IN (opening deal)
+                'position_id': 55555,
+                'symbol': 'BTCUSD',
+                'price': 67500.0,
+                'volume': 0.01,
+                'profit': 0.0,
+                'commission': -0.5,
+                'swap': 0.0,
+                'time': datetime.now() - timedelta(minutes=20),
+                'type': 'sell',
+            },
+            {
+                'ticket': 90002,
+                'order': 88888,  # Different order ticket for close
+                'entry': 1,  # OUT (closing deal)
+                'position_id': 55555,  # Same position_id
+                'symbol': 'BTCUSD',
+                'price': 67600.0,  # Closed at SL
+                'volume': 0.01,
+                'profit': -10.0,
+                'commission': -0.5,
+                'swap': 0.0,
+                'time': datetime.now() - timedelta(minutes=10),
+                'type': 'buy',
+            },
+        ]
+        
+        manager = PendingOrderManager(mt5_client=mock_mt5)
+        manager.pending_orders[12345] = self._make_order(12345)
+        
+        # Mock the DB update method so it doesn't actually hit DB
+        manager._update_trade_db_for_filled_closed = AsyncMock()
+        
+        result = await manager.sync_with_mt5()
+        
+        assert result['filled_closed'] == 1
+        assert result['cancelled'] == 0
+        assert 12345 not in manager.pending_orders
+        assert len(manager.order_history) == 1
+        assert manager.order_history[0].status == PendingOrderStatus.FILLED
+        assert manager.order_history[0].fill_price == 67500.0
+        
+        # Verify DB update was called with correct P/L
+        manager._update_trade_db_for_filled_closed.assert_called_once()
+        call_args = manager._update_trade_db_for_filled_closed.call_args
+        deal_result = call_args[0][2]
+        assert deal_result['closed'] == True
+        assert deal_result['close_price'] == 67600.0
+        assert deal_result['total_pnl'] == -10.0 + (-0.5) + (-0.5) + 0.0  # profit + close_comm + open_comm + swap
+    
+    @pytest.mark.asyncio
+    async def test_sync_order_truly_cancelled(self):
+        """Order truly cancelled externally -> marked as cancelled."""
+        from trading_bot.services.pending_order_manager import PendingOrderManager, PendingOrderStatus
+        
+        mock_mt5 = AsyncMock()
+        mock_mt5.get_orders.return_value = []
+        mock_mt5.get_positions.return_value = []
+        mock_mt5.get_history.return_value = []  # No deals at all
+        
+        manager = PendingOrderManager(mt5_client=mock_mt5)
+        manager.pending_orders[12345] = self._make_order(12345)
+        
+        result = await manager.sync_with_mt5()
+        
+        assert result['cancelled'] == 1
+        assert result['filled'] == 0
+        assert result['filled_closed'] == 0
+        assert 12345 not in manager.pending_orders
+        assert manager.order_history[0].status == PendingOrderStatus.CANCELLED
+        assert manager.order_history[0].cancel_reason == "external"
+    
+    @pytest.mark.asyncio
+    async def test_sync_order_cancelled_deals_exist_but_no_match(self):
+        """Deals exist for the symbol but none match our order -> cancelled."""
+        from trading_bot.services.pending_order_manager import PendingOrderManager, PendingOrderStatus
+        
+        mock_mt5 = AsyncMock()
+        mock_mt5.get_orders.return_value = []
+        mock_mt5.get_positions.return_value = []
+        
+        # Deals exist but for a different order ticket
+        mock_mt5.get_history.return_value = [
+            {
+                'ticket': 90001,
+                'order': 99999,  # Different order, not ours
+                'entry': 0,
+                'position_id': 55555,
+                'symbol': 'BTCUSD',
+                'price': 67000.0,
+                'volume': 0.02,
+                'profit': 0.0,
+                'commission': 0.0,
+                'swap': 0.0,
+                'time': datetime.now() - timedelta(minutes=20),
+                'type': 'sell',
+            },
+        ]
+        
+        manager = PendingOrderManager(mt5_client=mock_mt5)
+        manager.pending_orders[12345] = self._make_order(12345)
+        
+        result = await manager.sync_with_mt5()
+        
+        assert result['cancelled'] == 1
+        assert result['filled_closed'] == 0
+    
+    @pytest.mark.asyncio
+    async def test_sync_filled_but_not_yet_closed(self):
+        """Order filled (deal exists) but no closing deal -> treated as filled open position."""
+        from trading_bot.services.pending_order_manager import PendingOrderManager, PendingOrderStatus
+        
+        mock_mt5 = AsyncMock()
+        mock_mt5.get_orders.return_value = []
+        mock_mt5.get_positions.return_value = []  # Position not found (maybe different ticket format)
+        
+        # Opening deal exists but no closing deal
+        mock_mt5.get_history.return_value = [
+            {
+                'ticket': 90001,
+                'order': 12345,
+                'entry': 0,  # IN
+                'position_id': 55555,
+                'symbol': 'BTCUSD',
+                'price': 67500.0,
+                'volume': 0.01,
+                'profit': 0.0,
+                'commission': -0.5,
+                'swap': 0.0,
+                'time': datetime.now() - timedelta(minutes=5),
+                'type': 'sell',
+            },
+        ]
+        
+        manager = PendingOrderManager(mt5_client=mock_mt5)
+        manager.pending_orders[12345] = self._make_order(12345)
+        
+        # Mock DB update
+        manager._update_trade_db_for_filled_closed = AsyncMock()
+        
+        result = await manager.sync_with_mt5()
+        
+        # Should be detected as filled-closed path (with closed=False in deal_result)
+        # The order is removed from pending and marked filled
+        assert result['filled_closed'] == 1
+        assert 12345 not in manager.pending_orders
+        assert manager.order_history[0].status == PendingOrderStatus.FILLED
+    
+    @pytest.mark.asyncio
+    async def test_sync_multiple_orders_mixed_scenarios(self):
+        """Multiple orders with different outcomes in a single sync."""
+        from trading_bot.services.pending_order_manager import PendingOrderManager
+        
+        mock_mt5 = AsyncMock()
+        # Order 11111 still pending
+        mock_mt5.get_orders.return_value = [{'ticket': 11111}]
+        # Order 22222 filled and position open
+        mock_pos = MagicMock()
+        mock_pos.ticket = 22222
+        mock_pos.symbol = "XRPUSD"
+        mock_pos.price_open = 1.4685
+        mock_mt5.get_positions.return_value = [mock_pos]
+        
+        # Order 33333 filled then closed (deal history)
+        # Order 44444 truly cancelled (no deals)
+        def mock_get_history(start, end, symbol=None):
+            if symbol == "BTCUSD":
+                return [
+                    {'ticket': 90001, 'order': 33333, 'entry': 0,
+                     'position_id': 55555, 'symbol': 'BTCUSD', 'price': 67500.0,
+                     'volume': 0.01, 'profit': 0.0, 'commission': 0.0, 'swap': 0.0,
+                     'time': datetime.now(), 'type': 'sell'},
+                    {'ticket': 90002, 'order': 88888, 'entry': 1,
+                     'position_id': 55555, 'symbol': 'BTCUSD', 'price': 67600.0,
+                     'volume': 0.01, 'profit': -10.0, 'commission': 0.0, 'swap': 0.0,
+                     'time': datetime.now(), 'type': 'buy'},
+                ]
+            return []  # No deals for EURUSD (order 44444)
+        
+        mock_mt5.get_history = AsyncMock(side_effect=mock_get_history)
+        
+        manager = PendingOrderManager(mt5_client=mock_mt5)
+        manager._update_trade_db_for_filled_closed = AsyncMock()
+        
+        manager.pending_orders[11111] = self._make_order(11111, "EURUSD", 1.0800)
+        manager.pending_orders[22222] = self._make_order(22222, "XRPUSD", 1.4685)
+        manager.pending_orders[33333] = self._make_order(33333, "BTCUSD", 67500.0)
+        manager.pending_orders[44444] = self._make_order(44444, "EURUSD", 1.0900)
+        
+        result = await manager.sync_with_mt5()
+        
+        assert result['active'] == 1       # 11111
+        assert result['filled'] == 1       # 22222
+        assert result['filled_closed'] == 1  # 33333
+        assert result['cancelled'] == 1    # 44444
+
+
+class TestCheckDealHistoryForOrder:
+    """Tests for _check_deal_history_for_order helper."""
+    
+    def _make_order(self, ticket=12345, symbol="BTCUSD", price=67500.0):
+        from trading_bot.services.pending_order_manager import PendingOrder, PendingOrderStatus
+        return PendingOrder(
+            ticket=ticket, symbol=symbol, order_type="sell_limit",
+            direction="short", volume=0.01, price=price,
+            stop_loss=price + 100, take_profit=price - 500,
+            created_at=datetime.now() - timedelta(minutes=30),
+            expiration=datetime.now() + timedelta(hours=1),
+            status=PendingOrderStatus.ACTIVE
+        )
+    
+    @pytest.mark.asyncio
+    async def test_no_deals_returns_none(self):
+        """No deals in history -> returns None."""
+        from trading_bot.services.pending_order_manager import PendingOrderManager
+        
+        mock_mt5 = AsyncMock()
+        mock_mt5.get_history.return_value = []
+        
+        manager = PendingOrderManager(mt5_client=mock_mt5)
+        order = self._make_order()
+        
+        result = await manager._check_deal_history_for_order(12345, order)
+        assert result is None
+    
+    @pytest.mark.asyncio
+    async def test_opening_and_closing_deal_found(self):
+        """Both opening and closing deals found -> returns full result."""
+        from trading_bot.services.pending_order_manager import PendingOrderManager
+        
+        mock_mt5 = AsyncMock()
+        now = datetime.now()
+        mock_mt5.get_history.return_value = [
+            {
+                'ticket': 90001, 'order': 12345, 'entry': 0,
+                'position_id': 55555, 'symbol': 'BTCUSD',
+                'price': 67500.0, 'volume': 0.01,
+                'profit': 0.0, 'commission': -0.5, 'swap': 0.0,
+                'time': now - timedelta(minutes=20), 'type': 'sell',
+            },
+            {
+                'ticket': 90002, 'order': 88888, 'entry': 1,
+                'position_id': 55555, 'symbol': 'BTCUSD',
+                'price': 67600.0, 'volume': 0.01,
+                'profit': -10.0, 'commission': -0.5, 'swap': 0.0,
+                'time': now - timedelta(minutes=10), 'type': 'buy',
+            },
+        ]
+        
+        manager = PendingOrderManager(mt5_client=mock_mt5)
+        order = self._make_order()
+        
+        result = await manager._check_deal_history_for_order(12345, order)
+        
+        assert result is not None
+        assert result['filled'] == True
+        assert result['closed'] == True
+        assert result['fill_price'] == 67500.0
+        assert result['close_price'] == 67600.0
+        assert result['total_pnl'] == -10.0 + (-0.5) + (-0.5) + 0.0
+        assert result['position_id'] == 55555
+    
+    @pytest.mark.asyncio
+    async def test_only_opening_deal_found(self):
+        """Opening deal found but no closing -> filled but not closed."""
+        from trading_bot.services.pending_order_manager import PendingOrderManager
+        
+        mock_mt5 = AsyncMock()
+        mock_mt5.get_history.return_value = [
+            {
+                'ticket': 90001, 'order': 12345, 'entry': 0,
+                'position_id': 55555, 'symbol': 'BTCUSD',
+                'price': 67500.0, 'volume': 0.01,
+                'profit': 0.0, 'commission': -0.5, 'swap': 0.0,
+                'time': datetime.now(), 'type': 'sell',
+            },
+        ]
+        
+        manager = PendingOrderManager(mt5_client=mock_mt5)
+        order = self._make_order()
+        
+        result = await manager._check_deal_history_for_order(12345, order)
+        
+        assert result is not None
+        assert result['filled'] == True
+        assert result['closed'] == False
+    
+    @pytest.mark.asyncio
+    async def test_deal_history_error_returns_none(self):
+        """Exception in get_history -> returns None gracefully."""
+        from trading_bot.services.pending_order_manager import PendingOrderManager
+        
+        mock_mt5 = AsyncMock()
+        mock_mt5.get_history.side_effect = Exception("MT5 connection lost")
+        
+        manager = PendingOrderManager(mt5_client=mock_mt5)
+        order = self._make_order()
+        
+        result = await manager._check_deal_history_for_order(12345, order)
+        assert result is None
+
+
 # Fixtures
 @pytest.fixture
 def mock_mt5_client():

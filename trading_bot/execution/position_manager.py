@@ -61,6 +61,16 @@ class Position:
     tp2_hit: bool = False     # TP2 partial close executed
     initial_volume: float = 0.0  # Original volume before partial closes
     
+    # Peak profit tracking (aggressive profit protection)
+    peak_r_multiple: float = 0.0
+    peak_unrealized_pnl: float = 0.0
+    
+    # Near-TP tracking
+    near_tp_reached: bool = False
+    
+    # Close metadata (set before closing for reversal re-entry)
+    close_reason: str = ""  # "tp_hit", "sl_hit", "giveback_protection", "near_tp_reversal", "trailing_stop", "claude_close", "manual"
+    
     def __post_init__(self):
         self.initial_sl = self.stop_loss
         if self.initial_volume == 0.0:
@@ -104,6 +114,10 @@ class Position:
             "tp1_hit": self.tp1_hit,
             "tp2_hit": self.tp2_hit,
             "initial_volume": self.initial_volume,
+            "peak_r_multiple": self.peak_r_multiple,
+            "peak_unrealized_pnl": self.peak_unrealized_pnl,
+            "near_tp_reached": self.near_tp_reached,
+            "close_reason": self.close_reason,
         }
 
 
@@ -152,6 +166,7 @@ class PositionManager:
         
         self.positions: Dict[int, Position] = {}
         self.on_position_close = None  # Callback for when position closes
+        self.on_reversal_close = None  # Callback for reversal-type closes (profit protection)
         
         logger.info("Position manager initialized")
     
@@ -218,6 +233,10 @@ class PositionManager:
                     'tp1_hit': position.tp1_hit,
                     'tp2_hit': position.tp2_hit,
                     'initial_volume': position.initial_volume,
+                    'peak_r_multiple': position.peak_r_multiple,
+                    'peak_unrealized_pnl': position.peak_unrealized_pnl,
+                    'near_tp_reached': position.near_tp_reached,
+                    'close_reason': position.close_reason or None,
                 })
                 logger.debug(f"Persisted position {position.ticket} to database")
         except Exception as e:
@@ -269,6 +288,12 @@ class PositionManager:
                     position.tp1_hit = getattr(p, 'tp1_hit', False) or False
                     position.tp2_hit = getattr(p, 'tp2_hit', False) or False
                     position.initial_volume = getattr(p, 'initial_volume', 0.0) or position.volume
+                    # Restore peak profit tracking (survives bot restart)
+                    position.peak_r_multiple = getattr(p, 'peak_r_multiple', 0.0) or 0.0
+                    position.peak_unrealized_pnl = getattr(p, 'peak_unrealized_pnl', 0.0) or 0.0
+                    position.near_tp_reached = getattr(p, 'near_tp_reached', False) or False
+                    # Restore close reason (for reversal re-entry across restarts)
+                    position.close_reason = getattr(p, 'close_reason', '') or ''
                     positions.append(position)
                 
                 logger.info(f"Loaded {len(positions)} positions from database")
@@ -415,6 +440,12 @@ class PositionManager:
             
             self.update_price(ticket, current_price)
             
+            # Update peak profit tracking before any management decisions
+            r_multiple = position.current_r_multiple
+            if r_multiple > position.peak_r_multiple:
+                position.peak_r_multiple = r_multiple
+                position.peak_unrealized_pnl = position.unrealized_pnl
+            
             # Check for management actions
             action = await self._manage_position(position)
             if action:
@@ -426,15 +457,12 @@ class PositionManager:
         """
         Apply multi-TP management rules to a single position.
         
-        For positions large enough for partials (>= 0.03 lots):
+        Priority order:
+          0. Aggressive profit protection (giveback + near-TP reversal detection)
           1. TP1 hit (1.0R) -> Partial close 40% + move to break-even
+          1.5. Dynamic SL trailing between 1R-2R (fills the dead zone)
           2. TP2 hit (2.0R) -> Partial close 30% of original
           3. Trailing stop on runner (remaining 30%)
-        
-        For micro positions (< 0.03 lots, can't partial close):
-          1. 1.0R hit -> Move to break-even (no partial close)
-          2. 2.0R hit -> Start trailing stop (no partial close)
-          3. Let the trailing stop or MT5 TP handle the exit
         """
         r_multiple = position.current_r_multiple
         can_partial = position.volume >= 0.03  # Need at least 0.03 to split meaningfully
@@ -446,6 +474,14 @@ class PositionManager:
                 logger.info(f"SCALP: Moving {position.ticket} to break-even at {r_multiple:.1f}R")
                 return await self._move_to_break_even(position)
             return None  # Let MT5 TP handle the full close
+        
+        # =============================================
+        # AGGRESSIVE PROFIT PROTECTION (before TP stages)
+        # Only active after BE triggered (position was in profit)
+        # =============================================
+        protection_action = await self._check_profit_protection(position, r_multiple)
+        if protection_action:
+            return protection_action
         
         # Stage 0.5: If TP1 fired (partial close done) but break-even modification failed,
         # retry the break-even move. Without this, tp1_hit=True prevents re-entering Stage 1.
@@ -476,6 +512,11 @@ class PositionManager:
                     position.tp1_hit = True
                     return await self._move_to_break_even(position)
         
+        # Stage 1.5: Dynamic SL trailing between 1R and 2R (fills the dead zone)
+        dynamic_trail_action = await self._dynamic_trail_1r_to_2r(position, r_multiple)
+        if dynamic_trail_action:
+            return dynamic_trail_action
+        
         # Stage 2: TP2 - Partial close (if possible) or start trailing
         if position.tp1_hit and not position.tp2_hit:
             tp2_reached = False
@@ -503,6 +544,176 @@ class PositionManager:
         # Stage 3: Trailing stop on runner (applies to all position sizes)
         if position.tp2_hit and r_multiple >= self.trailing_start_r:
             return await self._update_trailing_stop(position)
+        
+        return None
+    
+    async def _check_profit_protection(self, position: Position, r_multiple: float) -> Optional[Dict[str, Any]]:
+        """
+        Aggressive profit protection — detect reversals and protect gains.
+        
+        Two triggers:
+        1. GIVEBACK: If peak R >= 1.0 and current R gave back 40%+ from peak, auto-close.
+        2. NEAR-TP REVERSAL: If price reached 85%+ of TP distance then pulls back to 50% of peak R.
+        """
+        peak_r = position.peak_r_multiple
+        
+        # Only activate protection when position was meaningfully in profit (peak >= 1.0R)
+        if peak_r < 1.0:
+            return None
+        
+        # Must have break-even triggered (we're past 1R management)
+        if not position.be_triggered:
+            return None
+        
+        # --- Near-TP tracking ---
+        # Calculate how far TP is in R terms
+        if position.risk_pips > 0 and position.take_profit > 0:
+            if position.direction == 'long':
+                tp_distance = position.take_profit - position.entry_price
+            else:
+                tp_distance = position.entry_price - position.take_profit
+            tp_r_multiple = tp_distance / position.risk_pips if position.risk_pips > 0 else 0
+            
+            # Mark near-TP reached if we hit 85%+ of the TP R distance
+            if tp_r_multiple > 0 and peak_r >= 0.85 * tp_r_multiple:
+                if not position.near_tp_reached:
+                    position.near_tp_reached = True
+                    logger.info(
+                        f"[PROFIT-PROTECT] {position.ticket} ({position.symbol}): "
+                        f"Near-TP reached! Peak {peak_r:.2f}R >= 85% of TP ({tp_r_multiple:.2f}R)"
+                    )
+        
+        # --- Near-TP Reversal Auto-Close ---
+        # If near-TP was reached and price pulled back to 50% of peak R, close
+        if position.near_tp_reached and peak_r > 0:
+            giveback_from_peak = (peak_r - r_multiple) / peak_r if peak_r > 0 else 0
+            if giveback_from_peak >= 0.50 and r_multiple > 0:
+                logger.warning(
+                    f"[PROFIT-PROTECT] NEAR-TP REVERSAL on {position.ticket} ({position.symbol}): "
+                    f"Peaked at {peak_r:.2f}R (near TP), now at {r_multiple:.2f}R "
+                    f"(gave back {giveback_from_peak:.0%}). Auto-closing to protect profit."
+                )
+                position.close_reason = "near_tp_reversal"
+                return await self._protection_close(position, "near_tp_reversal")
+        
+        # --- 40% Giveback Auto-Close ---
+        # If peak was >= 1.0R and trade gave back 40%+ from peak
+        if peak_r >= 1.0 and r_multiple > 0:
+            giveback_pct = (peak_r - r_multiple) / peak_r
+            if giveback_pct >= 0.40:
+                logger.warning(
+                    f"[PROFIT-PROTECT] GIVEBACK CLOSE on {position.ticket} ({position.symbol}): "
+                    f"Peaked at {peak_r:.2f}R, now at {r_multiple:.2f}R "
+                    f"(gave back {giveback_pct:.0%} >= 40%). Auto-closing."
+                )
+                position.close_reason = "giveback_protection"
+                return await self._protection_close(position, "giveback_protection")
+        
+        return None
+    
+    async def _protection_close(self, position: Position, reason: str) -> Dict[str, Any]:
+        """
+        Close an entire position due to profit protection trigger.
+        Sets close_reason and fires the reversal callback.
+        """
+        result_action = {
+            "action": f"protection_close_{reason}",
+            "ticket": position.ticket,
+            "symbol": position.symbol,
+            "direction": position.direction,
+            "peak_r": position.peak_r_multiple,
+            "current_r": position.current_r_multiple,
+            "close_reason": reason,
+        }
+        
+        if self.order_manager:
+            result = await self.order_manager.close_position(
+                ticket=position.ticket,
+                volume=position.volume  # Close full remaining volume
+            )
+            
+            if result.success:
+                logger.info(
+                    f"[PROFIT-PROTECT] Successfully closed {position.ticket} ({position.symbol}) "
+                    f"— reason: {reason}, volume: {position.volume}"
+                )
+                result_action["success"] = True
+                
+                # Fire reversal callback if registered
+                if self.on_reversal_close:
+                    try:
+                        await self.on_reversal_close(position)
+                    except Exception as e:
+                        logger.error(f"Error in reversal close callback: {e}")
+            else:
+                logger.warning(
+                    f"[PROFIT-PROTECT] Failed to close {position.ticket}: "
+                    f"{getattr(result, 'message', 'unknown error')}"
+                )
+                result_action["success"] = False
+                position.close_reason = ""  # Reset since close failed
+        else:
+            result_action["success"] = False
+            position.close_reason = ""
+        
+        return result_action
+    
+    async def _dynamic_trail_1r_to_2r(self, position: Position, r_multiple: float) -> Optional[Dict[str, Any]]:
+        """
+        Dynamic SL trailing between 1R and 2R — fills the dead zone.
+        
+        After TP1 hit and BE triggered, instead of leaving SL frozen at break-even
+        until 2.0R, progressively lock 50% of profit above 1R.
+        
+        Formula: locked_profit_r = (r_multiple - 1.0) * 0.5
+        At 1.5R -> SL locks 0.25R of profit (SL at entry + 0.25R)
+        At 1.75R -> SL locks 0.375R  
+        At 2.0R -> SL locks 0.5R (then standard trailing takes over)
+        """
+        if not (position.tp1_hit and position.be_triggered and not position.tp2_hit):
+            return None
+        
+        if r_multiple <= 1.0:
+            return None
+        
+        locked_profit_r = (r_multiple - 1.0) * 0.5
+        
+        if position.direction == 'long':
+            new_sl = position.entry_price + locked_profit_r * position.risk_pips
+            if new_sl <= position.stop_loss:
+                return None  # SL hasn't improved
+        else:
+            new_sl = position.entry_price - locked_profit_r * position.risk_pips
+            if new_sl >= position.stop_loss:
+                return None  # SL hasn't improved
+        
+        # Check spread before modifying
+        if self.order_manager and hasattr(self.order_manager, '_check_spread'):
+            spread_ok, current_spread, max_spread = await self.order_manager._check_spread(position.symbol)
+            if not spread_ok:
+                return None  # Skip this cycle, will retry
+        
+        if self.order_manager:
+            result = await self.order_manager.modify_order(
+                ticket=position.ticket,
+                stop_loss=new_sl
+            )
+            
+            if result.success:
+                old_sl = position.stop_loss
+                position.stop_loss = new_sl
+                logger.info(
+                    f"[DYNAMIC-TRAIL] {position.ticket} ({position.symbol}): "
+                    f"SL {old_sl:.5f} -> {new_sl:.5f} (locking {locked_profit_r:.2f}R at {r_multiple:.2f}R)"
+                )
+                return {
+                    "action": "dynamic_trail_1r_2r",
+                    "ticket": position.ticket,
+                    "old_sl": old_sl,
+                    "new_sl": new_sl,
+                    "locked_r": locked_profit_r,
+                    "current_r": r_multiple,
+                }
         
         return None
     

@@ -200,7 +200,7 @@ class ContextBuilder:
 5. ✓ MSS confirmed (structure shift)
 6. ✓ Entry at OB/FVG/Unicorn zone
 7. ✓ Stop beyond manipulation extreme
-8. ✓ Minimum 2:1 risk-reward
+8. ✓ Reward exceeds risk (R:R > 1:1, aim higher with good structure)
 9. ✓ No major news within 30 minutes
 
 ### Swing Exhaustion Validation -- TWO-TIER ENTRY SYSTEM

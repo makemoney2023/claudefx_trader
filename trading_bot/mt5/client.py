@@ -1777,6 +1777,79 @@ class MT5Client:
             traceback.print_exc()
             return []
     
+    async def get_order_history(
+        self,
+        start_time: datetime,
+        end_time: datetime,
+        ticket: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Get historical orders from MT5.
+        
+        Unlike get_history() which returns deals, this returns the orders
+        themselves with their final state (filled, cancelled, etc.).
+        
+        Args:
+            start_time: Start of history period
+            end_time: End of history period
+            ticket: Optional specific order ticket to look up
+            
+        Returns:
+            List of historical order dicts with fields:
+            - ticket: order ticket
+            - state: 0=started, 1=placed, 2=canceled, 3=partial, 4=filled, 5=rejected
+            - position_id: position ticket (set when order fills)
+            - symbol, volume, price_open, price_current, sl, tp, type, etc.
+        """
+        try:
+            if self._use_simulation:
+                return []
+            
+            mt5 = self._mcp_client
+            
+            async with self._lock:
+                if ticket:
+                    orders = await asyncio.to_thread(
+                        mt5.history_orders_get, ticket=ticket
+                    )
+                else:
+                    orders = await asyncio.to_thread(
+                        mt5.history_orders_get, start_time, end_time
+                    )
+            
+            if orders is None or len(orders) == 0:
+                return []
+            
+            result = []
+            for o in orders:
+                order_dict = {
+                    'ticket': o.ticket,
+                    'time_setup': datetime.fromtimestamp(o.time_setup) if o.time_setup else None,
+                    'time_done': datetime.fromtimestamp(o.time_done) if o.time_done else None,
+                    'type': int(o.type),
+                    'state': int(o.state),
+                    'position_id': o.position_id,
+                    'symbol': o.symbol,
+                    'volume_initial': o.volume_initial,
+                    'volume_current': o.volume_current,
+                    'price_open': o.price_open,
+                    'price_current': o.price_current,
+                    'sl': o.sl,
+                    'tp': o.tp,
+                    'comment': o.comment if hasattr(o, 'comment') else '',
+                    'magic': o.magic if hasattr(o, 'magic') else 0,
+                }
+                result.append(order_dict)
+            
+            logger.info(f"Retrieved {len(result)} historical orders from MT5")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error getting order history: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+    
     async def health_check(self) -> Dict[str, Any]:
         """
         Check MT5 connection health.
