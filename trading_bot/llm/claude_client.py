@@ -345,6 +345,8 @@ class ClaudeClient:
         """
         self.api_key = api_key or settings.claude.api_key
         self.model = model or settings.claude.model
+        self.model_heavy = "claude-opus-4-6"  # Best model for chart analysis + trade judge
+        self.model_light = self.model  # Sonnet for lighter tasks (re-evals, reviews)
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.max_retries = max_retries
@@ -374,7 +376,7 @@ class ClaudeClient:
                 api_key=self.api_key,
                 max_retries=max_retries
             )
-            logger.info(f"Claude client initialized with model: {self.model}")
+            logger.info(f"Claude client initialized — analysis: {self.model_heavy}, light tasks: {self.model_light}")
     
     async def _check_rate_limit(self):
         """Check and enforce rate limiting. Sleeps OUTSIDE the lock to avoid convoy starvation."""
@@ -499,9 +501,9 @@ class ClaudeClient:
                     "text": prompt
                 })
                 
-                # Create message with images and tool use
+                # Create message with images and tool use (Opus for best analysis quality)
                 message = await self.async_client.messages.create(
-                    model=self.model,
+                    model=self.model_heavy,
                     max_tokens=self.max_tokens,
                     temperature=self.temperature,
                     tools=[TRADE_SIGNAL_TOOL],
@@ -635,7 +637,7 @@ class ClaudeClient:
             )
             
             message = self.sync_client.messages.create(
-                model=self.model,
+                model=self.model_heavy,
                 max_tokens=self.max_tokens,
                 temperature=self.temperature,
                 tools=[TRADE_SIGNAL_TOOL],
@@ -939,7 +941,7 @@ If your R:R is below the target, you need exceptional confluence and high win pr
 If you cannot find a structural TP target that provides reasonable reward, either:
 1. TIGHTEN YOUR SL — use M5/M1 structure instead of M15 to reduce risk distance
 2. Return no_trade — the setup doesn't have enough room to run
-NEVER submit a trade where TP distance < SL distance. That is negative expectancy and will be rejected.
+NEVER submit a trade where TP distance < 1.5x SL distance. Trades with R:R below 1.5:1 will be automatically rejected.
 
 ⚠️ **CRYPTO R:R GUIDANCE** (aim higher due to significant dollar risk per pip):
 - Crypto SCALP: Aim for 2.0:1 R:R
@@ -954,6 +956,14 @@ a textbook ICT setup (clean sweep of liquidity + displacement + FVG/OB retest),
 you SHOULD signal a SCALP trade. Do NOT default to no_trade just because
 the higher timeframes lack a clear trend. Scalps are valid reactive trades
 on lower timeframe structure.
+
+⚠️ COUNTER-TREND SCALP WARNING: If your SCALP direction is AGAINST the D1 bias
+(e.g., D1 is BEARISH but you want to SCALP LONG on M5/M1), you MUST:
+1. Cap your confidence at 70% MAXIMUM — counter-trend scalps are higher risk
+2. Require at least 2.0:1 R:R — no marginal R:R allowed against the trend
+3. Have 3+ confluences on M5/M1 (not just 2)
+Counter-trend scalps CAN work at key reversal levels with full swing exhaustion,
+but they must clear a higher bar than with-trend scalps.
 
 You MUST use M5/M1 to:
 1. COUNT SWINGS into the POI (4-6 swing rule -- mandatory for reversals)
@@ -1313,7 +1323,7 @@ If you cannot point to at least two of these as ALREADY HAPPENED, you MUST retur
   - 0.80-0.89: Three+ confirmations, strong confluence, kill zone timing
   - 0.90-1.00: Full confluence: swing validation + displacement + sweep + FVG/OB + volume
   Do NOT park at exactly 0.75 every time. Your confidence MUST vary based on the actual evidence.
-- Aim for at least 1.5:1 risk-reward on scalps, 2:1 on intraday, 3:1 on swing. Lower R:R is acceptable only with exceptional confluence.
+- **MINIMUM 1.5:1 R:R on ALL trades** (1.5:1 scalps, 2:1 intraday, 3:1 swing). Trades below 1.5:1 are automatically rejected. Do NOT submit them.
 - Consider the current session (kill zone timing) -- outside kill zones, reduce confidence but still analyze
 - Identify specific price levels for entry, SL, and TP using M1/M5 precision
 - **CRITICAL: SL must NEVER equal entry price.** For LONG trades, SL must be placed BELOW entry (beyond the nearest swing low or OB). For SHORT trades, SL must be placed ABOVE entry (beyond the nearest swing high or OB). A zero-distance SL is invalid and will be rejected.
@@ -1430,6 +1440,28 @@ If you cannot point to at least two of these as ALREADY HAPPENED, you MUST retur
                 # Do NOT swap — main.py's A5 block will derive a proper SL
                 # from key levels (support_1 / resistance_1) or a % fallback.
             else:
+                # ── DIRECTION COHERENCE CHECK ──────────────────────────
+                # Before swap logic: if SL and TP are BOTH oriented for
+                # the opposite direction, the direction label is wrong.
+                # Flip the direction instead of swapping SL/TP.
+                levels_say_long = (sl < entry and tp > entry)
+                levels_say_short = (sl > entry and tp < entry)
+                
+                if direction == 'short' and levels_say_long:
+                    logger.warning(
+                        f"DIRECTION FLIP: Levels say LONG (SL={sl} < Entry={entry} < TP={tp}) "
+                        f"but direction was SHORT. Flipping to LONG."
+                    )
+                    direction = 'long'
+                    tool_input['direction'] = 'long'
+                elif direction == 'long' and levels_say_short:
+                    logger.warning(
+                        f"DIRECTION FLIP: Levels say SHORT (TP={tp} < Entry={entry} < SL={sl}) "
+                        f"but direction was LONG. Flipping to SHORT."
+                    )
+                    direction = 'short'
+                    tool_input['direction'] = 'short'
+                
                 # Detect swapped SL/TP: for longs SL should be below entry and TP above;
                 # for shorts SL should be above entry and TP below.
                 sl_wrong_side = (direction == 'long' and sl >= entry) or (direction == 'short' and sl <= entry)
@@ -1443,19 +1475,36 @@ If you cannot point to at least two of these as ALREADY HAPPENED, you MUST retur
                     )
                     tool_input['stop_loss'], tool_input['take_profit'] = tp, sl
                 elif sl_wrong_side and not tp_wrong_side:
-                    # Only SL is wrong — SL might actually be the TP value
                     logger.warning(
                         f"SL WRONG SIDE for {direction}: SL={sl}, TP={tp}, Entry={entry}. "
                         f"Swapping SL<->TP"
                     )
                     tool_input['stop_loss'], tool_input['take_profit'] = tp, sl
                 elif tp_wrong_side and not sl_wrong_side:
-                    # Only TP is wrong — TP might actually be the SL value
                     logger.warning(
                         f"TP WRONG SIDE for {direction}: SL={sl}, TP={tp}, Entry={entry}. "
                         f"Swapping SL<->TP"
                     )
                     tool_input['stop_loss'], tool_input['take_profit'] = tp, sl
+                
+                # ── POST-SWAP VALIDATION ──────────────────────────────
+                # Re-check after swap: if the result is WORSE, reject the signal.
+                new_sl = tool_input.get('stop_loss')
+                new_tp = tool_input.get('take_profit')
+                new_sl_wrong = (direction == 'long' and new_sl >= entry) or (direction == 'short' and new_sl <= entry)
+                new_tp_wrong = (direction == 'long' and new_tp <= entry) or (direction == 'short' and new_tp >= entry)
+                if new_sl_wrong or new_tp_wrong:
+                    logger.warning(
+                        f"POST-SWAP STILL INVALID for {direction}: SL={new_sl}, TP={new_tp}, "
+                        f"Entry={entry}. SL_wrong={new_sl_wrong}, TP_wrong={new_tp_wrong}. "
+                        f"Setting direction to no_trade."
+                    )
+                    tool_input['direction'] = 'no_trade'
+                    tool_input['confidence'] = 0.0
+                    tool_input['reasoning'] = (
+                        f"Signal rejected: SL/TP levels invalid after correction attempts. "
+                        f"Original: SL={sl}, TP={tp}, Entry={entry}, Dir={direction}."
+                    )
             
             # Final R:R check: warn if SL distance > TP distance (bad R:R)
             # Don't swap here — main.py's R:R enforcement will auto-extend TP to meet min R:R
@@ -1675,7 +1724,7 @@ If you cannot point to at least two of these as ALREADY HAPPENED, you MUST retur
         
         try:
             message = await self.async_client.messages.create(
-                model=self.model,
+                model=self.model_light,
                 max_tokens=10,
                 messages=[{"role": "user", "content": "Hello"}]
             )
@@ -1691,7 +1740,7 @@ If you cannot point to at least two of these as ALREADY HAPPENED, you MUST retur
         
         try:
             message = self.sync_client.messages.create(
-                model=self.model,
+                model=self.model_light,
                 max_tokens=10,
                 messages=[{"role": "user", "content": "Hello"}]
             )
@@ -1777,7 +1826,7 @@ Respond with JSON:
         
         try:
             message = await self.async_client.messages.create(
-                model=self.model,
+                model=self.model_light,
                 max_tokens=500,
                 temperature=0.2,
                 messages=[{"role": "user", "content": prompt}]
@@ -1859,7 +1908,7 @@ Respond with JSON:
         
         try:
             message = await self.async_client.messages.create(
-                model=self.model,
+                model=self.model_light,
                 max_tokens=1000,
                 temperature=0.3,
                 messages=[{"role": "user", "content": prompt}]
@@ -1982,7 +2031,7 @@ Respond ONLY with JSON:
         
         try:
             message = await self.async_client.messages.create(
-                model=self.model,
+                model=self.model_heavy,
                 max_tokens=800,
                 temperature=0.1,
                 messages=[{"role": "user", "content": prompt}]
@@ -2106,7 +2155,7 @@ Respond with JSON:
         
         try:
             message = await self.async_client.messages.create(
-                model=self.model,
+                model=self.model_light,
                 max_tokens=1500,
                 temperature=0.3,
                 messages=[{"role": "user", "content": prompt}]
@@ -2215,7 +2264,7 @@ Respond with JSON:
         
         try:
             message = await self.async_client.messages.create(
-                model=self.model,
+                model=self.model_light,
                 max_tokens=2000,
                 temperature=0.3,
                 messages=[{"role": "user", "content": prompt}]
@@ -2319,7 +2368,7 @@ Respond with JSON:
         
         try:
             message = await self.async_client.messages.create(
-                model=self.model,
+                model=self.model_light,
                 max_tokens=800,
                 temperature=0.2,
                 messages=[{"role": "user", "content": prompt}]

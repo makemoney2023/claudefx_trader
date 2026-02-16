@@ -98,21 +98,21 @@ class OrderManager:
     # Maximum spread thresholds (in price units, not pips)
     # RELAXED FOR DEMO TESTING - wider spreads allowed
     MAX_SPREAD_THRESHOLDS = {
-        # Forex majors: ~10 pips (relaxed for demo)
-        'EURUSD': 0.0010, 'GBPUSD': 0.0010, 'AUDUSD': 0.0010,
-        'NZDUSD': 0.0010, 'USDCHF': 0.0010, 'USDCAD': 0.0010,
-        'USDJPY': 0.10,
-        # Forex crosses: ~15 pips (relaxed)
-        'EURGBP': 0.0015, 'EURJPY': 0.15, 'GBPJPY': 0.15,
-        'AUDJPY': 0.15, 'EURAUD': 0.0015, 'GBPAUD': 0.0015,
-        'AUDCAD': 0.0015, 'AUDCHF': 0.0015, 'EURCHF': 0.0015,
-        'EURCAD': 0.0015, 'EURNZD': 0.0015, 'GBPCAD': 0.0015,
-        'GBPCHF': 0.0015, 'GBPNZD': 0.0015, 'NZDJPY': 0.15,
-        'NZDCAD': 0.0015, 'NZDCHF': 0.0015, 'CADJPY': 0.15,
-        'CADCHF': 0.0015, 'CHFJPY': 0.15,
-        # Metals (relaxed)
-        'XAUUSD': 2.00,   # Gold: max $2.00 spread
-        'XAGUSD': 0.20,   # Silver: max $0.20 spread
+        # Forex majors: ~3-5 pips (tightened for live)
+        'EURUSD': 0.0005, 'GBPUSD': 0.0005, 'AUDUSD': 0.0005,
+        'NZDUSD': 0.0005, 'USDCHF': 0.0005, 'USDCAD': 0.0005,
+        'USDJPY': 0.05,
+        # Forex crosses: ~5-8 pips (tightened for live)
+        'EURGBP': 0.0008, 'EURJPY': 0.08, 'GBPJPY': 0.08,
+        'AUDJPY': 0.08, 'EURAUD': 0.0008, 'GBPAUD': 0.0008,
+        'AUDCAD': 0.0008, 'AUDCHF': 0.0008, 'EURCHF': 0.0008,
+        'EURCAD': 0.0008, 'EURNZD': 0.0008, 'GBPCAD': 0.0008,
+        'GBPCHF': 0.0008, 'GBPNZD': 0.0008, 'NZDJPY': 0.08,
+        'NZDCAD': 0.0008, 'NZDCHF': 0.0008, 'CADJPY': 0.08,
+        'CADCHF': 0.0008, 'CHFJPY': 0.08,
+        # Metals (tightened for live)
+        'XAUUSD': 0.80,   # Gold: max $0.80 spread
+        'XAGUSD': 0.08,   # Silver: max $0.08 spread
         # Oil / Energy
         'USOIL': 0.10,    # WTI Crude: max $0.10 spread
         'WTIUSD': 0.10,

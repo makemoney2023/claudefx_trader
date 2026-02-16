@@ -93,6 +93,30 @@ class ChartScreenshot:
             PNG image as bytes
         """
         try:
+            # Validate minimum bar count
+            min_bars = {
+                'M1': 30, 'M5': 20, 'M15': 15, 'H1': 10, 'H4': 8, 'D1': 5
+            }
+            expected_min = min_bars.get(timeframe.upper(), 10)
+            actual_bars = len(df)
+            if actual_bars < expected_min:
+                logger.warning(
+                    f"[CHART-QUALITY] {symbol} {timeframe}: Only {actual_bars} bars "
+                    f"(expected >= {expected_min}). Chart may be unreliable for analysis."
+                )
+            
+            # Check for gaps in data (more than 3x expected interval between bars)
+            if actual_bars >= 2 and isinstance(df.index, pd.DatetimeIndex):
+                deltas = df.index.to_series().diff().dropna()
+                if len(deltas) > 0:
+                    median_delta = deltas.median()
+                    large_gaps = deltas[deltas > median_delta * 3]
+                    if len(large_gaps) > 0:
+                        logger.warning(
+                            f"[CHART-QUALITY] {symbol} {timeframe}: {len(large_gaps)} data gap(s) "
+                            f"detected (median interval: {median_delta}, largest gap: {deltas.max()})"
+                        )
+            
             # Ensure DataFrame has proper index
             df_plot = self._prepare_dataframe(df)
             

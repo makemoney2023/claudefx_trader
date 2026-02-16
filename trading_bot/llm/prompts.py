@@ -74,7 +74,7 @@ For a HIGH PROBABILITY setup, you need:
 - Liquidity sweep completed (stops taken)
 - Stop loss beyond manipulation extreme
 - Target at External Range Liquidity
-- **Aim for strong risk-reward: 1.5:1+ for scalps, 2:1+ for intraday, 3:1+ for swing. TP distance MUST exceed SL distance (R:R > 1:1). Risk small to gain big.**
+- **MINIMUM 1.5:1 risk-reward on ALL trades. TP distance from entry MUST be at least 1.5x the SL distance. Scalps: 1.5:1+, Intraday: 2:1+, Swing: 3:1+. NEVER return a trade with R:R below 1.5:1. Risk small to gain big.**
 
 ### 5b. Volume Confirmation Rules
 - **Volume confirmation**: Relative volume should be > 0.7x average for valid setups
@@ -230,7 +230,7 @@ Return your analysis in this exact JSON format:
 
 ## Important Rules
 1. Only recommend a trade if confidence is 0.7 or higher
-2. **CRITICAL: TP distance from entry MUST exceed SL distance (R:R > 1:1). NEVER return a trade where reward < risk.** Aim for 1.5:1+ on scalps, 2:1+ on intraday, 3:1+ on swing — lower R:R is acceptable with exceptional confluence.
+2. **CRITICAL: MINIMUM 1.5:1 RISK-REWARD on ALL trades. The TP distance from entry MUST be at LEAST 1.5x the SL distance. NEVER return a trade with R:R below 1.5:1.** Target: 1.5:1+ on scalps, 2:1+ on intraday, 3:1+ on swing. Trades below 1.5:1 will be automatically rejected.
 3. **CRITICAL: entry_price, stop_loss, and take_profit MUST ALL be ABSOLUTE PRICE LEVELS, NOT pip distances or point values.** For example, if DASHUSD is trading at 36.50, a valid stop_loss would be 35.80 (a price), NOT 0.70 (a distance). A valid take_profit would be 38.00 (a price), NOT 1.50 (a distance). ALL three values must be in the same magnitude as the current market price.
 4. **CRITICAL: For LONG trades, stop_loss MUST be BELOW entry_price and take_profit MUST be ABOVE entry_price. For SHORT trades, stop_loss MUST be ABOVE entry_price and take_profit MUST be BELOW entry_price. NEVER swap them.**
 5. Stop loss must be beyond manipulation extreme or recent structure

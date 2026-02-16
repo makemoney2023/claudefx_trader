@@ -330,7 +330,7 @@ class ClaudeSettings(BaseSettings):
     )
     
     api_key: str = Field(default="", description="Anthropic API key")
-    model: str = Field(default="claude-sonnet-4-20250514", description="Claude model to use")
+    model: str = Field(default="claude-sonnet-4-5-20250929", description="Claude model for light tasks (re-evals, reviews). Heavy tasks use claude-opus-4-6.")
     max_tokens: int = Field(default=4096, description="Maximum tokens in response")
     temperature: float = Field(default=0.3, description="Temperature for response generation")
 

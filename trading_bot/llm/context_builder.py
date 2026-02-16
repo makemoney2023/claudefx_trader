@@ -71,20 +71,24 @@ class ContextBuilder:
         """
         sections = []
         
-        # Priority order for documents
+        # Priority order for documents (all strategy docs, ordered by importance)
         priority_docs = [
-            'ict_strategy',
+            'ict_strategy',        # Core ICT methodology overview
             'time_and_price',      # Time meets price theory
             'amd_cycle',           # Power of 3 / Judas swing
-            'market_structure',
-            'fair_value_gap',
-            'order_blocks',
-            'liquidity_concepts',
+            'power_of_three',      # AMD cycle detailed
+            'market_structure',    # BOS, CHoCH, MSS
+            'fair_value_gap',      # FVG formation and trading
+            'order_blocks',        # OB, breaker blocks, mitigation
+            'liquidity_concepts',  # BSL/SSL, EQH/EQL, sweeps
+            'optimal_trade_entry', # OTE zone, Fibonacci, premium/discount
             'volume_concepts',     # Volume confirmation & institutional footprint
-            'kill_zones',
+            'kill_zones',          # Session times and kill zone strategies
             'silver_bullet',       # Silver Bullet model
-            'market_maker_model',  # MMXM
-            'execution_models',    # Entry techniques
+            'market_maker',        # Market maker concepts and tactics
+            'market_maker_model',  # MMXM detailed model
+            'execution_models',    # Unicorn, 2022, turtle soup entry techniques
+            'risk_management',     # Position sizing, drawdown management
             'precious_metals',     # Gold/Silver trading guide
             'swing_validation',    # 4-6 swing rule, prominent wicks, sweep-and-reclaim
             'trading_learnings',   # Auto-generated learning insights
@@ -200,7 +204,7 @@ class ContextBuilder:
 5. ✓ MSS confirmed (structure shift)
 6. ✓ Entry at OB/FVG/Unicorn zone
 7. ✓ Stop beyond manipulation extreme
-8. ✓ Reward exceeds risk (R:R > 1:1, aim higher with good structure)
+8. ✓ Minimum 1.5:1 risk-reward (1.5:1 scalp, 2:1 intraday, 3:1 swing)
 9. ✓ No major news within 30 minutes
 
 ### Swing Exhaustion Validation -- TWO-TIER ENTRY SYSTEM

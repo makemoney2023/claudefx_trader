@@ -10,7 +10,7 @@ import asyncio
 import signal
 import sys
 import base64
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict
 
 from .config import settings
@@ -267,6 +267,10 @@ class TradingBot:
         
         # Direction-flip cooldown tracking
         self._last_signal_direction: Dict[str, tuple] = {}  # symbol -> (direction, datetime)
+        
+        # Post-loss cooldown: prevent revenge trading by blocking re-entry
+        # for 30 minutes after a stop-loss exit on the same symbol
+        self._symbol_loss_cooldowns: Dict[str, datetime] = {}  # symbol -> cooldown_expires_at
         
         # SAFE Crypto symbols (24/7 trading) - ONLY USD pairs!
         # WARNING: BTC pairs (ETHBTC, DASHBTC, etc.) are EXCLUDED because 
@@ -1218,6 +1222,19 @@ class TradingBot:
             if bot_state:
                 bot_state.analyzing_symbol(symbol)
             
+            # POST-LOSS COOLDOWN: Prevent revenge trading
+            cooldown_expiry = self._symbol_loss_cooldowns.get(symbol)
+            if cooldown_expiry:
+                if datetime.now() < cooldown_expiry:
+                    remaining = (cooldown_expiry - datetime.now()).total_seconds() / 60
+                    logger.info(f"[LOSS-COOLDOWN] {symbol}: Skipping — {remaining:.0f}min cooldown remaining")
+                    if bot_state:
+                        bot_state.symbol_complete(symbol, "loss_cooldown")
+                    return
+                else:
+                    # Cooldown expired, clean up
+                    del self._symbol_loss_cooldowns[symbol]
+            
             # CRITICAL: Block dangerous pairs (BTC-quoted pairs have wrong contract values)
             if symbol.upper() in self.BLOCKED_PAIRS or symbol.upper().endswith('BTC') or symbol.upper().endswith('BIT'):
                 logger.error(f"🚫 BLOCKED: {symbol} is a BTC/BIT pair - contract value issues cause massive losses!")
@@ -1735,7 +1752,7 @@ class TradingBot:
                 # Continue without LTF charts -- M15 is still available
             
             # Build strategy context
-            strategy_context = self.context_builder.get_quick_reference()
+            strategy_context = self.context_builder.get_ict_context()
             
             # Get account info for enhanced context
             account_info = await self.mt5_client.get_account_info()
@@ -2019,7 +2036,7 @@ class TradingBot:
                     
                     # Try to get the other metal's price
                     other_symbol = 'XAGUSD' if symbol == 'XAUUSD' else 'XAUUSD'
-                    other_data = await self.data_fetcher.get_market_data(other_symbol, settings.timeframes.execution_tf)
+                    other_data = await self.data_fetcher.get_ohlcv(other_symbol, settings.timeframes.execution_tf)
                     if other_data and 'close' in other_data and len(other_data['close']) > 0:
                         if symbol == 'XAUUSD':
                             silver_price = float(other_data['close'].iloc[-1])
@@ -2250,6 +2267,33 @@ class TradingBot:
                 )
                 print(f"[A5-FIX] {symbol}: SL was at entry, corrected to {_sl}", flush=True)
             
+            # ── DIRECTION COHERENCE CHECK (A5 safety net) ──────────
+            # If SL/TP orientation clearly indicates the opposite direction,
+            # flip the direction label instead of swapping levels.
+            _direction_flipped = False
+            if _sl and _tp and _entry:
+                _levels_say_long = (_sl < _entry and _tp > _entry)
+                _levels_say_short = (_sl > _entry and _tp < _entry)
+                
+                if _dir == 'short' and _levels_say_long:
+                    logger.warning(
+                        f"[A5-FLIP] {symbol}: Levels say LONG (SL={_sl} < Entry={_entry} < TP={_tp}) "
+                        f"but direction was SHORT. Flipping to LONG."
+                    )
+                    print(f"[A5-FLIP] {symbol}: Direction flipped SHORT→LONG (levels indicate LONG)", flush=True)
+                    _dir = 'long'
+                    trade_signal.direction = 'long'
+                    _direction_flipped = True
+                elif _dir == 'long' and _levels_say_short:
+                    logger.warning(
+                        f"[A5-FLIP] {symbol}: Levels say SHORT (TP={_tp} < Entry={_entry} < SL={_sl}) "
+                        f"but direction was LONG. Flipping to SHORT."
+                    )
+                    print(f"[A5-FLIP] {symbol}: Direction flipped LONG→SHORT (levels indicate SHORT)", flush=True)
+                    _dir = 'short'
+                    trade_signal.direction = 'short'
+                    _direction_flipped = True
+            
             sl_wrong = False
             tp_wrong = False
             
@@ -2282,7 +2326,7 @@ class TradingBot:
                 _sl, _tp = _tp, _sl
                 trade_signal.stop_loss = _sl
                 trade_signal.take_profit = _tp
-                # Re-check after swap
+                # Re-check after swap (post-swap validation)
                 sl_wrong = False
                 tp_wrong = False
                 if _dir == 'long' and _sl >= _entry:
@@ -2381,13 +2425,10 @@ class TradingBot:
             
             if actual_rr < min_rr and sl_distance > 0:
                 # R:R is below minimum. Two tiers:
-                # 1) If R:R is at least 1.0:1 (reward >= risk), let it through
-                #    to the Trade Judge — Claude will evaluate if the setup quality
-                #    justifies the slightly lower R:R. The Judge has full context
-                #    (structure, HTF alignment, liquidity targets) to decide.
-                # 2) If R:R < 1.0:1 (risking MORE than the potential reward),
-                #    hard-reject — no analysis justifies negative expectancy.
-                _hard_floor_rr = 1.0
+                # 1) If R:R is at least 1.5:1 (decent reward for risk), let it
+                #    through to the Trade Judge for final evaluation.
+                # 2) If R:R < 1.5:1, hard-reject — marginal trades erode edge.
+                _hard_floor_rr = 1.5
                 
                 if actual_rr < _hard_floor_rr:
                     # Reward < risk — hard reject regardless of setup quality
@@ -2418,6 +2459,41 @@ class TradingBot:
             
             # Claude's TP is trusted — based on structure, liquidity, IPDA levels.
             # No hardcoded TP floors or ceilings. R:R enforcement above handles rejection.
+            
+            # ============================================
+            # COUNTER-TREND SCALP CAP
+            # If scalp direction opposes the D1 bias, enforce stricter limits
+            # ============================================
+            _trade_type = getattr(trade_signal, 'trade_type', 'intraday') or 'intraday'
+            _d1_bias = market_data.get('d1_bias', '').lower() if market_data else ''
+            _is_counter_trend_scalp = (
+                _trade_type == 'scalp'
+                and _d1_bias in ('bullish', 'bearish')
+                and (
+                    (_d1_bias == 'bullish' and _dir == 'short')
+                    or (_d1_bias == 'bearish' and _dir == 'long')
+                )
+            )
+            if _is_counter_trend_scalp:
+                # Cap confidence at 70%
+                if trade_signal.confidence > 0.70:
+                    logger.info(
+                        f"[COUNTER-SCALP] {symbol}: Counter-D1-trend scalp confidence "
+                        f"{trade_signal.confidence:.0%} -> capped at 70%"
+                    )
+                    trade_signal.confidence = 0.70
+                # Enforce 2.0:1 R:R minimum
+                if actual_rr < 2.0:
+                    logger.warning(
+                        f"[BLOCKED] {symbol}: Counter-D1-trend scalp R:R {actual_rr:.2f}:1 "
+                        f"below 2.0:1 minimum. D1={_d1_bias}, dir={_dir}. Rejected."
+                    )
+                    print(
+                        f"[BLOCKED] {symbol}: Counter-trend scalp needs 2.0:1 R:R, "
+                        f"got {actual_rr:.2f}:1. Skipping.",
+                        flush=True
+                    )
+                    return
             
             # ============================================
             # TRADE QUALITY FILTER (E3)
@@ -2597,14 +2673,19 @@ class TradingBot:
             # =============================================
             # DIRECTION-FLIP COOLDOWN
             # =============================================
-            # If Claude just flipped direction on the same symbol within 30 minutes,
-            # require higher confidence (85%) to proceed. This prevents the
+            # If Claude just flipped direction on the same symbol within 15 minutes,
+            # require higher confidence (80%) to proceed. This prevents the
             # prediction-driven flip-flopping pattern (e.g., LONG 75% -> SHORT 75%).
-            # EXCEPTION: Reversal re-entries bypass this entirely (Claude already confirmed structure).
-            flip_cooldown_minutes = 30
-            flip_min_confidence = 0.85
+            # EXCEPTIONS: Reversal re-entries and direction coherence flips bypass this.
+            flip_cooldown_minutes = 15
+            flip_min_confidence = 0.80
             
-            if getattr(trade_signal, 'reversal_reentry', False):
+            if _direction_flipped:
+                logger.info(
+                    f"[FLIP-GUARD] {symbol}: Bypassing cooldown — direction coherence "
+                    f"check already flipped to {trade_signal.direction.upper()}"
+                )
+            elif getattr(trade_signal, 'reversal_reentry', False):
                 logger.info(
                     f"[FLIP-GUARD] {symbol}: Bypassing cooldown for reversal re-entry "
                     f"({trade_signal.direction.upper()})"
@@ -2776,6 +2857,25 @@ class TradingBot:
                     final_lots = normalize_lots(symbol, crypto_adj)
                     logger.info(f"🪙 Crypto volatility adjustment: {size_result.lots} -> {final_lots} lots")
                 
+                # Apply scaling manager risk multiplier (reduces lots during drawdowns)
+                if self.scaling_manager:
+                    mode_config = self.scaling_manager.get_mode_config()
+                    risk_mult = getattr(mode_config, 'risk_multiplier', 1.0)
+                    if risk_mult != 1.0:
+                        pre_scale_lots = final_lots
+                        from .config import normalize_lots as _norm_lots
+                        final_lots = _norm_lots(symbol, final_lots * risk_mult)
+                        logger.info(
+                            f"[SCALING] {symbol}: Lots {pre_scale_lots} x {risk_mult:.2f} "
+                            f"({self.scaling_manager.current_mode.value}) = {final_lots}"
+                        )
+                        print(
+                            f"[SCALING] {symbol}: Position size adjusted "
+                            f"{pre_scale_lots} -> {final_lots} lots "
+                            f"(mode={self.scaling_manager.current_mode.value}, mult={risk_mult:.2f})",
+                            flush=True
+                        )
+                
                 # Create position size object
                 class SimplePositionSize:
                     def __init__(self, lots):
@@ -2856,6 +2956,9 @@ class TradingBot:
                         logger.info(f"📉 Reduced size due to DXY conflict: {original_lots} -> {position_size.lots} lots")
                     else:
                         logger.info(f"✅ DXY confirms {trade_signal.direction.upper()} bias for {symbol}")
+                
+                # Record original confidence before secondary modifiers
+                _conf_before_modifiers = trade_signal.confidence
                 
                 # GATE 2b: RETAIL CONTRARIAN Check (NEW)
                 # If retail is extreme, boost confidence when trading against them
@@ -2980,6 +3083,15 @@ class TradingBot:
                            (trade_signal.direction == 'short' and alt_sentiment == 'bearish'):
                             trade_signal.confidence = min(0.95, trade_signal.confidence + 0.03)
                             logger.info(f"₿✅ ALTCOIN sentiment {alt_sentiment}: {symbol} {trade_signal.direction.upper()} boosted (+3%)")
+                
+                # Cap total positive confidence boost from secondary modifiers at +10%
+                _conf_boost = trade_signal.confidence - _conf_before_modifiers
+                if _conf_boost > 0.10:
+                    trade_signal.confidence = _conf_before_modifiers + 0.10
+                    logger.info(
+                        f"[CONF-CAP] {symbol}: Secondary modifiers boosted +{_conf_boost*100:.0f}%, "
+                        f"capped to +10% (final: {trade_signal.confidence:.0%})"
+                    )
                 
                 # GATE 3: Displacement Check for Market Orders
                 # Only allow immediate market execution if displacement is confirmed
@@ -3460,13 +3572,13 @@ class TradingBot:
                     )
                 
                 # =============================================
-                # OPPOSITE-DIRECTION GUARD: Do not place an
-                # order that conflicts with an existing open
-                # position on the same symbol.
+                # POSITION CONFLICT GUARD: Block duplicate or
+                # conflicting positions on the same symbol.
                 # =============================================
                 if self.position_manager:
                     existing_positions = self.position_manager.get_positions_by_symbol(symbol)
                     if existing_positions:
+                        # Block opposite-direction conflict
                         opposite_dir = 'short' if trade_signal.direction == 'long' else 'long'
                         conflicting = [
                             p for p in existing_positions
@@ -3483,6 +3595,25 @@ class TradingBot:
                             logger.warning(
                                 f"Blocked {trade_signal.direction} {symbol}: opposite-direction "
                                 f"position exists (ticket={conflicting[0].ticket})"
+                            )
+                            self.daily_trades = max(0, self.daily_trades - 1)
+                            return
+                        
+                        # Block same-direction stacking
+                        same_dir = [
+                            p for p in existing_positions
+                            if p.direction == trade_signal.direction
+                        ]
+                        if same_dir:
+                            print(
+                                f"[BLOCKED] {symbol}: Already have {trade_signal.direction.upper()} "
+                                f"position open (ticket={same_dir[0].ticket}). "
+                                f"No same-direction stacking allowed.",
+                                flush=True
+                            )
+                            logger.warning(
+                                f"Blocked {trade_signal.direction} {symbol}: same-direction "
+                                f"position already open (ticket={same_dir[0].ticket})"
                             )
                             self.daily_trades = max(0, self.daily_trades - 1)
                             return
@@ -3516,6 +3647,29 @@ class TradingBot:
                 
                 # Respect Claude's explicit pending order choice — do NOT override to market
                 # even during distribution phase. Claude knows the entry model.
+                
+                # Add spread buffer to SL to prevent premature stop-outs from spread widening
+                _final_sl = trade_signal.stop_loss
+                _final_tp = trade_signal.take_profit
+                try:
+                    import MetaTrader5 as mt5
+                    _tick = mt5.symbol_info_tick(symbol)
+                    if _tick and _tick.ask > 0 and _tick.bid > 0:
+                        _spread = _tick.ask - _tick.bid
+                        if _spread > 0 and _final_sl:
+                            if trade_signal.direction == 'long':
+                                # Long SL is below entry, push it down by half a spread
+                                _final_sl = _final_sl - (_spread * 0.5)
+                            else:
+                                # Short SL is above entry, push it up by half a spread
+                                _final_sl = _final_sl + (_spread * 0.5)
+                            logger.info(
+                                f"[SPREAD-BUF] {symbol}: SL adjusted by 0.5x spread ({_spread:.5f}): "
+                                f"{trade_signal.stop_loss:.5f} -> {_final_sl:.5f}"
+                            )
+                except Exception as e:
+                    logger.debug(f"[SPREAD-BUF] Could not adjust SL for spread: {e}")
+                
                 if order_type == 'market':
                     # Use market order - immediate execution
                     logger.info(f"📈 Executing MARKET order (AMD: {trade_signal.amd_phase})")
@@ -3524,8 +3678,8 @@ class TradingBot:
                         symbol=symbol,
                         direction=trade_signal.direction,
                         volume=position_size.lots,
-                        stop_loss=trade_signal.stop_loss,
-                        take_profit=trade_signal.take_profit,
+                        stop_loss=_final_sl,
+                        take_profit=_final_tp,
                         comment="ICT_Bot"
                     )
                 elif order_type in ['buy_limit', 'sell_limit', 'buy_stop', 'sell_stop']:
@@ -3576,8 +3730,8 @@ class TradingBot:
                         order_type=order_type,
                         volume=position_size.lots,
                         price=entry_price,
-                        stop_loss=trade_signal.stop_loss,
-                        take_profit=trade_signal.take_profit,
+                        stop_loss=_final_sl,
+                        take_profit=_final_tp,
                         expiration_minutes=expiration_minutes,
                         comment="ICT_Bot_Pending"
                     )
@@ -3591,8 +3745,8 @@ class TradingBot:
                             direction=trade_signal.direction,
                             volume=position_size.lots,
                             price=entry_price,
-                            stop_loss=trade_signal.stop_loss,
-                            take_profit=trade_signal.take_profit,
+                            stop_loss=_final_sl,
+                            take_profit=_final_tp,
                             expiration_minutes=expiration_minutes
                         )
                 else:
@@ -3603,8 +3757,8 @@ class TradingBot:
                         symbol=symbol,
                         direction=trade_signal.direction,
                         volume=position_size.lots,
-                        stop_loss=trade_signal.stop_loss,
-                        take_profit=trade_signal.take_profit,
+                        stop_loss=_final_sl,
+                        take_profit=_final_tp,
                         comment="ICT_Bot"
                     )
                 
@@ -3922,7 +4076,7 @@ class TradingBot:
                 return
             
             # Build context and data
-            strategy_context = self.context_builder.get_quick_reference()
+            strategy_context = self.context_builder.get_ict_context()
             market_data = {
                 "current_price": current_price,
                 "bid": current_price - 0.00005,
@@ -4155,7 +4309,6 @@ class TradingBot:
                 # Time in trade
                 if hasattr(pos, 'open_time') and pos.open_time:
                     try:
-                        from datetime import datetime, timezone
                         if isinstance(pos.open_time, str):
                             open_dt = datetime.fromisoformat(pos.open_time.replace('Z', '+00:00'))
                         else:
@@ -4462,15 +4615,16 @@ class TradingBot:
         Run the Trade Judge — a pre-execution validation layer using Claude.
         
         Checks the proposed trade against learned patterns and risk math.
-        Returns APPROVE (proceed as-is) or DEMOTE (convert to pending limit).
+        Returns APPROVE (proceed as-is), DEMOTE (convert to pending limit),
+        or REJECT (skip entirely).
         
-        Fails open: any error or timeout returns APPROVE so we never block
-        a validated trade due to infrastructure issues.
+        Fails closed: timeout or error returns DEMOTE so marginal trades
+        are forced to pending limit orders rather than going straight to market.
         """
-        default_approve = {"verdict": "APPROVE", "reason": "Judge skipped", "suggested_entry": None, "risk_flags": []}
+        default_demote = {"verdict": "DEMOTE", "reason": "Judge timeout/error — defaulting to limit order", "suggested_entry": None, "risk_flags": ["judge_unavailable"]}
         
         if not self.claude_client or not self.claude_client.api_key:
-            return default_approve
+            return default_demote
         
         try:
             # Build signal summary
@@ -4550,10 +4704,10 @@ class TradingBot:
                 except Exception as e:
                     logger.debug(f"[JUDGE] Could not get learning context: {e}")
             
-            # Call the judge with a timeout — fail open
+            # Call the judge with a timeout — fail closed (DEMOTE on timeout)
             verdict = await asyncio.wait_for(
                 self.claude_client.judge_trade(signal_dict, risk_metrics, learning_context),
-                timeout=5.0
+                timeout=8.0
             )
             
             logger.info(
@@ -4564,11 +4718,11 @@ class TradingBot:
             return verdict
             
         except asyncio.TimeoutError:
-            logger.warning(f"[JUDGE] Timeout for {symbol} — failing open (APPROVE)")
-            return default_approve
+            logger.warning(f"[JUDGE] Timeout for {symbol} — failing closed (DEMOTE to limit order)")
+            return default_demote
         except Exception as e:
-            logger.warning(f"[JUDGE] Error for {symbol}: {e} — failing open (APPROVE)")
-            return default_approve
+            logger.warning(f"[JUDGE] Error for {symbol}: {e} — failing closed (DEMOTE to limit order)")
+            return default_demote
     
     async def _check_drawdown_circuit_breaker(self) -> bool:
         """
@@ -4860,7 +5014,6 @@ class TradingBot:
                     hours_open = 0
                     try:
                         if hasattr(position, 'open_time') and position.open_time:
-                            from datetime import datetime, timezone
                             if isinstance(position.open_time, str):
                                 open_dt = datetime.fromisoformat(position.open_time.replace('Z', '+00:00'))
                             else:
@@ -4922,15 +5075,38 @@ Respond with one of: HOLD, CLOSE, or TIGHTEN
 Include brief reasoning.
 """
                     
+                    # Generate chart image for visual context
+                    chart_content = []
+                    try:
+                        chart_b64 = await self._generate_chart_image(
+                            df, position.symbol, settings.timeframes.execution_tf
+                        )
+                        if chart_b64:
+                            chart_content.append({
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": chart_b64
+                                }
+                            })
+                    except Exception as chart_err:
+                        logger.debug(f"Could not generate chart for reeval: {chart_err}")
+                    
+                    chart_content.append({
+                        "type": "text",
+                        "text": position_context
+                    })
+                    
                     # Get Claude's recommendation (with timeout and validation)
                     try:
                         response = await asyncio.wait_for(
                             self.claude_client.async_client.messages.create(
-                                model=self.claude_client.model,
+                                model=self.claude_client.model_light,
                                 max_tokens=300,
                                 messages=[{
                                     "role": "user",
-                                    "content": position_context
+                                    "content": chart_content
                                 }]
                             ),
                             timeout=30  # 30s timeout per position
@@ -5335,13 +5511,36 @@ Should we KEEP it or CANCEL it?
 Consider: Is price moving TOWARD or AWAY from the entry? Has the entry zone been invalidated?
 Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
 """
+                    # Generate chart for visual context
+                    pending_chart_content = []
+                    try:
+                        _pending_df = await self.data_fetcher.get_ohlcv(
+                            symbol=symbol, timeframe=settings.timeframes.execution_tf, count=100
+                        )
+                        if _pending_df is not None and not _pending_df.empty:
+                            _pending_chart_b64 = await self._generate_chart_image(
+                                _pending_df, symbol, settings.timeframes.execution_tf
+                            )
+                            if _pending_chart_b64:
+                                pending_chart_content.append({
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": _pending_chart_b64
+                                    }
+                                })
+                    except Exception:
+                        pass
+                    
+                    pending_chart_content.append({"type": "text", "text": prompt})
                     
                     try:
                         response = await asyncio.wait_for(
                             self.claude_client.async_client.messages.create(
-                                model=self.claude_client.model,
+                                model=self.claude_client.model_light,
                                 max_tokens=200,
-                                messages=[{"role": "user", "content": prompt}]
+                                messages=[{"role": "user", "content": pending_chart_content}]
                             ),
                             timeout=20
                         )
@@ -5489,6 +5688,13 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
             if self.mt5_client.is_simulation:
                 logger.info("Simulation mode - no MT5 positions to sync")
                 return
+            
+            # Clean up stale DB records BEFORE main sync to avoid noisy
+            # "position closed" logs for positions that are long gone
+            stale_removed = await self.position_manager.cleanup_stale_db_records(self.mt5_client)
+            if stale_removed > 0:
+                # Reload after cleanup so db_positions is fresh
+                db_positions = await self.position_manager.load_from_db()
             
             mt5_positions = await self.mt5_client.get_positions()
             # MT5 Position is a dataclass - access attributes directly
@@ -5989,6 +6195,18 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
             elif profit_loss < 0:
                 self.loss_streak += 1
                 self.win_streak = 0
+                # Set 30-minute cooldown on this symbol to prevent revenge trading
+                cooldown_until = datetime.now() + timedelta(minutes=30)
+                self._symbol_loss_cooldowns[position.symbol] = cooldown_until
+                logger.info(
+                    f"[LOSS-COOLDOWN] {position.symbol}: 30-min cooldown set until "
+                    f"{cooldown_until.strftime('%H:%M:%S')} (P/L: ${profit_loss:.2f})"
+                )
+                print(
+                    f"[LOSS-COOLDOWN] {position.symbol}: No new entries for 30 minutes "
+                    f"(cooldown until {cooldown_until.strftime('%H:%M:%S')})",
+                    flush=True
+                )
             
             # Add to activity feed
             from .api.routes.activity import add_activity
@@ -6254,7 +6472,7 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                 return
             
             # ---- Build reversal-specific context ----
-            strategy_context = self.context_builder.get_quick_reference()
+            strategy_context = self.context_builder.get_ict_context()
             
             reversal_context = (
                 f"\n\n## REVERSAL ANALYSIS CONTEXT\n"
@@ -6498,6 +6716,14 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                     )
                     if sizing and sizing.get('position_size', 0) > 0:
                         position_size = sizing['position_size']
+                    
+                    # Apply scaling manager risk multiplier for reversals too
+                    if self.scaling_manager:
+                        _mode_cfg = self.scaling_manager.get_mode_config()
+                        _rmult = getattr(_mode_cfg, 'risk_multiplier', 1.0)
+                        if _rmult != 1.0:
+                            from .config import normalize_lots as _nl
+                            position_size = _nl(symbol, position_size * _rmult)
                 except Exception as e:
                     logger.warning(f"[REVERSAL] Position sizing error: {e}")
             

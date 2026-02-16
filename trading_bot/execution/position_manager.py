@@ -302,6 +302,57 @@ class PositionManager:
             logger.error(f"Error loading positions from database: {e}")
             return []
     
+    async def cleanup_stale_db_records(self, mt5_client) -> int:
+        """
+        Remove DB position_states records for positions no longer in MT5.
+        
+        Call this once at startup AFTER load_from_db but BEFORE the main
+        sync loop to silently prune stale records without triggering
+        close callbacks or noisy "position closed" logs every restart.
+        
+        Returns:
+            Number of stale records removed.
+        """
+        removed = 0
+        try:
+            mt5_positions = await mt5_client.get_positions()
+            mt5_tickets = {p.ticket for p in mt5_positions}
+            
+            pending_orders = await mt5_client.get_orders()
+            pending_tickets = set()
+            if pending_orders:
+                for order in pending_orders:
+                    if isinstance(order, dict):
+                        pending_tickets.add(order.get('ticket', 0))
+                    else:
+                        pending_tickets.add(getattr(order, 'ticket', 0))
+            
+            all_mt5_tickets = mt5_tickets | pending_tickets
+            
+            stale_tickets = [
+                ticket for ticket in list(self.positions.keys())
+                if ticket not in all_mt5_tickets
+            ]
+            
+            for ticket in stale_tickets:
+                pos = self.positions.get(ticket)
+                symbol = pos.symbol if pos else "?"
+                logger.info(
+                    f"[STARTUP-CLEANUP] Removing stale DB record: "
+                    f"ticket={ticket} symbol={symbol} (not in MT5)"
+                )
+                if ticket in self.positions:
+                    del self.positions[ticket]
+                await self._delete_position_from_db(ticket)
+                removed += 1
+            
+            if removed > 0:
+                logger.info(f"[STARTUP-CLEANUP] Removed {removed} stale position record(s) from DB")
+        except Exception as e:
+            logger.error(f"Error cleaning up stale DB records: {e}")
+        
+        return removed
+    
     async def sync_with_mt5(self, mt5_client) -> dict:
         """
         Sync positions with MT5 - detect closed positions.
