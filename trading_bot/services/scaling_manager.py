@@ -44,14 +44,14 @@ MODE_CONFIGS = {
     TradingMode.NORMAL: ModeConfig(
         risk_multiplier=1.0,
         setup_filter='A_and_B',
-        confidence_threshold=0.80,
+        confidence_threshold=0.75,
         max_daily_trades=25,
         description="Standard risk, requires strong conviction (swing validation + confluence)"
     ),
     TradingMode.CONSERVATIVE: ModeConfig(
         risk_multiplier=0.5,
         setup_filter='A_and_B',
-        confidence_threshold=0.80,
+        confidence_threshold=0.70,
         max_daily_trades=15,
         description="Half risk, A+ and A setups only (Mon/Fri caution)"
     ),

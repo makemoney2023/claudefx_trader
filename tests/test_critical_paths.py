@@ -662,37 +662,42 @@ class TestSLTPSwapDetection:
             client.max_tokens = 4096
         return client
 
-    def test_long_swapped_sl_tp_auto_corrected(self):
-        """For a LONG trade, if SL > entry and TP < entry, both should be swapped."""
+    def test_long_swapped_sl_tp_flips_direction(self):
+        """For a LONG trade, if SL > entry and TP < entry, direction should flip to SHORT."""
         client = self._make_client()
-        # Entry=100, but SL=102 (above entry) and TP=98 (below entry) — SWAPPED
+        # Entry=100, but SL=102 (above entry) and TP=98 (below entry)
+        # Levels are consistent with a SHORT trade, so direction flips.
         tool_input = {
             'direction': 'long',
             'entry_price': 100.0,
-            'stop_loss': 102.0,   # Wrong: above entry for long
-            'take_profit': 98.0,  # Wrong: below entry for long
+            'stop_loss': 102.0,   # Above entry — correct for short
+            'take_profit': 98.0,  # Below entry — correct for short
             'confidence': 0.8,
             'reasoning': 'test',
         }
         result = client._validate_trade_signal(tool_input)
-        # After auto-correction, SL should be 98 (below entry) and TP should be 102 (above entry)
-        assert result['stop_loss'] == 98.0, f"SL should be 98.0 after swap, got {result['stop_loss']}"
-        assert result['take_profit'] == 102.0, f"TP should be 102.0 after swap, got {result['take_profit']}"
+        # Direction coherence check should flip to SHORT (levels say short)
+        assert result['direction'] == 'short', f"Direction should flip to short, got {result['direction']}"
+        assert result['stop_loss'] == 102.0, f"SL should stay 102.0, got {result['stop_loss']}"
+        assert result['take_profit'] == 98.0, f"TP should stay 98.0, got {result['take_profit']}"
 
-    def test_short_swapped_sl_tp_auto_corrected(self):
-        """For a SHORT trade, if SL < entry and TP > entry, both should be swapped."""
+    def test_short_swapped_sl_tp_flips_direction(self):
+        """For a SHORT trade, if SL < entry and TP > entry, direction should flip to LONG."""
         client = self._make_client()
+        # Levels are consistent with a LONG trade, so direction flips.
         tool_input = {
             'direction': 'short',
             'entry_price': 100.0,
-            'stop_loss': 98.0,    # Wrong: below entry for short
-            'take_profit': 102.0, # Wrong: above entry for short
+            'stop_loss': 98.0,    # Below entry — correct for long
+            'take_profit': 102.0, # Above entry — correct for long
             'confidence': 0.8,
             'reasoning': 'test',
         }
         result = client._validate_trade_signal(tool_input)
-        assert result['stop_loss'] == 102.0, f"SL should be 102.0 after swap, got {result['stop_loss']}"
-        assert result['take_profit'] == 98.0, f"TP should be 98.0 after swap, got {result['take_profit']}"
+        # Direction coherence check should flip to LONG (levels say long)
+        assert result['direction'] == 'long', f"Direction should flip to long, got {result['direction']}"
+        assert result['stop_loss'] == 98.0, f"SL should stay 98.0, got {result['stop_loss']}"
+        assert result['take_profit'] == 102.0, f"TP should stay 102.0, got {result['take_profit']}"
 
     def test_pip_distance_tp_converted_to_absolute_long(self):
         """TP=0.09 when DASH is at ~36.0 should be detected as pip distance and converted."""
@@ -1056,11 +1061,11 @@ class TestDrawdownRecoveryMode:
         )
 
     def test_conservative_mode_config(self):
-        """CONSERVATIVE mode should have risk_multiplier=0.5, confidence_threshold=0.80."""
+        """CONSERVATIVE mode should have risk_multiplier=0.5, confidence_threshold=0.70."""
         from trading_bot.services.scaling_manager import MODE_CONFIGS, TradingMode
         config = MODE_CONFIGS[TradingMode.CONSERVATIVE]
         assert config.risk_multiplier == 0.5
-        assert config.confidence_threshold == 0.80
+        assert config.confidence_threshold == 0.70
         assert config.max_daily_trades == 15
 
     def test_normal_mode_on_no_issues(self):

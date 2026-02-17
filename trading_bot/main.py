@@ -272,6 +272,13 @@ class TradingBot:
         # for 30 minutes after a stop-loss exit on the same symbol
         self._symbol_loss_cooldowns: Dict[str, datetime] = {}  # symbol -> cooldown_expires_at
         
+        # New-candle trigger: only call Claude when a new M15 candle has closed
+        # Saves API costs by skipping redundant analyses on unchanged chart data
+        self._last_analyzed_candle: Dict[str, datetime] = {}  # symbol -> last closed candle timestamp
+        
+        # Dynamic learnings: throttle doc updates to at most once per hour
+        self._last_learnings_update: Optional[datetime] = None
+        
         # SAFE Crypto symbols (24/7 trading) - ONLY USD pairs!
         # WARNING: BTC pairs (ETHBTC, DASHBTC, etc.) are EXCLUDED because 
         # their contract value is in BTC, not USD, causing incorrect position sizing
@@ -593,34 +600,25 @@ class TradingBot:
             logger.info("Initializing Fibonacci analyzer...")
             self.fibonacci_analyzer = FibonacciAnalyzer()
             
-            # Firecrawl Intelligence Service (optional)
-            firecrawl_key = getattr(settings, 'firecrawl_api_key', None) or \
-                           getattr(getattr(settings, 'firecrawl', None), 'api_key', None)
-            if firecrawl_key:
-                logger.info("Initializing Firecrawl intelligence service...")
+            # Firecrawl Intelligence Service (optional — disabled if no credits)
+            print("[INIT] Firecrawl intelligence service...", flush=True)
+            self.firecrawl_service = None
+            self._firecrawl_consecutive_failures = 0
+            firecrawl_key = getattr(getattr(settings, 'firecrawl', None), 'api_key', None) or \
+                           getattr(settings, 'firecrawl_api_key', None)
+            firecrawl_enabled = getattr(getattr(settings, 'firecrawl', None), 'enabled', False)
+            if firecrawl_key and firecrawl_enabled:
+                refresh_min = getattr(getattr(settings, 'firecrawl', None), 'refresh_minutes', 15)
                 self.firecrawl_service = FirecrawlIntelligenceService(
                     api_key=firecrawl_key,
-                    refresh_minutes=15,
+                    refresh_minutes=refresh_min,
                     enabled=True
                 )
+                logger.info("Firecrawl intelligence service initialized")
+                print("[INIT] Firecrawl enabled (will auto-disable after 3 consecutive failures)", flush=True)
             else:
-                self.firecrawl_service = None
-                logger.info("Firecrawl service not configured (no API key)")
-            
-            # Firecrawl Intelligence Service - real-time market data
-            print("[INIT] Firecrawl intelligence service...", flush=True)
-            if hasattr(settings, 'firecrawl') and getattr(settings.firecrawl, 'api_key', None) and settings.firecrawl.enabled:
-                logger.info("Initializing Firecrawl intelligence service...")
-                self.firecrawl_service = FirecrawlIntelligenceService(
-                    api_key=settings.firecrawl.api_key,
-                    refresh_minutes=settings.firecrawl.refresh_minutes,
-                    enabled=settings.firecrawl.enabled
-                )
-                # Initial refresh (non-blocking — will be refreshed in background)
-                print("[INIT] Firecrawl initial refresh (skipping — handled by background task)...", flush=True)
-            else:
-                self.firecrawl_service = None
-                logger.info("Firecrawl intelligence disabled (no API key)")
+                logger.info("Firecrawl intelligence disabled (no API key or disabled in config)")
+                print("[INIT] Firecrawl disabled", flush=True)
             
             # Initialize Telegram notifier
             print("[INIT] Telegram notifier...", flush=True)
@@ -987,20 +985,30 @@ class TradingBot:
             # STEP 0D: PERIODIC FIRECRAWL INTELLIGENCE REFRESH
             # ============================================
             if hasattr(self, 'firecrawl_service') and self.firecrawl_service:
-                # Check if it's time to refresh (every 15 minutes)
                 if not hasattr(self, '_last_firecrawl_refresh'):
                     self._last_firecrawl_refresh = datetime.min
                 
                 time_since_refresh = (datetime.now() - self._last_firecrawl_refresh).total_seconds() / 60
+                refresh_min = getattr(getattr(settings, 'firecrawl', None), 'refresh_minutes', 15)
                 
-                if time_since_refresh >= settings.firecrawl.refresh_minutes:
-                    logger.info(f"🔄 Refreshing Firecrawl intelligence ({time_since_refresh:.0f}min since last refresh)...")
+                if time_since_refresh >= refresh_min:
                     try:
                         await self.firecrawl_service.refresh_all(cycle_symbols)
                         self._last_firecrawl_refresh = datetime.now()
-                        logger.info("✅ Firecrawl intelligence refreshed for all symbols")
+                        self._firecrawl_consecutive_failures = 0
+                        logger.info("Firecrawl intelligence refreshed")
                     except Exception as e:
-                        logger.error(f"Firecrawl refresh error: {e}")
+                        self._firecrawl_consecutive_failures += 1
+                        if self._firecrawl_consecutive_failures >= 3:
+                            print(
+                                f"[FIRECRAWL] Auto-disabled after {self._firecrawl_consecutive_failures} "
+                                f"consecutive failures (likely credits exhausted)",
+                                flush=True
+                            )
+                            logger.warning(f"Firecrawl auto-disabled after {self._firecrawl_consecutive_failures} failures: {e}")
+                            self.firecrawl_service = None
+                        else:
+                            logger.warning(f"Firecrawl refresh failed ({self._firecrawl_consecutive_failures}/3): {e}")
             
             # ============================================
             # STEP 1: TRACK EQUITY FOR GOAL
@@ -1088,9 +1096,8 @@ class TradingBot:
             # STEP 2b: FRIDAY PRE-CLOSE (Weekend Gap Protection)
             # ============================================
             import pytz
-            from datetime import datetime as dt_module
             est_tz = pytz.timezone('US/Eastern')
-            now_est = dt_module.now(est_tz)
+            now_est = datetime.now(est_tz)
             if now_est.weekday() == 4:  # Friday
                 if now_est.hour >= 16 and now_est.minute >= 30:
                     logger.warning("FRIDAY PRE-CLOSE: Closing forex positions before weekend")
@@ -1120,7 +1127,14 @@ class TradingBot:
             session = self.kill_zone_checker.get_current_session()
             print(f"[CYCLE] Session: {session.session_name}, is_tradeable={session.is_tradeable}, is_kill_zone={session.is_kill_zone}", flush=True)
             if not session.is_tradeable:
-                # Outside kill zone — but crypto trades 24/7, so only filter out forex
+                # Outside kill zone — check if crypto should also be restricted
+                if settings.trading.crypto_kill_zone_only:
+                    # Kill-zone-only mode: skip ALL symbols (including crypto) outside kill zones
+                    print(f"[CYCLE] BLOCKED: Outside kill zone ({session.session_name}), crypto_kill_zone_only=True", flush=True)
+                    logger.debug(f"Outside kill zone ({session.session_name}), all symbols blocked (crypto_kill_zone_only)")
+                    return
+                
+                # Legacy behavior: crypto trades 24/7, only filter out forex
                 crypto_in_cycle = [s for s in cycle_symbols if s in self.CRYPTO_SYMBOLS]
                 if crypto_in_cycle:
                     logger.info(
@@ -1175,8 +1189,20 @@ class TradingBot:
                 async def _process_symbol(sym):
                     try:
                         is_crypto = sym in self.CRYPTO_SYMBOLS
-                        if is_crypto:
-                            logger.info(f"🪙 {sym} is crypto - 24/7 trading enabled")
+                        
+                        # NEW-CANDLE TRIGGER: Only call Claude when a new M15 candle has closed
+                        try:
+                            candle_df = await self.data_fetcher.get_ohlcv(sym, "M15", count=2)
+                            if candle_df is not None and len(candle_df) >= 2:
+                                last_closed_ts = candle_df.index[-2] if hasattr(candle_df.index, '__getitem__') else candle_df.iloc[-2].name
+                                prev_ts = self._last_analyzed_candle.get(sym)
+                                if prev_ts is not None and last_closed_ts == prev_ts:
+                                    logger.debug(f"[SKIP] {sym}: No new M15 candle since last analysis")
+                                    return
+                                self._last_analyzed_candle[sym] = last_closed_ts
+                        except Exception as candle_err:
+                            logger.debug(f"Candle check failed for {sym}, proceeding: {candle_err}")
+                        
                         print(f"[CYCLE] Analyzing {sym} (crypto={is_crypto})...", flush=True)
                         # Per-symbol timeout: 120s max per analysis to prevent one slow symbol
                         # from blocking the entire batch
@@ -1185,7 +1211,7 @@ class TradingBot:
                             timeout=120.0
                         )
                     except asyncio.TimeoutError:
-                        logger.error(f"⏰ Analysis of {sym} TIMED OUT after 120s — skipping")
+                        logger.error(f"Analysis of {sym} TIMED OUT after 120s - skipping")
                     except Exception as e:
                         logger.error(f"Error analyzing {sym}: {e}")
                 
@@ -3670,9 +3696,25 @@ class TradingBot:
                 except Exception as e:
                     logger.debug(f"[SPREAD-BUF] Could not adjust SL for spread: {e}")
                 
+                # DRY-RUN MODE: Log the trade but skip actual execution
+                if settings.trading.dry_run:
+                    print(
+                        f"[DRY-RUN] Would place {order_type} {trade_signal.direction.upper()} "
+                        f"{symbol} @ {trade_signal.entry_price:.5f} "
+                        f"(SL: {_final_sl:.5f}, TP: {_final_tp:.5f}, "
+                        f"Lots: {position_size.lots}, Conf: {trade_signal.confidence:.0%})",
+                        flush=True
+                    )
+                    logger.info(
+                        f"[DRY-RUN] {symbol}: {order_type} {trade_signal.direction} "
+                        f"@ {trade_signal.entry_price}, SL={_final_sl}, TP={_final_tp}, "
+                        f"lots={position_size.lots}, confidence={trade_signal.confidence:.0%}"
+                    )
+                    return None
+                
                 if order_type == 'market':
                     # Use market order - immediate execution
-                    logger.info(f"📈 Executing MARKET order (AMD: {trade_signal.amd_phase})")
+                    logger.info(f"Executing MARKET order (AMD: {trade_signal.amd_phase})")
                     
                     result = await self.order_manager.place_market_order(
                         symbol=symbol,
@@ -5226,10 +5268,12 @@ Include brief reasoning.
                                 )
                     
                 except Exception as e:
-                    logger.error(f"Error re-evaluating position {position.ticket}: {e}")
+                    import traceback as _tb
+                    logger.error(f"Error re-evaluating position {position.ticket}: {e}\n{_tb.format_exc()}")
                     
         except Exception as e:
-            logger.error(f"Error in Claude re-evaluation: {e}")
+            import traceback as _tb
+            logger.error(f"Error in Claude re-evaluation: {e}\n{_tb.format_exc()}")
     
     async def _claude_reevaluate_pending_orders(self):
         """
@@ -6114,7 +6158,6 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
             
             if hasattr(self, 'mt5_client') and self.mt5_client and not self.mt5_client.is_simulation:
                 try:
-                    from datetime import timedelta
                     history = await self.mt5_client.get_history(
                         close_time - timedelta(minutes=10), close_time + timedelta(minutes=1)
                     )
@@ -6225,6 +6268,21 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                     "r_multiple": position.current_r_multiple
                 }
             )
+            
+            # Dynamic learning update: refresh trading_learnings.md after each close
+            # Throttled to at most once per hour to avoid excessive disk writes
+            if self.learning_service:
+                try:
+                    should_update = (
+                        self._last_learnings_update is None
+                        or (datetime.now() - self._last_learnings_update).total_seconds() >= 3600
+                    )
+                    if should_update:
+                        await self.learning_service.update_learnings_documentation()
+                        self._last_learnings_update = datetime.now()
+                        logger.info("[LEARNINGS] Updated trading_learnings.md after trade close")
+                except Exception as learn_err:
+                    logger.debug(f"Could not update learnings doc: {learn_err}")
             
             # Send Telegram notification ONLY if we confirmed the close via MT5 history.
             # If MT5 didn't return a matching close deal, the position may have

@@ -910,6 +910,8 @@ class TestTradeJudgeMechanical:
             client = ClaudeClient.__new__(ClaudeClient)
             client.api_key = "test"
             client.model = "test"
+            client.model_heavy = "test"
+            client.model_light = "test"
             client.max_tokens = 4096
             client.temperature = 0.3
             client.max_retries = 3
@@ -1117,14 +1119,14 @@ class TestTradeJudgePerformance:
             assert metric in source, f"Judge prompt missing risk metric: {metric}"
     
     def test_judge_latency_budget(self):
-        """_run_trade_judge should use asyncio.wait_for with timeout <= 5 seconds."""
+        """_run_trade_judge should use asyncio.wait_for with timeout <= 8 seconds."""
         import inspect
         from trading_bot.main import TradingBot
         
         source = inspect.getsource(TradingBot._run_trade_judge)
         assert 'wait_for' in source, "_run_trade_judge should use asyncio.wait_for"
-        assert 'timeout=5.0' in source or 'timeout=5' in source, \
-            "_run_trade_judge timeout should be 5 seconds"
+        assert 'timeout=8.0' in source or 'timeout=8' in source, \
+            "_run_trade_judge timeout should be 8 seconds"
     
     def test_judge_demote_default_price_improvement(self):
         """Default demote should use 0.2% price improvement from current."""

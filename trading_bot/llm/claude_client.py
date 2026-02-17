@@ -502,10 +502,12 @@ class ClaudeClient:
                 })
                 
                 # Create message with images and tool use (Opus for best analysis quality)
+                # Strategy docs go in system message with cache_control for Anthropic prompt caching
                 message = await self.async_client.messages.create(
                     model=self.model_heavy,
                     max_tokens=self.max_tokens,
                     temperature=self.temperature,
+                    system=self._build_system_messages(strategy_context),
                     tools=[TRADE_SIGNAL_TOOL],
                     tool_choice={"type": "tool", "name": "submit_trade_analysis"},
                     messages=[
@@ -640,6 +642,7 @@ class ClaudeClient:
                 model=self.model_heavy,
                 max_tokens=self.max_tokens,
                 temperature=self.temperature,
+                system=self._build_system_messages(strategy_context),
                 tools=[TRADE_SIGNAL_TOOL],
                 tool_choice={"type": "tool", "name": "submit_trade_analysis"},
                 messages=[
@@ -678,6 +681,21 @@ class ClaudeClient:
             logger.error(f"Error analyzing chart: {e}")
             return self._create_no_trade_result(f"Analysis error: {str(e)}")
     
+    def _build_system_messages(self, strategy_context: str) -> list:
+        """Build system messages with prompt caching for strategy docs."""
+        return [
+            {
+                "type": "text",
+                "text": "You are an expert ICT (Inner Circle Trading) forex analyst. "
+                        "Analyze charts using the ICT methodology described below.",
+            },
+            {
+                "type": "text",
+                "text": strategy_context,
+                "cache_control": {"type": "ephemeral"}
+            }
+        ]
+    
     def _build_analysis_prompt(
         self,
         symbol: str,
@@ -686,11 +704,8 @@ class ClaudeClient:
         market_data: Optional[Dict[str, Any]],
         analysis_data: Optional[Dict[str, Any]]
     ) -> str:
-        """Build the analysis prompt for Claude."""
-        prompt = f"""You are an expert ICT (Inner Circle Trading) forex analyst. Analyze the attached {symbol} {timeframe} chart using ICT methodology.
-
-## Strategy Context
-{strategy_context}
+        """Build the analysis prompt for Claude (symbol-specific, no strategy docs)."""
+        prompt = f"""Analyze the attached {symbol} {timeframe} chart using the ICT strategy context provided in the system message.
 
 ## Current Market Information
 - Symbol: {symbol}

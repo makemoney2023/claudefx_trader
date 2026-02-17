@@ -346,8 +346,8 @@ class TradingSettings(BaseSettings):
     )
     
     symbols: List[str] = Field(
-        default=["EURUSD", "GBPUSD", "XAUUSD"],
-        description="List of trading symbols"
+        default=["XAUUSD", "XAGUSD", "BTCUSD"],
+        description="List of trading symbols (override via TRADING_SYMBOLS env var)"
     )
     risk_per_trade: float = Field(
         default=0.01,
@@ -380,6 +380,14 @@ class TradingSettings(BaseSettings):
     allow_simulation_trades: bool = Field(
         default=False,
         description="Allow trades in MT5 simulation mode (for testing only)"
+    )
+    crypto_kill_zone_only: bool = Field(
+        default=True,
+        description="Restrict crypto analysis to kill zones only (saves API costs)"
+    )
+    dry_run: bool = Field(
+        default=False,
+        description="Run full analysis pipeline but skip order execution (for testing signal quality)"
     )
     max_position_size: float = Field(
         default=1.0,
