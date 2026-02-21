@@ -346,7 +346,7 @@ class TradingSettings(BaseSettings):
     )
     
     symbols: List[str] = Field(
-        default=["XAUUSD", "XAGUSD", "BTCUSD"],
+        default=["BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD"],
         description="List of trading symbols (override via TRADING_SYMBOLS env var)"
     )
     risk_per_trade: float = Field(

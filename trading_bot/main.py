@@ -272,9 +272,10 @@ class TradingBot:
         # for 30 minutes after a stop-loss exit on the same symbol
         self._symbol_loss_cooldowns: Dict[str, datetime] = {}  # symbol -> cooldown_expires_at
         
-        # New-candle trigger: only call Claude when a new M15 candle has closed
+        # Analysis cooldown: only call Claude once per 5 minutes per symbol
         # Saves API costs by skipping redundant analyses on unchanged chart data
-        self._last_analyzed_candle: Dict[str, datetime] = {}  # symbol -> last closed candle timestamp
+        self._last_analysis_time: Dict[str, datetime] = {}  # symbol -> last analysis datetime
+        self._analysis_cooldown_seconds: int = 300  # 5 minutes
         
         # Dynamic learnings: throttle doc updates to at most once per hour
         self._last_learnings_update: Optional[datetime] = None
@@ -1190,18 +1191,14 @@ class TradingBot:
                     try:
                         is_crypto = sym in self.CRYPTO_SYMBOLS
                         
-                        # NEW-CANDLE TRIGGER: Only call Claude when a new M15 candle has closed
-                        try:
-                            candle_df = await self.data_fetcher.get_ohlcv(sym, "M15", count=2)
-                            if candle_df is not None and len(candle_df) >= 2:
-                                last_closed_ts = candle_df.index[-2] if hasattr(candle_df.index, '__getitem__') else candle_df.iloc[-2].name
-                                prev_ts = self._last_analyzed_candle.get(sym)
-                                if prev_ts is not None and last_closed_ts == prev_ts:
-                                    logger.debug(f"[SKIP] {sym}: No new M15 candle since last analysis")
-                                    return
-                                self._last_analyzed_candle[sym] = last_closed_ts
-                        except Exception as candle_err:
-                            logger.debug(f"Candle check failed for {sym}, proceeding: {candle_err}")
+                        # ANALYSIS COOLDOWN: Only call Claude once per 5 minutes per symbol
+                        last_run = self._last_analysis_time.get(sym)
+                        now = datetime.now()
+                        if last_run is not None:
+                            elapsed = (now - last_run).total_seconds()
+                            if elapsed < self._analysis_cooldown_seconds:
+                                return
+                        self._last_analysis_time[sym] = now
                         
                         print(f"[CYCLE] Analyzing {sym} (crypto={is_crypto})...", flush=True)
                         # Per-symbol timeout: 120s max per analysis to prevent one slow symbol
