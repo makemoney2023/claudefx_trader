@@ -262,20 +262,19 @@ class RiskManager:
         if (sl_distance / pip_size) < min_sl_pips:
             warnings.append(f"Stop loss is tight ({sl_distance / pip_size:.1f} pips vs recommended {min_sl_pips:.0f})")
         
-        # Reject if SL distance is less than 1.5x the current spread
-        # Trades this tight are almost guaranteed to stop out from noise
+        # Check if SL distance is less than 1.0x the current spread
         try:
             import MetaTrader5 as mt5
             tick = mt5.symbol_info_tick(symbol)
             if tick and tick.ask > 0 and tick.bid > 0:
                 current_spread = tick.ask - tick.bid
-                if current_spread > 0 and sl_distance < current_spread * 1.5:
-                    errors.append(
-                        f"SL too close to entry: {sl_distance:.5f} < 1.5x spread ({current_spread:.5f}). "
-                        f"Will stop out from spread noise."
+                if current_spread > 0 and sl_distance < current_spread * 1.0:
+                    warnings.append(
+                        f"SL tight vs spread: {sl_distance:.5f} < 1.0x spread ({current_spread:.5f}). "
+                        f"Risk of spread noise stop-out."
                     )
         except Exception:
-            pass  # If spread check fails, don't block
+            pass
         
         # Check if trade size is reasonable
         if position_size.lots > 10:

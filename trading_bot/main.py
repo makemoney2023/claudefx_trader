@@ -508,6 +508,12 @@ class TradingBot:
                 max_daily_drawdown=settings.trading.max_daily_drawdown,  # 3% from config
                 max_weekly_drawdown=settings.trading.max_weekly_drawdown,  # 6% from config
             )
+            # Demo account: AGGRESSIVE mode for maximum data collection
+            # AGGRESSIVE LOCK prevents performance rules from downgrading;
+            # only drawdown protections can override
+            from .services.scaling_manager import TradingMode
+            self.scaling_manager.current_mode = TradingMode.AGGRESSIVE
+            logger.info("Scaling mode set to AGGRESSIVE (demo data collection)")
             
             # Session Analytics - track performance by session
             logger.info("Initializing session analytics...")
@@ -2448,10 +2454,13 @@ class TradingBot:
             
             if actual_rr < min_rr and sl_distance > 0:
                 # R:R is below minimum. Two tiers:
-                # 1) If R:R is at least 1.5:1 (decent reward for risk), let it
-                #    through to the Trade Judge for final evaluation.
-                # 2) If R:R < 1.5:1, hard-reject — marginal trades erode edge.
-                _hard_floor_rr = 1.5
+                # 1) If R:R >= hard floor, let Trade Judge decide.
+                # 2) If R:R < hard floor, hard-reject.
+                # In AGGRESSIVE mode (demo data collection), lower floor to 1.0
+                # to collect more trade outcomes for learning.
+                _is_aggressive = (self.scaling_manager and 
+                                  self.scaling_manager.current_mode.value == 'aggressive')
+                _hard_floor_rr = 1.0 if _is_aggressive else 1.5
                 
                 if actual_rr < _hard_floor_rr:
                     # Reward < risk — hard reject regardless of setup quality
@@ -2582,7 +2591,7 @@ class TradingBot:
             # Require minimum confluence factors for trades
             # In AGGRESSIVE mode (data collection), lower the bar to 1 factor at 65%+ confidence
             min_confluence = 1 if (self.scaling_manager and self.scaling_manager.current_mode.value == 'aggressive') else 2
-            confidence_override = 0.65 if (self.scaling_manager and self.scaling_manager.current_mode.value == 'aggressive') else 0.80
+            confidence_override = 0.65 if (self.scaling_manager and self.scaling_manager.current_mode.value == 'aggressive') else 0.75
             
             if confluence_count < min_confluence:
                 # Allow Claude high-confidence signals through even with low confluence
@@ -3375,6 +3384,33 @@ class TradingBot:
                 # No hardcoded TP floors or sanity gates — Claude's TP is final.
                 # The FINAL R:R SAFETY NET above handles rejection of bad R:R.
                 # No price fabrication. Accept or reject only.
+                
+                # =============================================
+                # STALE ENTRY FIX: Rebase SL/TP for market orders
+                # When Claude proposed entry differs from current price,
+                # preserve the SL/TP distances so they stay valid
+                # =============================================
+                if (trade_signal.order_type in ('market', None) and 
+                    trade_signal.entry_price and trade_signal.stop_loss and trade_signal.take_profit and
+                    current_price > 0):
+                    proposed_entry = trade_signal.entry_price
+                    drift = abs(current_price - proposed_entry)
+                    drift_pct = drift / proposed_entry if proposed_entry > 0 else 0
+                    if drift_pct > 0.002:  # >0.2% drift triggers rebase
+                        sl_offset = trade_signal.stop_loss - proposed_entry
+                        tp_offset = trade_signal.take_profit - proposed_entry
+                        new_sl = round(current_price + sl_offset, 5)
+                        new_tp = round(current_price + tp_offset, 5)
+                        print(
+                            f"[REBASE] {symbol}: Price drifted {drift_pct:.2%} "
+                            f"(proposed {proposed_entry:.5f} -> market {current_price:.5f}). "
+                            f"SL {trade_signal.stop_loss:.5f}->{new_sl:.5f}, "
+                            f"TP {trade_signal.take_profit:.5f}->{new_tp:.5f}",
+                            flush=True
+                        )
+                        trade_signal.entry_price = current_price
+                        trade_signal.stop_loss = new_sl
+                        trade_signal.take_profit = new_tp
                 
                 # =============================================
                 # TRADE JUDGE (pre-execution validation)
