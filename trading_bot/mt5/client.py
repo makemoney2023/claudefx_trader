@@ -1412,20 +1412,49 @@ class MT5Client:
         price: Optional[float] = None
     ) -> Dict[str, Any]:
         """
-        Modify an order (alias for modify_position for OrderManager compatibility).
-        
-        Args:
-            ticket: Order/position ticket
-            stop_loss: New stop loss
-            take_profit: New take profit
-            price: New price (for pending orders, not implemented yet)
-            
-        Returns:
-            Dict with modification result
+        Modify a pending order's price, SL, and/or TP.
+        Uses TRADE_ACTION_MODIFY for pending orders.
+        Falls back to modify_position if the ticket is an open position.
         """
-        # For now, delegate to modify_position
-        # In the future, can add support for modifying pending order prices
-        return await self.modify_position(ticket, stop_loss, take_profit)
+        if self._use_simulation:
+            return {"success": True, "simulated": True}
+
+        try:
+            mt5 = self._mcp_client
+
+            async with self._lock:
+                orders = await asyncio.to_thread(mt5.orders_get, ticket=ticket)
+
+            if orders and len(orders) > 0:
+                order = orders[0]
+                request = {
+                    "action": mt5.TRADE_ACTION_MODIFY,
+                    "order": ticket,
+                    "symbol": order.symbol,
+                    "price": price if price is not None else order.price_open,
+                    "sl": stop_loss if stop_loss is not None else (order.sl or 0.0),
+                    "tp": take_profit if take_profit is not None else (order.tp or 0.0),
+                    "type_time": order.type_time,
+                    "expiration": order.expiration,
+                }
+
+                async with self._lock:
+                    result = await asyncio.to_thread(mt5.order_send, request)
+
+                if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                    logger.info(f"Pending order {ticket} modified successfully")
+                    return {"success": True, "ticket": ticket}
+                else:
+                    err = getattr(result, 'comment', 'unknown') if result else 'no result'
+                    code = getattr(result, 'retcode', -1) if result else -1
+                    logger.warning(f"Pending order modify failed: {err} (code {code})")
+                    return {"success": False, "error": err, "retcode": code}
+            else:
+                return await self.modify_position(ticket, stop_loss, take_profit)
+
+        except Exception as e:
+            logger.error(f"Error modifying order {ticket}: {e}")
+            return {"success": False, "error": str(e)}
     
     async def get_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         """

@@ -81,7 +81,7 @@ TRADE_SIGNAL_TOOL = {
             "order_type": {
                 "type": "string",
                 "enum": ["market", "buy_limit", "sell_limit", "buy_stop", "sell_stop"],
-                "description": "Use 'market' when displacement is confirmed and momentum is strong — do NOT miss moves waiting for pullbacks. Use 'buy_limit' to buy at a LOWER price (OB/FVG fill when price is approaching), 'sell_limit' to sell at a HIGHER price (OB/FVG fill), 'buy_stop' to buy above current price (breakout), 'sell_stop' to sell below current price (breakdown). Match order type to market conditions: limit orders in ranging markets, market orders during active displacement."
+                "description": "Use 'market' when displacement is confirmed and momentum is strong — do NOT miss moves waiting for pullbacks. Use 'buy_limit' to buy at a LOWER price (OB/FVG retracement fill), 'sell_limit' to sell at a HIGHER price (OB/FVG retracement fill). CRITICAL: For BREAKOUT entries where price is consolidating below/above a key level and you expect a break, use 'buy_stop' (buy ABOVE current price) or 'sell_stop' (sell BELOW current price). Do NOT use buy_limit for breakout longs or sell_limit for breakout shorts — the order will never fill. Match order type to setup: limit for retracements, stop for breakouts, market for active displacement."
             },
             "amd_phase": {
                 "type": "string",

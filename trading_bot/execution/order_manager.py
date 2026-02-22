@@ -144,17 +144,14 @@ class OrderManager:
             if not symbol_info:
                 return True, 0, 0
             
-            # Get spread from symbol info
-            current_spread = symbol_info.get('spread', 0)
-            ask = symbol_info.get('ask', 0)
-            bid = symbol_info.get('bid', 0)
+            current_spread = getattr(symbol_info, 'spread', 0) or 0
+            ask = getattr(symbol_info, 'ask', 0) or 0
+            bid = getattr(symbol_info, 'bid', 0) or 0
             
-            # Calculate actual spread in price units
             if ask and bid:
                 spread_price = ask - bid
             else:
-                # Convert point spread to price
-                point = symbol_info.get('point', 0.00001)
+                point = getattr(symbol_info, 'point', 0.00001) or 0.00001
                 spread_price = current_spread * point
             
             # Get max threshold

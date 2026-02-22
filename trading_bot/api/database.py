@@ -86,6 +86,12 @@ class TradeModel(Base):
     confluence_factors: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)    # List of confluence factors
     confluence_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)    # Number of confluence factors
     
+    # Risk tracking (for daily risk reclaim on close)
+    risk_percent: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    
+    # P/L source tracking (for sync overwrite logic)
+    pnl_source: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)  # "mt5", "fallback", "sync"
+    
     # Notes
     notes: Mapped[str] = mapped_column(Text, default="")
     
@@ -398,6 +404,10 @@ async def init_db():
             ("analysis_logs", "outcome_result", "VARCHAR(20)"),
             # Persist close_reason for reversal re-entry across restarts
             ("position_states", "close_reason", "VARCHAR(100)"),
+            # Risk tracking (for daily risk reclaim on close)
+            ("trades", "risk_percent", "FLOAT"),
+            # P/L source tracking (for sync overwrite logic)
+            ("trades", "pnl_source", "VARCHAR(20)"),
         ]
         for table, column, col_type in migrations:
             try:

@@ -96,6 +96,7 @@ async def save_trade_to_db(
     ict_concepts: dict = None,
     timeframe: str = "M15",
     session_name: str = "",
+    risk_percent: float = None,
 ):
     """Save an executed trade to the database with full analysis context."""
     if not DB_AVAILABLE:
@@ -113,13 +114,13 @@ async def save_trade_to_db(
                 session=session_name,
                 entry_price=entry_price,
                 entry_time=datetime.utcnow(),
-                entry_reason=reasoning[:500] if reasoning else f"ICT Signal - Confidence: {confidence:.0%}",
+                entry_reason=reasoning[:1000] if reasoning else f"ICT Signal - Confidence: {confidence:.0%}",
                 stop_loss=stop_loss,
                 take_profit=take_profit,
                 position_size=position_size,
                 risk_amount=0.0,
                 claude_confidence=confidence,
-                claude_reasoning=reasoning[:2000] if reasoning else "",
+                claude_reasoning=reasoning[:5000] if reasoning else "",
                 # Judge analysis
                 judge_verdict=judge_verdict,
                 judge_reason=judge_reason[:1000] if judge_reason else None,
@@ -132,6 +133,7 @@ async def save_trade_to_db(
                 ict_concepts=ict_concepts,
                 confluence_factors=confluence_factors,
                 confluence_count=confluence_count,
+                risk_percent=risk_percent,
             )
             session.add(trade)
             await session.commit()
@@ -1115,8 +1117,9 @@ class TradingBot:
                                 result = await self.order_manager.close_position(ticket=ticket)
                                 if result.success:
                                     logger.info(f"  Closed {pos.symbol} position {ticket} for weekend protection")
-                                    if self.on_position_close:
-                                        await self.on_position_close(pos)
+                                    pos.close_reason = 'weekend_protection'
+                                    await self._handle_position_close(pos)
+                                    self.position_manager.remove_position(ticket)
                             except Exception as e:
                                 logger.error(f"  Failed to close {pos.symbol} position {ticket}: {e}")
                     
@@ -3510,6 +3513,15 @@ class TradingBot:
                         trade_signal.order_type = 'buy_limit'
                     else:
                         trade_signal.order_type = 'sell_limit'
+                    # Rebase SL/TP as offsets from the demoted entry
+                    _orig_entry = trade_signal.entry_price or current_price
+                    if trade_signal.stop_loss and _orig_entry and _orig_entry > 0:
+                        _sl_offset = trade_signal.stop_loss - _orig_entry
+                        trade_signal.stop_loss = demoted_entry + _sl_offset
+                    if trade_signal.take_profit and _orig_entry and _orig_entry > 0:
+                        _tp_offset = trade_signal.take_profit - _orig_entry
+                        trade_signal.take_profit = demoted_entry + _tp_offset
+                    
                     trade_signal.entry_price = demoted_entry
                     
                     # ---- Guard: SL must remain on the correct side of the demoted entry ----
@@ -3704,6 +3716,26 @@ class TradingBot:
                             f"differs from market {current_price:.5f} by {price_diff_pct:.2%}"
                         )
                 
+                # Fix mislabeled limit/stop orders: buy_limit must be BELOW price,
+                # sell_limit must be ABOVE price. If inverted, swap to stop.
+                if order_type in ('buy_limit', 'sell_limit', 'buy_stop', 'sell_stop') and entry_price and current_price > 0:
+                    if order_type == 'buy_limit' and entry_price > current_price * 1.001:
+                        order_type = 'buy_stop'
+                        trade_signal.order_type = order_type
+                        print(f"[ORDER-FIX] {symbol}: buy_limit above market -> buy_stop (entry={entry_price:.5f} > market={current_price:.5f})", flush=True)
+                    elif order_type == 'sell_limit' and entry_price < current_price * 0.999:
+                        order_type = 'sell_stop'
+                        trade_signal.order_type = order_type
+                        print(f"[ORDER-FIX] {symbol}: sell_limit below market -> sell_stop (entry={entry_price:.5f} < market={current_price:.5f})", flush=True)
+                    elif order_type == 'buy_stop' and entry_price < current_price * 0.999:
+                        order_type = 'buy_limit'
+                        trade_signal.order_type = order_type
+                        print(f"[ORDER-FIX] {symbol}: buy_stop below market -> buy_limit (entry={entry_price:.5f} < market={current_price:.5f})", flush=True)
+                    elif order_type == 'sell_stop' and entry_price > current_price * 1.001:
+                        order_type = 'sell_limit'
+                        trade_signal.order_type = order_type
+                        print(f"[ORDER-FIX] {symbol}: sell_stop above market -> sell_limit (entry={entry_price:.5f} > market={current_price:.5f})", flush=True)
+                
                 # Respect Claude's explicit pending order choice — do NOT override to market
                 # even during distribution phase. Claude knows the entry model.
                 
@@ -3712,7 +3744,7 @@ class TradingBot:
                 _final_tp = trade_signal.take_profit
                 try:
                     import MetaTrader5 as mt5
-                    _tick = mt5.symbol_info_tick(symbol)
+                    _tick = await asyncio.to_thread(mt5.symbol_info_tick, symbol)
                     if _tick and _tick.ask > 0 and _tick.bid > 0:
                         _spread = _tick.ask - _tick.bid
                         if _spread > 0 and _final_sl:
@@ -3785,9 +3817,9 @@ class TradingBot:
                         )
                         if old_success:
                             self.daily_trades = max(0, self.daily_trades - 1)
-                            # Reclaim risk budget for the old order
+                            # Reclaim risk budget for the old order (use stored risk, not default)
                             if hasattr(self, 'risk_manager') and self.risk_manager:
-                                _risk_pct = self.risk_manager.risk_per_trade
+                                _risk_pct = getattr(old_order, 'risk_percent', None) or self.risk_manager.risk_per_trade
                                 self.risk_manager.update_daily_risk(-_risk_pct)
                             # Clear old signal hash
                             old_hash = self._get_signal_hash(symbol, old_order.direction, old_order.price)
@@ -3822,7 +3854,8 @@ class TradingBot:
                             price=entry_price,
                             stop_loss=_final_sl,
                             take_profit=_final_tp,
-                            expiration_minutes=expiration_minutes
+                            expiration_minutes=expiration_minutes,
+                            risk_percent=size_result.risk_percent if hasattr(size_result, 'risk_percent') else None,
                         )
                 else:
                     # Fallback to market order if order type unclear
@@ -3948,6 +3981,7 @@ class TradingBot:
                                 },
                                 timeframe="M15",
                                 session_name=self.kill_zone_checker.get_current_session().session_name if self.kill_zone_checker else "",
+                                risk_percent=size_result.risk_percent if hasattr(size_result, 'risk_percent') else self.risk_manager.risk_per_trade,
                             )
                             
                             # Pending orders: do NOT send Telegram notification.
@@ -4058,6 +4092,7 @@ class TradingBot:
                                 },
                                 timeframe="M15",
                                 session_name=self.kill_zone_checker.get_current_session().session_name if self.kill_zone_checker else "",
+                                risk_percent=size_result.risk_percent if hasattr(size_result, 'risk_percent') else self.risk_manager.risk_per_trade,
                             )
                             
                             # Send Telegram notification
@@ -5044,6 +5079,7 @@ class TradingBot:
             if not positions:
                 return
             
+            print(f"[POS-REEVAL] Claude re-evaluating {len(positions)} open position(s)...", flush=True)
             logger.info(f"Claude re-evaluating {len(positions)} open positions...")
             
             # Clean up stale entries for positions that no longer exist
@@ -5054,24 +5090,33 @@ class TradingBot:
             
             for position in positions:
                 try:
+                    _pos_age = ""
+                    if position.open_time:
+                        _pos_age = f"{(datetime.now() - position.open_time).total_seconds() / 60:.0f}min"
+                    _pos_pnl = getattr(position, 'unrealized_pnl', None) or 0
+                    print(
+                        f"[POS-REEVAL] #{position.ticket} {position.symbol} {position.direction} "
+                        f"entry={position.entry_price:.5f} SL={position.stop_loss} TP={position.take_profit} "
+                        f"P/L=${_pos_pnl:.2f} age={_pos_age}",
+                        flush=True
+                    )
+                    
                     # Throttle: if last decision was HOLD and cooldown hasn't elapsed, skip
-                    # This prevents spamming Claude API and flooding activity feed with
-                    # repetitive HOLD messages every 60 seconds.
-                    # Cooldown tiers: <2h open → 5min, 2-8h → 10min, >8h → 15min
                     last_state = self._position_reeval_state.get(position.ticket)
                     if last_state and last_state.get("decision") == "HOLD":
                         since_last = (datetime.now() - last_state["time"]).total_seconds()
-                        # Determine cooldown based on how long the position has been open
                         _hrs = last_state.get("hours_open", 0)
                         if _hrs > 8:
-                            cooldown_secs = 900   # 15 min for mature positions
+                            cooldown_secs = 900
                         elif _hrs > 2:
-                            cooldown_secs = 600   # 10 min for established positions
+                            cooldown_secs = 600
                         else:
-                            cooldown_secs = 300   # 5 min for fresh positions
+                            cooldown_secs = 300
                         
                         if since_last < cooldown_secs:
-                            continue  # Skip — recent HOLD, no need to ask Claude again
+                            remaining = cooldown_secs - since_last
+                            print(f"[POS-REEVAL] #{position.ticket} SKIP — HOLD cooldown ({remaining:.0f}s remaining)", flush=True)
+                            continue
                     
                     # Get current chart for this position
                     df = await self.data_fetcher.get_ohlcv(
@@ -5198,17 +5243,23 @@ Include brief reasoning.
                         logger.warning(f"Empty Claude response for {position.symbol} reevaluation")
                         continue
                     
-                    recommendation = response.content[0].text.strip().upper()
+                    raw_reeval = response.content[0].text.strip()
+                    recommendation = raw_reeval.upper().replace("*", "").replace("#", "").strip()
                     
                     logger.info(f"Claude recommendation for {position.symbol}: {recommendation[:100]}")
                     
-                    # Determine decision type for logging
-                    if recommendation.startswith("CLOSE"):
+                    if "CLOSE" in recommendation.split(".")[0]:
                         decision = "CLOSE"
                     elif "TIGHTEN" in recommendation:
                         decision = "TIGHTEN"
                     else:
                         decision = "HOLD"
+                    
+                    print(
+                        f"[POS-REEVAL] #{position.ticket} {position.symbol}: {decision} — "
+                        f"{raw_reeval[:120]}",
+                        flush=True
+                    )
                     
                     # Record the re-eval state for throttling (cooldown before next call)
                     self._position_reeval_state[position.ticket] = {
@@ -5331,10 +5382,19 @@ Include brief reasoning.
             cancelled_count = 0
             kept_count = 0
             
+            print(f"[PENDING-REEVAL] Checking {len(active_orders)} pending order(s)...", flush=True)
+            
             for order in active_orders:
                 try:
                     symbol = order.symbol
                     order_direction = order.direction  # 'long' or 'short'
+                    age_str = f"{(datetime.now() - order.created_at).total_seconds() / 60:.0f}min"
+                    print(
+                        f"[PENDING-REEVAL] #{order.ticket} {symbol} {order.order_type} "
+                        f"@ {order.price:.5f} | dir={order_direction} | age={age_str} "
+                        f"| SL={order.stop_loss:.5f} TP={order.take_profit:.5f}",
+                        flush=True
+                    )
                     
                     # ── TIER 1: Direction flip check (instant, no Claude call) ──
                     latest_signal = self._last_signal_per_symbol.get(symbol)
@@ -5359,9 +5419,9 @@ Include brief reasoning.
                             if success:
                                 cancelled_count += 1
                                 
-                                # Reclaim daily risk budget
+                                # Reclaim daily risk budget (use stored risk, not default)
                                 if hasattr(self, 'risk_manager') and self.risk_manager:
-                                    _risk_pct = self.risk_manager.risk_per_trade
+                                    _risk_pct = getattr(order, 'risk_percent', None) or self.risk_manager.risk_per_trade
                                     self.risk_manager.update_daily_risk(-_risk_pct)
                                     print(
                                         f"[RISK] {symbol}: Daily risk reclaimed -{_risk_pct*100:.1f}%, "
@@ -5465,7 +5525,7 @@ Include brief reasoning.
                                     cancelled_count += 1
                                     self.daily_trades = max(0, self.daily_trades - 1)
                                     if hasattr(self, 'risk_manager') and self.risk_manager:
-                                        _risk_pct = self.risk_manager.risk_per_trade
+                                        _risk_pct = getattr(order, 'risk_percent', None) or self.risk_manager.risk_per_trade
                                         self.risk_manager.update_daily_risk(-_risk_pct)
                                     old_hash = self._get_signal_hash(symbol, order_direction, order.price)
                                     self._recent_signal_hashes.discard(old_hash)
@@ -5496,20 +5556,38 @@ Include brief reasoning.
                                 self.daily_trades = max(0, self.daily_trades - 1)
                                 _risk_pct = 0
                                 if hasattr(self, 'risk_manager') and self.risk_manager:
-                                    _risk_pct = self.risk_manager.risk_per_trade
+                                    _risk_pct = getattr(order, 'risk_percent', None) or self.risk_manager.risk_per_trade
                                     self.risk_manager.update_daily_risk(-_risk_pct)
                                 old_hash = self._get_signal_hash(symbol, order_direction, order.price)
                                 self._recent_signal_hashes.discard(old_hash)
                                 self._signal_hash_expiry.pop(old_hash, None)
                                 
-                                # Place market order to catch the move
+                                # Rebase SL/TP from original limit price to current market price
+                                _orig_entry = order.price
+                                _new_sl = order.stop_loss
+                                _new_tp = order.take_profit
+                                if _orig_entry and _orig_entry > 0:
+                                    _sl_offset = order.stop_loss - _orig_entry if order.stop_loss else 0
+                                    _tp_offset = order.take_profit - _orig_entry if order.take_profit else 0
+                                    if _sl_offset != 0:
+                                        _new_sl = current_price + _sl_offset
+                                    if _tp_offset != 0:
+                                        _new_tp = current_price + _tp_offset
+                                    print(
+                                        f"[PENDING-REEVAL] {symbol}: Rebased SL/TP from limit@{_orig_entry:.5f} "
+                                        f"to market@{current_price:.5f} — "
+                                        f"SL: {order.stop_loss:.5f}->{_new_sl:.5f}, "
+                                        f"TP: {order.take_profit:.5f}->{_new_tp:.5f}",
+                                        flush=True
+                                    )
+                                
                                 try:
                                     market_result = await self.order_manager.place_market_order(
                                         symbol=symbol,
                                         direction=order_direction,
                                         volume=order.volume,
-                                        stop_loss=order.stop_loss,
-                                        take_profit=order.take_profit,
+                                        stop_loss=_new_sl,
+                                        take_profit=_new_tp,
                                         comment="ICT_Bot_Upgrade"
                                     )
                                     
@@ -5520,11 +5598,47 @@ Include brief reasoning.
                                             self.risk_manager.update_daily_risk(_risk_pct)
                                         
                                         fill_ticket = market_result.ticket or market_result.order_id
+                                        fill_price = market_result.fill_price or current_price
                                         print(
                                             f"[PENDING-REEVAL] MARKET FILL #{fill_ticket} {symbol} {order_direction.upper()} "
-                                            f"@ market (was limit @ {order.price:.5f})",
+                                            f"@ {fill_price:.5f} (was limit @ {order.price:.5f})",
                                             flush=True
                                         )
+                                        
+                                        # Create Position object so position_manager tracks it
+                                        try:
+                                            upgraded_pos = Position(
+                                                ticket=fill_ticket,
+                                                symbol=symbol,
+                                                direction=order_direction,
+                                                volume=order.volume,
+                                                entry_price=fill_price,
+                                                stop_loss=_new_sl or fill_price,
+                                                take_profit=_new_tp or 0,
+                                                open_time=datetime.now(),
+                                            )
+                                            upgraded_pos.trade_type = 'intraday'
+                                            self.position_manager.add_position(upgraded_pos)
+                                        except Exception as pos_err:
+                                            logger.warning(f"[PENDING-REEVAL] Could not create Position for upgrade: {pos_err}")
+                                        
+                                        # Save to DB
+                                        try:
+                                            await save_trade_to_db(
+                                                ticket=fill_ticket,
+                                                symbol=symbol,
+                                                direction=order_direction,
+                                                entry_price=fill_price,
+                                                stop_loss=_new_sl or 0,
+                                                take_profit=_new_tp or 0,
+                                                position_size=order.volume,
+                                                confidence=0.0,
+                                                reasoning=f"Upgraded from pending {order.order_type} @ {order.price:.5f}",
+                                                order_type="market",
+                                                risk_percent=getattr(order, 'risk_percent', None) or (_risk_pct if _risk_pct > 0 else None),
+                                            )
+                                        except Exception as db_err:
+                                            logger.warning(f"[PENDING-REEVAL] DB save for upgrade failed: {db_err}")
                                         
                                         from .api.routes.activity import add_activity
                                         add_activity(
@@ -5549,10 +5663,14 @@ Include brief reasoning.
                             
                             continue  # Done with this order
                     
-                    # ── TIER 2: Claude re-eval for aged orders (1+ hour old) ──
-                    if age_minutes < 60:
-                        # Order is fresh — skip Claude check, keep it
+                    # ── TIER 2: Claude re-eval for aged orders ──
+                    if age_minutes < 15:
                         kept_count += 1
+                        print(
+                            f"[PENDING-REEVAL] KEEP #{order.ticket} {symbol} {order.order_type} "
+                            f"@ {order.price:.5f} — fresh ({age_minutes:.0f}min, re-eval at 15min)",
+                            flush=True
+                        )
                         continue
                     
                     # Order has been sitting for over 1 hour — ask Claude
@@ -5634,8 +5752,10 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                         kept_count += 1
                         continue
                     
-                    recommendation = response.content[0].text.strip().upper()
-                    decision = "CANCEL" if recommendation.startswith("CANCEL") else "KEEP"
+                    raw_recommendation = response.content[0].text.strip()
+                    # Strip markdown formatting (bold, etc.) before parsing
+                    recommendation = raw_recommendation.upper().replace("*", "").replace("#", "").strip()
+                    decision = "CANCEL" if "CANCEL" in recommendation else "KEEP"
                     
                     # Log to bot_state
                     from .api.routes.bot_status import bot_state
@@ -5660,9 +5780,9 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                         if success:
                             cancelled_count += 1
                             
-                            # Reclaim daily risk budget
+                            # Reclaim daily risk budget (use stored risk, not default)
                             if hasattr(self, 'risk_manager') and self.risk_manager:
-                                _risk_pct = self.risk_manager.risk_per_trade
+                                _risk_pct = getattr(order, 'risk_percent', None) or self.risk_manager.risk_per_trade
                                 self.risk_manager.update_daily_risk(-_risk_pct)
                                 print(
                                     f"[RISK] {symbol}: Daily risk reclaimed -{_risk_pct*100:.1f}%, "
@@ -5999,18 +6119,19 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                                 select(TradeModel).where(TradeModel.trade_id == trade_id)
                             )
                             trade = result.scalar_one_or_none()
-                            # Update if: no exit data, or wrongly marked as cancelled (exit==entry, P/L=0)
                             _needs_update = (
                                 trade and (
                                     trade.exit_price is None or 
                                     trade.exit_price == 0 or
-                                    (trade.profit_loss == 0 and trade.exit_price == trade.entry_price)
+                                    (trade.profit_loss == 0 and trade.exit_price == trade.entry_price) or
+                                    getattr(trade, 'pnl_source', None) == 'fallback'
                                 )
                             )
                             if _needs_update:
                                 trade.exit_price = price
                                 trade.exit_time = close_time if isinstance(close_time, datetime) else datetime.now()
                                 trade.profit_loss = total_pnl
+                                trade.pnl_source = "mt5"
                                 trade.exit_reason = "Closed on MT5 (TP/SL/manual)"
                                 await session.commit()
                                 updated_count += 1
@@ -6191,34 +6312,96 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
             
             if hasattr(self, 'mt5_client') and self.mt5_client and not self.mt5_client.is_simulation:
                 try:
+                    # Wide window (24h back) to avoid timezone mismatch between local and broker time
                     history = await self.mt5_client.get_history(
-                        close_time - timedelta(minutes=10), close_time + timedelta(minutes=1)
+                        close_time - timedelta(hours=24), close_time + timedelta(hours=1)
                     )
-                    # Find the close deal for this ticket
+                    print(f"[CLOSE] {position.symbol}: Searching {len(history)} deals for ticket #{position.ticket}...", flush=True)
+                    total_profit = 0.0
+                    total_commission = 0.0
+                    total_swap = 0.0
+                    close_deal_count = 0
+                    _last_deal_time = None
                     for deal in history:
                         if deal.get('position_id') == position.ticket and deal.get('entry') == 1:
                             actual_close_price = deal.get('price', position.current_price)
-                            # Use MT5's authoritative profit (includes commission + swap)
-                            mt5_profit = deal.get('profit', None)
+                            mt5_profit = deal.get('profit', 0) or 0
                             mt5_commission = deal.get('commission', 0) or 0
                             mt5_swap = deal.get('swap', 0) or 0
-                            if mt5_profit is not None:
-                                profit_loss = mt5_profit + mt5_commission + mt5_swap
-                                mt5_profit_found = True
-                                print(f"[CLOSE] {position.symbol}: MT5 actual P/L = ${profit_loss:.2f} (profit={mt5_profit}, commission={mt5_commission}, swap={mt5_swap})", flush=True)
-                            logger.info(f"  Actual close price from MT5: {actual_close_price:.5f}, profit: {mt5_profit}")
-                            break
+                            total_profit += mt5_profit
+                            total_commission += mt5_commission
+                            total_swap += mt5_swap
+                            close_deal_count += 1
+                            _deal_ts = deal.get('time', None)
+                            if _deal_ts:
+                                try:
+                                    _last_deal_time = datetime.fromtimestamp(_deal_ts) if isinstance(_deal_ts, (int, float)) else _deal_ts
+                                except Exception:
+                                    pass
+                        elif deal.get('position_id') == position.ticket and deal.get('entry') == 0:
+                            total_commission += deal.get('commission', 0) or 0
+                    if close_deal_count > 0:
+                        profit_loss = total_profit + total_commission + total_swap
+                        mt5_profit_found = True
+                        if _last_deal_time:
+                            close_time = _last_deal_time
+                        print(
+                            f"[CLOSE] {position.symbol}: MT5 actual P/L = ${profit_loss:.2f} "
+                            f"({close_deal_count} close deal(s), profit={total_profit:.2f}, "
+                            f"commission={total_commission:.2f}, swap={total_swap:.2f}, "
+                            f"exit={actual_close_price:.5f})",
+                            flush=True
+                        )
+                    if not mt5_profit_found:
+                        print(f"[CLOSE] {position.symbol}: WARNING — no close deal found in {len(history)} deals for #{position.ticket}", flush=True)
                 except Exception as e:
                     logger.warning(f"Could not fetch close details from MT5 history: {e}")
+                    print(f"[CLOSE] {position.symbol}: MT5 history error: {e}", flush=True)
             
             # Fallback: manual calculation if MT5 history unavailable
             if profit_loss is None:
+                # Check if SL was likely triggered — use SL as exit price instead of
+                # current_price which may have moved far past the SL by detection time
+                sl_price = getattr(position, 'stop_loss', None)
+                tp_price = getattr(position, 'take_profit', None)
+                fallback_exit = actual_close_price  # default: current_price
+                fallback_reason = "current_price"
+                
+                if sl_price and sl_price > 0:
+                    if position.direction == 'long' and actual_close_price < sl_price:
+                        fallback_exit = sl_price
+                        fallback_reason = "SL_hit (price below SL)"
+                    elif position.direction == 'short' and actual_close_price > sl_price:
+                        fallback_exit = sl_price
+                        fallback_reason = "SL_hit (price above SL)"
+                    elif position.direction == 'long' and actual_close_price <= position.entry_price and sl_price < position.entry_price:
+                        fallback_exit = sl_price
+                        fallback_reason = "SL_likely (price fell, SL below entry)"
+                    elif position.direction == 'short' and actual_close_price >= position.entry_price and sl_price > position.entry_price:
+                        fallback_exit = sl_price
+                        fallback_reason = "SL_likely (price rose, SL above entry)"
+                
+                if tp_price and tp_price > 0:
+                    if position.direction == 'long' and actual_close_price >= tp_price:
+                        fallback_exit = tp_price
+                        fallback_reason = "TP_hit (price above TP)"
+                    elif position.direction == 'short' and actual_close_price <= tp_price:
+                        fallback_exit = tp_price
+                        fallback_reason = "TP_hit (price below TP)"
+                
+                actual_close_price = fallback_exit
+                
                 from .config import calculate_pl
                 if position.direction == 'long':
                     profit_loss = calculate_pl(position.symbol, actual_close_price - position.entry_price, position.volume)
                 else:
                     profit_loss = calculate_pl(position.symbol, position.entry_price - actual_close_price, position.volume)
-                print(f"[CLOSE] {position.symbol}: Fallback P/L = ${profit_loss:.2f} (tick_value={_spec.tick_value}, contract_size={_spec.contract_size})", flush=True)
+                print(
+                    f"[CLOSE] {position.symbol}: Fallback P/L = ${profit_loss:.2f} "
+                    f"(exit={actual_close_price:.5f}, reason={fallback_reason}, "
+                    f"SL={sl_price}, TP={tp_price}, market={position.current_price:.5f})",
+                    flush=True
+                )
             
             # Calculate pips using actual close price and symbol spec
             pip_size = _spec.pip_size
@@ -6249,6 +6432,7 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                             trade_record.exit_reason = getattr(position, 'close_reason', 'position_closed')
                             trade_record.profit_loss = profit_loss
                             trade_record.profit_loss_pips = pips
+                            trade_record.pnl_source = "mt5" if mt5_profit_found else "fallback"
                             # R-multiple
                             if position.stop_loss and position.entry_price:
                                 risk_pips = abs(position.entry_price - position.stop_loss) / pip_size
@@ -6371,9 +6555,35 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                 except Exception as e:
                     logger.warning(f"Could not update scaling manager: {e}")
             
-            # Have Claude review the trade for losses AND big wins (>2R)
-            # This populates the learning system for future analysis improvement
-            should_review = profit_loss < 0 or position.current_r_multiple >= 2.0
+            # Reclaim daily risk budget now that the position is closed
+            if hasattr(self, 'risk_manager') and self.risk_manager:
+                try:
+                    _reclaim_pct = self.risk_manager.risk_per_trade  # default
+                    if DB_AVAILABLE:
+                        try:
+                            from sqlalchemy import select
+                            async with async_session() as db_sess:
+                                _tr = await db_sess.execute(
+                                    select(TradeModel).where(TradeModel.trade_id == str(position.ticket))
+                                )
+                                _rec = _tr.scalar_one_or_none()
+                                if _rec and getattr(_rec, 'risk_percent', None):
+                                    _reclaim_pct = _rec.risk_percent
+                        except Exception:
+                            pass
+                    self.risk_manager.update_daily_risk(-_reclaim_pct)
+                    print(
+                        f"[RISK] {position.symbol}: Daily risk reclaimed -{_reclaim_pct*100:.1f}% "
+                        f"(position closed), total: {self.risk_manager.daily_risk_used*100:.1f}%/"
+                        f"{self.risk_manager.max_daily_risk*100:.0f}%",
+                        flush=True
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not reclaim daily risk for {position.symbol}: {e}")
+            
+            # Have Claude review ALL closed trades for learning
+            # (Previously only losses and big wins; now every trade for data collection)
+            should_review = True
             
             if should_review and self.claude_client and self.claude_client.api_key:
                 try:
@@ -6396,7 +6606,7 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                                 )
                                 trade_record = result.scalar_one_or_none()
                                 if trade_record:
-                                    entry_reason = trade_record.entry_reason or 'N/A'
+                                    entry_reason = trade_record.claude_reasoning or trade_record.entry_reason or 'N/A'
                                     original_confidence = trade_record.claude_confidence or 0.0
                                     trade_timeframe = trade_record.timeframe or 'M15'
                                     _db_judge_verdict = getattr(trade_record, 'judge_verdict', None)
@@ -6411,7 +6621,7 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                         'symbol': position.symbol,
                         'direction': position.direction,
                         'entry_price': position.entry_price,
-                        'exit_price': position.current_price,
+                        'exit_price': actual_close_price,
                         'stop_loss': position.stop_loss,
                         'take_profit': position.take_profit,
                         'profit_loss': profit_loss,
@@ -6421,7 +6631,6 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                         'entry_reason': entry_reason,
                         'original_confidence': original_confidence,
                         'timeframe': trade_timeframe,
-                        # Judge & confluence context (for the review)
                         'judge_verdict': _db_judge_verdict,
                         'judge_reason': _db_judge_reason,
                         'confluence_factors': _db_confluence_factors,
@@ -6705,22 +6914,26 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
             
             # ---- Risk Manager Validation ----
             if self.risk_manager:
+                try:
+                    _acct = await self.mt5_client.get_account_info() if self.mt5_client else None
+                    _balance = _acct.balance if _acct else 10000.0
+                except Exception:
+                    _balance = 10000.0
                 risk_check = self.risk_manager.validate_trade(
-                    symbol=symbol,
-                    direction=trade_signal.direction,
                     entry_price=trade_signal.entry_price or current_price,
                     stop_loss=trade_signal.stop_loss or 0,
                     take_profit=trade_signal.take_profit or 0,
-                    position_size=0.01,
+                    direction=trade_signal.direction,
+                    symbol=symbol,
+                    account_balance=_balance,
                     trade_type=getattr(trade_signal, 'trade_type', 'intraday'),
                 )
-                if not risk_check.get('valid', True):
-                    errors = risk_check.get('errors', [])
+                if not risk_check.is_valid:
                     logger.warning(
-                        f"[REVERSAL] {symbol}: Risk manager rejected — {errors}"
+                        f"[REVERSAL] {symbol}: Risk manager rejected — {risk_check.errors}"
                     )
                     print(
-                        f"[REVERSAL] {symbol}: REJECTED by risk manager — {errors}",
+                        f"[REVERSAL] {symbol}: REJECTED by risk manager — {risk_check.errors}",
                         flush=True
                     )
                     return
@@ -6820,6 +7033,15 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
             
             # ---- Place the order ----
             self.daily_trades += 1
+            _reversal_risk_pct = self.risk_manager.risk_per_trade if self.risk_manager else 0.02
+            if hasattr(self, 'risk_manager') and self.risk_manager:
+                self.risk_manager.update_daily_risk(_reversal_risk_pct)
+                print(
+                    f"[RISK] {symbol}: Reversal daily risk +{_reversal_risk_pct*100:.1f}%, "
+                    f"total: {self.risk_manager.daily_risk_used*100:.1f}%/"
+                    f"{self.risk_manager.max_daily_risk*100:.0f}%",
+                    flush=True
+                )
             
             order_type = getattr(trade_signal, 'order_type', 'market') or 'market'
             

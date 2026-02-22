@@ -419,6 +419,8 @@ class PositionManager:
                 if ticket not in self.positions:
                     logger.warning(f"Position {ticket} in MT5 but not tracked - adding to tracking")
                     from datetime import datetime
+                    _mt5_time = getattr(mt5_pos, 'time', None)
+                    _open_time = datetime.fromtimestamp(_mt5_time) if _mt5_time else datetime.now()
                     position = Position(
                         ticket=ticket,
                         symbol=mt5_pos.symbol,
@@ -427,7 +429,7 @@ class PositionManager:
                         entry_price=mt5_pos.price_open,
                         stop_loss=mt5_pos.sl,
                         take_profit=mt5_pos.tp,
-                        open_time=datetime.now()
+                        open_time=_open_time,
                     )
                     
                     # Auto-calculate multi-TP levels from SL/TP if available
@@ -452,7 +454,7 @@ class PositionManager:
                 'mt5_positions': len(mt5_positions),
                 'tracked_positions': len(self.positions),
                 'closed_count': len(closed_positions),
-                'closed': [p.ticket for p in closed_positions],
+                'closed': closed_positions,
                 'new_positions': new_positions
             }
         except Exception as e:
@@ -689,6 +691,9 @@ class PositionManager:
                     f"— reason: {reason}, volume: {position.volume}"
                 )
                 result_action["success"] = True
+                
+                # Remove from tracking immediately
+                self.remove_position(position.ticket)
                 
                 # Fire reversal callback if registered
                 if self.on_reversal_close:

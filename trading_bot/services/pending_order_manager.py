@@ -41,6 +41,9 @@ class PendingOrder:
     expiration: datetime
     status: PendingOrderStatus = PendingOrderStatus.ACTIVE
     
+    # Risk tracking (for accurate daily risk reclaim on cancel)
+    risk_percent: Optional[float] = None
+    
     # Tracking fields
     fill_price: Optional[float] = None
     fill_time: Optional[datetime] = None
@@ -135,7 +138,8 @@ class PendingOrderManager:
         price: float,
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
-        expiration_minutes: int = 120
+        expiration_minutes: int = 120,
+        risk_percent: Optional[float] = None
     ) -> PendingOrder:
         """
         Add a pending order to track.
@@ -186,7 +190,8 @@ class PendingOrderManager:
             take_profit=take_profit,
             created_at=datetime.now(),
             expiration=expiration,
-            status=PendingOrderStatus.ACTIVE
+            status=PendingOrderStatus.ACTIVE,
+            risk_percent=risk_percent,
         )
         
         self.pending_orders[ticket] = order
@@ -332,12 +337,22 @@ class PendingOrderManager:
                     continue
                 
                 # Order no longer in MT5 pending list -- check if it became a position
-                position_found = any(
-                    p.ticket == ticket or 
-                    (p.symbol == order.symbol and 
-                     abs(p.price_open - order.price) < 0.0001)
-                    for p in mt5_positions
-                )
+                # Priority 1: MT5 links positions to originating orders via the 'order' field
+                # Priority 2: Match by symbol + percentage-based price tolerance (0.1%)
+                position_found = False
+                for p in mt5_positions:
+                    if getattr(p, 'ticket', None) == ticket:
+                        position_found = True
+                        break
+                    mt5_order_link = getattr(p, 'identifier', None) or getattr(p, 'order', None)
+                    if mt5_order_link and mt5_order_link == ticket:
+                        position_found = True
+                        break
+                    if p.symbol == order.symbol and order.price > 0:
+                        price_tol = abs(p.price_open - order.price) / order.price
+                        if price_tol < 0.001:
+                            position_found = True
+                            break
                 
                 if position_found:
                     # Order was filled and position is still open
