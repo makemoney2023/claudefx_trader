@@ -2219,6 +2219,7 @@ class TradingBot:
                 market_data["last_signal"] = self._last_signal_per_symbol[symbol]
             
             # Regenerate M15 chart WITH ICT overlays now that analysis is complete
+            print(f"[CHART-DEBUG] {symbol}: ob_obj={type(ob_obj).__name__ if ob_obj else None}, fvg_obj={type(fvg_obj).__name__ if fvg_obj else None}, liq_obj={type(liq_obj).__name__ if liq_obj else None}, ms_obj={type(ms_obj).__name__ if ms_obj else None}", flush=True)
             try:
                 _chart_obs = []
                 _chart_fvgs = []
@@ -2260,9 +2261,11 @@ class TradingBot:
                     )
                     if _enhanced_chart:
                         chart_base64 = _enhanced_chart
-                        logger.info(f"Enhanced M15 chart with {len(_chart_obs)} OBs, {len(_chart_fvgs)} FVGs, {len(_chart_liq)} liq levels, {len(_chart_swings)} swings")
+                        print(f"[CHART] {symbol}: Enhanced M15 chart with {len(_chart_obs)} OBs, {len(_chart_fvgs)} FVGs, {len(_chart_liq)} liq levels, {len(_chart_swings)} swings", flush=True)
+                else:
+                    print(f"[CHART] {symbol}: No ICT overlays found (OBs={len(_chart_obs)}, FVGs={len(_chart_fvgs)}, liq={len(_chart_liq)}, swings={len(_chart_swings)})", flush=True)
             except Exception as overlay_err:
-                logger.warning(f"Could not add overlays to chart: {overlay_err}")
+                print(f"[CHART] {symbol}: Overlay error: {overlay_err}", flush=True)
             
             # Get Claude's analysis
             logger.info(f"Requesting Claude analysis for {symbol}...")
@@ -3827,6 +3830,58 @@ class TradingBot:
                         order_type = 'sell_limit'
                         trade_signal.order_type = order_type
                         print(f"[ORDER-FIX] {symbol}: sell_stop above market -> sell_limit (entry={entry_price:.5f} > market={current_price:.5f})", flush=True)
+                
+                # ICT Zone Validation: block limit orders that contradict the price zone
+                # Premium = sell only, Discount = buy only (stop orders exempt - breakouts)
+                if order_type in ('buy_limit', 'sell_limit'):
+                    _zone_str = None
+                    _retrace_pct = None
+                    try:
+                        _pd_data = analysis_results.get("premium_discount", {})
+                        if isinstance(_pd_data, dict):
+                            _zone_str = _pd_data.get("current_zone")
+                            _retrace_pct = _pd_data.get("retracement_percent")
+                        elif hasattr(_pd_data, 'current_zone'):
+                            _zone_str = _pd_data.current_zone.value if hasattr(_pd_data.current_zone, 'value') else str(_pd_data.current_zone)
+                            _retrace_pct = getattr(_pd_data, 'retracement_percent', None)
+                    except Exception:
+                        pass
+
+                    if _zone_str and _retrace_pct is not None:
+                        if order_type == 'buy_limit' and _retrace_pct > 0.70:
+                            print(
+                                f"[ZONE-BLOCK] {symbol}: buy_limit in PREMIUM zone ({_retrace_pct:.0%}) — "
+                                f"ICT rule: do NOT buy in premium. Blocking trade.",
+                                flush=True
+                            )
+                            logger.warning(f"Zone block: buy_limit in premium ({_retrace_pct:.0%}) for {symbol}")
+                            self.daily_trades = max(0, self.daily_trades - 1)
+                            return
+                        elif order_type == 'sell_limit' and _retrace_pct < 0.30:
+                            print(
+                                f"[ZONE-BLOCK] {symbol}: sell_limit in DISCOUNT zone ({_retrace_pct:.0%}) — "
+                                f"ICT rule: do NOT sell in discount. Blocking trade.",
+                                flush=True
+                            )
+                            logger.warning(f"Zone block: sell_limit in discount ({_retrace_pct:.0%}) for {symbol}")
+                            self.daily_trades = max(0, self.daily_trades - 1)
+                            return
+                        elif order_type == 'buy_limit' and _retrace_pct > 0.55:
+                            _old_conf = trade_signal.confidence
+                            trade_signal.confidence = min(trade_signal.confidence, 0.60)
+                            print(
+                                f"[ZONE-WARN] {symbol}: buy_limit in upper zone ({_retrace_pct:.0%}) — "
+                                f"confidence capped {_old_conf:.0%} -> {trade_signal.confidence:.0%}",
+                                flush=True
+                            )
+                        elif order_type == 'sell_limit' and _retrace_pct < 0.45:
+                            _old_conf = trade_signal.confidence
+                            trade_signal.confidence = min(trade_signal.confidence, 0.60)
+                            print(
+                                f"[ZONE-WARN] {symbol}: sell_limit in lower zone ({_retrace_pct:.0%}) — "
+                                f"confidence capped {_old_conf:.0%} -> {trade_signal.confidence:.0%}",
+                                flush=True
+                            )
                 
                 # Respect Claude's explicit pending order choice — do NOT override to market
                 # even during distribution phase. Claude knows the entry model.

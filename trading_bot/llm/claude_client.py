@@ -81,7 +81,7 @@ TRADE_SIGNAL_TOOL = {
             "order_type": {
                 "type": "string",
                 "enum": ["market", "buy_limit", "sell_limit", "buy_stop", "sell_stop"],
-                "description": "Use 'market' when displacement is confirmed and momentum is strong — do NOT miss moves waiting for pullbacks. Use 'buy_limit' to buy at a LOWER price (OB/FVG retracement fill), 'sell_limit' to sell at a HIGHER price (OB/FVG retracement fill). CRITICAL: For BREAKOUT entries where price is consolidating below/above a key level and you expect a break, use 'buy_stop' (buy ABOVE current price) or 'sell_stop' (sell BELOW current price). Do NOT use buy_limit for breakout longs or sell_limit for breakout shorts — the order will never fill. Match order type to setup: limit for retracements, stop for breakouts, market for active displacement."
+                "description": "Use 'market' when displacement is confirmed and momentum is strong — do NOT miss moves waiting for pullbacks. Use 'buy_limit' to buy at a LOWER price (OB/FVG retracement fill), 'sell_limit' to sell at a HIGHER price (OB/FVG retracement fill). CRITICAL ZONE RULES: buy_limit ONLY in DISCOUNT zone (below 50% equilibrium) — NEVER place buy_limit in premium, price is expensive. sell_limit ONLY in PREMIUM zone (above 50% equilibrium) — NEVER place sell_limit in discount, price is cheap. This is the core ICT principle: buy discount, sell premium. For BREAKOUT entries where price is consolidating below/above a key level and you expect a break, use 'buy_stop' (buy ABOVE current price) or 'sell_stop' (sell BELOW current price). Match order type to setup: limit for retracements in correct zone, stop for breakouts, market for active displacement."
             },
             "amd_phase": {
                 "type": "string",
@@ -687,7 +687,12 @@ class ClaudeClient:
             {
                 "type": "text",
                 "text": "You are an expert ICT (Inner Circle Trading) forex analyst. "
-                        "Analyze charts using the ICT methodology described below.",
+                        "Analyze charts using the ICT methodology described below. "
+                        "CRITICAL ZONE RULE — NEVER VIOLATE: "
+                        "buy_limit ONLY in discount zone (below equilibrium). "
+                        "sell_limit ONLY in premium zone (above equilibrium). "
+                        "Buying expensive (premium) or selling cheap (discount) is retail behavior. "
+                        "For breakouts, use buy_stop/sell_stop instead.",
             },
             {
                 "type": "text",

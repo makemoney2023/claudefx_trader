@@ -689,6 +689,18 @@ def _sync_bot_services_to_api(bot):
 app = create_app()
 
 
+@app.post("/api/admin/reset-daily-risk")
+async def reset_daily_risk():
+    """Reset the daily risk counter so new trades can be placed."""
+    if not _bot_instance or not hasattr(_bot_instance, 'risk_manager'):
+        return JSONResponse(status_code=503, content={"error": "Bot not running"})
+    rm = _bot_instance.risk_manager
+    old = rm.daily_risk_used
+    rm.reset_daily_risk()
+    _bot_instance.daily_trades = 0
+    return {"status": "ok", "old_daily_risk": f"{old*100:.1f}%", "new_daily_risk": "0.0%"}
+
+
 if __name__ == "__main__":
     import sys
     import uvicorn
