@@ -656,6 +656,15 @@ class TradeLearningService:
                 for i, pattern in enumerate(winning_patterns, 1):
                     context_parts.append(f"{i}. {pattern}")
             
+            # Symbol + direction pattern stats from DB
+            try:
+                pattern_lines = await self._get_symbol_pattern_stats(symbol)
+                if pattern_lines:
+                    context_parts.append("\n### Trade Patterns (Historical)")
+                    context_parts.extend(pattern_lines)
+            except Exception:
+                pass
+            
             # Final warning
             context_parts.append("\n**IMPORTANT:** Consider these learnings before making your recommendation.")
             context_parts.append("If this setup matches a known mistake pattern, reduce confidence or recommend no_trade.")
@@ -665,6 +674,47 @@ class TradeLearningService:
         except Exception as e:
             logger.error(f"Failed to build Claude context: {e}")
             return ""
+    
+    async def _get_symbol_pattern_stats(self, symbol: str) -> List[str]:
+        """Query DB for symbol+direction win/loss stats to give Claude explicit pattern feedback."""
+        lines = []
+        try:
+            from sqlalchemy import select, func, case
+            async with async_session_maker() as session:
+                cutoff = datetime.utcnow() - timedelta(days=90)
+                stmt = (
+                    select(
+                        TradeModel.direction,
+                        func.count().label('total'),
+                        func.sum(case((TradeModel.profit_loss > 0, 1), else_=0)).label('wins'),
+                        func.sum(case((TradeModel.profit_loss <= 0, 1), else_=0)).label('losses'),
+                        func.avg(TradeModel.r_multiple).label('avg_r'),
+                    )
+                    .where(TradeModel.symbol == symbol)
+                    .where(TradeModel.timestamp >= cutoff)
+                    .where(TradeModel.exit_price.isnot(None))
+                    .group_by(TradeModel.direction)
+                )
+                result = await session.execute(stmt)
+                rows = result.all()
+                for row in rows:
+                    direction = row.direction or 'unknown'
+                    total = row.total or 0
+                    wins = int(row.wins or 0)
+                    losses = int(row.losses or 0)
+                    avg_r = float(row.avg_r or 0)
+                    wr = wins / total * 100 if total > 0 else 0
+                    lines.append(
+                        f"[PATTERN] {symbol} {direction.upper()}: {wins}W/{losses}L "
+                        f"({wr:.0f}% win rate), avg {avg_r:.1f}R over last {total} trades"
+                    )
+                    if wr < 40 and total >= 3:
+                        lines.append(f"  WARNING: {direction.upper()} trades on {symbol} are losing money. Consider avoiding or reducing size.")
+                    elif wr >= 70 and total >= 3:
+                        lines.append(f"  STRONG: {direction.upper()} trades on {symbol} are profitable. Lean toward this direction.")
+        except Exception as e:
+            logger.debug(f"Could not get symbol pattern stats: {e}")
+        return lines
     
     # =========================================================================
     # WEEKLY CONSOLIDATION

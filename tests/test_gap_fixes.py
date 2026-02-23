@@ -1163,19 +1163,19 @@ class TestTradeJudgePerformance:
                "suggested < entry_price" in source, \
             "Judge should clamp short entries that worsen the trade"
     
-    def test_judge_preserves_sl_tp_on_demote(self):
-        """Demote logic in main.py should only change entry and order_type, not SL/TP."""
+    def test_judge_rebases_sl_tp_on_demote(self):
+        """Demote logic should rebase SL/TP as offsets from the demoted entry."""
         import inspect
         from trading_bot.main import TradingBot
         
         source = inspect.getsource(TradingBot._analyze_and_trade)
-        # The DEMOTE block should set order_type and entry_price but NOT stop_loss or take_profit
-        # Find the DEMOTE handling section
         assert "trade_signal.order_type = 'buy_limit'" in source, "DEMOTE should set buy_limit for longs"
         assert "trade_signal.order_type = 'sell_limit'" in source, "DEMOTE should set sell_limit for shorts"
-        # SL/TP should NOT be reassigned in the demote block
-        assert "trade_signal.stop_loss =" not in source.split("TRADE JUDGE")[1].split("PENDING ORDER VS MARKET")[0], \
-            "DEMOTE block should NOT modify stop_loss"
+        demote_start = source.find("verdict') == 'DEMOTE'")
+        approve_start = source.find("APPROVE", demote_start)
+        demote_section = source[demote_start:approve_start]
+        assert "_sl_offset" in demote_section, "DEMOTE should rebase SL as offset from demoted entry"
+        assert "_tp_offset" in demote_section, "DEMOTE should rebase TP as offset from demoted entry"
     
     def test_run_trade_judge_exists_in_trading_bot(self):
         """TradingBot should have _run_trade_judge method."""

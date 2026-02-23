@@ -264,6 +264,9 @@ class TradingBot:
         # HOLD decisions trigger a cooldown before next re-eval (saves API calls, reduces log spam)
         self._position_reeval_state: Dict[int, Dict] = {}
         
+        # Cache MTF results per symbol for position re-evaluation context
+        self._last_mtf_results: Dict[str, Dict] = {}
+        
         # Cycle-to-cycle signal memory (per symbol) for reactive context
         self._last_signal_per_symbol: Dict[str, Dict[str, Any]] = {}
         
@@ -1754,7 +1757,7 @@ class TradingBot:
                 logger.debug(f"Claude not configured, using technical analysis only for {symbol}")
                 return
             
-            # Generate chart image for Claude (primary M15 chart)
+            # Generate initial chart (will be regenerated with overlays after analysis)
             chart_base64 = await self._generate_chart_image(df, symbol)
             if not chart_base64:
                 logger.warning(f"Failed to generate chart for {symbol}")
@@ -1793,11 +1796,27 @@ class TradingBot:
             # Prepare market data for Claude (ENHANCED with all integrated services)
             from .config import get_symbol_spec as _gss
             _sym_spec = _gss(symbol)
+            # Fetch real bid/ask/spread from MT5
+            _real_bid = current_price
+            _real_ask = current_price
+            _real_spread = 0.0
+            _spread_pct = 0.0
+            try:
+                _sym_info = await self.mt5_client.get_symbol_info(symbol)
+                if _sym_info and getattr(_sym_info, 'ask', 0) > 0:
+                    _real_bid = _sym_info.bid
+                    _real_ask = _sym_info.ask
+                    _real_spread = _real_ask - _real_bid
+                    _spread_pct = _real_spread / ((_real_ask + _real_bid) / 2) if (_real_ask + _real_bid) > 0 else 0
+            except Exception:
+                pass
+            
             market_data = {
                 "current_price": current_price,
-                "bid": current_price - 0.00005,
-                "ask": current_price + 0.00005,
-                "spread": 1.0,
+                "bid": _real_bid,
+                "ask": _real_ask,
+                "spread": round(_real_spread, 6),
+                "spread_pct": f"{_spread_pct:.4%}",
                 # Account & Goal Context
                 "account_equity": current_equity,
                 "scaling_tier": self.position_sizer.get_tier_name(current_equity) if self.position_sizer else "Unknown",
@@ -2152,12 +2171,17 @@ class TradingBot:
                 "volume": analysis_results.get("volume", {})
             }
             
-            # Add MTF context to market_data for Claude
+            # Add MTF context to market_data for Claude (and cache for position re-eval)
             if mtf_result:
                 market_data["htf_bias"] = mtf_result.overall_bias.value
                 market_data["htf_alignment"] = mtf_result.alignment
                 market_data["htf_can_trade_long"] = mtf_result.can_trade_long
                 market_data["htf_can_trade_short"] = mtf_result.can_trade_short
+                self._last_mtf_results[symbol] = {
+                    "d1_bias": mtf_result.daily_analysis.bias.value if mtf_result.daily_analysis else "unknown",
+                    "h4_bias": mtf_result.h4_analysis.bias.value if mtf_result.h4_analysis else "unknown",
+                    "alignment": mtf_result.alignment,
+                }
                 # D1 context (top-down starting point)
                 market_data["d1_bias"] = mtf_result.daily_analysis.bias.value if mtf_result.daily_analysis else None
                 market_data["d1_structure"] = mtf_result.daily_analysis.structure if mtf_result.daily_analysis else None
@@ -2193,6 +2217,52 @@ class TradingBot:
             # Inject last signal memory so Claude knows what it said last cycle
             if symbol in self._last_signal_per_symbol:
                 market_data["last_signal"] = self._last_signal_per_symbol[symbol]
+            
+            # Regenerate M15 chart WITH ICT overlays now that analysis is complete
+            try:
+                _chart_obs = []
+                _chart_fvgs = []
+                _chart_liq = []
+                _chart_swings = []
+                if ob_obj:
+                    for ob in (getattr(ob_obj, 'bullish_obs', []) or [])[-5:]:
+                        _chart_obs.append({"top": float(ob.high), "bottom": float(ob.low), "type": "bullish"})
+                    for ob in (getattr(ob_obj, 'bearish_obs', []) or [])[-5:]:
+                        _chart_obs.append({"top": float(ob.high), "bottom": float(ob.low), "type": "bearish"})
+                if fvg_obj:
+                    for f in (getattr(fvg_obj, 'bullish_fvgs', []) or [])[-5:]:
+                        _chart_fvgs.append({"top": float(f.top), "bottom": float(f.bottom), "type": "bullish"})
+                    for f in (getattr(fvg_obj, 'bearish_fvgs', []) or [])[-5:]:
+                        _chart_fvgs.append({"top": float(f.top), "bottom": float(f.bottom), "type": "bearish"})
+                if liq_obj:
+                    for p in (getattr(liq_obj, 'bsl_pools', []) or [])[-5:]:
+                        _price = float(p.price) if hasattr(p, 'price') else float(p)
+                        _chart_liq.append({"price": _price, "label": "BSL", "color": "purple"})
+                    for p in (getattr(liq_obj, 'ssl_pools', []) or [])[-5:]:
+                        _price = float(p.price) if hasattr(p, 'price') else float(p)
+                        _chart_liq.append({"price": _price, "label": "SSL", "color": "purple"})
+                if ms_obj:
+                    for sh in (getattr(ms_obj, 'swing_highs', []) or [])[-8:]:
+                        _p = float(sh.price) if hasattr(sh, 'price') else float(sh)
+                        _idx = getattr(sh, 'index', None) or getattr(sh, 'bar_index', None)
+                        _chart_swings.append({"price": _p, "type": "high", "index": _idx})
+                    for sl_pt in (getattr(ms_obj, 'swing_lows', []) or [])[-8:]:
+                        _p = float(sl_pt.price) if hasattr(sl_pt, 'price') else float(sl_pt)
+                        _idx = getattr(sl_pt, 'index', None) or getattr(sl_pt, 'bar_index', None)
+                        _chart_swings.append({"price": _p, "type": "low", "index": _idx})
+                if _chart_obs or _chart_fvgs or _chart_liq or _chart_swings:
+                    _enhanced_chart = await self._generate_chart_image(
+                        df, symbol,
+                        order_blocks=_chart_obs if _chart_obs else None,
+                        fvg_zones=_chart_fvgs if _chart_fvgs else None,
+                        liquidity_levels=_chart_liq if _chart_liq else None,
+                        swing_points=_chart_swings if _chart_swings else None,
+                    )
+                    if _enhanced_chart:
+                        chart_base64 = _enhanced_chart
+                        logger.info(f"Enhanced M15 chart with {len(_chart_obs)} OBs, {len(_chart_fvgs)} FVGs, {len(_chart_liq)} liq levels, {len(_chart_swings)} swings")
+            except Exception as overlay_err:
+                logger.warning(f"Could not add overlays to chart: {overlay_err}")
             
             # Get Claude's analysis
             logger.info(f"Requesting Claude analysis for {symbol}...")
@@ -2591,6 +2661,27 @@ class TradingBot:
             logger.info(f"Confluence factors for {symbol}: {confluence_count} ({', '.join(confluence_factors) if confluence_factors else 'none'})")
             print(f"[CONFLUENCE] {symbol}: {confluence_count} factors ({', '.join(confluence_factors) if confluence_factors else 'none'}), confidence={trade_signal.confidence:.0%}", flush=True)
             
+            # Volume enforcement -- block dead-market entries
+            _rel_vol = 1.0
+            try:
+                _vol_data = analysis_results.get("volume", {})
+                if isinstance(_vol_data, dict):
+                    _rel_vol = _vol_data.get("relative_volume", 1.0) or 1.0
+                elif hasattr(_vol_data, 'relative_volume'):
+                    _rel_vol = getattr(_vol_data, 'relative_volume', 1.0) or 1.0
+            except Exception:
+                pass
+            
+            if _rel_vol < 0.3:
+                print(f"[VOLUME-BLOCK] {symbol}: Relative volume {_rel_vol:.2f}x < 0.3 — dead market, skipping", flush=True)
+                logger.warning(f"Trade blocked for {symbol}: relative volume {_rel_vol:.2f}x (dead market)")
+                return
+            elif _rel_vol < 0.5:
+                _old_conf = trade_signal.confidence
+                trade_signal.confidence = min(trade_signal.confidence, 0.70)
+                if _old_conf != trade_signal.confidence:
+                    print(f"[VOLUME-CAP] {symbol}: Relative volume {_rel_vol:.2f}x — confidence capped {_old_conf:.0%} -> {trade_signal.confidence:.0%}", flush=True)
+            
             # Require minimum confluence factors for trades
             # In AGGRESSIVE mode (data collection), lower the bar to 1 factor at 65%+ confidence
             min_confluence = 1 if (self.scaling_manager and self.scaling_manager.current_mode.value == 'aggressive') else 2
@@ -2881,7 +2972,8 @@ class TradingBot:
                     loss_streak=self.loss_streak,
                     current_exposure_lots=self._get_current_exposure_lots(),
                     correlation_multiplier=size_multiplier,
-                    claude_recommendation=claude_size_rec
+                    claude_recommendation=claude_size_rec,
+                    confluence_count=confluence_count or 0,
                 )
                 
                 # Apply crypto volatility adjustment if applicable
@@ -4238,21 +4330,34 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Error in analysis-only mode for {symbol}: {e}")
     
-    async def _generate_chart_image(self, df, symbol: str, timeframe: Optional[str] = None) -> Optional[str]:
+    async def _generate_chart_image(
+        self, df, symbol: str, timeframe: Optional[str] = None,
+        order_blocks=None, fvg_zones=None, liquidity_levels=None, swing_points=None
+    ) -> Optional[str]:
         """Generate a chart image and return as base64.
         
         Runs in a thread pool to avoid blocking the event loop (matplotlib is sync/CPU-bound).
+        Accepts optional ICT overlay data to draw on the chart.
         """
         try:
             from .utils.chart_screenshot import create_simple_chart
             if create_simple_chart:
                 tf_label = timeframe or settings.timeframes.execution_tf
-                # Run in thread pool so chart generation doesn't block the API event loop
+                kwargs = {}
+                if order_blocks:
+                    kwargs['order_blocks'] = order_blocks
+                if fvg_zones:
+                    kwargs['fvg_zones'] = fvg_zones
+                if liquidity_levels:
+                    kwargs['liquidity_levels'] = liquidity_levels
+                if swing_points:
+                    kwargs['swing_points'] = swing_points
                 chart_base64 = await asyncio.to_thread(
                     create_simple_chart,
                     df, 
                     symbol, 
-                    tf_label
+                    tf_label,
+                    **kwargs
                 )
                 if chart_base64:
                     return chart_base64
@@ -4261,8 +4366,6 @@ class TradingBot:
         except Exception as e:
             logger.warning(f"Error generating chart: {e}")
         
-        # Return a minimal placeholder if chart generation fails
-        # Claude will rely more on the analysis data
         return self._create_placeholder_image()
     
     def _create_placeholder_image(self) -> str:
@@ -5150,6 +5253,40 @@ class TradingBot:
                     pnl = getattr(position, 'unrealized_pnl', 0) or 0
                     is_stagnant = hours_open >= 4 and abs(r_mult) < 0.2
                     
+                    # Gather enriched context for better re-evaluation
+                    _reeval_extra = ""
+                    try:
+                        # HTF bias
+                        if hasattr(self, '_last_mtf_results') and position.symbol in self._last_mtf_results:
+                            _mtf = self._last_mtf_results[position.symbol]
+                            _reeval_extra += f"\n## Higher Timeframe Context\n"
+                            _reeval_extra += f"- D1 Bias: {_mtf.get('d1_bias', 'unknown')}\n"
+                            _reeval_extra += f"- H4 Bias: {_mtf.get('h4_bias', 'unknown')}\n"
+                            _reeval_extra += f"- HTF Alignment: {_mtf.get('alignment', 'unknown')}\n"
+                    except Exception:
+                        pass
+                    try:
+                        # Learning context
+                        if hasattr(self, 'learning_service') and self.learning_service:
+                            _learn_ctx = await self.learning_service.build_context_for_claude(
+                                symbol=position.symbol,
+                                direction=position.direction,
+                                trade_type=getattr(position, 'trade_type', 'intraday'),
+                            )
+                            if _learn_ctx:
+                                _reeval_extra += f"\n## Lessons from Past Trades\n{_learn_ctx[:800]}\n"
+                    except Exception:
+                        pass
+                    try:
+                        # Real spread
+                        _sym_info = await self.mt5_client.get_symbol_info(position.symbol)
+                        if _sym_info and getattr(_sym_info, 'ask', 0) > 0:
+                            _spread = _sym_info.ask - _sym_info.bid
+                            _spread_pct = _spread / ((_sym_info.ask + _sym_info.bid) / 2) * 100
+                            _reeval_extra += f"\n- Current Spread: {_spread:.5f} ({_spread_pct:.3f}%)\n"
+                    except Exception:
+                        pass
+                    
                     # Build context for Claude
                     position_context = f"""
 ## Open Position to Evaluate
@@ -5164,6 +5301,7 @@ class TradingBot:
 - Unrealized P&L: ${pnl:.2f}
 - Time in Trade: {hours_open:.1f} hours (since {position.open_time})
 - Stagnant: {"YES - barely moved" if is_stagnant else "No"}
+{_reeval_extra}
 
 ## Context -- BE PATIENT
 Good entries need time to develop. Closing too early is worse than holding through
@@ -5248,7 +5386,7 @@ Include brief reasoning.
                     
                     logger.info(f"Claude recommendation for {position.symbol}: {recommendation[:100]}")
                     
-                    if "CLOSE" in recommendation.split(".")[0]:
+                    if recommendation.startswith("CLOSE"):
                         decision = "CLOSE"
                     elif "TIGHTEN" in recommendation:
                         decision = "TIGHTEN"

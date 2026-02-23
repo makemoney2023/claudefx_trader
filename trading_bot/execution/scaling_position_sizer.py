@@ -289,7 +289,8 @@ class ScalingPositionSizer:
         loss_streak: int = 0,
         current_exposure_lots: float = 0.0,
         correlation_multiplier: float = 1.0,
-        claude_recommendation: Optional[float] = None
+        claude_recommendation: Optional[float] = None,
+        confluence_count: int = 0,
     ) -> PositionSizeResult:
         """
         Calculate position size with all adjustments.
@@ -332,15 +333,36 @@ class ScalingPositionSizer:
             lots *= grade_mult
             adjustments.append(f"Setup grade {setup_grade.value}: {grade_mult}x")
         
-        # Adjustment 2: Confidence
-        if confidence < 0.7:
+        # Adjustment 2: Confidence (tiered)
+        if confidence < 0.68:
+            conf_mult = 0.5
+        elif confidence < 0.75:
             conf_mult = 0.75
+        elif confidence < 0.85:
+            conf_mult = 1.0
+        elif confidence < 0.90:
+            conf_mult = 1.25
+        else:
+            conf_mult = 1.5
+        if conf_mult != 1.0:
             lots *= conf_mult
-            adjustments.append(f"Low confidence ({confidence:.0%}): {conf_mult}x")
-        elif confidence >= 0.85:
-            conf_mult = 1.15
-            lots *= conf_mult
-            adjustments.append(f"High confidence ({confidence:.0%}): {conf_mult}x")
+            adjustments.append(f"Confidence ({confidence:.0%}): {conf_mult}x")
+        
+        # Adjustment 2b: Confluence count (more factors = higher conviction)
+        _confluence = confluence_count
+        if _confluence >= 4:
+            _cf_mult = 1.15
+        elif _confluence == 3:
+            _cf_mult = 1.0
+        elif _confluence == 2:
+            _cf_mult = 0.85
+        elif _confluence == 1:
+            _cf_mult = 0.7
+        else:
+            _cf_mult = 1.0
+        if _cf_mult != 1.0:
+            lots *= _cf_mult
+            adjustments.append(f"Confluence ({_confluence}): {_cf_mult}x")
         
         # Adjustment 3: Win/Loss Streak
         if win_streak >= 3:

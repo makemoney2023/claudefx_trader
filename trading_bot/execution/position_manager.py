@@ -420,7 +420,12 @@ class PositionManager:
                     logger.warning(f"Position {ticket} in MT5 but not tracked - adding to tracking")
                     from datetime import datetime
                     _mt5_time = getattr(mt5_pos, 'time', None)
-                    _open_time = datetime.fromtimestamp(_mt5_time) if _mt5_time else datetime.now()
+                    if isinstance(_mt5_time, datetime):
+                        _open_time = _mt5_time
+                    elif isinstance(_mt5_time, (int, float)):
+                        _open_time = datetime.fromtimestamp(_mt5_time)
+                    else:
+                        _open_time = datetime.now()
                     position = Position(
                         ticket=ticket,
                         symbol=mt5_pos.symbol,
@@ -637,10 +642,11 @@ class PositionManager:
                     )
         
         # --- Near-TP Reversal Auto-Close ---
-        # If near-TP was reached and price pulled back to 50% of peak R, close
+        _is_crypto = any(c in position.symbol.upper() for c in ['BTC', 'ETH', 'XRP', 'SOL', 'ADA', 'DOGE'])
+        _near_tp_giveback = 0.70 if _is_crypto else 0.60
         if position.near_tp_reached and peak_r > 0:
             giveback_from_peak = (peak_r - r_multiple) / peak_r if peak_r > 0 else 0
-            if giveback_from_peak >= 0.50 and r_multiple > 0:
+            if giveback_from_peak >= _near_tp_giveback and r_multiple > 0:
                 logger.warning(
                     f"[PROFIT-PROTECT] NEAR-TP REVERSAL on {position.ticket} ({position.symbol}): "
                     f"Peaked at {peak_r:.2f}R (near TP), now at {r_multiple:.2f}R "
@@ -649,15 +655,14 @@ class PositionManager:
                 position.close_reason = "near_tp_reversal"
                 return await self._protection_close(position, "near_tp_reversal")
         
-        # --- 40% Giveback Auto-Close ---
-        # If peak was >= 1.0R and trade gave back 40%+ from peak
+        _giveback_threshold = 0.65 if _is_crypto else 0.55
         if peak_r >= 1.0 and r_multiple > 0:
             giveback_pct = (peak_r - r_multiple) / peak_r
-            if giveback_pct >= 0.40:
+            if giveback_pct >= _giveback_threshold:
                 logger.warning(
                     f"[PROFIT-PROTECT] GIVEBACK CLOSE on {position.ticket} ({position.symbol}): "
                     f"Peaked at {peak_r:.2f}R, now at {r_multiple:.2f}R "
-                    f"(gave back {giveback_pct:.0%} >= 40%). Auto-closing."
+                    f"(gave back {giveback_pct:.0%} >= {_giveback_threshold:.0%}). Auto-closing."
                 )
                 position.close_reason = "giveback_protection"
                 return await self._protection_close(position, "giveback_protection")
@@ -806,8 +811,8 @@ class PositionManager:
                 position.tp1_hit = True
                 position.partial_closed = True
                 
-                # Second: move to break-even
-                buffer = position.risk_pips * 0.1
+                _is_crypto_be = any(c in position.symbol.upper() for c in ['BTC', 'ETH', 'XRP', 'SOL', 'ADA', 'DOGE'])
+                buffer = position.risk_pips * (0.30 if _is_crypto_be else 0.25)
                 if position.direction == 'long':
                     new_sl = position.entry_price + buffer
                 else:
@@ -918,8 +923,8 @@ class PositionManager:
                     "reason": "spread_too_wide"
                 }
         
-        # Add a small buffer (spread consideration)
-        buffer = position.risk_pips * 0.1
+        _is_crypto_be2 = any(c in position.symbol.upper() for c in ['BTC', 'ETH', 'XRP', 'SOL', 'ADA', 'DOGE'])
+        buffer = position.risk_pips * (0.30 if _is_crypto_be2 else 0.25)
         
         if position.direction == 'long':
             new_sl = position.entry_price + buffer

@@ -293,9 +293,9 @@ class TestNearTPProtection:
         long_position.peak_r_multiple = 2.7
         long_position.near_tp_reached = True
 
-        # 50% giveback from peak: 2.7 * 0.5 = 1.35, current = 1.35
-        # giveback = (2.7 - 1.35) / 2.7 = 0.5 = 50%
-        result = await pm._check_profit_protection(long_position, 1.35)
+        # 60% giveback from peak: 2.7 * 0.4 = 1.08, current = 1.08
+        # giveback = (2.7 - 1.08) / 2.7 = 0.6 = 60%
+        result = await pm._check_profit_protection(long_position, 1.08)
 
         assert result is not None
         assert long_position.close_reason == "near_tp_reversal"
@@ -319,9 +319,9 @@ class TestNearTPProtection:
         long_position.peak_r_multiple = 2.8  # Near TP (>= 2.55)
         long_position.near_tp_reached = True
 
-        # 50% giveback: now at 1.4R (2.8 * 0.5 = 1.4)
-        # This also exceeds 40% giveback, but near-TP should fire first
-        result = await pm._check_profit_protection(long_position, 1.4)
+        # 60% giveback: now at 1.12R (2.8 * 0.4 = 1.12)
+        # This also exceeds 55% giveback, but near-TP should fire first
+        result = await pm._check_profit_protection(long_position, 1.12)
 
         assert result is not None
         assert long_position.close_reason == "near_tp_reversal"
@@ -564,9 +564,9 @@ class TestManagePositionsIntegration:
         await pm.manage_positions({"XAUUSD": 110.0})
         assert long_position.peak_r_multiple == pytest.approx(2.0)
 
-        # Second call: price drops to 1.0R (105) — 50% giveback
-        # Protection should close because peak was 2.0R and gave back 50%
-        await pm.manage_positions({"XAUUSD": 105.0})
+        # Second call: price drops to 0.9R (104.5) — 55% giveback
+        # Protection should close because peak was 2.0R and gave back 55%
+        await pm.manage_positions({"XAUUSD": 104.5})
         # After giveback close, close_reason should be set
         # (if order_manager succeeds, which our mock does)
         assert long_position.close_reason == "giveback_protection"

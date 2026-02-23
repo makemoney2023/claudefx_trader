@@ -368,7 +368,8 @@ class ChartScreenshot:
 def create_simple_chart(
     df: pd.DataFrame,
     symbol: str,
-    timeframe: str
+    timeframe: str,
+    **kwargs
 ) -> str:
     """
     Quick utility to create a simple chart as base64.
@@ -377,9 +378,11 @@ def create_simple_chart(
         df: DataFrame with OHLCV data
         symbol: Trading symbol
         timeframe: Chart timeframe
+        **kwargs: Overlay data (order_blocks, fvg_zones, liquidity_levels, swing_points)
         
     Returns:
         Base64 encoded PNG image
     """
-    generator = ChartScreenshot()
-    return generator.generate_base64(df, symbol, timeframe)
+    dpi = kwargs.pop('dpi', 150)
+    generator = ChartScreenshot(dpi=dpi)
+    return generator.generate_base64(df, symbol, timeframe, **kwargs)
