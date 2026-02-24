@@ -6516,7 +6516,11 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                     close_deal_count = 0
                     _last_deal_time = None
                     for deal in history:
-                        if deal.get('position_id') == position.ticket and deal.get('entry') == 1:
+                        _matches_ticket = (
+                            deal.get('position_id') == position.ticket
+                            or deal.get('order') == position.ticket
+                        )
+                        if _matches_ticket and deal.get('entry') == 1:
                             actual_close_price = deal.get('price', position.current_price)
                             mt5_profit = deal.get('profit', 0) or 0
                             mt5_commission = deal.get('commission', 0) or 0
@@ -6531,7 +6535,7 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                                     _last_deal_time = datetime.fromtimestamp(_deal_ts) if isinstance(_deal_ts, (int, float)) else _deal_ts
                                 except Exception:
                                     pass
-                        elif deal.get('position_id') == position.ticket and deal.get('entry') == 0:
+                        elif _matches_ticket and deal.get('entry') == 0:
                             total_commission += deal.get('commission', 0) or 0
                     if close_deal_count > 0:
                         profit_loss = total_profit + total_commission + total_swap
@@ -6552,35 +6556,30 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                     print(f"[CLOSE] {position.symbol}: MT5 history error: {e}", flush=True)
             
             # Fallback: manual calculation if MT5 history unavailable
+            # Conservative approach: assume SL was hit unless price clearly past TP.
+            # This prevents false WINs when current_price drifts favorably after SL hit.
             if profit_loss is None:
-                # Check if SL was likely triggered — use SL as exit price instead of
-                # current_price which may have moved far past the SL by detection time
                 sl_price = getattr(position, 'stop_loss', None)
                 tp_price = getattr(position, 'take_profit', None)
                 fallback_exit = actual_close_price  # default: current_price
-                fallback_reason = "current_price"
+                fallback_reason = "current_price (no SL/TP)"
                 
-                if sl_price and sl_price > 0:
-                    if position.direction == 'long' and actual_close_price < sl_price:
-                        fallback_exit = sl_price
-                        fallback_reason = "SL_hit (price below SL)"
-                    elif position.direction == 'short' and actual_close_price > sl_price:
-                        fallback_exit = sl_price
-                        fallback_reason = "SL_hit (price above SL)"
-                    elif position.direction == 'long' and actual_close_price <= position.entry_price and sl_price < position.entry_price:
-                        fallback_exit = sl_price
-                        fallback_reason = "SL_likely (price fell, SL below entry)"
-                    elif position.direction == 'short' and actual_close_price >= position.entry_price and sl_price > position.entry_price:
-                        fallback_exit = sl_price
-                        fallback_reason = "SL_likely (price rose, SL above entry)"
-                
+                # Check TP first — only if price is clearly past TP
+                _tp_hit = False
                 if tp_price and tp_price > 0:
                     if position.direction == 'long' and actual_close_price >= tp_price:
                         fallback_exit = tp_price
-                        fallback_reason = "TP_hit (price above TP)"
+                        fallback_reason = "TP_hit (price past TP)"
+                        _tp_hit = True
                     elif position.direction == 'short' and actual_close_price <= tp_price:
                         fallback_exit = tp_price
-                        fallback_reason = "TP_hit (price below TP)"
+                        fallback_reason = "TP_hit (price past TP)"
+                        _tp_hit = True
+                
+                # If TP not clearly hit, assume SL (conservative)
+                if not _tp_hit and sl_price and sl_price > 0:
+                    fallback_exit = sl_price
+                    fallback_reason = "SL_assumed (no MT5 history, conservative)"
                 
                 actual_close_price = fallback_exit
                 
@@ -6694,10 +6693,7 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                 except Exception as learn_err:
                     logger.debug(f"Could not update learnings doc: {learn_err}")
             
-            # Send Telegram notification ONLY if we confirmed the close via MT5 history.
-            # If MT5 didn't return a matching close deal, the position may have
-            # disappeared due to a cancelled pending order or sync glitch — don't
-            # send a misleading WIN/LOSS notification.
+            # Send Telegram notification
             if mt5_profit_found:
                 await notify(
                     NotificationType.TRADE_CLOSED,
@@ -6711,10 +6707,24 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                     ticket=position.ticket
                 )
             else:
+                # No MT5 history confirmation — send UNCONFIRMED notification
+                # so the user knows to verify the P/L manually
                 print(
-                    f"[CLOSE] {position.symbol}: Telegram notification SKIPPED — "
-                    f"no confirmed close deal in MT5 history (may be cancelled order or sync glitch)",
+                    f"[CLOSE] {position.symbol}: UNCONFIRMED P/L (no MT5 close deal found) — "
+                    f"estimated P/L=${profit_loss:+.2f}, verify manually",
                     flush=True
+                )
+                await notify(
+                    NotificationType.TRADE_CLOSED,
+                    f"Trade closed (UNCONFIRMED): {position.symbol}",
+                    symbol=position.symbol,
+                    direction=position.direction,
+                    entry_price=position.entry_price,
+                    exit_price=actual_close_price,
+                    profit_loss=profit_loss,
+                    pips=pips,
+                    ticket=position.ticket,
+                    unconfirmed=True
                 )
             
             # Remove from correlation tracking

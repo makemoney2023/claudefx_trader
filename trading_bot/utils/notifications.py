@@ -210,12 +210,20 @@ class TelegramNotifier:
         exit_price: float,
         profit_loss: float,
         pips: float,
-        ticket: Optional[int] = None
+        ticket: Optional[int] = None,
+        unconfirmed: bool = False
     ) -> bool:
         """Send trade closed notification."""
         emoji = "✅" if profit_loss >= 0 else "❌"
         result_word = "WIN" if profit_loss >= 0 else "LOSS"
+        if unconfirmed:
+            emoji = "⚠️"
+            result_word = f"UNCONFIRMED {result_word}"
         fp = lambda p: self._format_price(p, symbol)
+        
+        confirm_line = ""
+        if unconfirmed:
+            confirm_line = "\n<b>⚠️ P/L is estimated (no MT5 confirmation) — verify manually</b>"
         
         message = f"""
 {emoji} <b>Trade Closed — {result_word}</b>
@@ -225,7 +233,7 @@ class TelegramNotifier:
 <b>Entry:</b> {fp(entry_price)}
 <b>Exit:</b> {fp(exit_price)}
 <b>P/L:</b> ${profit_loss:+.2f} ({pips:+.1f} pips)
-{f'<b>Ticket:</b> {ticket}' if ticket else ''}
+{f'<b>Ticket:</b> {ticket}' if ticket else ''}{confirm_line}
 """
         return await self.send_message(message.strip())
     
@@ -318,7 +326,8 @@ async def notify(
             exit_price=kwargs.get('exit_price', 0),
             profit_loss=kwargs.get('profit_loss', 0),
             pips=kwargs.get('pips', 0),
-            ticket=kwargs.get('ticket')
+            ticket=kwargs.get('ticket'),
+            unconfirmed=kwargs.get('unconfirmed', False)
         )
     
     elif notification_type == NotificationType.ERROR:
