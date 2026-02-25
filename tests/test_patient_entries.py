@@ -378,10 +378,10 @@ class TestDirectionalBiasFix:
         assert "ONLY trade in the direction" not in prompt
 
     def test_soft_guidance_present(self):
-        """The prompt should contain soft directional guidance, not hard blocks."""
+        """The prompt should contain directional authority hierarchy."""
         prompt = self._build_prompt_with_bearish_htf()
-        assert "DIRECTIONAL GUIDANCE" in prompt
-        assert "not a hard block" in prompt
+        assert "DIRECTIONAL AUTHORITY" in prompt
+        assert "strict hierarchy" in prompt
 
     def test_counter_trend_label_not_blocked(self):
         """When HTF is bearish, longs should show as 'COUNTER-TREND', not 'BLOCKED'."""
@@ -395,9 +395,9 @@ class TestDirectionalBiasFix:
         assert "PREFERRED" in prompt
 
     def test_both_directions_evaluable(self):
-        """The prompt should instruct Claude to evaluate BOTH directions."""
+        """The prompt should allow counter-trend trades with M15 confirmation."""
         prompt = self._build_prompt_with_bearish_htf()
-        assert "ALWAYS evaluate BOTH" in prompt or "EVALUATE BOTH DIRECTIONS" in prompt
+        assert "Counter-trend trades" in prompt or "counter-trend" in prompt.lower()
 
     def test_counter_trend_reversal_explicitly_valid(self):
         """The prompt should explicitly state counter-trend reversals are valid."""

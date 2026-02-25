@@ -867,7 +867,7 @@ IMPORTANT: If you see ACTIVE DISPLACEMENT (strong candles with follow-through), 
                     if status == 'preferred':
                         return f"✅ PREFERRED (with-trend)"
                     elif status == 'counter_trend':
-                        return f"⚠️ COUNTER-TREND (valid with Tier 1 swing validation)"
+                        return f"⚠️ COUNTER-TREND (requires M15 confirmation + Tier 1 swing validation)"
                     else:
                         return f"⚠️ Insufficient data"
                 
@@ -896,17 +896,17 @@ IMPORTANT: If you see ACTIVE DISPLACEMENT (strong candles with follow-through), 
 - Trade Short: {_format_direction_status(short_status, 'short')}
 - Key HTF Levels: {market_data.get('htf_key_levels', [])}
 
-⚠️ DIRECTIONAL GUIDANCE (not a hard block):
-- PREFER trading in the direction of the D1 bias -- it is your primary edge.
-- If D1 is BEARISH: prefer SHORT setups. For LONG setups, you need EXTRA
-  confluence: full Tier 1 swing validation (4+ swings, rounding, sweep) on
-  M5/M1, and reduce confidence by 10-15%.
-- If D1 is BULLISH: prefer LONG setups. For SHORT setups, same rule applies.
-- Counter-trend reversals at key levels with full swing exhaustion validation
-  are VALID high-probability trades. The swing validation framework exists
-  precisely for this purpose -- to catch reversals!
-- If D1/H4/H1 are NOT aligned, reduce confidence by 15%.
-- ALWAYS evaluate BOTH long AND short setups. Do not default to one side.
+🚨 DIRECTIONAL AUTHORITY (strict hierarchy — follow in order):
+1. M15 IS YOUR EXECUTION GATE. If M15 structure is bearish, you may ONLY go short
+   (or no_trade). If M15 structure is bullish, you may ONLY go long (or no_trade).
+   Exception: manipulation phase (Judas swing) where M15 temporarily opposes the move.
+2. D1+H4 SET THE PREFERRED DIRECTION. Trade with D1/H4 when M15 confirms.
+   If M15 opposes D1/H4, it means the pullback is NOT done — WAIT, do not fight it.
+3. If D1 AND H4 BOTH oppose your direction, do NOT take the trade regardless of M15.
+4. Counter-trend trades (against D1) are valid ONLY when M15 structure has already
+   shifted to confirm the reversal (CHoCH or BOS in your direction). Never anticipate
+   a reversal before M15 confirms it.
+5. If D1/H4/H1 are NOT aligned, reduce confidence by 15%.
 """
             
             # =============================================
@@ -931,7 +931,9 @@ IMPORTANT: If you see ACTIVE DISPLACEMENT (strong candles with follow-through), 
 - M1 Structure: {market_data.get('m1_structure', 'N/A')}
 - M1 Trend: {market_data.get('m1_trend', 'N/A')}
 
-⚠️ CRITICAL: Use M15 for intraday trade setup identification, M5/M1 for precision entries AND scalps.
+🚨 M15 EXECUTION GATE: Do NOT enter LONG if M15 bias is BEARISH. Do NOT enter SHORT
+if M15 bias is BULLISH. M15 bearish + D1 bullish means the pullback is still active —
+WAIT for M15 to shift before entering. Use M5/M1 for precision entries and scalps.
 
 ## Trade Type Classification (REQUIRED — you MUST set trade_type for every signal)
 
@@ -988,8 +990,8 @@ on lower timeframe structure.
 1. Cap your confidence at 70% MAXIMUM — counter-trend scalps are higher risk
 2. Require at least 2.0:1 R:R — no marginal R:R allowed against the trend
 3. Have 3+ confluences on M5/M1 (not just 2)
-Counter-trend scalps CAN work at key reversal levels with full swing exhaustion,
-but they must clear a higher bar than with-trend scalps.
+Counter-trend scalps are valid ONLY when M15 has already shifted to confirm the
+reversal. They must clear a higher bar than with-trend scalps.
 
 You MUST use M5/M1 to:
 1. COUNT SWINGS into the POI (4-6 swing rule -- mandatory for reversals)
