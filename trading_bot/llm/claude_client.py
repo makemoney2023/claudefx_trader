@@ -692,7 +692,13 @@ class ClaudeClient:
                         "buy_limit ONLY in discount zone (below equilibrium). "
                         "sell_limit ONLY in premium zone (above equilibrium). "
                         "Buying expensive (premium) or selling cheap (discount) is retail behavior. "
-                        "For breakouts, use buy_stop/sell_stop instead.",
+                        "For breakouts, use buy_stop/sell_stop instead. "
+                        "CRITICAL STRUCTURE RULES — NEVER VIOLATE: "
+                        "1) NEVER go long when M15 structure is bearish. NEVER go short when M15 structure is bullish. "
+                        "The execution timeframe (M15) must confirm your direction. "
+                        "2) NEVER go long when D1 AND H4 are both bearish. NEVER go short when D1 AND H4 are both bullish. "
+                        "Higher timeframes set the direction — lower timeframes only refine the entry. "
+                        "3) During Distribution phase, the move is done. Avoid new entries unless displacement confirms a fresh cycle.",
             },
             {
                 "type": "text",

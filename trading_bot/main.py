@@ -2604,6 +2604,92 @@ class TradingBot:
                     return
             
             # ============================================
+            # M15 EXECUTION TIMEFRAME STRUCTURE GATE
+            # M15 is the execution TF — trading against it means
+            # fighting the current price action.
+            # ============================================
+            _m15_bias = (market_data.get('m15_bias') or '').lower() if market_data else ''
+            _amd_phase_raw = getattr(trade_signal, 'amd_phase', '') or ''
+            _amd_phase_lc = _amd_phase_raw.lower()
+            _m15_opposes = (
+                (_m15_bias == 'bearish' and _dir == 'long')
+                or (_m15_bias == 'bullish' and _dir == 'short')
+            )
+            if _m15_opposes and _amd_phase_lc != 'manipulation':
+                logger.warning(
+                    f"[BLOCKED] {symbol}: {_dir.upper()} contradicts M15 bias "
+                    f"({_m15_bias}). Execution TF must confirm direction. Rejected."
+                )
+                print(
+                    f"[BLOCKED] {symbol}: {_dir.upper()} vs M15 {_m15_bias} structure. "
+                    f"Execution timeframe opposes trade. Skipping.",
+                    flush=True
+                )
+                return
+
+            # ============================================
+            # HTF (D1 + H4) ALIGNMENT GATE
+            # Both D1 and H4 opposing = hard block.
+            # One opposing = confidence cap.
+            # ============================================
+            _h4_bias = (market_data.get('h4_bias') or '').lower() if market_data else ''
+            _d1_opposes = (
+                (_d1_bias == 'bearish' and _dir == 'long')
+                or (_d1_bias == 'bullish' and _dir == 'short')
+            )
+            _h4_opposes = (
+                (_h4_bias == 'bearish' and _dir == 'long')
+                or (_h4_bias == 'bullish' and _dir == 'short')
+            )
+            if _d1_opposes and _h4_opposes:
+                logger.warning(
+                    f"[BLOCKED] {symbol}: {_dir.upper()} opposes BOTH D1 ({_d1_bias}) "
+                    f"and H4 ({_h4_bias}). HTF alignment required. Rejected."
+                )
+                print(
+                    f"[BLOCKED] {symbol}: {_dir.upper()} vs D1={_d1_bias} & H4={_h4_bias}. "
+                    f"Both HTFs oppose — skipping.",
+                    flush=True
+                )
+                return
+            elif _d1_opposes or _h4_opposes:
+                _opposing_tf = 'D1' if _d1_opposes else 'H4'
+                if trade_signal.confidence > 0.60:
+                    logger.info(
+                        f"[HTF-CAP] {symbol}: {_opposing_tf} opposes {_dir.upper()} "
+                        f"({_d1_bias}/{_h4_bias}). Confidence {trade_signal.confidence:.0%} -> 60%"
+                    )
+                    trade_signal.confidence = 0.60
+
+            # ============================================
+            # AMD DISTRIBUTION PHASE GATE
+            # Distribution = move is done. Require strong R:R
+            # and cap confidence for marginal entries.
+            # ============================================
+            _bot_amd_phase = ''
+            if analysis_results.get("amd_cycle"):
+                _bot_amd_phase = (analysis_results["amd_cycle"].get("phase") or '').lower()
+            _effective_amd = _bot_amd_phase or _amd_phase_lc
+            if _effective_amd == 'distribution':
+                if trade_signal.confidence > 0.55:
+                    logger.info(
+                        f"[DISTRIB-CAP] {symbol}: Distribution phase — confidence "
+                        f"{trade_signal.confidence:.0%} -> capped at 55%"
+                    )
+                    trade_signal.confidence = 0.55
+                if actual_rr < 2.5:
+                    logger.warning(
+                        f"[BLOCKED] {symbol}: Distribution phase + R:R {actual_rr:.2f}:1 "
+                        f"below 2.5:1 minimum. Move is done. Rejected."
+                    )
+                    print(
+                        f"[BLOCKED] {symbol}: Distribution phase, R:R only "
+                        f"{actual_rr:.2f}:1 (need 2.5). Skipping.",
+                        flush=True
+                    )
+                    return
+
+            # ============================================
             # TRADE QUALITY FILTER (E3)
             # Count ICT confluence factors for quality grading
             # ============================================
