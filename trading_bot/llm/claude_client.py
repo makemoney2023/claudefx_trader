@@ -694,11 +694,10 @@ class ClaudeClient:
                         "Buying expensive (premium) or selling cheap (discount) is retail behavior. "
                         "For breakouts, use buy_stop/sell_stop instead. "
                         "CRITICAL STRUCTURE RULES — NEVER VIOLATE: "
-                        "1) NEVER go long when M15 structure is bearish. NEVER go short when M15 structure is bullish. "
-                        "The execution timeframe (M15) must confirm your direction. "
-                        "2) NEVER go long when D1 AND H4 are both bearish. NEVER go short when D1 AND H4 are both bullish. "
+                        "1) NEVER go long when D1 AND H4 are both bearish. NEVER go short when D1 AND H4 are both bullish. "
                         "Higher timeframes set the direction — lower timeframes only refine the entry. "
-                        "3) During Distribution phase, the move is done. Avoid new entries unless displacement confirms a fresh cycle.",
+                        "2) During Distribution phase, the move is done. Avoid new entries unless displacement confirms a fresh cycle. "
+                        "3) M15 direction rules are detailed in the DIRECTIONAL AUTHORITY section of the analysis prompt.",
             },
             {
                 "type": "text",
@@ -839,7 +838,7 @@ IMPORTANT: If you see ACTIVE DISPLACEMENT (strong candles with follow-through), 
                     prompt += """- **CRITICAL WARNING: EXTREMELY LOW VOLUME (<0.3x avg) - AVOID TRADE - insufficient institutional participation**
 """
                 elif rel_vol < 0.5:
-                    prompt += """- **WARNING: LOW VOLUME (<0.5x avg) - Reduce confidence by 15% - thin market conditions**
+                    prompt += """- **WARNING: LOW VOLUME (<0.5x avg) - thin market conditions, mention in warnings**
 """
                 elif rel_vol < 0.7:
                     prompt += """- **CAUTION: BELOW-AVERAGE VOLUME (0.5x-0.7x avg) - Proceed with reduced size, institutional participation is marginal**
@@ -901,12 +900,14 @@ IMPORTANT: If you see ACTIVE DISPLACEMENT (strong candles with follow-through), 
    (or no_trade). If M15 structure is bullish, you may ONLY go long (or no_trade).
    Exception: manipulation phase (Judas swing) where M15 temporarily opposes the move.
 2. D1+H4 SET THE PREFERRED DIRECTION. Trade with D1/H4 when M15 confirms.
-   If M15 opposes D1/H4, it means the pullback is NOT done — WAIT, do not fight it.
+   If M15 opposes D1/H4, it means the pullback is NOT done — WAIT for M15 to confirm,
+   OR place a PENDING LIMIT ORDER (buy_limit / sell_limit) at a key level (OB, FVG,
+   liquidity sweep zone) in the D1/H4 direction. This anticipates the pullback completing.
 3. If D1 AND H4 BOTH oppose your direction, do NOT take the trade regardless of M15.
 4. Counter-trend trades (against D1) are valid ONLY when M15 structure has already
    shifted to confirm the reversal (CHoCH or BOS in your direction). Never anticipate
    a reversal before M15 confirms it.
-5. If D1/H4/H1 are NOT aligned, reduce confidence by 15%.
+5. If D1/H4/H1 are NOT aligned, note this as a warning factor (see CONFIDENCE ADJUSTMENT RULES below).
 """
             
             # =============================================
@@ -931,9 +932,7 @@ IMPORTANT: If you see ACTIVE DISPLACEMENT (strong candles with follow-through), 
 - M1 Structure: {market_data.get('m1_structure', 'N/A')}
 - M1 Trend: {market_data.get('m1_trend', 'N/A')}
 
-🚨 M15 EXECUTION GATE: Do NOT enter LONG if M15 bias is BEARISH. Do NOT enter SHORT
-if M15 bias is BULLISH. M15 bearish + D1 bullish means the pullback is still active —
-WAIT for M15 to shift before entering. Use M5/M1 for precision entries and scalps.
+See DIRECTIONAL AUTHORITY above for M15 execution rules. Use M5/M1 for precision entries.
 
 ## Trade Type Classification (REQUIRED — you MUST set trade_type for every signal)
 
@@ -941,7 +940,10 @@ WAIT for M15 to shift before entering. Use M5/M1 for precision entries and scalp
 - Setup identified on M5/M1 charts
 - Target: 5-20 pips (metals: 50-200 pips due to pip value), hold time <30 min
 - Valid when: M5/M1 shows a clean ICT setup (OB, FVG, sweep, displacement) even if
-  D1/H4 are ranging or unclear. Scalps do NOT require full HTF alignment.
+  D1/H4 are RANGING or UNCLEAR. Scalps do NOT require full HTF alignment.
+  NOTE: If D1 AND H4 are both actively OPPOSING your scalp direction (both bearish
+  for a long scalp), the HTF gate still applies (see DIRECTIONAL AUTHORITY rule 3).
+  Ranging/unclear HTFs are fine for scalps; actively opposing HTFs are not.
 - Requirements: Must have at least 2 confluences on M5/M1 (e.g., OB + FVG, sweep + displacement)
 - SL: Tight — just beyond the M1 structure level (typically 5-15 pips)
 - R:R: Target 1.5:1 (lower threshold than intraday since high win-rate setups)
@@ -987,7 +989,7 @@ on lower timeframe structure.
 
 ⚠️ COUNTER-TREND SCALP WARNING: If your SCALP direction is AGAINST the D1 bias
 (e.g., D1 is BEARISH but you want to SCALP LONG on M5/M1), you MUST:
-1. Cap your confidence at 70% MAXIMUM — counter-trend scalps are higher risk
+1. Set confidence to 70%+ (the system will cap it to 55% for risk management)
 2. Require at least 2.0:1 R:R — no marginal R:R allowed against the trend
 3. Have 3+ confluences on M5/M1 (not just 2)
 Counter-trend scalps are valid ONLY when M15 has already shifted to confirm the
@@ -1004,8 +1006,6 @@ You MUST use M5/M1 to:
 Use M5/M1 context to refine your entry level and assess momentum exhaustion.
 If M5/M1 shows structure aligning with your trade thesis, boost confidence.
 If M5/M1 shows structure AGAINST your thesis (e.g., bearish M1 for a long), reduce confidence.
-Use PENDING ORDERS (buy_limit/sell_limit/buy_stop/sell_stop) at key levels when price is ranging or approaching.
-Use MARKET orders when displacement is confirmed and momentum is strong — do NOT miss moves by waiting for pullbacks that never come.
 
 ## MANDATORY ANALYSIS WORKFLOW (follow this order)
 
@@ -1259,7 +1259,7 @@ Unicorn/Breaker setups, buy_stop/sell_stop breakouts):
 ## 📊 TRADINGVIEW TECHNICAL CONSENSUS
 - Signal: {tv.get('signal', 'neutral').upper()}
 - Consensus: {tv.get('consensus', 'neutral').upper()}
-- ⚠️ If your analysis CONFLICTS with TV consensus, reduce confidence by 5-10%
+- ⚠️ If your analysis CONFLICTS with TV consensus, note this as a warning factor
 """
             
             # Options Flow
@@ -1343,34 +1343,55 @@ Analyze the chart image and provide:
 Trading these causes CATASTROPHIC losses due to incorrect position sizing.
 If the current symbol ends in BTC or BIT, you MUST return direction="no_trade" with reasoning explaining it's a dangerous BTC-quoted pair.
 
-## CORE MANDATE -- REACT, DO NOT PREDICT:
-You are a REACTIVE trader. You signal a trade ONLY when price has ALREADY confirmed a
-setup on the chart. You NEVER signal because you think price "will" move in a direction.
-If nothing has been confirmed yet, return no_trade. Missing a move is always better than
-predicting one and being wrong.
+## CORE MANDATE -- CONFIRMED SETUPS FIRST, ANTICIPATORY SECOND:
+You operate in TWO modes:
 
-**Before recommending ANY trade (long or short), you MUST cite at least TWO of these
-confirmations that have ALREADY OCCURRED on the chart -- not "developing" or "likely":**
+MODE 1 (PRIMARY) -- REACTIVE: Signal a trade when price has ALREADY confirmed a setup.
+Before recommending a MARKET order, cite at least TWO confirmations that have ALREADY
+OCCURRED on the chart (not "developing" or "likely"):
 1. A displacement candle has CLOSED (strong impulsive move with body > 70% of range)
 2. A Break of Structure (BOS) or Change of Character (CHoCH) has PRINTED on M1/M5
 3. A liquidity sweep has COMPLETED (wick swept a high/low and price reclaimed)
 4. Price is AT or INSIDE a valid FVG/OB entry zone RIGHT NOW (not approaching it)
+If you cannot cite two of these for a MARKET order, do NOT use a market order.
 
-If you cannot point to at least two of these as ALREADY HAPPENED, you MUST return no_trade.
-"Approaching a level" or "likely to break" is NOT confirmation -- that is prediction.
+MODE 2 (SECONDARY) -- ANTICIPATORY: When D1+H4 agree on direction but M15 is pulling
+back (opposing), you MAY place a PENDING LIMIT ORDER (buy_limit/sell_limit) at a key
+level (OB, FVG, liquidity sweep zone) in the HTF direction. Requirements:
+- Order type MUST be buy_limit or sell_limit (never market)
+- Entry must be at a specific structural level (name it in reasoning)
+- Confidence capped at 55-60%
+- This is NOT predicting -- it is positioning at a key level where price is likely
+  to react IF it arrives there
+
+NEVER use a MARKET order based on prediction. Anticipation is only valid via pending
+limit orders at defined structural levels.
 
 ## Important Rules -- PATIENCE IS THE EDGE:
 - **Do NOT force a trade.** If the setup is not textbook (swing validation, confluence, clear levels), return no_trade. It is ALWAYS better to miss a move than to enter poorly and draw down.
 - **Quality over quantity.** One perfect entry with circular price action confirmation is worth more than five mediocre entries. Wait for the setup to come to you.
-- **Use the right order type for the situation.** Use buy_limit/sell_limit for reversal entries at sweep-and-reclaim zones, OBs, FVGs, or prominent wicks when price is approaching. Use buy_stop/sell_stop for breakout entries. Use MARKET when displacement is underway and momentum is strong — a limit order during a strong move will miss the entry.
 - **Confidence must reflect CONFIRMED evidence, not conviction in a direction.** Use this scale:
   - 0.60-0.69: One confirmation present, setup developing but incomplete
   - 0.70-0.79: Two confirmations present, valid but not ideal
   - 0.80-0.89: Three+ confirmations, strong confluence, kill zone timing
   - 0.90-1.00: Full confluence: swing validation + displacement + sweep + FVG/OB + volume
   Do NOT park at exactly 0.75 every time. Your confidence MUST vary based on the actual evidence.
-- **MINIMUM 1.5:1 R:R on ALL trades** (1.5:1 scalps, 2:1 intraday, 3:1 swing). Trades below 1.5:1 are automatically rejected. Do NOT submit them.
-- Consider the current session (kill zone timing) -- outside kill zones, reduce confidence but still analyze
+
+## CONFIDENCE ADJUSTMENT RULES (cap total reduction at -20%):
+Start with your base confidence from setup quality, then apply AT MOST -20% total:
+- D1/H4/H1 misaligned: -10%
+- Low volume (below 0.7x): -5%
+- Against TV consensus: -5%
+- Outside kill zone: already handled by the system (do NOT reduce further)
+- Total reduction MUST NOT exceed -20% from your base confidence.
+The system applies its own session and volume adjustments — do not double-count.
+Your stated confidence is your SETUP QUALITY assessment only. Do NOT pre-discount
+for session timing or volume — the system handles those independently. If you see
+low volume or off-session timing, mention it in your warnings field but do NOT
+reduce your confidence number for it.
+
+- **MINIMUM 1.5:1 R:R on ALL trades** — see R:R GUIDANCE section above for details per trade type.
+- Session timing is handled by the system — focus on setup quality.
 - Identify specific price levels for entry, SL, and TP using M1/M5 precision
 - **CRITICAL: SL must NEVER equal entry price.** For LONG trades, SL must be placed BELOW entry (beyond the nearest swing low or OB). For SHORT trades, SL must be placed ABOVE entry (beyond the nearest swing high or OB). A zero-distance SL is invalid and will be rejected.
 - If genuinely no setup exists (ranging, no structure, no POI nearby), recommend "no_trade" with your reasoning
@@ -1383,7 +1404,7 @@ If you cannot point to at least two of these as ALREADY HAPPENED, you MUST retur
 - Relative volume must be > 0.7x average for valid setups
 - Displacement + high volume (>1.5x) = Confirmed institutional intent -> boost confidence
 - Liquidity sweep + volume spike (>2x) = Confirmed stop hunt -> high probability reversal
-- LOW VOLUME (<0.5x avg): Reduce confidence by 15% -- thin markets are unreliable
+- LOW VOLUME (<0.5x avg): Thin markets are unreliable -- mention in warnings
 - EXTREMELY LOW VOLUME (<0.3x avg): AVOID TRADE entirely -- no institutional commitment
 - Volume climax (>3x avg) + reversal candle: Possible exhaustion -- watch for reversal
 - Volume trend increasing into displacement: Confirms institutional participation

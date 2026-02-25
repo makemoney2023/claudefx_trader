@@ -2772,7 +2772,9 @@ class TradingBot:
             _session_name = (_session.session_name if _session else '').lower()
             _is_kill = _session.is_kill_zone if _session else False
             _session_penalty = 0.0
-            if not _is_kill:
+            if self._off_hours_mode:
+                pass  # Off-hours block already capped confidence — don't double-penalize
+            elif not _is_kill:
                 if 'asian' in _session_name:
                     _session_penalty = 0.10
                 else:
