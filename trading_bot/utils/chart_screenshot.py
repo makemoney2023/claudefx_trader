@@ -372,6 +372,7 @@ class ChartScreenshot:
         trade_markers: Optional[List[Dict]] = None,
         volume_profile: Optional[Dict] = None,
         reactive_levels: Optional[List[Dict]] = None,
+        bar_extreme_zones: Optional[List[Dict]] = None,
     ) -> bytes:
         """
         Generate a 2x2 multi-timeframe composite chart as a single image.
@@ -383,6 +384,8 @@ class ChartScreenshot:
             trade_markers: Trade history markers for M15 panel
             volume_profile: Volume profile data for M15 panel
             reactive_levels: Historical reactive levels for M15 panel
+            bar_extreme_zones: Supply/demand zones from bar extremes.
+                Each dict: {"top", "bottom", "type": "supply"|"demand", "tf"}
 
         Returns:
             PNG image as bytes
@@ -420,6 +423,10 @@ class ChartScreenshot:
 
             if is_m15 and reactive_levels:
                 self._draw_reactive_levels(ax, reactive_levels)
+
+            if bar_extreme_zones:
+                panel_zones = [z for z in bar_extreme_zones if z.get('tf', '').upper() == tf_label.upper()]
+                self._draw_bar_extreme_zones(ax, panel_zones)
 
         for idx in range(n, 4):
             row, col = panel_positions[idx]
@@ -560,6 +567,31 @@ class ChartScreenshot:
         if val is not None:
             ax.axhline(y=val, color='#1565C0', linestyle='--', linewidth=0.7, alpha=0.6)
             ax.annotate('VAL', xy=(xlim[1], val), fontsize=6, color='#1565C0', va='center', ha='right')
+
+    def _draw_bar_extreme_zones(self, ax, zones: List[Dict]):
+        """Draw supply/demand zones from bar extremes as shaded bands."""
+        for z in zones:
+            top = z.get('top', 0)
+            bottom = z.get('bottom', 0)
+            z_type = z.get('type', '')
+            if z_type == 'supply':
+                color = '#ef5350'
+                label = 'S'
+            elif z_type == 'demand':
+                color = '#26a69a'
+                label = 'D'
+            else:
+                continue
+            ax.axhspan(bottom, top, color=color, alpha=0.12, linewidth=0)
+            ax.axhline(y=top, color=color, linestyle=':', linewidth=0.6, alpha=0.5)
+            ax.axhline(y=bottom, color=color, linestyle=':', linewidth=0.6, alpha=0.5)
+            mid = (top + bottom) / 2
+            xlim = ax.get_xlim()
+            ax.annotate(
+                f'{label}-Zone', xy=(xlim[0] + (xlim[1] - xlim[0]) * 0.02, mid),
+                fontsize=6, color=color, va='center', ha='left', alpha=0.7,
+                fontweight='bold',
+            )
 
     def _draw_reactive_levels(self, ax, levels: List[Dict]):
         """Draw historical reactive price levels as semi-transparent bands."""

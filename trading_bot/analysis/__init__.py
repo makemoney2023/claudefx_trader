@@ -46,6 +46,7 @@ from .displacement import DisplacementDetector, DisplacementCandle, Displacement
 from .volume_analysis import VolumeAnalyzer, VolumeAnalysis
 from .ipda import IPDATracker, IPDALevel, IPDAAnalysis, get_ipda_targets
 from .premium_discount import PremiumDiscountAnalyzer, PremiumDiscountAnalysis, PriceZone as PDZone, validate_entry_zone
+from .bar_extreme_zones import BarExtremeZoneDetector, BarExtremeZone, BarExtremeAnalysis
 
 __all__ = [
     # Market Structure
@@ -122,4 +123,8 @@ __all__ = [
     # Volume Analysis
     "VolumeAnalyzer",
     "VolumeAnalysis",
+    # Bar Extreme Supply/Demand Zones
+    "BarExtremeZoneDetector",
+    "BarExtremeZone",
+    "BarExtremeAnalysis",
 ]

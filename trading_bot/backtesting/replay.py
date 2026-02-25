@@ -231,10 +231,11 @@ class ClaudeReplayBacktester:
     # Approximate cost per API call (Opus 4.5 with images)
     COST_PER_CALL = 0.08
 
-    def __init__(self, claude_client=None, mt5_client=None):
+    def __init__(self, claude_client=None, mt5_client=None, trade_learning_service=None):
         self._claude = claude_client
         self._data_loader = HistoricalDataLoader(mt5_client)
         self._chart_gen = None
+        self._learning_service = trade_learning_service
 
     async def estimate_cost(
         self, symbol: str, start: datetime, end: datetime, interval_hours: float = 1.0
@@ -295,6 +296,19 @@ class ClaudeReplayBacktester:
             f"({len(m15_data)} M15 bars, interval={interval_hours}h)"
         )
 
+        # Pre-fetch learnings context so replay uses same context as live bot
+        setup_playbook = ""
+        learning_context_str = ""
+        if self._learning_service:
+            try:
+                setup_playbook = await self._learning_service.build_setup_playbook(lookback_days=180, min_sample=3)
+            except Exception as e:
+                logger.debug(f"[REPLAY] Setup playbook unavailable: {e}")
+            try:
+                learning_context_str = await self._learning_service.build_context_for_claude(symbol, "london")
+            except Exception as e:
+                logger.debug(f"[REPLAY] Learning context unavailable: {e}")
+
         # Walk through the data at the specified interval
         current = start_date
         signals_processed = 0
@@ -347,6 +361,18 @@ class ClaudeReplayBacktester:
                     'atr_14': round(atr_val, 6),
                     'atr_min_sl': round(atr_val * 1.5, 6),
                 }
+                if setup_playbook:
+                    market_data['setup_playbook'] = setup_playbook
+                if learning_context_str:
+                    market_data['learning_context'] = learning_context_str
+
+                try:
+                    from ..analysis.bar_extreme_zones import BarExtremeZoneDetector
+                    _be_det = BarExtremeZoneDetector()
+                    _be_m15 = _be_det.detect(m15_window, current_price, 'M15')
+                    market_data['bar_extreme_m15'] = _be_m15.to_dict()
+                except Exception:
+                    pass
 
                 # Call Claude
                 claude_result = await self._claude.analyze_chart_async(

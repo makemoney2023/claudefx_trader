@@ -1861,7 +1861,26 @@ class TradingBot:
                         )
                 except Exception as _vp_err:
                     logger.debug(f"[VP] Volume profile error for {symbol}: {_vp_err}")
-                
+
+                # Detect bar extreme supply/demand zones on available timeframes
+                _bar_extreme_zones = []
+                try:
+                    from .analysis.bar_extreme_zones import BarExtremeZoneDetector
+                    _be_detector = BarExtremeZoneDetector()
+                    _current_price = float(df['close'].iloc[-1])
+                    for _be_tf, _be_df in [('D1', _mtf_dfs.get('D1')), ('H1', _mtf_dfs.get('H1')), ('M15', df), ('M5', _mtf_dfs.get('M5'))]:
+                        if _be_df is not None and len(_be_df) > 20:
+                            _be_result = _be_detector.detect(_be_df, _current_price, _be_tf)
+                            market_data[f"bar_extreme_{_be_tf.lower()}"] = _be_result.to_dict()
+                            if _be_result.supply_zone:
+                                _bar_extreme_zones.append({"top": _be_result.supply_zone.top, "bottom": _be_result.supply_zone.bottom, "type": "supply", "tf": _be_tf})
+                            if _be_result.demand_zone:
+                                _bar_extreme_zones.append({"top": _be_result.demand_zone.top, "bottom": _be_result.demand_zone.bottom, "type": "demand", "tf": _be_tf})
+                    if _bar_extreme_zones:
+                        logger.info(f"[BAR_EXTREME] {symbol}: {len(_bar_extreme_zones)} zones across {len(set(z['tf'] for z in _bar_extreme_zones))} timeframes")
+                except Exception as _be_err:
+                    logger.debug(f"[BAR_EXTREME] Error for {symbol}: {_be_err}")
+
                 # Generate composite chart (D1, H1, M15, M5) as primary image
                 _composite_base64 = None
                 try:
@@ -1887,6 +1906,8 @@ class TradingBot:
                             _comp_kwargs['volume_profile'] = _vp_data
                         if _reactive_levels:
                             _comp_kwargs['reactive_levels'] = _reactive_levels
+                        if _bar_extreme_zones:
+                            _comp_kwargs['bar_extreme_zones'] = _bar_extreme_zones
                         _composite_base64 = await asyncio.to_thread(
                             create_composite_chart, _composite_panels, symbol,
                             **_comp_kwargs

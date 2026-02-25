@@ -734,6 +734,51 @@ export const api = {
   
   deleteLearningPrune: () =>
     fetchApi<{ message: string; count: number }>('/api/learning/prune', { method: 'DELETE', requiresAuth: true }),
+
+  // =========================================================================
+  // BACKTESTING
+  // =========================================================================
+
+  listBacktestRuns: (params?: { run_type?: string; status?: string; limit?: number; offset?: number }) =>
+    fetchApi<BacktestRun[]>('/api/backtest/runs', { params: params as Record<string, string | number | boolean> | undefined }),
+
+  getBacktestRun: (id: number) =>
+    fetchApi<BacktestRun>(`/api/backtest/runs/${id}`),
+
+  deleteBacktestRun: (id: number) =>
+    fetchApi<{ ok: boolean }>(`/api/backtest/runs/${id}`, { method: 'DELETE', requiresAuth: true }),
+
+  cancelBacktestRun: (id: number) =>
+    fetchApi<{ ok: boolean }>(`/api/backtest/runs/${id}/cancel`, { method: 'POST', requiresAuth: true }),
+
+  startIctBacktest: (config: IctBacktestConfig) =>
+    fetchApi<BacktestRun>('/api/backtest/ict', {
+      method: 'POST',
+      body: JSON.stringify(config),
+      requiresAuth: true,
+      timeout: 300000,
+    }),
+
+  estimateReplayCost: (config: ReplayBacktestConfig) =>
+    fetchApi<{ symbol: string; period: string; estimated_api_calls: number; estimated_cost: string; interval_hours: number }>(
+      '/api/backtest/replay/estimate',
+      { method: 'POST', body: JSON.stringify(config) }
+    ),
+
+  startReplayBacktest: (config: ReplayBacktestConfig) =>
+    fetchApi<BacktestRun>('/api/backtest/replay', {
+      method: 'POST',
+      body: JSON.stringify(config),
+      requiresAuth: true,
+    }),
+
+  startOptimizer: (config: OptimizerConfig) =>
+    fetchApi<BacktestRun>('/api/backtest/optimizer', {
+      method: 'POST',
+      body: JSON.stringify(config),
+      requiresAuth: true,
+      timeout: 120000,
+    }),
 }
 
 export function createWebSocket(channel: string): WebSocket {
@@ -2023,4 +2068,58 @@ export interface PerformanceSummary {
     loss_streak: number
   }
   error?: string
+}
+
+// Backtesting API
+export type BacktestRunType = 'ict' | 'replay' | 'optimizer'
+export type BacktestRunStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'
+
+export interface BacktestRun {
+  id: number
+  run_type: BacktestRunType
+  status: BacktestRunStatus
+  symbol: string | null
+  timeframe: string | null
+  start_date: string
+  end_date: string
+  progress_pct: number
+  current_step: string
+  total_trades: number | null
+  win_rate: number | null
+  net_profit: number | null
+  sharpe_ratio: number | null
+  profit_factor: number | null
+  max_drawdown: number | null
+  estimated_cost: number | null
+  actual_cost: number | null
+  error_message: string | null
+  config_json: Record<string, unknown>
+  result_json: Record<string, unknown> | null
+  created_at: string
+  completed_at: string | null
+}
+
+export interface IctBacktestConfig {
+  symbol: string
+  timeframe: string
+  start_date: string
+  end_date: string
+  initial_balance?: number
+  risk_per_trade?: number
+  min_risk_reward?: number
+}
+
+export interface ReplayBacktestConfig {
+  symbol: string
+  start_date: string
+  end_date: string
+  interval_hours?: number
+  max_signals?: number
+}
+
+export interface OptimizerConfig {
+  lookback_days?: number
+  n_folds?: number
+  train_ratio?: number
+  param_space?: Record<string, unknown[]>
 }

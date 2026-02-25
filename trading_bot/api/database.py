@@ -352,6 +352,44 @@ class WeeklyReviewModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class BacktestRunModel(Base):
+    """
+    Persists backtest runs (ICT, Claude Replay, Walk-Forward Optimizer).
+    Used for listing past runs, progress polling, and viewing full results.
+    """
+    __tablename__ = "backtest_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_type: Mapped[str] = mapped_column(String(20), index=True)  # ict, replay, optimizer
+    status: Mapped[str] = mapped_column(String(20), index=True)  # pending, running, completed, failed, cancelled
+
+    symbol: Mapped[Optional[str]] = mapped_column(String(20), nullable=True, index=True)
+    timeframe: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    start_date: Mapped[datetime] = mapped_column(DateTime)
+    end_date: Mapped[datetime] = mapped_column(DateTime)
+
+    config_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    result_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+
+    progress_pct: Mapped[int] = mapped_column(Integer, default=0)
+    current_step: Mapped[str] = mapped_column(String(255), default="")
+
+    total_trades: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    win_rate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    net_profit: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    sharpe_ratio: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    profit_factor: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    max_drawdown: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    estimated_cost: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    actual_cost: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
 # Database engine and session
 engine = create_async_engine(DATABASE_URL, echo=False)
 async_session_maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)

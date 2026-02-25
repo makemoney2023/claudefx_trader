@@ -57,6 +57,10 @@ class UpdateTradingConfigRequest(BaseModel):
     max_daily_drawdown: Optional[float] = Field(None, ge=0.01, le=0.20)
     max_weekly_drawdown: Optional[float] = Field(None, ge=0.01, le=0.30)
     max_daily_profit_target: Optional[float] = Field(None, ge=0.01, le=1.0)
+    gate_min_confidence: Optional[float] = Field(None, ge=0.0, le=1.0)
+    gate_session_penalty_asian: Optional[float] = Field(None, ge=0.0, le=0.5)
+    gate_cooldown_minutes: Optional[int] = Field(None, ge=0, le=120)
+    gate_counter_trend_rr_floor: Optional[float] = Field(None, ge=1.0, le=10.0)
 
 
 class UpdateTimeframeConfigRequest(BaseModel):
@@ -193,7 +197,23 @@ async def update_trading_config(request: UpdateTradingConfigRequest, persist: bo
     if request.max_daily_profit_target is not None:
         settings.trading.max_daily_profit_target = request.max_daily_profit_target
         updates_to_persist['max_daily_profit_target'] = request.max_daily_profit_target
-    
+
+    if request.gate_min_confidence is not None:
+        settings.trading.gate_min_confidence = request.gate_min_confidence
+        updates_to_persist['gate_min_confidence'] = request.gate_min_confidence
+
+    if request.gate_session_penalty_asian is not None:
+        settings.trading.gate_session_penalty_asian = request.gate_session_penalty_asian
+        updates_to_persist['gate_session_penalty_asian'] = request.gate_session_penalty_asian
+
+    if request.gate_cooldown_minutes is not None:
+        settings.trading.gate_cooldown_minutes = request.gate_cooldown_minutes
+        updates_to_persist['gate_cooldown_minutes'] = request.gate_cooldown_minutes
+
+    if request.gate_counter_trend_rr_floor is not None:
+        settings.trading.gate_counter_trend_rr_floor = request.gate_counter_trend_rr_floor
+        updates_to_persist['gate_counter_trend_rr_floor'] = request.gate_counter_trend_rr_floor
+
     # Gap 5: Persist changes to .env.local
     if persist and updates_to_persist:
         try:

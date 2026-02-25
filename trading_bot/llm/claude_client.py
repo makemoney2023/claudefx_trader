@@ -904,6 +904,29 @@ IMPORTANT: If you see ACTIVE DISPLACEMENT (strong candles with follow-through), 
 **Use the playbook above: favor PREFERRED setups, avoid or reduce confidence for AVOID setups.**
 """
             
+            # Bar Extreme Supply/Demand Zones (multi-timeframe)
+            _be_tfs = [k for k in market_data if k.startswith('bar_extreme_')]
+            if _be_tfs:
+                prompt += "\n## Bar Extreme Supply/Demand Zones\n"
+                for _be_key in sorted(_be_tfs):
+                    _be = market_data[_be_key]
+                    _tf_label = _be.get('timeframe', _be_key.replace('bar_extreme_', '').upper())
+                    sz = _be.get('supply_zone')
+                    dz = _be.get('demand_zone')
+                    prompt += f"\n### {_tf_label}\n"
+                    if sz:
+                        prompt += f"- Supply Zone: {sz['top']} – {sz['bottom']} (range of highest bar)\n"
+                    if dz:
+                        prompt += f"- Demand Zone: {dz['bottom']} – {dz['top']} (range of lowest bar)\n"
+                    prompt += f"- Bias: **{_be.get('bias', 'neutral').upper()}** ({_be.get('bias_reason', '')})\n"
+                prompt += """
+**BAR EXTREME ZONE RULES:**
+- If price hits a demand zone first and respects it (bounce), look for LONGS. Enter on the retest, SL below the demand zone, TP at the supply zone.
+- If price hits a supply zone first and rejects, look for SHORTS. Enter on the retest, SL above the supply zone, TP at the demand zone.
+- Use the execution timeframe (M15/M5) zone for precise entry. Use higher TF (H1/D1) zones for directional bias and TP targets.
+- Bar extreme zones are additional confluence — stack with FVG, OB, and liquidity for high-confidence entries.
+"""
+
             # =============================================
             # FULL MULTI-TIMEFRAME CONTEXT (D1 → H4 → H1 → M15 → M5 → M1)
             # =============================================

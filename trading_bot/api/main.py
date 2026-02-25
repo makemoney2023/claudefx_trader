@@ -461,8 +461,9 @@ def create_app() -> FastAPI:
     )
     
     # Register routers
-    from .routes import activity, bot_status, news, silver, goal, crypto, scaling, session, precious_metals, learning, orders, intelligence
+    from .routes import activity, backtest, bot_status, news, silver, goal, crypto, scaling, session, precious_metals, learning, orders, intelligence
     app.include_router(trades.router, prefix="/api/trades", tags=["Trades"])
+    app.include_router(backtest.router, prefix="/api/backtest", tags=["Backtesting"])
     app.include_router(analysis.router, prefix="/api/analysis", tags=["Analysis"])
     app.include_router(config.router, prefix="/api/config", tags=["Configuration"])
     app.include_router(performance.router, prefix="/api/performance", tags=["Performance"])
