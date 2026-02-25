@@ -276,6 +276,7 @@ class TradingBot:
         # Post-loss cooldown: prevent revenge trading by blocking re-entry
         # for 30 minutes after a stop-loss exit on the same symbol
         self._symbol_loss_cooldowns: Dict[str, datetime] = {}  # symbol -> cooldown_expires_at
+        self._off_hours_mode: bool = False  # True when outside kill zones (soft-block)
         
         # Analysis cooldown: only call Claude once per 5 minutes per symbol
         # Saves API costs by skipping redundant analyses on unchanged chart data
@@ -1140,25 +1141,25 @@ class TradingBot:
             session = self.kill_zone_checker.get_current_session()
             print(f"[CYCLE] Session: {session.session_name}, is_tradeable={session.is_tradeable}, is_kill_zone={session.is_kill_zone}", flush=True)
             if not session.is_tradeable:
-                # Outside kill zone — check if crypto should also be restricted
                 if settings.trading.crypto_kill_zone_only:
-                    # Kill-zone-only mode: skip ALL symbols (including crypto) outside kill zones
-                    print(f"[CYCLE] BLOCKED: Outside kill zone ({session.session_name}), crypto_kill_zone_only=True", flush=True)
-                    logger.debug(f"Outside kill zone ({session.session_name}), all symbols blocked (crypto_kill_zone_only)")
-                    return
-                
-                # Legacy behavior: crypto trades 24/7, only filter out forex
-                crypto_in_cycle = [s for s in cycle_symbols if s in self.CRYPTO_SYMBOLS]
-                if crypto_in_cycle:
-                    logger.info(
-                        f"Outside kill zone ({session.session_name}) - "
-                        f"forex blocked, {len(crypto_in_cycle)} crypto symbols still active"
-                    )
-                    cycle_symbols = crypto_in_cycle
+                    print(f"[CYCLE] OFF-HOURS ({session.session_name}): soft-block active, analysis continues with caps", flush=True)
+                    logger.info(f"Outside kill zone ({session.session_name}) — soft-block: confidence capped, R:R raised")
+                    self._off_hours_mode = True
                 else:
-                    print(f"[CYCLE] BLOCKED: Outside kill zone ({session.session_name}), no crypto to trade", flush=True)
-                    logger.debug(f"Outside valid trading session ({session.session_name}), skipping cycle")
-                    return
+                    crypto_in_cycle = [s for s in cycle_symbols if s in self.CRYPTO_SYMBOLS]
+                    if crypto_in_cycle:
+                        logger.info(
+                            f"Outside kill zone ({session.session_name}) - "
+                            f"forex blocked, {len(crypto_in_cycle)} crypto symbols still active"
+                        )
+                        cycle_symbols = crypto_in_cycle
+                        self._off_hours_mode = True
+                    else:
+                        print(f"[CYCLE] BLOCKED: Outside kill zone ({session.session_name}), no crypto to trade", flush=True)
+                        logger.debug(f"Outside valid trading session ({session.session_name}), skipping cycle")
+                        return
+            else:
+                self._off_hours_mode = False
             
             # Check for Silver Bullet window
             silver_bullet_status = self.silver_bullet_detector.is_in_silver_bullet_window()
@@ -1267,8 +1268,11 @@ class TradingBot:
                         bot_state.symbol_complete(symbol, "loss_cooldown")
                     return
                 else:
-                    # Cooldown expired, clean up
+                    # Cooldown expired — flag this symbol for higher confidence bar
                     del self._symbol_loss_cooldowns[symbol]
+                    if not hasattr(self, '_post_cooldown_symbols'):
+                        self._post_cooldown_symbols = set()
+                    self._post_cooldown_symbols.add(symbol)
             
             # CRITICAL: Block dangerous pairs (BTC-quoted pairs have wrong contract values)
             if symbol.upper() in self.BLOCKED_PAIRS or symbol.upper().endswith('BTC') or symbol.upper().endswith('BIT'):
@@ -2616,16 +2620,40 @@ class TradingBot:
                 or (_m15_bias == 'bullish' and _dir == 'short')
             )
             if _m15_opposes and _amd_phase_lc != 'manipulation':
-                logger.warning(
-                    f"[BLOCKED] {symbol}: {_dir.upper()} contradicts M15 bias "
-                    f"({_m15_bias}). Execution TF must confirm direction. Rejected."
+                _d1_supports = (
+                    (_d1_bias == 'bullish' and _dir == 'long')
+                    or (_d1_bias == 'bearish' and _dir == 'short')
                 )
-                print(
-                    f"[BLOCKED] {symbol}: {_dir.upper()} vs M15 {_m15_bias} structure. "
-                    f"Execution timeframe opposes trade. Skipping.",
-                    flush=True
+                _h4_supports = (
+                    (_h4_bias == 'bullish' and _dir == 'long')
+                    or (_h4_bias == 'bearish' and _dir == 'short')
                 )
-                return
+                _is_pending_limit = trade_signal.order_type in ('buy_limit', 'sell_limit')
+                _is_pullback = _d1_supports and _h4_supports and _is_pending_limit
+
+                if _is_pullback:
+                    trade_signal.confidence = min(trade_signal.confidence, 0.55)
+                    logger.info(
+                        f"[ANTICIPATORY] {symbol}: M15 opposes {_dir.upper()} but D1+H4 "
+                        f"support — allowing pending limit (pullback entry). "
+                        f"Confidence capped at {trade_signal.confidence:.0%}"
+                    )
+                    print(
+                        f"[ANTICIPATORY] {symbol}: Pullback detected, pending {trade_signal.order_type} "
+                        f"allowed at key level. Confidence {trade_signal.confidence:.0%}",
+                        flush=True
+                    )
+                else:
+                    logger.warning(
+                        f"[BLOCKED] {symbol}: {_dir.upper()} contradicts M15 bias "
+                        f"({_m15_bias}). Execution TF must confirm direction. Rejected."
+                    )
+                    print(
+                        f"[BLOCKED] {symbol}: {_dir.upper()} vs M15 {_m15_bias} structure. "
+                        f"Execution timeframe opposes trade. Skipping.",
+                        flush=True
+                    )
+                    return
 
             # ============================================
             # HTF (D1 + H4) ALIGNMENT GATE
@@ -2641,17 +2669,26 @@ class TradingBot:
                 (_h4_bias == 'bearish' and _dir == 'long')
                 or (_h4_bias == 'bullish' and _dir == 'short')
             )
+            _trade_type_lc = (trade_signal.trade_type or '').lower()
+            _is_scalp = 'scalp' in _trade_type_lc
             if _d1_opposes and _h4_opposes:
-                logger.warning(
-                    f"[BLOCKED] {symbol}: {_dir.upper()} opposes BOTH D1 ({_d1_bias}) "
-                    f"and H4 ({_h4_bias}). HTF alignment required. Rejected."
-                )
-                print(
-                    f"[BLOCKED] {symbol}: {_dir.upper()} vs D1={_d1_bias} & H4={_h4_bias}. "
-                    f"Both HTFs oppose — skipping.",
-                    flush=True
-                )
-                return
+                if _is_scalp and not _m15_opposes and actual_rr >= 2.0 and trade_signal.confidence >= 0.70:
+                    trade_signal.confidence = min(trade_signal.confidence, 0.55)
+                    logger.info(
+                        f"[COUNTER-SCALP] {symbol}: HTFs oppose but M15 confirms {_dir.upper()} — "
+                        f"allowing scalp with capped confidence {trade_signal.confidence:.0%}"
+                    )
+                else:
+                    logger.warning(
+                        f"[BLOCKED] {symbol}: {_dir.upper()} opposes BOTH D1 ({_d1_bias}) "
+                        f"and H4 ({_h4_bias}). HTF alignment required. Rejected."
+                    )
+                    print(
+                        f"[BLOCKED] {symbol}: {_dir.upper()} vs D1={_d1_bias} & H4={_h4_bias}. "
+                        f"Both HTFs oppose — skipping.",
+                        flush=True
+                    )
+                    return
             elif _d1_opposes or _h4_opposes:
                 _opposing_tf = 'D1' if _d1_opposes else 'H4'
                 if trade_signal.confidence > 0.60:
@@ -2688,6 +2725,68 @@ class TradingBot:
                         flush=True
                     )
                     return
+
+            # ============================================
+            # OFF-HOURS SOFT BLOCK
+            # Outside kill zones: cap confidence, raise R:R bar
+            # ============================================
+            if self._off_hours_mode:
+                if trade_signal.confidence > 0.50:
+                    logger.info(
+                        f"[OFF-HOURS] {symbol}: Confidence {trade_signal.confidence:.0%} -> 50% (outside kill zone)"
+                    )
+                    trade_signal.confidence = 0.50
+                if actual_rr < 3.0:
+                    logger.warning(
+                        f"[BLOCKED] {symbol}: Off-hours R:R {actual_rr:.2f}:1 < 3.0 minimum. Skipping."
+                    )
+                    print(
+                        f"[BLOCKED] {symbol}: Off-hours, need 3.0 R:R, got {actual_rr:.2f}. Skipping.",
+                        flush=True
+                    )
+                    return
+
+            # ============================================
+            # POST-COOLDOWN CONFIDENCE GATE
+            # First trade after a loss cooldown needs 75%+
+            # ============================================
+            if hasattr(self, '_post_cooldown_symbols') and symbol in self._post_cooldown_symbols:
+                if trade_signal.confidence < 0.75:
+                    logger.warning(
+                        f"[POST-COOLDOWN] {symbol}: First signal after loss cooldown "
+                        f"needs 75%+ confidence, got {trade_signal.confidence:.0%}. Rejected."
+                    )
+                    print(
+                        f"[POST-COOLDOWN] {symbol}: Need 75% confidence after loss, "
+                        f"got {trade_signal.confidence:.0%}. Skipping.",
+                        flush=True
+                    )
+                    return
+                self._post_cooldown_symbols.discard(symbol)
+
+            # ============================================
+            # SESSION-AWARE CONFIDENCE ADJUSTMENT
+            # Kill zones = baseline, off-session = penalty
+            # ============================================
+            _session = self.kill_zone_checker.get_current_session() if self.kill_zone_checker else None
+            _session_name = (_session.session_name if _session else '').lower()
+            _is_kill = _session.is_kill_zone if _session else False
+            _session_penalty = 0.0
+            if not _is_kill:
+                if 'asian' in _session_name:
+                    _session_penalty = 0.10
+                else:
+                    _session_penalty = 0.15
+            elif 'london close' in _session_name or 'london_close' in _session_name:
+                _session_penalty = 0.05
+            if _session_penalty > 0 and trade_signal.confidence > 0:
+                _old_conf = trade_signal.confidence
+                trade_signal.confidence = max(0.40, trade_signal.confidence - _session_penalty)
+                if trade_signal.confidence != _old_conf:
+                    logger.info(
+                        f"[SESSION-CONF] {symbol}: {_session_name} penalty -{_session_penalty:.0%}: "
+                        f"confidence {_old_conf:.0%} -> {trade_signal.confidence:.0%}"
+                    )
 
             # ============================================
             # TRADE QUALITY FILTER (E3)
@@ -6733,15 +6832,16 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
             elif profit_loss < 0:
                 self.loss_streak += 1
                 self.win_streak = 0
-                # Set 30-minute cooldown on this symbol to prevent revenge trading
-                cooldown_until = datetime.now() + timedelta(minutes=30)
+                _is_crypto_sym = any(c in position.symbol.upper() for c in ['BTC', 'ETH', 'XRP', 'SOL', 'ADA', 'DOGE'])
+                _cooldown_min = 15 if _is_crypto_sym else 30
+                cooldown_until = datetime.now() + timedelta(minutes=_cooldown_min)
                 self._symbol_loss_cooldowns[position.symbol] = cooldown_until
                 logger.info(
-                    f"[LOSS-COOLDOWN] {position.symbol}: 30-min cooldown set until "
+                    f"[LOSS-COOLDOWN] {position.symbol}: {_cooldown_min}-min cooldown set until "
                     f"{cooldown_until.strftime('%H:%M:%S')} (P/L: ${profit_loss:.2f})"
                 )
                 print(
-                    f"[LOSS-COOLDOWN] {position.symbol}: No new entries for 30 minutes "
+                    f"[LOSS-COOLDOWN] {position.symbol}: No new entries for {_cooldown_min} minutes "
                     f"(cooldown until {cooldown_until.strftime('%H:%M:%S')})",
                     flush=True
                 )

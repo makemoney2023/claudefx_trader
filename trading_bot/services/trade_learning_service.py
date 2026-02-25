@@ -665,6 +665,15 @@ class TradeLearningService:
             except Exception:
                 pass
             
+            # Confidence calibration feedback
+            try:
+                cal_lines = await self._get_confidence_calibration()
+                if cal_lines:
+                    context_parts.append("\n### Confidence Calibration")
+                    context_parts.extend(cal_lines)
+            except Exception:
+                pass
+            
             # Final warning
             context_parts.append("\n**IMPORTANT:** Consider these learnings before making your recommendation.")
             context_parts.append("If this setup matches a known mistake pattern, reduce confidence or recommend no_trade.")
@@ -675,6 +684,67 @@ class TradeLearningService:
             logger.error(f"Failed to build Claude context: {e}")
             return ""
     
+    async def _get_confidence_calibration(self) -> List[str]:
+        """Compute win rates by stated-confidence band so Claude can self-calibrate."""
+        lines = []
+        try:
+            from sqlalchemy import select, func, case, cast, Integer
+            async with async_session_maker() as session:
+                cutoff = datetime.utcnow() - timedelta(days=30)
+                stmt = (
+                    select(
+                        TradeModel.claude_confidence,
+                        TradeModel.profit_loss,
+                    )
+                    .where(TradeModel.timestamp >= cutoff)
+                    .where(TradeModel.exit_price.isnot(None))
+                    .where(TradeModel.claude_confidence.isnot(None))
+                    .where(TradeModel.claude_confidence > 0)
+                )
+                result = await session.execute(stmt)
+                rows = result.all()
+
+                if len(rows) < 5:
+                    return lines
+
+                bands = {
+                    '60-69%': (0.60, 0.70),
+                    '70-79%': (0.70, 0.80),
+                    '80-89%': (0.80, 0.90),
+                    '90-100%': (0.90, 1.01),
+                }
+                band_stats = {k: {'wins': 0, 'losses': 0} for k in bands}
+                for row in rows:
+                    conf = float(row.claude_confidence or 0)
+                    won = (row.profit_loss or 0) > 0
+                    for label, (lo, hi) in bands.items():
+                        if lo <= conf < hi:
+                            if won:
+                                band_stats[label]['wins'] += 1
+                            else:
+                                band_stats[label]['losses'] += 1
+                            break
+
+                lines.append("[CONFIDENCE CALIBRATION] Your stated confidence vs actual win rate (last 30 days):")
+                for label in bands:
+                    w = band_stats[label]['wins']
+                    l = band_stats[label]['losses']
+                    total = w + l
+                    if total >= 2:
+                        wr = w / total * 100
+                        tag = ''
+                        if wr < 40:
+                            tag = ' OVERCONFIDENT — reduce confidence in this band'
+                        elif wr >= 70:
+                            tag = ' WELL CALIBRATED'
+                        lines.append(f"  Confidence {label}: {w}W/{l}L ({wr:.0f}% actual win rate){tag}")
+                if len(lines) == 1:
+                    return []
+                lines.append("Adjust your stated confidence so it matches actual outcomes. If 70-79% band wins only 40%, you are overconfident.")
+        except Exception as e:
+            logger.debug(f"Could not get confidence calibration: {e}")
+        return lines
+
     async def _get_symbol_pattern_stats(self, symbol: str) -> List[str]:
         """Query DB for symbol+direction win/loss stats to give Claude explicit pattern feedback."""
         lines = []

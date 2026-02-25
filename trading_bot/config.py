@@ -362,8 +362,8 @@ class TradingSettings(BaseSettings):
         description="Minimum risk-reward ratio (1:3 = risk 1 to make 3)"
     )
     allowed_sessions: List[str] = Field(
-        default=["all"],
-        description="Allowed trading sessions. Use ['all'] to trade during all sessions, or specify ['london', 'new_york', 'asian', etc.]"
+        default=["london", "new_york", "london_close"],
+        description="Allowed trading sessions: 'london', 'new_york', 'london_close', 'asian'. Use ['all'] for 24/7."
     )
     max_daily_profit_target: float = Field(
         default=0.50,

@@ -1034,6 +1034,24 @@ Only return no_trade if NONE of the above passes found a valid setup.
 ⚠️ You MUST NOT skip Pass 3. If you are about to return no_trade, first
 re-examine the M5/M1 data and charts one more time for scalp opportunities.
 The most common mistake is ignoring clean M5/M1 setups because D1/H4 are unclear.
+
+## ORDER TYPE SELECTION — STOP ORDERS FOR BREAKOUTS
+
+Do NOT default to buy_limit/sell_limit for every trade. Consider the full order type palette:
+
+- **buy_limit / sell_limit**: Use when price is APPROACHING a key level (OB, FVG, liquidity pool)
+  and you expect a reversal/reaction. Entry is AWAY from current price.
+- **buy_stop / sell_stop**: Use when price is consolidating NEAR a key breakout level and you
+  expect a break THROUGH it. buy_stop = buy ABOVE current price on breakout. sell_stop = sell
+  BELOW current price on breakdown. Ideal for:
+  • Consolidation above/below a session high/low with displacement building
+  • Price coiling near an equal highs/lows liquidity pool
+  • M15/H1 structure shift pending (CHoCH about to confirm)
+- **market**: Use when displacement is ALREADY happening — confirmed BOS/CHoCH with strong
+  candle bodies and volume. Do not wait for a pullback that may never come.
+
+If you find yourself always choosing buy_limit or sell_limit, you are likely missing breakout
+setups. Evaluate whether the best entry is INTO a level (limit) or THROUGH a level (stop).
 """
             
             # =============================================
