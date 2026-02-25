@@ -427,6 +427,113 @@ class NewsService:
         title = event.get('title', '').lower()
         return any(pattern in title for pattern in self.CPI_PATTERNS)
     
+    # Per-symbol event impact scores (0-1).  Higher = more volatile reaction.
+    SYMBOL_EVENT_IMPACT = {
+        'XAUUSD': {'FOMC': 0.95, 'NFP': 0.90, 'CPI': 0.85, 'PPI': 0.60, 'GDP': 0.55, 'ECB': 0.40, 'BOE': 0.30},
+        'XAGUSD': {'FOMC': 0.90, 'NFP': 0.85, 'CPI': 0.80, 'PPI': 0.55, 'GDP': 0.50, 'ECB': 0.35, 'BOE': 0.25},
+        'EURUSD': {'FOMC': 0.85, 'NFP': 0.85, 'CPI': 0.80, 'ECB': 0.95, 'BOE': 0.35, 'GDP': 0.60, 'PPI': 0.50},
+        'GBPUSD': {'FOMC': 0.80, 'NFP': 0.80, 'CPI': 0.75, 'BOE': 0.95, 'ECB': 0.35, 'GDP': 0.60, 'PPI': 0.50},
+        'USDJPY': {'FOMC': 0.90, 'NFP': 0.85, 'CPI': 0.80, 'BOJ': 0.95, 'GDP': 0.60, 'PPI': 0.50},
+        'USDCHF': {'FOMC': 0.80, 'NFP': 0.75, 'CPI': 0.70, 'SNB': 0.90, 'ECB': 0.50},
+        'USDCAD': {'FOMC': 0.80, 'NFP': 0.80, 'CPI': 0.70, 'BOC': 0.90, 'GDP': 0.55},
+        'AUDUSD': {'FOMC': 0.70, 'NFP': 0.65, 'RBA': 0.90, 'CPI': 0.65, 'GDP': 0.60},
+        'NZDUSD': {'FOMC': 0.65, 'NFP': 0.60, 'RBNZ': 0.90, 'CPI': 0.60},
+        'BTCUSD': {'FOMC': 0.70, 'NFP': 0.50, 'CPI': 0.55, 'SEC': 0.85},
+        'ETHUSD': {'FOMC': 0.65, 'NFP': 0.45, 'CPI': 0.50, 'SEC': 0.80},
+    }
+    
+    # Event keyword to canonical name mapping
+    EVENT_ALIASES = {
+        'fomc': 'FOMC', 'fed rate': 'FOMC', 'federal reserve': 'FOMC', 'interest rate decision': 'FOMC',
+        'nonfarm': 'NFP', 'non-farm': 'NFP', 'nfp': 'NFP', 'payroll': 'NFP',
+        'cpi': 'CPI', 'consumer price': 'CPI', 'inflation': 'CPI',
+        'ecb': 'ECB', 'european central bank': 'ECB',
+        'boe': 'BOE', 'bank of england': 'BOE',
+        'boj': 'BOJ', 'bank of japan': 'BOJ',
+        'rba': 'RBA', 'reserve bank of australia': 'RBA',
+        'rbnz': 'RBNZ', 'reserve bank of new zealand': 'RBNZ',
+        'snb': 'SNB', 'swiss national bank': 'SNB',
+        'boc': 'BOC', 'bank of canada': 'BOC',
+        'gdp': 'GDP', 'gross domestic': 'GDP',
+        'ppi': 'PPI', 'producer price': 'PPI',
+        'sec': 'SEC', 'securities': 'SEC',
+    }
+    
+    def _classify_event(self, event: Dict[str, Any]) -> Optional[str]:
+        """Map an event to a canonical event name."""
+        title = event.get('title', '').lower()
+        for keyword, canonical in self.EVENT_ALIASES.items():
+            if keyword in title:
+                return canonical
+        return None
+    
+    def get_event_impact_for_symbol(self, symbol: str, event: Dict[str, Any]) -> float:
+        """
+        Return impact score (0-1) for a symbol/event pair.
+        Higher means more historical volatility from this event for this symbol.
+        """
+        canonical = self._classify_event(event)
+        if not canonical:
+            return 0.3 if event.get('impact', '').lower() == 'high' else 0.1
+        
+        symbol_impacts = self.SYMBOL_EVENT_IMPACT.get(symbol, {})
+        return symbol_impacts.get(canonical, 0.3)
+    
+    def should_reduce_size(self, symbol: str, lookahead_minutes: int = 120) -> Tuple[float, str]:
+        """
+        Return (size_multiplier, reason) based on upcoming events.
+
+        Multiplier ranges:
+        - 1.0 = no reduction
+        - 0.5 = half size (high-impact event within lookahead)
+        - 0.25 = quarter size (critical event imminent)
+        
+        Args:
+            symbol: Trading symbol
+            lookahead_minutes: How far ahead to look for events
+        
+        Returns:
+            Tuple of (multiplier, reason_string)
+        """
+        now = datetime.now()
+        worst_multiplier = 1.0
+        worst_reason = ""
+        
+        for event in self._events:
+            impact = event.get('impact', '').lower()
+            if impact not in ['high', 'red'] and event.get('impact') != 3:
+                continue
+            
+            try:
+                event_time = datetime.fromisoformat(event['datetime'])
+            except (KeyError, ValueError):
+                continue
+            
+            minutes_until = (event_time - now).total_seconds() / 60
+            if minutes_until < 0 or minutes_until > lookahead_minutes:
+                continue
+            
+            impact_score = self.get_event_impact_for_symbol(symbol, event)
+            
+            if minutes_until <= 30 and impact_score >= 0.8:
+                multiplier = 0.25
+            elif minutes_until <= 60 and impact_score >= 0.7:
+                multiplier = 0.5
+            elif minutes_until <= 120 and impact_score >= 0.6:
+                multiplier = 0.75
+            else:
+                multiplier = 0.85
+            
+            if multiplier < worst_multiplier:
+                worst_multiplier = multiplier
+                title = event.get('title', 'Unknown')
+                worst_reason = (
+                    f"{title} in {int(minutes_until)}min "
+                    f"(impact {impact_score:.0%} on {symbol})"
+                )
+        
+        return worst_multiplier, worst_reason
+    
     def get_status(self) -> Dict[str, Any]:
         """Get current news service status."""
         is_blackout, reason = self.is_blackout_period()

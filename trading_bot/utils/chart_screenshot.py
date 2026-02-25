@@ -365,6 +365,223 @@ class ChartScreenshot:
                     )
 
 
+    def generate_composite(
+        self,
+        charts: List[Dict[str, Any]],
+        symbol: str,
+        trade_markers: Optional[List[Dict]] = None,
+        volume_profile: Optional[Dict] = None,
+        reactive_levels: Optional[List[Dict]] = None,
+    ) -> bytes:
+        """
+        Generate a 2x2 multi-timeframe composite chart as a single image.
+
+        Args:
+            charts: List of dicts with keys 'timeframe', 'df', and optional 'overlays'.
+                    Expected order: [D1, H1, M15, M5]. Up to 4 panels.
+            symbol: Trading symbol
+            trade_markers: Trade history markers for M15 panel
+            volume_profile: Volume profile data for M15 panel
+            reactive_levels: Historical reactive levels for M15 panel
+
+        Returns:
+            PNG image as bytes
+        """
+        import matplotlib.gridspec as gridspec
+
+        n = min(len(charts), 4)
+        if n == 0:
+            raise ValueError("At least one chart dict is required")
+
+        fig = plt.figure(figsize=(20, 14), dpi=150)
+        gs = gridspec.GridSpec(2, 2, hspace=0.30, wspace=0.20)
+
+        panel_positions = [(0, 0), (0, 1), (1, 0), (1, 1)]
+
+        for idx in range(n):
+            row, col = panel_positions[idx]
+            chart_info = charts[idx]
+            tf_label = chart_info.get('timeframe', f'TF{idx}')
+            df_raw = chart_info['df']
+            overlays = chart_info.get('overlays', {})
+
+            ax = fig.add_subplot(gs[row, col])
+            df_plot = self._prepare_dataframe(df_raw)
+
+            is_m15 = tf_label.upper() == 'M15'
+
+            self._draw_candlestick_panel(ax, df_plot, tf_label, symbol, is_m15, overlays)
+
+            if is_m15 and trade_markers:
+                self._draw_trade_markers(ax, df_plot, trade_markers)
+
+            if is_m15 and volume_profile:
+                self._draw_volume_profile(ax, volume_profile)
+
+            if is_m15 and reactive_levels:
+                self._draw_reactive_levels(ax, reactive_levels)
+
+        for idx in range(n, 4):
+            row, col = panel_positions[idx]
+            ax = fig.add_subplot(gs[row, col])
+            ax.set_visible(False)
+
+        fig.suptitle(f"{symbol} Multi-Timeframe Composite", fontsize=14, fontweight='bold')
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', bbox_inches='tight')
+        buf.seek(0)
+        image_bytes = buf.getvalue()
+        plt.close(fig)
+        return image_bytes
+
+    def generate_composite_base64(self, charts: List[Dict[str, Any]], symbol: str, **kwargs) -> str:
+        """Generate composite chart as base64 string."""
+        image_bytes = self.generate_composite(charts, symbol, **kwargs)
+        return base64.b64encode(image_bytes).decode('utf-8')
+
+    def _draw_candlestick_panel(
+        self, ax, df: pd.DataFrame, timeframe: str, symbol: str,
+        apply_overlays: bool = False, overlays: Optional[Dict] = None
+    ):
+        """Draw a candlestick sub-panel on the given axes."""
+        import matplotlib.dates as mdates
+
+        if not isinstance(df.index, pd.DatetimeIndex):
+            ax.text(0.5, 0.5, f"{timeframe}\nNo data", transform=ax.transAxes, ha='center', va='center')
+            return
+
+        dates = mdates.date2num(df.index.to_pydatetime())
+        opens = df['open'].values
+        highs = df['high'].values
+        lows = df['low'].values
+        closes = df['close'].values
+
+        for i in range(len(df)):
+            color = '#26a69a' if closes[i] >= opens[i] else '#ef5350'
+            ax.plot([dates[i], dates[i]], [lows[i], highs[i]], color=color, linewidth=0.6)
+            body_bottom = min(opens[i], closes[i])
+            body_height = abs(closes[i] - opens[i])
+            if body_height < (highs[i] - lows[i]) * 0.01:
+                body_height = (highs[i] - lows[i]) * 0.01
+            ax.bar(dates[i], body_height, bottom=body_bottom, width=0.6 / max(len(df) / 50, 1),
+                   color=color, edgecolor=color, linewidth=0.3)
+
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d %H:%M'))
+        ax.tick_params(axis='x', rotation=30, labelsize=7)
+        ax.tick_params(axis='y', labelsize=8)
+        ax.set_title(f"{timeframe}", fontsize=11, fontweight='bold', pad=4)
+        ax.grid(True, alpha=0.15)
+        ax.yaxis.set_label_position('right')
+        ax.yaxis.tick_right()
+
+        if apply_overlays and overlays:
+            import matplotlib.patches as patches
+            for ob in overlays.get('order_blocks', []):
+                top, bottom = ob.get('top', 0), ob.get('bottom', 0)
+                color = '#26a69a' if ob.get('type') == 'bullish' else '#ef5350'
+                xlim = ax.get_xlim()
+                rect = patches.Rectangle(
+                    (xlim[0], bottom), xlim[1] - xlim[0], top - bottom,
+                    alpha=0.15, facecolor=color, edgecolor=color, linewidth=0.5
+                )
+                ax.add_patch(rect)
+            for fvg in overlays.get('fvg_zones', []):
+                top, bottom = fvg.get('top', 0), fvg.get('bottom', 0)
+                color = '#2196F3' if fvg.get('type') == 'bullish' else '#FF9800'
+                xlim = ax.get_xlim()
+                rect = patches.Rectangle(
+                    (xlim[0], bottom), xlim[1] - xlim[0], top - bottom,
+                    alpha=0.10, facecolor=color, edgecolor=color, linewidth=0.5, linestyle='--'
+                )
+                ax.add_patch(rect)
+            for liq in overlays.get('liquidity_levels', []):
+                ax.axhline(y=liq.get('price', 0), color='purple', linestyle='--',
+                           linewidth=0.8, alpha=0.6)
+
+    def _draw_trade_markers(self, ax, df: pd.DataFrame, markers: List[Dict]):
+        """Draw trade entry markers with P/L labels on the chart."""
+        import matplotlib.dates as mdates
+
+        for m in markers:
+            try:
+                ts = pd.Timestamp(m['time'])
+                if ts < df.index[0] or ts > df.index[-1]:
+                    continue
+                x_pos = mdates.date2num(ts.to_pydatetime())
+                price = m['price']
+                is_win = m.get('outcome', 'loss') == 'win'
+                direction = m.get('direction', 'long')
+
+                marker_char = '^' if direction == 'long' else 'v'
+                color = '#26a69a' if is_win else '#ef5350'
+
+                ax.scatter(x_pos, price, marker=marker_char, color=color, s=80, zorder=5, edgecolors='black', linewidths=0.5)
+
+                label = m.get('label', '')
+                if label:
+                    offset_y = 8 if direction == 'long' else -8
+                    ax.annotate(label, xy=(x_pos, price), xytext=(0, offset_y),
+                                textcoords='offset points', fontsize=6, color=color,
+                                ha='center', va='bottom' if direction == 'long' else 'top',
+                                fontweight='bold')
+            except Exception:
+                continue
+
+    def _draw_volume_profile(self, ax, vp: Dict):
+        """Draw vertical volume profile on the right side of the chart."""
+        price_levels = vp.get('price_levels', [])
+        volumes = vp.get('volumes', [])
+        poc = vp.get('poc')
+        vah = vp.get('vah')
+        val = vp.get('val')
+
+        if not price_levels or not volumes:
+            return
+
+        max_vol = max(volumes) if volumes else 1
+        xlim = ax.get_xlim()
+        chart_width = xlim[1] - xlim[0]
+        bar_max_width = chart_width * 0.12
+
+        for price, vol in zip(price_levels, volumes):
+            width = (vol / max_vol) * bar_max_width
+            bin_height = (max(price_levels) - min(price_levels)) / len(price_levels) if len(price_levels) > 1 else 1
+            ax.barh(price, width, height=bin_height * 0.9, left=xlim[1] - bar_max_width,
+                    color='#5C6BC0', alpha=0.25, edgecolor='none')
+
+        if poc is not None:
+            ax.axhline(y=poc, color='#FF6F00', linestyle='-', linewidth=1.0, alpha=0.8)
+            ax.annotate('POC', xy=(xlim[1], poc), fontsize=6, color='#FF6F00',
+                        va='center', ha='right', fontweight='bold')
+        if vah is not None:
+            ax.axhline(y=vah, color='#1565C0', linestyle='--', linewidth=0.7, alpha=0.6)
+            ax.annotate('VAH', xy=(xlim[1], vah), fontsize=6, color='#1565C0', va='center', ha='right')
+        if val is not None:
+            ax.axhline(y=val, color='#1565C0', linestyle='--', linewidth=0.7, alpha=0.6)
+            ax.annotate('VAL', xy=(xlim[1], val), fontsize=6, color='#1565C0', va='center', ha='right')
+
+    def _draw_reactive_levels(self, ax, levels: List[Dict]):
+        """Draw historical reactive price levels as semi-transparent bands."""
+        for level in levels:
+            price = level.get('price', 0)
+            count = level.get('reaction_count', 1)
+            win_rate = level.get('win_rate', 0.5)
+
+            alpha = min(0.05 + count * 0.04, 0.35)
+            if win_rate > 0.6:
+                color = '#26a69a'
+            elif win_rate < 0.4:
+                color = '#ef5350'
+            else:
+                color = '#9E9E9E'
+
+            band = price * 0.001
+            ax.axhspan(price - band, price + band, color=color, alpha=alpha)
+            ax.annotate(f'{win_rate:.0%} ({count})', xy=(ax.get_xlim()[1], price),
+                        fontsize=5, color=color, va='center', ha='right', alpha=0.7)
+
+
 def create_simple_chart(
     df: pd.DataFrame,
     symbol: str,
@@ -386,3 +603,23 @@ def create_simple_chart(
     dpi = kwargs.pop('dpi', 150)
     generator = ChartScreenshot(dpi=dpi)
     return generator.generate_base64(df, symbol, timeframe, **kwargs)
+
+
+def create_composite_chart(
+    charts: List[Dict[str, Any]],
+    symbol: str,
+    **kwargs
+) -> str:
+    """
+    Create a multi-timeframe composite chart as base64.
+
+    Args:
+        charts: List of dicts with 'timeframe', 'df', and optional 'overlays'
+        symbol: Trading symbol
+        **kwargs: trade_markers, volume_profile, reactive_levels
+
+    Returns:
+        Base64 encoded PNG image
+    """
+    generator = ChartScreenshot()
+    return generator.generate_composite_base64(charts, symbol, **kwargs)

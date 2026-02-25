@@ -13,6 +13,8 @@ import base64
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict
 
+import numpy as np
+
 from .config import settings
 from .utils.logging import setup_logging, get_logger
 from .mt5.client import MT5Client
@@ -243,6 +245,11 @@ class TradingBot:
         # Additional analysis components
         self.mtf_analyzer: Optional[MTFAnalyzer] = None
         self.fibonacci_analyzer: Optional[FibonacciAnalyzer] = None
+        self.regime_classifier = None
+        
+        # Playbook cache (rebuilt daily)
+        self._playbook_cache = None
+        self._playbook_cache_time = None
         
         # Trading state
         self.win_streak = 0
@@ -604,6 +611,11 @@ class TradingBot:
             # Premium/Discount Analyzer - Entry zone validation
             logger.info("Initializing premium/discount analyzer...")
             self.premium_discount_analyzer = PremiumDiscountAnalyzer()
+            
+            # Regime Classifier - Market regime detection for strategy adaptation
+            logger.info("Initializing regime classifier...")
+            from .analysis.regime_classifier import RegimeClassifier
+            self.regime_classifier = RegimeClassifier()
             
             # MTF Analyzer - Higher timeframe bias confirmation
             logger.info("Initializing MTF analyzer...")
@@ -1022,6 +1034,26 @@ class TradingBot:
                             self.firecrawl_service = None
                         else:
                             logger.warning(f"Firecrawl refresh failed ({self._firecrawl_consecutive_failures}/3): {e}")
+            
+            # ============================================
+            # STEP 0E: UPDATE DYNAMIC CORRELATIONS
+            # ============================================
+            if self.correlation_service:
+                try:
+                    _corr_data = {}
+                    for _corr_sym in cycle_symbols:
+                        _corr_df = await self.data_fetcher.get_ohlcv(
+                            symbol=_corr_sym, timeframe='D1', count=25
+                        )
+                        if _corr_df is not None and not _corr_df.empty:
+                            _corr_data[_corr_sym] = _corr_df
+                    if len(_corr_data) >= 2:
+                        self.correlation_service.update_dynamic_correlations(_corr_data)
+                        _port_risk = self.correlation_service.get_portfolio_risk_score()
+                        if _port_risk > 0.5:
+                            logger.warning(f"[CORR] Portfolio risk score: {_port_risk:.2f} (elevated)")
+                except Exception as _corr_err:
+                    logger.debug(f"[CORR] Dynamic correlation update error: {_corr_err}")
             
             # ============================================
             # STEP 1: TRACK EQUITY FOR GOAL
@@ -1767,28 +1799,122 @@ class TradingBot:
                 logger.warning(f"Failed to generate chart for {symbol}")
                 return
             
-            # Generate M5 and M1 charts for swing counting and precision entries
+            # Fetch multi-timeframe data for composite chart and LTF analysis
+            _mtf_dfs = {}  # {timeframe: DataFrame}
             additional_charts = []
             try:
-                for ltf, ltf_candles in [('M5', 100), ('M1', 100)]:
-                    ltf_df = await self.data_fetcher.get_ohlcv(
-                        symbol=symbol,
-                        timeframe=ltf,
-                        count=ltf_candles
+                for _ctf, _ctf_candles in [('D1', 60), ('H1', 100), ('M5', 100), ('M1', 100)]:
+                    _ctf_df = await self.data_fetcher.get_ohlcv(
+                        symbol=symbol, timeframe=_ctf, count=_ctf_candles
                     )
+                    if _ctf_df is not None and not _ctf_df.empty:
+                        _mtf_dfs[_ctf] = _ctf_df
+                
+                # Fetch last 5 trades for trade markers on M15 chart
+                _trade_markers = []
+                try:
+                    if DB_AVAILABLE:
+                        from .api.database import async_session_maker, TradeModel as _TM
+                        async with async_session_maker() as _tm_sess:
+                            from sqlalchemy import select, desc
+                            _tm_q = select(_TM).where(
+                                _TM.symbol == symbol
+                            ).order_by(desc(_TM.timestamp)).limit(5)
+                            _tm_rows = (await _tm_sess.execute(_tm_q)).scalars().all()
+                            for _t in _tm_rows:
+                                _trade_markers.append({
+                                    'time': _t.entry_time or _t.timestamp,
+                                    'price': _t.entry_price,
+                                    'direction': _t.direction,
+                                    'outcome': 'win' if (_t.profit_loss or 0) > 0 else 'loss',
+                                    'label': f"{'+' if (_t.r_multiple or 0) >= 0 else ''}{(_t.r_multiple or 0):.1f}R"
+                                })
+                        if _trade_markers:
+                            logger.info(f"[MARKERS] {symbol}: {len(_trade_markers)} trade markers for chart")
+                except Exception as _tm_err:
+                    logger.debug(f"[MARKERS] Could not fetch trade markers for {symbol}: {_tm_err}")
+                
+                # Fetch reactive levels for M15 chart heatmap
+                _reactive_levels = []
+                try:
+                    if self.learning_service:
+                        _reactive_levels = await self.learning_service.get_reactive_levels(symbol, lookback_days=90)
+                        if _reactive_levels:
+                            logger.info(f"[REACTIVE] {symbol}: {len(_reactive_levels)} reactive levels found")
+                except Exception as _rl_err:
+                    logger.debug(f"[REACTIVE] Error fetching reactive levels for {symbol}: {_rl_err}")
+                
+                # Compute volume profile for M15 chart
+                _vp_data = None
+                try:
+                    from .analysis.volume_profile import compute_volume_profile
+                    _vp_data = compute_volume_profile(df, num_bins=50)
+                    if _vp_data:
+                        market_data["volume_profile_levels"] = {
+                            'poc': _vp_data['poc'],
+                            'vah': _vp_data['vah'],
+                            'val': _vp_data['val'],
+                        }
+                        logger.info(
+                            f"[VP] {symbol}: POC={_vp_data['poc']:.5f}, "
+                            f"VAH={_vp_data['vah']:.5f}, VAL={_vp_data['val']:.5f}"
+                        )
+                except Exception as _vp_err:
+                    logger.debug(f"[VP] Volume profile error for {symbol}: {_vp_err}")
+                
+                # Generate composite chart (D1, H1, M15, M5) as primary image
+                _composite_base64 = None
+                try:
+                    from .utils.chart_screenshot import create_composite_chart
+                    _composite_panels = []
+                    for _panel_tf, _panel_df in [
+                        ('D1', _mtf_dfs.get('D1')),
+                        ('H1', _mtf_dfs.get('H1')),
+                        ('M15', df),
+                        ('M5', _mtf_dfs.get('M5'))
+                    ]:
+                        if _panel_df is not None and not _panel_df.empty:
+                            _composite_panels.append({
+                                'timeframe': _panel_tf,
+                                'df': _panel_df,
+                                'overlays': {}
+                            })
+                    if len(_composite_panels) >= 2:
+                        _comp_kwargs = {}
+                        if _trade_markers:
+                            _comp_kwargs['trade_markers'] = _trade_markers
+                        if _vp_data:
+                            _comp_kwargs['volume_profile'] = _vp_data
+                        if _reactive_levels:
+                            _comp_kwargs['reactive_levels'] = _reactive_levels
+                        _composite_base64 = await asyncio.to_thread(
+                            create_composite_chart, _composite_panels, symbol,
+                            **_comp_kwargs
+                        )
+                        if _composite_base64:
+                            logger.info(f"[COMPOSITE] {symbol}: Generated {len(_composite_panels)}-panel composite chart")
+                except Exception as _comp_err:
+                    logger.warning(f"[COMPOSITE] {symbol}: Failed to generate composite: {_comp_err}")
+                
+                # Generate individual M5/M1 charts for precision entry analysis
+                for ltf in ['M5', 'M1']:
+                    ltf_df = _mtf_dfs.get(ltf)
                     if ltf_df is not None and not ltf_df.empty:
                         ltf_chart = await self._generate_chart_image(ltf_df, symbol, timeframe=ltf)
                         if ltf_chart:
-                            additional_charts.append({
-                                'base64': ltf_chart,
-                                'timeframe': ltf
-                            })
-                            logger.debug(f"Generated {ltf} chart for {symbol}")
+                            additional_charts.append({'base64': ltf_chart, 'timeframe': ltf})
+                
+                # Prepend composite chart as the first additional chart if available
+                if _composite_base64:
+                    additional_charts.insert(0, {
+                        'base64': _composite_base64,
+                        'timeframe': 'COMPOSITE (D1/H1/M15/M5)'
+                    })
+                
                 if additional_charts:
-                    logger.info(f"Sending {len(additional_charts)} additional LTF charts for {symbol} (M5/M1)")
+                    logger.info(f"Sending {len(additional_charts)} charts for {symbol} (composite + LTF)")
             except Exception as e:
-                logger.warning(f"Failed to generate LTF charts for {symbol}: {e}")
-                # Continue without LTF charts -- M15 is still available
+                logger.warning(f"Failed to generate multi-TF charts for {symbol}: {e}")
             
             # Build strategy context
             strategy_context = self.context_builder.get_ict_context()
@@ -1840,6 +1966,33 @@ class TradingBot:
                 "volume_max": _sym_spec.volume_max,
                 "volume_step": _sym_spec.volume_step,
             }
+            
+            # Add ATR context for Claude's SL placement awareness
+            try:
+                from .utils.candle_utils import calculate_atr as _calc_atr_ctx
+                _atr_ctx = _calc_atr_ctx(df, period=14)
+                _atr_current = float(_atr_ctx.iloc[-1]) if not _atr_ctx.empty and not np.isnan(_atr_ctx.iloc[-1]) else None
+                if _atr_current:
+                    market_data["atr_14"] = round(_atr_current, 6)
+                    market_data["atr_min_sl"] = round(_atr_current * 1.5, 6)
+            except Exception:
+                pass
+            
+            # Add market regime classification
+            if self.regime_classifier:
+                try:
+                    _amd_phase = 'unknown'
+                    if 'amd_cycle' in analysis_results:
+                        _amd_phase = analysis_results['amd_cycle'].get('phase', 'unknown')
+                    _regime_result = self.regime_classifier.classify(df, market_phase=_amd_phase)
+                    if _regime_result:
+                        market_data["regime"] = _regime_result.to_dict()
+                        logger.info(
+                            f"[REGIME] {symbol}: {_regime_result.regime.value} "
+                            f"(ADX={_regime_result.adx:.1f}, vol={_regime_result.volatility_ratio:.2f}x)"
+                        )
+                except Exception as _reg_err:
+                    logger.debug(f"[REGIME] Classification error for {symbol}: {_reg_err}")
             
             # Add recent performance context
             if self.scaling_manager:
@@ -2081,6 +2234,31 @@ class TradingBot:
                         logger.debug(f"Added learning context for {symbol}")
                 except Exception as e:
                     logger.warning(f"Could not add learning context: {e}")
+            
+            # Add MFE/MAE excursion data for SL/TP validation
+            try:
+                from .analysis.excursion_analysis import ExcursionAnalyzer
+                _excursion = ExcursionAnalyzer()
+                _exc_result = await _excursion.compute(symbol, direction='all', lookback_days=90)
+                if _exc_result and _exc_result.sample_size >= 5:
+                    market_data["excursion_data"] = _exc_result.to_dict()
+                    logger.debug(f"Added MFE/MAE data for {symbol}: opt_SL={_exc_result.optimal_sl:.5f}, opt_TP={_exc_result.optimal_tp:.5f}")
+            except Exception as _exc_err:
+                logger.debug(f"Could not compute excursion data for {symbol}: {_exc_err}")
+            
+            # Add setup playbook from historical trade data
+            if self.learning_service:
+                try:
+                    if not hasattr(self, '_playbook_cache') or not self._playbook_cache:
+                        self._playbook_cache = await self.learning_service.build_setup_playbook()
+                        self._playbook_cache_time = datetime.now()
+                    elif hasattr(self, '_playbook_cache_time') and (datetime.now() - self._playbook_cache_time).total_seconds() > 86400:
+                        self._playbook_cache = await self.learning_service.build_setup_playbook()
+                        self._playbook_cache_time = datetime.now()
+                    if self._playbook_cache:
+                        market_data["setup_playbook"] = self._playbook_cache
+                except Exception as e:
+                    logger.debug(f"Could not build setup playbook: {e}")
             
             # Add precious metals context for gold/silver
             if symbol in self.PRECIOUS_METALS and self.precious_metals_analyzer:
@@ -2504,6 +2682,49 @@ class TradingBot:
                 return
             
             logger.info(f"Signal price checks passed for {symbol}: Entry={_entry}, SL={_sl}, TP={_tp}")
+            
+            # ============================================
+            # ATR-BASED MINIMUM SL DISTANCE (v3)
+            # Ensure SL is at least 1.5x ATR(14) from entry
+            # to avoid stop-outs from normal price noise.
+            # ============================================
+            try:
+                from .utils.candle_utils import calculate_atr as _calc_atr
+                _atr_series = _calc_atr(df, period=14)
+                _atr_val = float(_atr_series.iloc[-1]) if not _atr_series.empty and not np.isnan(_atr_series.iloc[-1]) else None
+                if _atr_val and _atr_val > 0 and _sl and _entry:
+                    _min_sl_dist = _atr_val * 1.5
+                    _current_sl_dist = abs(_entry - _sl)
+                    if _current_sl_dist < _min_sl_dist:
+                        _old_sl = _sl
+                        if _dir == 'long':
+                            _sl = _entry - _min_sl_dist
+                        else:
+                            _sl = _entry + _min_sl_dist
+                        trade_signal.stop_loss = _sl
+                        _new_tp_dist = abs(_tp - _entry) if _tp else 0
+                        _new_rr = _new_tp_dist / _min_sl_dist if _min_sl_dist > 0 else 0
+                        logger.info(
+                            f"[ATR-SL-ADJUST] {symbol}: SL widened from {_old_sl:.5f} to {_sl:.5f} "
+                            f"(ATR={_atr_val:.5f}, min_dist={_min_sl_dist:.5f}, new R:R={_new_rr:.2f})"
+                        )
+                        print(
+                            f"[ATR-SL-ADJUST] {symbol}: SL {_old_sl:.5f} -> {_sl:.5f} "
+                            f"(1.5x ATR={_min_sl_dist:.5f}), R:R now {_new_rr:.2f}:1",
+                            flush=True
+                        )
+                        if _new_rr < 1.5:
+                            logger.warning(
+                                f"[ATR-SL-BLOCK] {symbol}: After ATR SL widen, R:R={_new_rr:.2f} < 1.5. "
+                                f"SL too wide for TP target. Blocking trade."
+                            )
+                            print(
+                                f"[ATR-SL-BLOCK] {symbol}: R:R {_new_rr:.2f}:1 after ATR widen — trade blocked.",
+                                flush=True
+                            )
+                            return
+            except Exception as _atr_err:
+                logger.debug(f"[ATR-SL] Could not apply ATR SL check for {symbol}: {_atr_err}")
             
             # ============================================
             # R:R ENFORCEMENT (A6)
@@ -3192,6 +3413,26 @@ class TradingBot:
                             f"(mode={self.scaling_manager.current_mode.value}, mult={risk_mult:.2f})",
                             flush=True
                         )
+                
+                # Apply news impact position size reduction
+                if self.news_service:
+                    try:
+                        _news_mult, _news_reason = self.news_service.should_reduce_size(symbol)
+                        if _news_mult < 1.0:
+                            pre_news_lots = final_lots
+                            from .config import normalize_lots as _norm_news
+                            final_lots = _norm_news(symbol, final_lots * _news_mult)
+                            logger.info(
+                                f"[NEWS-IMPACT] {symbol}: Lots {pre_news_lots} x {_news_mult:.2f} "
+                                f"= {final_lots} ({_news_reason})"
+                            )
+                            print(
+                                f"[NEWS-IMPACT] {symbol}: Size reduced {pre_news_lots} -> "
+                                f"{final_lots} lots ({_news_reason})",
+                                flush=True
+                            )
+                    except Exception as _news_err:
+                        logger.debug(f"[NEWS-IMPACT] Error checking news impact for {symbol}: {_news_err}")
                 
                 # Create position size object
                 class SimplePositionSize:
@@ -4112,7 +4353,50 @@ class TradingBot:
                     return None
                 
                 if order_type == 'market':
-                    # Use market order - immediate execution
+                    # Tick-level micro-confirmation before market execution
+                    _tick_ok = True
+                    try:
+                        _tick_info = await self.mt5_client.get_symbol_info(symbol)
+                        if _tick_info and getattr(_tick_info, 'ask', 0) > 0:
+                            _tick_bid = _tick_info.bid
+                            _tick_ask = _tick_info.ask
+                            _tick_price = _tick_ask if trade_signal.direction == 'long' else _tick_bid
+                            _tick_dev = abs(_tick_price - (trade_signal.entry_price or current_price))
+                            
+                            # Check if price has moved too far from Claude's entry (>0.5x ATR)
+                            _tick_atr = market_data.get('atr_14', 0)
+                            _tick_max_dev = _tick_atr * 0.5 if _tick_atr > 0 else (trade_signal.entry_price or current_price) * 0.003
+                            
+                            if _tick_dev > _tick_max_dev and _tick_max_dev > 0:
+                                # Price moved significantly — recalculate R:R
+                                _new_entry = _tick_price
+                                _new_sl_dist = abs(_new_entry - _final_sl)
+                                _new_tp_dist = abs(_final_tp - _new_entry)
+                                _new_rr = _new_tp_dist / _new_sl_dist if _new_sl_dist > 0 else 0
+                                
+                                if _new_rr < 1.5:
+                                    logger.warning(
+                                        f"[TICK-REFINE] {symbol}: Price moved {_tick_dev:.5f} from entry "
+                                        f"(>{_tick_max_dev:.5f} limit). New R:R={_new_rr:.2f} < 1.5. Skipping."
+                                    )
+                                    print(
+                                        f"[TICK-REFINE] {symbol}: BLOCKED — price slipped {_tick_dev:.5f}, "
+                                        f"R:R dropped to {_new_rr:.2f}:1",
+                                        flush=True
+                                    )
+                                    _tick_ok = False
+                                else:
+                                    trade_signal.entry_price = _new_entry
+                                    logger.info(
+                                        f"[TICK-REFINE] {symbol}: Entry adjusted to live tick "
+                                        f"{_new_entry:.5f} (was {current_price:.5f}), R:R={_new_rr:.2f}"
+                                    )
+                    except Exception as _tick_err:
+                        logger.debug(f"[TICK-REFINE] Error for {symbol}: {_tick_err}")
+                    
+                    if not _tick_ok:
+                        return
+                    
                     logger.info(f"Executing MARKET order (AMD: {trade_signal.amd_phase})")
                     
                     result = await self.order_manager.place_market_order(

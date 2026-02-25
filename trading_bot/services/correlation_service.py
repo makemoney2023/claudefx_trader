@@ -312,6 +312,70 @@ class CorrelationService:
         
         return max(0, remaining / 1000)  # Convert back to lots
     
+    def update_dynamic_correlations(self, symbol_data: Dict[str, 'pd.DataFrame']) -> None:
+        """
+        Compute 20-day rolling Pearson correlations from live close prices
+        and merge with static defaults (using the HIGHER absolute value).
+
+        Args:
+            symbol_data: Dict mapping symbol -> DataFrame with 'close' column
+        """
+        import pandas as pd
+
+        symbols = list(symbol_data.keys())
+        if len(symbols) < 2:
+            return
+
+        # Build aligned close-price matrix
+        closes: Dict[str, List[float]] = {}
+        min_len = min(len(symbol_data[s]) for s in symbols)
+        for s in symbols:
+            closes[s] = symbol_data[s]['close'].values[-min_len:].astype(float).tolist()
+
+        if min_len < 5:
+            return
+
+        updated = 0
+        for i, sym_a in enumerate(symbols):
+            for sym_b in symbols[i + 1:]:
+                dynamic_corr = self.calculate_correlation(closes[sym_a], closes[sym_b])
+
+                # Take the HIGHER absolute value between dynamic and static
+                static_corr = self.DEFAULT_CORRELATIONS.get(
+                    (sym_a, sym_b),
+                    self.DEFAULT_CORRELATIONS.get((sym_b, sym_a), 0.0)
+                )
+                if abs(dynamic_corr) >= abs(static_corr):
+                    self.set_correlation(sym_a, sym_b, dynamic_corr)
+                    updated += 1
+
+        if updated > 0:
+            logger.info(f"Updated {updated} dynamic correlations from {len(symbols)} symbols")
+
+    def get_portfolio_risk_score(self) -> float:
+        """
+        Combine all open position correlations into a single 0-1 risk number.
+
+        0 = no correlated risk, 1 = maximum correlated risk.
+        """
+        if len(self._open_positions) < 2:
+            return 0.0
+
+        symbols = list(self._open_positions.keys())
+        total_pairs = 0
+        total_abs_corr = 0.0
+
+        for i, sym_a in enumerate(symbols):
+            for sym_b in symbols[i + 1:]:
+                corr = abs(self.get_correlation(sym_a, sym_b))
+                total_abs_corr += corr
+                total_pairs += 1
+
+        if total_pairs == 0:
+            return 0.0
+
+        return min(1.0, total_abs_corr / total_pairs)
+
     def get_status(self) -> Dict[str, Any]:
         """Get correlation service status."""
         open_symbols = list(self._open_positions.keys())
@@ -321,5 +385,6 @@ class CorrelationService:
             'open_positions': len(self._open_positions),
             'symbols': open_symbols,
             'correlation_groups': self.get_correlation_groups(),
-            'warnings': warnings
+            'warnings': warnings,
+            'portfolio_risk_score': self.get_portfolio_risk_score(),
         }

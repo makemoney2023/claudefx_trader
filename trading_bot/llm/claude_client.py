@@ -823,6 +823,38 @@ IMPORTANT: If you see ACTIVE DISPLACEMENT (strong candles with follow-through), 
 - {"Gold is less volatile, preferred in risk-off" if symbol == "XAUUSD" else "Silver has higher beta, more volatile than gold"}
 """
             
+            # ATR volatility context for SL placement
+            if market_data.get('atr_14'):
+                prompt += f"""
+## Volatility (ATR)
+- M15 ATR(14): {market_data['atr_14']}
+- Minimum SL Distance (1.5x ATR): {market_data.get('atr_min_sl', 'N/A')}
+- **Your SL must be at least {market_data.get('atr_min_sl', 'N/A')} from entry. SLs tighter than 1.5x ATR will be automatically widened. If widening pushes R:R below 1.5, the trade will be blocked.**
+"""
+            
+            # Market regime context
+            if market_data.get('regime'):
+                regime = market_data['regime']
+                prompt += f"""
+## Market Regime
+- Regime: {regime.get('regime', 'unknown')}
+- Trend Strength (ADX): {regime.get('adx', 'N/A')}
+- Volatility Ratio: {regime.get('volatility_ratio', 'N/A')}x avg
+- Phase: {regime.get('phase', 'unknown')}
+- **Strategy Guidance**: {regime.get('guidance', 'Use standard approach')}
+"""
+            
+            # Volume profile levels
+            if market_data.get('volume_profile_levels'):
+                vpl = market_data['volume_profile_levels']
+                prompt += f"""
+## Volume Profile Levels
+- POC (Point of Control): {vpl.get('poc', 'N/A')}
+- VAH (Value Area High): {vpl.get('vah', 'N/A')}
+- VAL (Value Area Low): {vpl.get('val', 'N/A')}
+- Current price vs POC: {"Above POC" if market_data.get('current_price', 0) > (vpl.get('poc', 0) or 0) else "Below POC"}
+"""
+            
             # Volume analysis context
             if market_data.get('volume_profile'):
                 vp = market_data['volume_profile']
@@ -851,6 +883,25 @@ IMPORTANT: If you see ACTIVE DISPLACEMENT (strong candles with follow-through), 
             if market_data.get('learning_context'):
                 prompt += f"""
 {market_data['learning_context']}
+"""
+            
+            # MFE/MAE excursion data for SL/TP optimization
+            if market_data.get('excursion_data'):
+                exc = market_data['excursion_data']
+                prompt += f"""
+## Historical SL/TP Guidance (MFE/MAE from {exc.get('sample_size', 0)} trades)
+- Optimal SL (90th pctl MAE of winners): {exc.get('optimal_sl', 'N/A')}
+- Optimal TP (median MFE of winners): {exc.get('optimal_tp', 'N/A')}
+- Average winner runs: {exc.get('median_mfe', 'N/A')} (median MFE)
+- Average winner dips: {exc.get('median_mae', 'N/A')} before reaching TP
+- **Calibrate your SL/TP against these historical distributions. SL tighter than optimal_sl risks noise stop-outs. TP beyond p90_mfe is statistically unlikely.**
+"""
+            
+            # Setup playbook from historical performance
+            if market_data.get('setup_playbook'):
+                prompt += f"""
+{market_data['setup_playbook']}
+**Use the playbook above: favor PREFERRED setups, avoid or reduce confidence for AVOID setups.**
 """
             
             # =============================================

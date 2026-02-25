@@ -397,6 +397,24 @@ class TradingSettings(BaseSettings):
         default=5.0,
         description="Maximum total exposure in lots across all positions"
     )
+    
+    # Gate parameters (optimizable via walk-forward optimizer)
+    gate_min_confidence: float = Field(
+        default=0.60,
+        description="Minimum Claude confidence to accept a signal"
+    )
+    gate_session_penalty_asian: float = Field(
+        default=0.05,
+        description="Confidence penalty for Asian session signals"
+    )
+    gate_cooldown_minutes: int = Field(
+        default=30,
+        description="Cooldown between signals for the same symbol"
+    )
+    gate_counter_trend_rr_floor: float = Field(
+        default=2.5,
+        description="Minimum R:R for counter-trend scalps"
+    )
 
 
 class TimeframeSettings(BaseSettings):

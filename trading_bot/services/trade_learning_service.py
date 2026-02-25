@@ -1325,3 +1325,161 @@ Total R: {review.total_r:.1f}R
         except Exception as e:
             logger.error(f"Failed to get all learnings: {e}")
             return []
+    
+    async def build_setup_playbook(
+        self,
+        lookback_days: int = 180,
+        min_sample: int = 3,
+    ) -> str:
+        """
+        Mine historical closed trades to build a playbook of setup performance.
+
+        Groups by (setup_type x symbol x session x direction) and returns
+        ranked text suitable for Claude's prompt context.
+
+        Returns:
+            Formatted playbook string, e.g.:
+            [PLAYBOOK] XAUUSD LONG London, OB+sweep: 12W/5L (71% WR), avg +1.8R -- PREFERRED
+        """
+        try:
+            cutoff = datetime.now() - timedelta(days=lookback_days)
+            
+            async with async_session_maker() as session:
+                q = select(TradeModel).where(
+                    and_(
+                        TradeModel.timestamp >= cutoff.isoformat(),
+                        TradeModel.exit_price.isnot(None),
+                    )
+                )
+                result = await session.execute(q)
+                trades = result.scalars().all()
+            
+            if not trades:
+                return ""
+            
+            # Group trades
+            groups: Dict[str, List] = {}
+            for t in trades:
+                setup = t.trade_type or 'unknown'
+                sym = t.symbol or 'unknown'
+                sess = t.session or 'unknown'
+                direction = t.direction or 'unknown'
+                key = f"{sym}|{direction}|{sess}|{setup}"
+                if key not in groups:
+                    groups[key] = []
+                groups[key].append({
+                    'won': (t.profit_loss or 0) > 0,
+                    'r': self._sanitize_r(t.r_multiple or 0),
+                })
+            
+            lines = []
+            for key, entries in groups.items():
+                if len(entries) < min_sample:
+                    continue
+                sym, direction, sess, setup = key.split('|')
+                wins = sum(1 for e in entries if e['won'])
+                losses = len(entries) - wins
+                wr = wins / len(entries) * 100 if entries else 0
+                avg_r = sum(e['r'] for e in entries) / len(entries) if entries else 0
+                ev = wr / 100 * avg_r - (1 - wr / 100)  # Expected Value
+                
+                tag = "PREFERRED" if wr >= 60 and avg_r > 0 else "AVOID" if wr < 40 else "NEUTRAL"
+                lines.append((
+                    ev,
+                    f"[PLAYBOOK] {sym} {direction.upper()} {sess}, {setup}: "
+                    f"{wins}W/{losses}L ({wr:.0f}% WR), avg {avg_r:+.1f}R -- {tag}"
+                ))
+            
+            lines.sort(key=lambda x: x[0], reverse=True)
+            
+            if not lines:
+                return ""
+            
+            playbook = "## Setup Playbook (from historical data)\n"
+            for _, line in lines[:15]:
+                playbook += f"{line}\n"
+            
+            return playbook
+            
+        except Exception as e:
+            logger.warning(f"Failed to build setup playbook: {e}")
+            return ""
+    
+    async def get_reactive_levels(
+        self,
+        symbol: str,
+        lookback_days: int = 90,
+        cluster_pct: float = 0.001,
+    ) -> List[Dict[str, Any]]:
+        """
+        Find historical price levels where the bot traded this symbol,
+        clustered into reactive zones with win-rate coloring.
+
+        Args:
+            symbol: Trading symbol
+            lookback_days: How far back to look
+            cluster_pct: Percentage tolerance for clustering (0.1%)
+
+        Returns:
+            List of reactive level dicts with price, reaction_count, win_rate, avg_r
+        """
+        try:
+            cutoff = datetime.now() - timedelta(days=lookback_days)
+            
+            async with async_session_maker() as session:
+                q = select(TradeModel).where(
+                    and_(
+                        TradeModel.symbol == symbol,
+                        TradeModel.timestamp >= cutoff.isoformat(),
+                        TradeModel.entry_price.isnot(None),
+                    )
+                )
+                result = await session.execute(q)
+                trades = result.scalars().all()
+            
+            if not trades:
+                return []
+            
+            entries = []
+            for t in trades:
+                entries.append({
+                    'price': float(t.entry_price),
+                    'won': (t.profit_loss or 0) > 0,
+                    'r': self._sanitize_r(t.r_multiple or 0),
+                })
+            
+            entries.sort(key=lambda x: x['price'])
+            
+            clusters: List[List[Dict]] = []
+            current_cluster = [entries[0]]
+            
+            for e in entries[1:]:
+                ref_price = current_cluster[0]['price']
+                if ref_price > 0 and abs(e['price'] - ref_price) / ref_price <= cluster_pct:
+                    current_cluster.append(e)
+                else:
+                    clusters.append(current_cluster)
+                    current_cluster = [e]
+            clusters.append(current_cluster)
+            
+            levels = []
+            for cluster in clusters:
+                if len(cluster) < 2:
+                    continue
+                avg_price = sum(e['price'] for e in cluster) / len(cluster)
+                wins = sum(1 for e in cluster if e['won'])
+                win_rate = wins / len(cluster) if cluster else 0
+                avg_r = sum(e['r'] for e in cluster) / len(cluster) if cluster else 0
+                levels.append({
+                    'price': round(avg_price, 5),
+                    'reaction_count': len(cluster),
+                    'win_rate': round(win_rate, 2),
+                    'avg_r': round(avg_r, 2),
+                })
+            
+            levels.sort(key=lambda x: x['reaction_count'], reverse=True)
+            return levels[:20]
+            
+        except Exception as e:
+            logger.warning(f"Failed to get reactive levels for {symbol}: {e}")
+            return []
