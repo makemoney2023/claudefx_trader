@@ -566,14 +566,25 @@ async def _run_replay_task(run_id: int):
     learning_service = TradeLearningService()
     bt = ClaudeReplayBacktester(claude_client=claude, mt5_client=mt5, trade_learning_service=learning_service)
 
-    async def _update_progress(pct: int, step: str):
+    _live_log: list = []
+
+    async def _update_progress(pct: int, step: str, log_entry=None):
         try:
+            if log_entry:
+                _live_log.append(log_entry)
+                if len(_live_log) > 50:
+                    _live_log.pop(0)
             async with async_session_maker() as sess:
                 from sqlalchemy import select
                 row = (await sess.execute(select(BacktestRunModel).where(BacktestRunModel.id == run_id))).scalar_one_or_none()
                 if row:
                     row.progress_pct = pct
                     row.current_step = step
+                    cfg = row.config_json or {}
+                    cfg["live_log"] = list(_live_log)
+                    row.config_json = cfg
+                    from sqlalchemy.orm.attributes import flag_modified
+                    flag_modified(row, "config_json")
                     await sess.commit()
         except Exception:
             pass

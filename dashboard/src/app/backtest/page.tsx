@@ -44,7 +44,9 @@ export default function BacktestPage() {
     min_risk_reward: 2,
   })
   const [ictRunning, setIctRunning] = useState(false)
+  const [ictRunId, setIctRunId] = useState<number | null>(null)
   const [ictResult, setIctResult] = useState<BacktestRun | null>(null)
+  const [ictProgress, setIctProgress] = useState<{ pct: number; step: string }>({ pct: 0, step: '' })
 
   // Replay
   const [replayConfig, setReplayConfig] = useState<ReplayBacktestConfig>({
@@ -60,6 +62,7 @@ export default function BacktestPage() {
   const [replayRunId, setReplayRunId] = useState<number | null>(null)
   const [replayResult, setReplayResult] = useState<BacktestRun | null>(null)
   const [replayProgress, setReplayProgress] = useState<{ pct: number; step: string }>({ pct: 0, step: '' })
+  const [replayLiveLog, setReplayLiveLog] = useState<Array<Record<string, unknown>>>([])
 
   // Optimizer
   const [optConfig, setOptConfig] = useState<OptimizerConfig>({
@@ -70,6 +73,7 @@ export default function BacktestPage() {
   const [optRunning, setOptRunning] = useState(false)
   const [optRunId, setOptRunId] = useState<number | null>(null)
   const [optResult, setOptResult] = useState<BacktestRun | null>(null)
+  const [optProgress, setOptProgress] = useState<{ pct: number; step: string }>({ pct: 0, step: '' })
 
   const fetchPastRuns = useCallback(async () => {
     try {
@@ -121,6 +125,24 @@ export default function BacktestPage() {
     fetchSymbols()
   }, [])
 
+  // Poll for ICT run
+  useEffect(() => {
+    if (!ictRunId || !ictRunning) return
+    const t = setInterval(async () => {
+      try {
+        const run = await api.getBacktestRun(ictRunId)
+        setIctProgress({ pct: run.progress_pct ?? 0, step: run.current_step ?? '' })
+        if (run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled') {
+          setIctRunning(false)
+          setIctRunId(null)
+          setIctResult(run)
+          fetchPastRuns()
+        }
+      } catch {}
+    }, POLL_INTERVAL_MS)
+    return () => clearInterval(t)
+  }, [ictRunId, ictRunning, fetchPastRuns])
+
   // Poll for replay run
   useEffect(() => {
     if (!replayRunId || !replayRunning) return
@@ -128,6 +150,8 @@ export default function BacktestPage() {
       try {
         const run = await api.getBacktestRun(replayRunId)
         setReplayProgress({ pct: run.progress_pct ?? 0, step: run.current_step ?? '' })
+        const liveLog = (run.config_json as Record<string, unknown>)?.live_log
+        if (Array.isArray(liveLog)) setReplayLiveLog(liveLog)
         if (run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled') {
           setReplayRunning(false)
           setReplayRunId(null)
@@ -145,6 +169,7 @@ export default function BacktestPage() {
     const t = setInterval(async () => {
       try {
         const run = await api.getBacktestRun(optRunId)
+        setOptProgress({ pct: run.progress_pct ?? 0, step: run.current_step ?? '' })
         if (run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled') {
           setOptRunning(false)
           setOptRunId(null)
@@ -157,16 +182,14 @@ export default function BacktestPage() {
   }, [optRunId, optRunning, fetchPastRuns])
 
   const runIct = async () => {
-    setIctRunning(true)
     setIctResult(null)
+    setIctProgress({ pct: 0, step: 'Starting ICT backtest...' })
     try {
       const run = await api.startIctBacktest(ictConfig)
-      setIctResult(run)
-      fetchPastRuns()
+      setIctRunId(run.id)
+      setIctRunning(true)
     } catch (e) {
       console.error(e)
-    } finally {
-      setIctRunning(false)
     }
   }
 
@@ -189,6 +212,7 @@ export default function BacktestPage() {
   const runReplay = async () => {
     setReplayResult(null)
     setReplayProgress({ pct: 0, step: 'Starting replay...' })
+    setReplayLiveLog([])
     try {
       const run = await api.startReplayBacktest(replayConfig)
       setReplayRunId(run.id)
@@ -200,6 +224,7 @@ export default function BacktestPage() {
 
   const runOptimizer = async () => {
     setOptResult(null)
+    setOptProgress({ pct: 0, step: 'Starting optimization...' })
     try {
       const run = await api.startOptimizer(optConfig)
       setOptRunId(run.id)
@@ -541,10 +566,22 @@ export default function BacktestPage() {
         <div className="lg:col-span-2">
           {tab === 'ict' && (
             ictRunning ? (
-              <div className="card h-full flex items-center justify-center min-h-[200px]">
-                <div className="text-center">
-                  <Loader2 className="w-12 h-12 animate-spin mx-auto mb-2 text-blue-400" />
-                  <p>Running ICT backtest...</p>
+              <div className="card p-6 space-y-4">
+                <div className="flex items-center gap-3">
+                  <Loader2 className="w-6 h-6 animate-spin text-blue-400" />
+                  <p className="text-lg font-medium">ICT Backtest Running</p>
+                </div>
+                <div className="w-full">
+                  <div className="flex justify-between text-sm text-slate-400 mb-1">
+                    <span>{ictProgress.step || 'Starting ICT backtest...'}</span>
+                    <span>{ictProgress.pct}%</span>
+                  </div>
+                  <div className="w-full bg-slate-700 rounded-full h-3 overflow-hidden">
+                    <div
+                      className="bg-blue-500 h-3 rounded-full transition-all duration-500"
+                      style={{ width: `${ictProgress.pct}%` }}
+                    />
+                  </div>
                 </div>
               </div>
             ) : ictResult ? (
@@ -566,10 +603,12 @@ export default function BacktestPage() {
 
           {tab === 'replay' && (
             replayRunning ? (
-              <div className="card h-full flex flex-col items-center justify-center min-h-[200px] gap-4 p-6">
-                <Loader2 className="w-10 h-10 animate-spin text-blue-400" />
-                <p className="text-lg font-medium">Replay Backtest Running</p>
-                <div className="w-full max-w-md">
+              <div className="card p-6 space-y-4">
+                <div className="flex items-center gap-3">
+                  <Loader2 className="w-6 h-6 animate-spin text-blue-400" />
+                  <p className="text-lg font-medium">Replay Backtest Running</p>
+                </div>
+                <div className="w-full">
                   <div className="flex justify-between text-sm text-slate-400 mb-1">
                     <span>{replayProgress.step || 'Starting replay...'}</span>
                     <span>{replayProgress.pct}%</span>
@@ -581,6 +620,51 @@ export default function BacktestPage() {
                     />
                   </div>
                 </div>
+                {replayLiveLog.length > 0 && (
+                  <div className="mt-4">
+                    <p className="text-xs text-slate-400 mb-2 uppercase tracking-wider font-semibold">Live Trade Feed</p>
+                    <div className="bg-slate-900 rounded-lg border border-slate-700 max-h-[320px] overflow-y-auto font-mono text-xs">
+                      {replayLiveLog.slice().reverse().map((entry, i) => {
+                        const isWin = entry.outcome === 'win'
+                        const isLoss = entry.outcome === 'loss'
+                        return (
+                          <div key={i} className={cn(
+                            'px-3 py-1.5 border-b border-slate-800 flex items-center gap-2',
+                            i === 0 && 'bg-slate-800/50'
+                          )}>
+                            <span className="text-slate-500 w-6 text-right">#{entry.trade_num as number}</span>
+                            <span className="text-slate-400 w-[72px]">{entry.time as string}</span>
+                            <span className={cn(
+                              'w-12 font-bold uppercase',
+                              entry.direction === 'long' ? 'text-green-400' : 'text-red-400'
+                            )}>
+                              {entry.direction as string}
+                            </span>
+                            <span className="text-slate-300 w-20">@ {entry.entry as number}</span>
+                            <span className="text-slate-500 w-14">{((entry.confidence as number) * 100).toFixed(0)}%</span>
+                            <span className={cn(
+                              'w-8 font-bold text-center rounded px-1',
+                              isWin && 'text-green-400 bg-green-500/10',
+                              isLoss && 'text-red-400 bg-red-500/10',
+                              !isWin && !isLoss && 'text-yellow-400 bg-yellow-500/10',
+                            )}>
+                              {isWin ? 'W' : isLoss ? 'L' : 'T'}
+                            </span>
+                            <span className={cn(
+                              'w-14 text-right',
+                              (entry.r as number) > 0 ? 'text-green-400' : 'text-red-400'
+                            )}>
+                              {(entry.r as number) > 0 ? '+' : ''}{(entry.r as number).toFixed(2)}R
+                            </span>
+                            <span className="text-slate-500 ml-auto">
+                              WR {entry.running_wr as number}% | {(entry.running_r as number) > 0 ? '+' : ''}{(entry.running_r as number).toFixed(1)}R
+                            </span>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </div>
+                )}
                 <p className="text-xs text-slate-500">Each snapshot sends a chart to Claude for analysis (~15-30s per call)</p>
               </div>
             ) : replayResult ? (
@@ -607,10 +691,22 @@ export default function BacktestPage() {
 
           {tab === 'optimizer' && (
             optRunning ? (
-              <div className="card h-full flex items-center justify-center min-h-[200px]">
-                <div className="text-center">
-                  <Loader2 className="w-12 h-12 animate-spin mx-auto mb-2 text-blue-400" />
-                  <p>Walk-forward optimization running…</p>
+              <div className="card p-6 space-y-4">
+                <div className="flex items-center gap-3">
+                  <Loader2 className="w-6 h-6 animate-spin text-blue-400" />
+                  <p className="text-lg font-medium">Walk-Forward Optimization Running</p>
+                </div>
+                <div className="w-full">
+                  <div className="flex justify-between text-sm text-slate-400 mb-1">
+                    <span>{optProgress.step || 'Running optimization...'}</span>
+                    <span>{optProgress.pct}%</span>
+                  </div>
+                  <div className="w-full bg-slate-700 rounded-full h-3 overflow-hidden">
+                    <div
+                      className="bg-green-500 h-3 rounded-full transition-all duration-500"
+                      style={{ width: `${optProgress.pct}%` }}
+                    />
+                  </div>
                 </div>
               </div>
             ) : optResult ? (

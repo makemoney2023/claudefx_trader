@@ -310,10 +310,12 @@ class ClaudeReplayBacktester:
         except Exception as e:
             logger.warning(f"[REPLAY] D1 data unavailable (non-fatal): {e}")
 
-        logger.info(
-            f"[REPLAY] Starting {symbol} backtest: {start_date.date()} to {end_date.date()} "
-            f"({len(m15_data)} M15 bars, interval={interval_hours}h)"
-        )
+        logger.info("=" * 70)
+        logger.info(f"[REPLAY] {symbol} BACKTEST STARTING")
+        logger.info(f"[REPLAY] Period: {start_date.date()} to {end_date.date()}")
+        logger.info(f"[REPLAY] Data: {len(m15_data)} M15 bars | H1: {'loaded' if h1_data is not None else 'N/A'} | D1: {'loaded' if d1_data is not None else 'N/A'}")
+        logger.info(f"[REPLAY] Interval: {interval_hours}h | Max signals: {max_signals} | Dry run: {dry_run}")
+        logger.info("=" * 70)
 
         setup_playbook = ""
         if self._learning_service:
@@ -357,15 +359,15 @@ class ClaudeReplayBacktester:
                 step_idx += 1
                 continue
 
-            if progress_callback and step_idx % 5 == 0:
-                pct = min(int(step_idx / max(total_steps, 1) * 100), 99)
-                step_desc = (
-                    f"Snapshot {step_idx}/{total_steps} | "
-                    f"{result.total_trades} trades, "
-                    f"{result.wins}W/{result.losses}L"
-                )
+            pct = min(int(step_idx / max(total_steps, 1) * 100), 99)
+            step_desc = (
+                f"Snapshot {step_idx}/{total_steps} | "
+                f"{result.total_trades} trades, "
+                f"{result.wins}W/{result.losses}L"
+            )
+            if progress_callback and step_idx % 3 == 0:
                 try:
-                    await progress_callback(pct, step_desc)
+                    await progress_callback(pct, step_desc, None)
                 except Exception:
                     pass
 
@@ -553,7 +555,6 @@ class ClaudeReplayBacktester:
                     )
                     result.total_signals += 1
 
-                    # Simulate trade using future data
                     future = m15_data[m15_data.index > window_end].head(200)
                     trade = _simulate_trade(replay_sig, future)
                     result.trades.append(trade)
@@ -565,6 +566,46 @@ class ClaudeReplayBacktester:
                         result.losses += 1
                     else:
                         result.timeouts += 1
+
+                    wr = result.wins / result.total_trades * 100 if result.total_trades else 0
+                    r_sum = sum(t.r_multiple for t in result.trades)
+                    outcome_icon = "W" if trade.outcome == "win" else ("L" if trade.outcome == "loss" else "T")
+
+                    logger.info(
+                        f"[REPLAY] #{result.total_trades} {current.strftime('%m/%d %H:%M')} "
+                        f"{sig.direction.upper()} {symbol} @ {sig.entry_price:.5f} "
+                        f"SL={sig.stop_loss:.5f} TP={sig.take_profit:.5f} "
+                        f"conf={sig.confidence:.0%} | "
+                        f"{outcome_icon} R={trade.r_multiple:+.2f} bars={trade.bars_held} | "
+                        f"Running: {result.wins}W/{result.losses}L/{result.timeouts}T "
+                        f"WR={wr:.0f}% totalR={r_sum:+.1f}"
+                    )
+
+                    log_entry = {
+                        "type": "trade",
+                        "time": current.strftime("%m/%d %H:%M"),
+                        "direction": sig.direction,
+                        "confidence": round(sig.confidence, 2),
+                        "entry": round(sig.entry_price, 5),
+                        "sl": round(sig.stop_loss, 5),
+                        "tp": round(sig.take_profit, 5),
+                        "outcome": trade.outcome,
+                        "r": round(trade.r_multiple, 2),
+                        "bars": trade.bars_held,
+                        "running_wr": round(wr, 1),
+                        "running_r": round(r_sum, 2),
+                        "trade_num": result.total_trades,
+                    }
+                    if progress_callback:
+                        try:
+                            await progress_callback(pct, step_desc, log_entry)
+                        except Exception:
+                            pass
+                else:
+                    logger.debug(
+                        f"[REPLAY] {current.strftime('%m/%d %H:%M')} No trade signal "
+                        f"({snapshot_session} session, price={current_price:.5f})"
+                    )
 
                 signals_processed += 1
 
@@ -604,10 +645,18 @@ class ClaudeReplayBacktester:
         result.estimated_cost = result.api_calls * self.COST_PER_CALL
         result.duration_seconds = time.time() - start_time
 
+        logger.info("=" * 70)
+        logger.info(f"[REPLAY] {symbol} BACKTEST COMPLETE")
         logger.info(
-            f"[REPLAY] {symbol} complete: {result.total_trades} trades, "
-            f"WR={result.win_rate:.0f}%, avg_R={result.avg_r:.2f}, "
-            f"total_R={result.total_r:.1f}, cost=${result.estimated_cost:.2f}"
+            f"[REPLAY] Trades: {result.total_trades} "
+            f"({result.wins}W / {result.losses}L / {result.timeouts}T)"
         )
+        logger.info(f"[REPLAY] Win Rate: {result.win_rate:.1f}%")
+        logger.info(f"[REPLAY] Avg R: {result.avg_r:+.2f} | Total R: {result.total_r:+.1f}")
+        logger.info(f"[REPLAY] Sharpe: {result.sharpe_ratio:.2f} | Profit Factor: {result.profit_factor:.2f}")
+        logger.info(f"[REPLAY] Max Drawdown: {result.max_drawdown_r:.2f}R")
+        logger.info(f"[REPLAY] API calls: {result.api_calls} | Cost: ${result.estimated_cost:.2f}")
+        logger.info(f"[REPLAY] Duration: {result.duration_seconds:.0f}s")
+        logger.info("=" * 70)
 
         return result
