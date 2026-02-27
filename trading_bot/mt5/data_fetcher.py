@@ -105,6 +105,38 @@ class DataFetcher:
             logger.error(f"Error fetching OHLCV data: {e}")
             return None
     
+    async def get_ohlcv_range(
+        self,
+        symbol: str,
+        timeframe: str,
+        start: datetime,
+        end: datetime,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Get OHLCV data for a specific date range using MT5 copy_rates_range.
+        """
+        if not self.mt5_client:
+            logger.error("MT5 client not connected")
+            return None
+
+        try:
+            raw_data = await self.mt5_client.get_ohlcv_range(
+                symbol=symbol,
+                timeframe=timeframe,
+                date_from=start,
+                date_to=end,
+            )
+            if not raw_data:
+                logger.warning(f"No range data for {symbol} {timeframe} {start.date()}-{end.date()}")
+                return None
+
+            df = self._to_dataframe(raw_data)
+            logger.info(f"Fetched {len(df)} bars for {symbol} {timeframe} range {start.date()}-{end.date()}")
+            return df
+        except Exception as e:
+            logger.error(f"Error fetching OHLCV range data: {e}")
+            return None
+
     async def get_multi_timeframe_data(
         self,
         symbol: str,

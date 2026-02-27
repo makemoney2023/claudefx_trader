@@ -59,6 +59,7 @@ export default function BacktestPage() {
   const [replayRunning, setReplayRunning] = useState(false)
   const [replayRunId, setReplayRunId] = useState<number | null>(null)
   const [replayResult, setReplayResult] = useState<BacktestRun | null>(null)
+  const [replayProgress, setReplayProgress] = useState<{ pct: number; step: string }>({ pct: 0, step: '' })
 
   // Optimizer
   const [optConfig, setOptConfig] = useState<OptimizerConfig>({
@@ -85,17 +86,22 @@ export default function BacktestPage() {
 
   useEffect(() => {
     const fetchSymbols = async () => {
+      let loaded = false
       try {
         const data = await api.getMarketWatchSymbols()
-        setSymbols(data.symbols)
-        if (data.symbols.length > 0 && !ictConfig.symbol) {
-          setIctConfig((prev) => ({ ...prev, symbol: data.symbols[0].name }))
-          setReplayConfig((prev) => ({ ...prev, symbol: data.symbols[0].name }))
+        if (data.symbols.length > 0) {
+          setSymbols(data.symbols)
+          if (!ictConfig.symbol) {
+            setIctConfig((prev) => ({ ...prev, symbol: data.symbols[0].name }))
+            setReplayConfig((prev) => ({ ...prev, symbol: data.symbols[0].name }))
+          }
+          loaded = true
         }
-      } catch {
+      } catch {}
+      if (!loaded) {
         try {
           const configData = await api.getConfig()
-          const fallback = configData.trading.symbols.map((s) => ({
+          const fallback = configData.trading.symbols.map((s: string) => ({
             name: s,
             description: '',
             path: '',
@@ -109,9 +115,8 @@ export default function BacktestPage() {
             setReplayConfig((prev) => ({ ...prev, symbol: fallback[0].name }))
           }
         } catch {}
-      } finally {
-        setSymbolsLoading(false)
       }
+      setSymbolsLoading(false)
     }
     fetchSymbols()
   }, [])
@@ -122,6 +127,7 @@ export default function BacktestPage() {
     const t = setInterval(async () => {
       try {
         const run = await api.getBacktestRun(replayRunId)
+        setReplayProgress({ pct: run.progress_pct ?? 0, step: run.current_step ?? '' })
         if (run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled') {
           setReplayRunning(false)
           setReplayRunId(null)
@@ -182,6 +188,7 @@ export default function BacktestPage() {
 
   const runReplay = async () => {
     setReplayResult(null)
+    setReplayProgress({ pct: 0, step: 'Starting replay...' })
     try {
       const run = await api.startReplayBacktest(replayConfig)
       setReplayRunId(run.id)
@@ -559,12 +566,22 @@ export default function BacktestPage() {
 
           {tab === 'replay' && (
             replayRunning ? (
-              <div className="card h-full flex items-center justify-center min-h-[200px]">
-                <div className="text-center">
-                  <Loader2 className="w-12 h-12 animate-spin mx-auto mb-2 text-blue-400" />
-                  <p>Replay backtest running…</p>
-                  <p className="text-sm text-slate-400 mt-1">Polling for results</p>
+              <div className="card h-full flex flex-col items-center justify-center min-h-[200px] gap-4 p-6">
+                <Loader2 className="w-10 h-10 animate-spin text-blue-400" />
+                <p className="text-lg font-medium">Replay Backtest Running</p>
+                <div className="w-full max-w-md">
+                  <div className="flex justify-between text-sm text-slate-400 mb-1">
+                    <span>{replayProgress.step || 'Starting replay...'}</span>
+                    <span>{replayProgress.pct}%</span>
+                  </div>
+                  <div className="w-full bg-slate-700 rounded-full h-3 overflow-hidden">
+                    <div
+                      className="bg-blue-500 h-3 rounded-full transition-all duration-500"
+                      style={{ width: `${replayProgress.pct}%` }}
+                    />
+                  </div>
                 </div>
+                <p className="text-xs text-slate-500">Each snapshot sends a chart to Claude for analysis (~15-30s per call)</p>
               </div>
             ) : replayResult ? (
               <div className="space-y-4">

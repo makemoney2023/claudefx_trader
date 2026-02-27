@@ -922,6 +922,72 @@ class MT5Client:
                 return self._get_simulated_ohlcv(symbol, timeframe, count)
             return None  # Don't fake data when connected to real MT5
     
+    async def get_ohlcv_range(
+        self,
+        symbol: str,
+        timeframe: str,
+        date_from: datetime,
+        date_to: datetime,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """
+        Get OHLCV data for a date range using MT5 copy_rates_range.
+
+        Args:
+            symbol: Trading symbol
+            timeframe: Timeframe string (M1, M5, M15, H1, D1, etc.)
+            date_from: Start datetime
+            date_to: End datetime
+
+        Returns:
+            List of OHLCV dicts or None
+        """
+        try:
+            tf_value = self.TIMEFRAMES.get(timeframe.upper())
+            if not tf_value:
+                logger.error(f"Invalid timeframe: {timeframe}")
+                return None
+
+            if self._use_simulation:
+                return self._get_simulated_ohlcv(symbol, timeframe, 500)
+
+            import MetaTrader5 as mt5
+            tf_map = {
+                1: mt5.TIMEFRAME_M1, 5: mt5.TIMEFRAME_M5,
+                15: mt5.TIMEFRAME_M15, 30: mt5.TIMEFRAME_M30,
+                60: mt5.TIMEFRAME_H1, 240: mt5.TIMEFRAME_H4,
+                1440: mt5.TIMEFRAME_D1, 10080: mt5.TIMEFRAME_W1,
+                43200: mt5.TIMEFRAME_MN1,
+            }
+            mt5_tf = tf_map.get(tf_value, mt5.TIMEFRAME_H1)
+
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(mt5.copy_rates_range, symbol, mt5_tf, date_from, date_to),
+                    timeout=30,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"MT5 copy_rates_range timed out after 30s for {symbol} {timeframe}")
+                return None
+
+            if result is not None and len(result) > 0:
+                bars = []
+                for bar in result:
+                    bars.append({
+                        'time': datetime.fromtimestamp(bar['time']).isoformat(),
+                        'open': float(bar['open']),
+                        'high': float(bar['high']),
+                        'low': float(bar['low']),
+                        'close': float(bar['close']),
+                        'volume': int(bar['tick_volume']),
+                    })
+                return bars
+
+            return None
+
+        except Exception as e:
+            logger.error(f"Error getting OHLCV range data: {e}")
+            return None
+
     def _get_simulated_ohlcv(self, symbol: str, timeframe: str, count: int) -> List[Dict[str, Any]]:
         """Generate simulated OHLCV data."""
         import numpy as np

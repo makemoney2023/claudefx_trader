@@ -13,7 +13,7 @@ Usage:
 import itertools
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional
 
 import numpy as np
 
@@ -79,14 +79,15 @@ def _simulate_gate_logic(
     """
     taken = []
     daily_counts: Dict[str, int] = {}
+    last_trade_time: Optional[str] = None
 
     for t in trades:
         conf = t.get('confidence', 0)
         rr = t.get('risk_reward', 0)
         session = t.get('session', '').lower()
         trade_date = t.get('date', '')
+        timestamp = t.get('timestamp', '')
 
-        # Confidence gate
         adjusted_conf = conf
         if 'asian' in session:
             adjusted_conf -= params.session_penalty_asian
@@ -94,30 +95,59 @@ def _simulate_gate_logic(
         if adjusted_conf < params.min_confidence:
             continue
 
-        # R:R gate
-        if rr < params.min_rr:
+        # Counter-trend trades require higher R:R floor
+        direction = t.get('direction', '')
+        trend = t.get('trend', '')
+        is_counter_trend = (
+            (direction == 'long' and trend == 'bearish') or
+            (direction == 'short' and trend == 'bullish')
+        )
+        effective_min_rr = params.counter_trend_rr_floor if is_counter_trend else params.min_rr
+        if rr < effective_min_rr:
             continue
 
-        # Daily trade limit
         if trade_date in daily_counts and daily_counts[trade_date] >= params.max_daily_trades:
             continue
 
+        # Cooldown gate: skip if too close to previous trade
+        if last_trade_time and timestamp and params.cooldown_minutes > 0:
+            try:
+                prev_dt = datetime.fromisoformat(last_trade_time)
+                curr_dt = datetime.fromisoformat(timestamp)
+                if (curr_dt - prev_dt).total_seconds() < params.cooldown_minutes * 60:
+                    continue
+            except (ValueError, TypeError):
+                pass
+
         daily_counts[trade_date] = daily_counts.get(trade_date, 0) + 1
         taken.append(t)
+        last_trade_time = timestamp
 
     return taken
 
 
 def _compute_sharpe(trades: List[Dict[str, Any]]) -> float:
-    """Compute annualized Sharpe ratio from R-multiples."""
+    """Compute annualized Sharpe ratio from R-multiples, scaled by actual trade frequency."""
     if len(trades) < 2:
         return 0.0
     r_vals = [t.get('r_multiple', 0) for t in trades]
     mean_r = np.mean(r_vals)
-    std_r = np.std(r_vals)
+    std_r = np.std(r_vals, ddof=1)
     if std_r == 0:
         return 0.0
-    return float(mean_r / std_r * np.sqrt(min(252, len(r_vals))))
+    timestamps = [t.get('timestamp', '') for t in trades if t.get('timestamp')]
+    if len(timestamps) >= 2:
+        try:
+            first = datetime.fromisoformat(timestamps[0])
+            last = datetime.fromisoformat(timestamps[-1])
+            span_days = max((last - first).days, 1)
+            trades_per_year = len(trades) / span_days * 365
+        except (ValueError, TypeError):
+            trades_per_year = len(trades)
+    else:
+        trades_per_year = len(trades)
+    annualization = np.sqrt(max(trades_per_year, 1))
+    return float(mean_r / std_r * annualization)
 
 
 class WalkForwardOptimizer:
@@ -134,6 +164,8 @@ class WalkForwardOptimizer:
         'min_rr': [1.5, 2.0, 2.5, 3.0],
         'max_daily_trades': [2, 3, 4, 5],
         'session_penalty_asian': [0.0, 0.05, 0.10],
+        'cooldown_minutes': [0, 30, 60],
+        'counter_trend_rr_floor': [2.0, 2.5, 3.0],
     }
 
     def __init__(self, param_space: Optional[Dict[str, List]] = None):
@@ -144,6 +176,7 @@ class WalkForwardOptimizer:
         lookback_days: int = 180,
         n_folds: int = 3,
         train_ratio: float = 0.7,
+        progress_callback=None,
     ) -> Optional[OptimizationResult]:
         """
         Run walk-forward optimization using historical trades from the database.
@@ -152,6 +185,7 @@ class WalkForwardOptimizer:
             lookback_days: How far back to look for trades
             n_folds: Number of walk-forward folds
             train_ratio: Proportion of data for in-sample
+            progress_callback: Optional async fn(pct: int, step: str)
 
         Returns:
             OptimizationResult or None if insufficient data
@@ -163,14 +197,13 @@ class WalkForwardOptimizer:
 
         logger.info(f"[OPTIMIZER] Running walk-forward on {len(trades)} trades, {n_folds} folds")
 
-        # Sort by timestamp
         trades.sort(key=lambda t: t.get('timestamp', ''))
 
-        # Generate parameter combos
         keys = list(self.param_space.keys())
         values = list(self.param_space.values())
         combos = list(itertools.product(*values))
 
+        # Non-overlapping folds (anchored expanding window)
         fold_size = len(trades) // n_folds
         best_overall_params = None
         best_overall_oos_sharpe = -999
@@ -178,7 +211,14 @@ class WalkForwardOptimizer:
         fold_best_params = []
 
         for fold in range(n_folds):
-            fold_start = fold * (fold_size // 2)  # Overlapping folds
+            if progress_callback:
+                pct = int(fold / max(n_folds, 1) * 80)
+                try:
+                    await progress_callback(pct, f"Fold {fold + 1}/{n_folds} ({len(combos)} combos)")
+                except Exception:
+                    pass
+
+            fold_start = fold * fold_size
             fold_end = min(fold_start + fold_size, len(trades))
             fold_trades = trades[fold_start:fold_end]
 
@@ -205,9 +245,14 @@ class WalkForwardOptimizer:
             if best_combo is None:
                 continue
 
-            # Validate on out-of-sample
             oos_taken = _simulate_gate_logic(test, best_combo)
             oos_sharpe = _compute_sharpe(oos_taken) if oos_taken else 0
+
+            oos_flagged = ""
+            if len(oos_taken) < 10:
+                oos_flagged = " [LOW_OOS_COUNT]"
+            elif best_is_sharpe > 0 and oos_sharpe < best_is_sharpe * 0.5:
+                oos_flagged = " [OOS_DEGRADED]"
 
             fold_best_params.append(best_combo)
             all_results.append({
@@ -217,6 +262,7 @@ class WalkForwardOptimizer:
                 'out_of_sample_sharpe': round(oos_sharpe, 3),
                 'in_sample_trades': len(_simulate_gate_logic(train, best_combo)),
                 'out_of_sample_trades': len(oos_taken),
+                'flag': oos_flagged.strip() if oos_flagged else None,
             })
 
             if oos_sharpe > best_overall_oos_sharpe:
@@ -225,16 +271,20 @@ class WalkForwardOptimizer:
 
             logger.info(
                 f"[OPTIMIZER] Fold {fold}: IS Sharpe={best_is_sharpe:.3f}, "
-                f"OOS Sharpe={oos_sharpe:.3f}, params={best_combo.to_dict()}"
+                f"OOS Sharpe={oos_sharpe:.3f}{oos_flagged}, params={best_combo.to_dict()}"
             )
 
         if best_overall_params is None:
             return None
 
-        # Measure parameter stability across folds
+        if progress_callback:
+            try:
+                await progress_callback(90, "Computing final evaluation...")
+            except Exception:
+                pass
+
         stability = self._measure_stability(fold_best_params)
 
-        # Full in-sample and out-of-sample evaluation with best params
         split = int(len(trades) * train_ratio)
         full_is = _simulate_gate_logic(trades[:split], best_overall_params)
         full_oos = _simulate_gate_logic(trades[split:], best_overall_params)
@@ -266,7 +316,7 @@ class WalkForwardOptimizer:
         if len(fold_params) < 2:
             return 1.0
 
-        keys = ['min_confidence', 'min_rr', 'max_daily_trades']
+        keys = ['min_confidence', 'min_rr', 'max_daily_trades', 'cooldown_minutes', 'counter_trend_rr_floor']
         total_cv = 0
         counted = 0
 
@@ -275,7 +325,7 @@ class WalkForwardOptimizer:
             mean = np.mean(values)
             std = np.std(values)
             if mean > 0:
-                cv = std / mean  # Coefficient of variation
+                cv = std / mean
                 total_cv += cv
                 counted += 1
 
@@ -318,6 +368,7 @@ class WalkForwardOptimizer:
                     'profit_loss': t.profit_loss or 0,
                     'date': t.timestamp[:10] if t.timestamp else '',
                     'trade_type': t.trade_type or 'intraday',
+                    'trend': getattr(t, 'market_structure', '') or '',
                 }
                 for t in trades
             ]

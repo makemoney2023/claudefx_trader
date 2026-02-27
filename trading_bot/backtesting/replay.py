@@ -10,7 +10,6 @@ Run on weekends with sampled subsets.
 """
 
 import asyncio
-import json
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -23,6 +22,20 @@ from ..utils.logging import get_logger
 from ..utils.candle_utils import calculate_atr
 
 logger = get_logger(__name__)
+
+
+def _detect_session(ts: datetime) -> str:
+    """Derive trading session from UTC timestamp."""
+    h = ts.hour
+    if 0 <= h < 7:
+        return "asian"
+    if 7 <= h < 13:
+        return "london"
+    if 13 <= h < 17:
+        return "new_york"
+    if 17 <= h < 22:
+        return "new_york_pm"
+    return "asian"
 
 
 @dataclass
@@ -138,6 +151,8 @@ def _simulate_trade(
     Simulate a trade outcome using price data after the signal.
 
     Checks each bar to see if SL or TP is hit first, tracking MFE/MAE.
+    When both SL and TP are hit on the same bar, uses the bar's open to
+    infer which level was reached first.
     """
     if future_data is None or future_data.empty:
         return ReplayTrade(signal=signal, outcome='timeout')
@@ -147,7 +162,7 @@ def _simulate_trade(
     tp = signal.take_profit
     is_long = signal.direction == 'long'
 
-    sl_dist = abs(entry - sl) if sl else 1.0
+    sl_dist = abs(entry - sl) if sl is not None else 1.0
     mfe = 0.0
     mae = 0.0
 
@@ -155,6 +170,7 @@ def _simulate_trade(
         if i >= max_bars:
             break
 
+        bar_open = float(bar['open'])
         high = float(bar['high'])
         low = float(bar['low'])
         close = float(bar['close'])
@@ -169,47 +185,42 @@ def _simulate_trade(
         mfe = max(mfe, fav)
         mae = max(mae, adv)
 
-        # Check SL hit
-        if is_long and low <= sl:
+        sl_hit = (is_long and low <= sl) or (not is_long and high >= sl)
+        tp_hit = (is_long and high >= tp) or (not is_long and low <= tp)
+
+        if sl_hit and tp_hit:
+            dist_to_sl = abs(bar_open - sl)
+            dist_to_tp = abs(bar_open - tp)
+            if dist_to_sl <= dist_to_tp:
+                sl_hit, tp_hit = True, False
+            else:
+                sl_hit, tp_hit = False, True
+
+        if sl_hit:
+            pnl = (sl - entry) if is_long else (entry - sl)
             return ReplayTrade(
                 signal=signal, outcome='loss', exit_price=sl,
                 exit_time=bar.name if hasattr(bar, 'name') else None,
-                pnl_pips=sl - entry, r_multiple=-1.0,
-                mfe_pips=mfe, mae_pips=mae, bars_held=i + 1,
-            )
-        if not is_long and high >= sl:
-            return ReplayTrade(
-                signal=signal, outcome='loss', exit_price=sl,
-                exit_time=bar.name if hasattr(bar, 'name') else None,
-                pnl_pips=entry - sl, r_multiple=-1.0,
+                pnl_pips=pnl, r_multiple=-1.0,
                 mfe_pips=mfe, mae_pips=mae, bars_held=i + 1,
             )
 
-        # Check TP hit
-        if is_long and high >= tp:
-            r = (tp - entry) / sl_dist if sl_dist > 0 else 0
+        if tp_hit:
+            pnl = (tp - entry) if is_long else (entry - tp)
+            r = pnl / sl_dist if sl_dist > 0 else 0
             return ReplayTrade(
                 signal=signal, outcome='win', exit_price=tp,
                 exit_time=bar.name if hasattr(bar, 'name') else None,
-                pnl_pips=tp - entry, r_multiple=r,
-                mfe_pips=mfe, mae_pips=mae, bars_held=i + 1,
-            )
-        if not is_long and low <= tp:
-            r = (entry - tp) / sl_dist if sl_dist > 0 else 0
-            return ReplayTrade(
-                signal=signal, outcome='win', exit_price=tp,
-                exit_time=bar.name if hasattr(bar, 'name') else None,
-                pnl_pips=entry - tp, r_multiple=r,
+                pnl_pips=pnl, r_multiple=r,
                 mfe_pips=mfe, mae_pips=mae, bars_held=i + 1,
             )
 
-    # Timed out — close at last available close
     last_close = float(future_data.iloc[-1]['close'])
     pnl = (last_close - entry) if is_long else (entry - last_close)
     r = pnl / sl_dist if sl_dist > 0 else 0
     return ReplayTrade(
         signal=signal,
-        outcome='win' if pnl > 0 else 'loss',
+        outcome='timeout',
         exit_price=last_close,
         pnl_pips=pnl,
         r_multiple=r,
@@ -260,6 +271,7 @@ class ClaudeReplayBacktester:
         interval_hours: float = 1.0,
         max_signals: int = 500,
         dry_run: bool = False,
+        progress_callback=None,
     ) -> ReplayResult:
         """
         Run the replay backtest.
@@ -282,32 +294,33 @@ class ClaudeReplayBacktester:
             logger.error("Claude client not available for replay")
             return result
 
-        # Load the full historical dataset for simulation
         m15_data = await self._data_loader.load(symbol, 'M15', start_date, end_date + timedelta(days=5))
         if m15_data is None or m15_data.empty:
             logger.error(f"No historical M15 data for {symbol}")
             return result
 
-        h1_data = await self._data_loader.load(symbol, 'H1', start_date, end_date + timedelta(days=5))
-        d1_data = await self._data_loader.load(symbol, 'D1', start_date - timedelta(days=60), end_date)
+        h1_data = None
+        d1_data = None
+        try:
+            h1_data = await self._data_loader.load(symbol, 'H1', start_date, end_date + timedelta(days=5))
+        except Exception as e:
+            logger.warning(f"[REPLAY] H1 data unavailable (non-fatal): {e}")
+        try:
+            d1_data = await self._data_loader.load(symbol, 'D1', start_date - timedelta(days=60), end_date)
+        except Exception as e:
+            logger.warning(f"[REPLAY] D1 data unavailable (non-fatal): {e}")
 
         logger.info(
             f"[REPLAY] Starting {symbol} backtest: {start_date.date()} to {end_date.date()} "
             f"({len(m15_data)} M15 bars, interval={interval_hours}h)"
         )
 
-        # Pre-fetch learnings context so replay uses same context as live bot
         setup_playbook = ""
-        learning_context_str = ""
         if self._learning_service:
             try:
                 setup_playbook = await self._learning_service.build_setup_playbook(lookback_days=180, min_sample=3)
             except Exception as e:
                 logger.debug(f"[REPLAY] Setup playbook unavailable: {e}")
-            try:
-                learning_context_str = await self._learning_service.build_context_for_claude(symbol, "london")
-            except Exception as e:
-                logger.debug(f"[REPLAY] Learning context unavailable: {e}")
 
         # Walk through the data at the specified interval
         current = start_date
@@ -320,14 +333,20 @@ class ClaudeReplayBacktester:
         except Exception:
             pass
 
+        total_steps = min(
+            int((end_date - start_date).total_seconds() / 3600 / interval_hours) + 1,
+            max_signals,
+        )
+        step_idx = 0
+
         while current <= end_date and signals_processed < max_signals:
-            # Get lookback window for chart generation
             window_end = current
             lookback_bars = 100
             m15_window = m15_data[m15_data.index <= window_end].tail(lookback_bars)
 
             if len(m15_window) < 20:
                 current += timedelta(hours=interval_hours)
+                step_idx += 1
                 continue
 
             result.api_calls += 1
@@ -335,14 +354,154 @@ class ClaudeReplayBacktester:
             if dry_run:
                 current += timedelta(hours=interval_hours)
                 signals_processed += 1
+                step_idx += 1
                 continue
 
-            try:
-                # Generate chart
-                from ..utils.chart_screenshot import create_simple_chart
-                chart_b64 = await asyncio.to_thread(
-                    create_simple_chart, m15_window, symbol, 'M15'
+            if progress_callback and step_idx % 5 == 0:
+                pct = min(int(step_idx / max(total_steps, 1) * 100), 99)
+                step_desc = (
+                    f"Snapshot {step_idx}/{total_steps} | "
+                    f"{result.total_trades} trades, "
+                    f"{result.wins}W/{result.losses}L"
                 )
+                try:
+                    await progress_callback(pct, step_desc)
+                except Exception:
+                    pass
+
+            try:
+                current_price = float(m15_window['close'].iloc[-1])
+                atr_s = calculate_atr(m15_window, period=14)
+                atr_val = float(atr_s.iloc[-1]) if not atr_s.empty else 0
+                snapshot_session = _detect_session(current)
+
+                analysis_data: Dict[str, Any] = {}
+                _bar_extreme_zones: list = []
+                _be_m15 = None
+                _m15_overlays: Dict[str, Any] = {}
+                try:
+                    from ..analysis.market_structure import MarketStructureAnalyzer
+                    from ..analysis.fair_value_gap import FVGDetector
+                    from ..analysis.order_blocks import OrderBlockDetector
+                    from ..analysis.liquidity import LiquidityMapper
+                    from ..analysis.bar_extreme_zones import BarExtremeZoneDetector
+                    from ..config import get_symbol_spec
+
+                    _spec = get_symbol_spec(symbol)
+                    _pip = _spec.pip_size
+
+                    ms = MarketStructureAnalyzer().analyze(m15_window)
+                    analysis_data["market_structure"] = {
+                        "trend": ms.trend.value,
+                        "structure_breaks": len(ms.structure_breaks),
+                        "break_details": [
+                            {"type": sb.type.value, "price": float(sb.price)}
+                            for sb in ms.structure_breaks[-5:]
+                        ] if ms.structure_breaks else [],
+                        "swing_highs": [float(sh.price) for sh in ms.swing_highs[-5:]],
+                        "swing_lows": [float(sl_.price) for sl_ in ms.swing_lows[-5:]],
+                    }
+
+                    fvg = FVGDetector(pip_value=_pip).detect(m15_window)
+                    analysis_data["fvg"] = {
+                        "bullish": len(fvg.bullish_fvgs),
+                        "bearish": len(fvg.bearish_fvgs),
+                        "active": len(fvg.active_fvgs),
+                        "bullish_zones": [{"high": float(f.top), "low": float(f.bottom)} for f in fvg.bullish_fvgs[-3:]],
+                        "bearish_zones": [{"high": float(f.top), "low": float(f.bottom)} for f in fvg.bearish_fvgs[-3:]],
+                    }
+
+                    ob = OrderBlockDetector().detect(m15_window)
+                    analysis_data["order_blocks"] = {
+                        "bullish": len(ob.bullish_obs),
+                        "bearish": len(ob.bearish_obs),
+                        "bullish_zones": [{"high": float(o.high), "low": float(o.low)} for o in ob.bullish_obs[-3:]],
+                        "bearish_zones": [{"high": float(o.high), "low": float(o.low)} for o in ob.bearish_obs[-3:]],
+                    }
+
+                    liq = LiquidityMapper(pip_value=_pip).analyze(m15_window, current_price)
+                    analysis_data["liquidity"] = {
+                        "nearest_bsl": float(liq.nearest_bsl) if liq.nearest_bsl else None,
+                        "nearest_ssl": float(liq.nearest_ssl) if liq.nearest_ssl else None,
+                        "all_bsl": [float(p.price) for p in liq.bsl_pools[-5:]],
+                        "all_ssl": [float(p.price) for p in liq.ssl_pools[-5:]],
+                        "equal_highs": [float(eh.price) for eh in liq.equal_highs[-3:]] if liq.equal_highs else [],
+                        "equal_lows": [float(el.price) for el in liq.equal_lows[-3:]] if liq.equal_lows else [],
+                    }
+
+                    _be = BarExtremeZoneDetector()
+                    _be_m15 = _be.detect(m15_window, current_price, 'M15')
+                    if _be_m15.supply_zone:
+                        _bar_extreme_zones.append({"top": _be_m15.supply_zone.top, "bottom": _be_m15.supply_zone.bottom, "type": "supply", "tf": "M15"})
+                    if _be_m15.demand_zone:
+                        _bar_extreme_zones.append({"top": _be_m15.demand_zone.top, "bottom": _be_m15.demand_zone.bottom, "type": "demand", "tf": "M15"})
+
+                    # Chart overlays for M15 panel
+                    _m15_overlays = {
+                        "order_blocks": (
+                            [{"top": float(o.high), "bottom": float(o.low), "type": "bullish"} for o in ob.bullish_obs[-5:]]
+                            + [{"top": float(o.high), "bottom": float(o.low), "type": "bearish"} for o in ob.bearish_obs[-5:]]
+                        ),
+                        "fvg_zones": (
+                            [{"top": float(f.top), "bottom": float(f.bottom), "type": "bullish"} for f in fvg.bullish_fvgs[-5:]]
+                            + [{"top": float(f.top), "bottom": float(f.bottom), "type": "bearish"} for f in fvg.bearish_fvgs[-5:]]
+                        ),
+                        "liquidity_levels": (
+                            [{"price": float(p.price), "label": "BSL", "color": "purple"} for p in liq.bsl_pools[-5:]]
+                            + [{"price": float(p.price), "label": "SSL", "color": "purple"} for p in liq.ssl_pools[-5:]]
+                        ),
+                        "swing_points": (
+                            [{"price": float(sh.price), "type": "high", "index": sh.index} for sh in ms.swing_highs[-8:]]
+                            + [{"price": float(sl_.price), "type": "low", "index": sl_.index} for sl_ in ms.swing_lows[-8:]]
+                        ),
+                    }
+                except Exception as _analysis_err:
+                    logger.debug(f"[REPLAY] Analysis enrichment failed: {_analysis_err}")
+                    _m15_overlays = {}
+
+                if h1_data is not None and not h1_data.empty:
+                    h1_window = h1_data[h1_data.index <= window_end].tail(100)
+                    if len(h1_window) >= 20:
+                        try:
+                            from ..analysis.market_structure import MarketStructureAnalyzer as _MSA
+                            from ..analysis.bar_extreme_zones import BarExtremeZoneDetector as _BED
+                            h1_ms = _MSA().analyze(h1_window)
+                            analysis_data["h1_bias"] = h1_ms.trend.value
+                            h1_be = _BED().detect(h1_window, current_price, 'H1')
+                            if h1_be.supply_zone:
+                                _bar_extreme_zones.append({"top": h1_be.supply_zone.top, "bottom": h1_be.supply_zone.bottom, "type": "supply", "tf": "H1"})
+                            if h1_be.demand_zone:
+                                _bar_extreme_zones.append({"top": h1_be.demand_zone.top, "bottom": h1_be.demand_zone.bottom, "type": "demand", "tf": "H1"})
+                        except Exception:
+                            pass
+
+                if d1_data is not None and not d1_data.empty:
+                    d1_window = d1_data[d1_data.index <= window_end].tail(60)
+                    if len(d1_window) >= 10:
+                        try:
+                            from ..analysis.market_structure import MarketStructureAnalyzer as _MSA2
+                            d1_ms = _MSA2().analyze(d1_window)
+                            analysis_data["d1_bias"] = d1_ms.trend.value
+                        except Exception:
+                            pass
+
+                # --- Generate composite chart (M15 + H1 if available) ---
+                from ..utils.chart_screenshot import create_composite_chart, create_simple_chart
+                chart_panels = [{"timeframe": "M15", "df": m15_window, "overlays": _m15_overlays}]
+                if h1_data is not None and not h1_data.empty:
+                    h1_chart_win = h1_data[h1_data.index <= window_end].tail(100)
+                    if len(h1_chart_win) >= 10:
+                        chart_panels.insert(0, {"timeframe": "H1", "df": h1_chart_win})
+
+                try:
+                    chart_b64 = await asyncio.to_thread(
+                        create_composite_chart, chart_panels, symbol,
+                        bar_extreme_zones=_bar_extreme_zones if _bar_extreme_zones else None,
+                    )
+                except Exception:
+                    chart_b64 = await asyncio.to_thread(
+                        create_simple_chart, m15_window, symbol, 'M15'
+                    )
 
                 if not chart_b64:
                     current += timedelta(hours=interval_hours)
@@ -350,37 +509,32 @@ class ClaudeReplayBacktester:
 
                 strategy_ctx = context_builder.get_ict_context() if context_builder else ""
 
-                # Build minimal market data
-                current_price = float(m15_window['close'].iloc[-1])
-                atr_s = calculate_atr(m15_window, period=14)
-                atr_val = float(atr_s.iloc[-1]) if not atr_s.empty else 0
-
-                market_data = {
+                market_data: Dict[str, Any] = {
                     'current_price': current_price,
-                    'session': 'london',
+                    'session': snapshot_session,
                     'atr_14': round(atr_val, 6),
                     'atr_min_sl': round(atr_val * 1.5, 6),
                 }
                 if setup_playbook:
                     market_data['setup_playbook'] = setup_playbook
-                if learning_context_str:
-                    market_data['learning_context'] = learning_context_str
+                if self._learning_service:
+                    try:
+                        lctx = await self._learning_service.build_context_for_claude(symbol, snapshot_session)
+                        if lctx:
+                            market_data['learning_context'] = lctx
+                    except Exception:
+                        pass
 
-                try:
-                    from ..analysis.bar_extreme_zones import BarExtremeZoneDetector
-                    _be_det = BarExtremeZoneDetector()
-                    _be_m15 = _be_det.detect(m15_window, current_price, 'M15')
+                if _be_m15:
                     market_data['bar_extreme_m15'] = _be_m15.to_dict()
-                except Exception:
-                    pass
 
-                # Call Claude
                 claude_result = await self._claude.analyze_chart_async(
                     chart_image_base64=chart_b64,
                     symbol=symbol,
                     timeframe='M15',
                     strategy_context=strategy_ctx,
                     market_data=market_data,
+                    analysis_data=analysis_data if analysis_data else None,
                 )
 
                 sig = claude_result.signal
@@ -418,6 +572,7 @@ class ClaudeReplayBacktester:
                 logger.warning(f"[REPLAY] Error at {current}: {e}")
 
             current += timedelta(hours=interval_hours)
+            step_idx += 1
 
         # Compute aggregate metrics
         if result.total_trades > 0:
@@ -432,9 +587,14 @@ class ClaudeReplayBacktester:
             dd = cumulative - peak
             result.max_drawdown_r = float(np.min(dd)) if len(dd) > 0 else 0
 
-            # Sharpe (R-based)
-            if np.std(r_values) > 0:
-                result.sharpe_ratio = float(np.mean(r_values) / np.std(r_values) * np.sqrt(252))
+            # Sharpe (R-based, annualized by actual trade frequency)
+            if np.std(r_values, ddof=1) > 0:
+                calendar_days = max((end_date - start_date).days, 1)
+                trades_per_year = result.total_trades / calendar_days * 365
+                annualization = np.sqrt(max(trades_per_year, 1))
+                result.sharpe_ratio = float(
+                    np.mean(r_values) / np.std(r_values, ddof=1) * annualization
+                )
 
             # Profit factor
             gross_profit = sum(t.r_multiple for t in result.trades if t.r_multiple > 0)

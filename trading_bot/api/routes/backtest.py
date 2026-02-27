@@ -20,8 +20,54 @@ logger = get_logger(__name__)
 
 router = APIRouter()
 
-# Background tasks for long-running backtests (run_id -> asyncio.Task)
 _backtest_tasks: Dict[int, asyncio.Task] = {}
+MAX_CONCURRENT_BACKTESTS = 2
+
+
+def _validate_dates(start_str: str, end_str: str) -> tuple:
+    """Parse and validate date strings. Raises HTTPException on invalid input."""
+    try:
+        start_dt = datetime.strptime(start_str, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid start_date format: '{start_str}'. Use YYYY-MM-DD.")
+    try:
+        end_dt = datetime.strptime(end_str, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid end_date format: '{end_str}'. Use YYYY-MM-DD.")
+    if end_dt <= start_dt:
+        raise HTTPException(status_code=400, detail="end_date must be after start_date")
+    if (end_dt - start_dt).days > 365:
+        raise HTTPException(status_code=400, detail="Date range cannot exceed 1 year")
+    return start_dt, end_dt
+
+
+def _check_concurrent_limit():
+    """Raise 429 if too many backtests are already running."""
+    active = sum(1 for t in _backtest_tasks.values() if not t.done())
+    if active >= MAX_CONCURRENT_BACKTESTS:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Max {MAX_CONCURRENT_BACKTESTS} concurrent backtests allowed. Wait for a run to finish or cancel one.",
+        )
+
+
+async def cleanup_orphaned_runs():
+    """Mark any 'running' backtest rows as 'failed' on startup."""
+    try:
+        async with async_session_maker() as session:
+            from sqlalchemy import select
+            q = select(BacktestRunModel).where(BacktestRunModel.status == "running")
+            result = await session.execute(q)
+            rows = result.scalars().all()
+            for r in rows:
+                r.status = "failed"
+                r.error_message = "Server restarted while backtest was running"
+                r.completed_at = datetime.utcnow()
+            if rows:
+                await session.commit()
+                logger.info(f"[BACKTEST] Cleaned up {len(rows)} orphaned 'running' backtest rows")
+    except Exception as e:
+        logger.warning(f"[BACKTEST] Orphan cleanup failed: {e}")
 
 
 def _get_mt5_client():
@@ -125,36 +171,48 @@ def _replay_trade_to_dict(trade: Any) -> Dict[str, Any]:
     }
 
 
-async def _feed_replay_learnings(run_id: int, result: Any) -> int:
+async def _feed_replay_learnings(run_id: int, result: Any, learning_service=None) -> int:
     """
     Store qualifying replay trades (losses and wins > 2R) as learnings.
     Returns count of learnings stored.
     """
     try:
-        from ...services.trade_learning_service import TradeLearningService
-        svc = TradeLearningService()
+        if learning_service is None:
+            from ...services.trade_learning_service import TradeLearningService
+            learning_service = TradeLearningService()
         count = 0
         for i, t in enumerate(result.trades):
-            # Same criteria as live: losses and big wins (>2R)
             if t.outcome == "loss" or (t.outcome == "win" and t.r_multiple >= 2.0):
                 trade_id = f"bt-replay-{run_id}-{result.symbol}-{i:03d}"
+
+                ts = t.signal.timestamp
+                h = ts.hour if hasattr(ts, "hour") else 0
+                if 0 <= h < 7:
+                    session_name = "asian"
+                elif 7 <= h < 13:
+                    session_name = "london"
+                elif 13 <= h < 17:
+                    session_name = "new_york"
+                else:
+                    session_name = "new_york_pm"
+
                 review = {
                     "grade": "B" if t.outcome == "win" else "C",
                     "outcome": t.outcome,
                     "analysis": (t.signal.reasoning or "")[:5000],
-                    "what_went_right": ["Simulated win"] if t.outcome == "win" else [],
-                    "what_went_wrong": ["Simulated loss"] if t.outcome == "loss" else [],
-                    "learnings": [],
+                    "what_went_right": [f"R-multiple: {t.r_multiple:.2f}"] if t.outcome == "win" else [],
+                    "what_went_wrong": [f"SL hit, R: {t.r_multiple:.2f}"] if t.outcome == "loss" else [],
+                    "learnings": [f"Backtest trade {t.signal.direction} {result.symbol} | bars_held={t.bars_held}"],
                     "source": "backtest",
                 }
-                await svc.store_trade_review(
+                await learning_service.store_trade_review(
                     trade_id=trade_id,
                     symbol=result.symbol,
                     direction=t.signal.direction,
-                    profit_loss=0.0,
+                    profit_loss=t.r_multiple,
                     r_multiple=t.r_multiple,
                     review=review,
-                    session="",
+                    session=session_name,
                     setup_type="ICT",
                     entry_reason=(t.signal.reasoning or "")[:2000],
                     original_confidence=t.signal.confidence,
@@ -307,34 +365,88 @@ async def cancel_backtest_run(run_id: int):
 async def replay_estimate(body: ReplayEstimateRequest):
     """Estimate API cost for a replay backtest without running it."""
     from ...backtesting.replay import ClaudeReplayBacktester
-    start = datetime.strptime(body.start_date, "%Y-%m-%d")
-    end = datetime.strptime(body.end_date, "%Y-%m-%d")
+    start, end = _validate_dates(body.start_date, body.end_date)
     bt = ClaudeReplayBacktester(claude_client=None, mt5_client=None)
     estimate = await bt.estimate_cost(body.symbol, start, end, body.interval_hours)
     return estimate
 
 
 # ---------------------------------------------------------------------------
-# POST /ict — Run ICT backtest (sync, in thread)
+# POST /ict — Run ICT backtest (background task)
 # ---------------------------------------------------------------------------
+
+async def _run_ict_task(run_id: int):
+    """Background task: run ICT backtest and persist results."""
+    from ...backtesting.engine import Backtester, BacktestConfig
+
+    async with async_session_maker() as session:
+        from sqlalchemy import select
+        r = (await session.execute(select(BacktestRunModel).where(BacktestRunModel.id == run_id))).scalar_one_or_none()
+        if not r or r.status != "running":
+            return
+        cfg = r.config_json or {}
+
+    try:
+        config = BacktestConfig(
+            symbol=cfg.get("symbol", ""),
+            timeframe=cfg.get("timeframe", "H1"),
+            start_date=datetime.strptime(cfg["start_date"], "%Y-%m-%d"),
+            end_date=datetime.strptime(cfg["end_date"], "%Y-%m-%d"),
+            initial_balance=float(cfg.get("initial_balance", 10000)),
+            risk_per_trade=float(cfg.get("risk_per_trade", 0.01)),
+            min_risk_reward=float(cfg.get("min_risk_reward", 2.0)),
+            data_source="mt5",
+        )
+        backtester = Backtester(config)
+        result = await asyncio.to_thread(backtester.run, None, True)
+        res_dict = result.to_dict()
+        metrics = res_dict.get("metrics", {})
+        async with async_session_maker() as session:
+            from sqlalchemy import select
+            row = (await session.execute(select(BacktestRunModel).where(BacktestRunModel.id == run_id))).scalar_one_or_none()
+            if row:
+                row.status = "completed"
+                row.progress_pct = 100
+                row.current_step = "Completed"
+                row.result_json = res_dict
+                row.total_trades = metrics.get("total_trades") or 0
+                row.win_rate = metrics.get("win_rate")
+                row.net_profit = metrics.get("net_profit")
+                row.sharpe_ratio = metrics.get("sharpe_ratio")
+                row.profit_factor = metrics.get("profit_factor")
+                row.max_drawdown = metrics.get("max_drawdown")
+                row.completed_at = datetime.utcnow()
+                await session.commit()
+    except asyncio.CancelledError:
+        async with async_session_maker() as session:
+            from sqlalchemy import select
+            row = (await session.execute(select(BacktestRunModel).where(BacktestRunModel.id == run_id))).scalar_one_or_none()
+            if row:
+                row.status = "cancelled"
+                row.current_step = "Cancelled"
+                row.completed_at = datetime.utcnow()
+                await session.commit()
+        return
+    except Exception as e:
+        logger.exception(f"[BACKTEST] ICT run {run_id} failed: {e}")
+        async with async_session_maker() as session:
+            from sqlalchemy import select
+            row = (await session.execute(select(BacktestRunModel).where(BacktestRunModel.id == run_id))).scalar_one_or_none()
+            if row:
+                row.status = "failed"
+                row.error_message = str(e)[:2000]
+                row.completed_at = datetime.utcnow()
+                await session.commit()
+    finally:
+        _backtest_tasks.pop(run_id, None)
+
 
 @router.post("/ict", response_model=BacktestRunResponse, dependencies=[Depends(RequireAuth())])
 async def start_ict_backtest(body: IctBacktestRequest):
-    """Run ICT strategy backtest. Runs synchronously in a thread."""
-    from ...backtesting.engine import Backtester, BacktestConfig
+    """Start ICT strategy backtest as a background task."""
+    _check_concurrent_limit()
+    start_dt, end_dt = _validate_dates(body.start_date, body.end_date)
 
-    start_dt = datetime.strptime(body.start_date, "%Y-%m-%d")
-    end_dt = datetime.strptime(body.end_date, "%Y-%m-%d")
-    config = BacktestConfig(
-        symbol=body.symbol,
-        timeframe=body.timeframe,
-        start_date=start_dt,
-        end_date=end_dt,
-        initial_balance=body.initial_balance,
-        risk_per_trade=body.risk_per_trade,
-        min_risk_reward=body.min_risk_reward,
-        data_source="mt5",
-    )
     config_json = {
         "symbol": body.symbol,
         "timeframe": body.timeframe,
@@ -355,44 +467,15 @@ async def start_ict_backtest(body: IctBacktestRequest):
             end_date=end_dt,
             config_json=config_json,
             progress_pct=0,
-            current_step="Running ICT backtest...",
+            current_step="Starting ICT backtest...",
         )
         session.add(row)
         await session.commit()
         await session.refresh(row)
         run_id = row.id
 
-    try:
-        backtester = Backtester(config)
-        result = await asyncio.to_thread(backtester.run, None, True)
-        res_dict = result.to_dict()
-        metrics = res_dict.get("metrics", {})
-        async with async_session_maker() as session:
-            from sqlalchemy import select
-            r = (await session.execute(select(BacktestRunModel).where(BacktestRunModel.id == run_id))).scalar_one_or_none()
-            if r:
-                r.status = "completed"
-                r.progress_pct = 100
-                r.current_step = "Completed"
-                r.result_json = res_dict
-                r.total_trades = metrics.get("total_trades") or 0
-                r.win_rate = metrics.get("win_rate")
-                r.net_profit = metrics.get("net_profit")
-                r.sharpe_ratio = metrics.get("sharpe_ratio")
-                r.profit_factor = metrics.get("profit_factor")
-                r.max_drawdown = metrics.get("max_drawdown")
-                r.completed_at = datetime.utcnow()
-                await session.commit()
-    except Exception as e:
-        logger.exception(f"[BACKTEST] ICT run {run_id} failed: {e}")
-        async with async_session_maker() as session:
-            from sqlalchemy import select
-            r = (await session.execute(select(BacktestRunModel).where(BacktestRunModel.id == run_id))).scalar_one_or_none()
-            if r:
-                r.status = "failed"
-                r.error_message = str(e)[:2000]
-                r.completed_at = datetime.utcnow()
-                await session.commit()
+    task = asyncio.create_task(_run_ict_task(run_id))
+    _backtest_tasks[run_id] = task
 
     async with async_session_maker() as session:
         from sqlalchemy import select
@@ -431,6 +514,7 @@ async def start_ict_backtest(body: IctBacktestRequest):
 
 async def _run_replay_task(run_id: int):
     """Background task: run replay backtester and persist result + learnings."""
+    logger.info(f"[REPLAY-TASK] Starting background replay task for run_id={run_id}")
     from ...backtesting.replay import ClaudeReplayBacktester, ReplayResult
     from ...llm.claude_client import ClaudeClient
     from ...services.trade_learning_service import TradeLearningService
@@ -448,6 +532,11 @@ async def _run_replay_task(run_id: int):
         max_signals = int(cfg.get("max_signals", 100))
 
     mt5 = _get_mt5_client()
+    if mt5 and not getattr(mt5, "is_connected", False):
+        try:
+            await mt5.ensure_connected()
+        except Exception as e:
+            logger.warning(f"[REPLAY-TASK] ensure_connected failed: {e}")
     if not mt5 or not getattr(mt5, "is_connected", False):
         async with async_session_maker() as session:
             from sqlalchemy import select
@@ -476,6 +565,20 @@ async def _run_replay_task(run_id: int):
 
     learning_service = TradeLearningService()
     bt = ClaudeReplayBacktester(claude_client=claude, mt5_client=mt5, trade_learning_service=learning_service)
+
+    async def _update_progress(pct: int, step: str):
+        try:
+            async with async_session_maker() as sess:
+                from sqlalchemy import select
+                row = (await sess.execute(select(BacktestRunModel).where(BacktestRunModel.id == run_id))).scalar_one_or_none()
+                if row:
+                    row.progress_pct = pct
+                    row.current_step = step
+                    await sess.commit()
+        except Exception:
+            pass
+
+    logger.info(f"[REPLAY-TASK] Run {run_id}: launching bt.run({symbol}, {start_date}, {end_date}, interval={interval_hours}h)")
     try:
         result = await bt.run(
             symbol=symbol,
@@ -484,6 +587,7 @@ async def _run_replay_task(run_id: int):
             interval_hours=interval_hours,
             max_signals=max_signals,
             dry_run=False,
+            progress_callback=_update_progress,
         )
     except asyncio.CancelledError:
         async with async_session_maker() as session:
@@ -507,10 +611,9 @@ async def _run_replay_task(run_id: int):
                 await session.commit()
         return
 
-    # Persist result
     result_dict = result.to_dict()
     result_dict["trades"] = [_replay_trade_to_dict(t) for t in result.trades]
-    learnings_stored = await _feed_replay_learnings(run_id, result)
+    learnings_stored = await _feed_replay_learnings(run_id, result, learning_service=learning_service)
     result_dict["learnings_stored"] = learnings_stored
 
     async with async_session_maker() as session:
@@ -532,15 +635,14 @@ async def _run_replay_task(run_id: int):
             row.completed_at = datetime.utcnow()
             await session.commit()
 
-    if run_id in _backtest_tasks:
-        del _backtest_tasks[run_id]
+    _backtest_tasks.pop(run_id, None)
 
 
 @router.post("/replay", response_model=BacktestRunResponse, dependencies=[Depends(RequireAuth())])
 async def start_replay_backtest(body: ReplayBacktestRequest):
     """Start Claude replay backtest as a background task. Returns run id and status immediately."""
-    start_dt = datetime.strptime(body.start_date, "%Y-%m-%d")
-    end_dt = datetime.strptime(body.end_date, "%Y-%m-%d")
+    _check_concurrent_limit()
+    start_dt, end_dt = _validate_dates(body.start_date, body.end_date)
     config_json = {
         "symbol": body.symbol,
         "start_date": body.start_date,
@@ -618,12 +720,25 @@ async def _run_optimizer_task(run_id: int):
         train_ratio = float(cfg.get("train_ratio", 0.7))
         param_space = cfg.get("param_space")
 
+    async def _opt_progress(pct: int, step: str):
+        try:
+            async with async_session_maker() as sess:
+                from sqlalchemy import select
+                row = (await sess.execute(select(BacktestRunModel).where(BacktestRunModel.id == run_id))).scalar_one_or_none()
+                if row:
+                    row.progress_pct = pct
+                    row.current_step = step
+                    await sess.commit()
+        except Exception:
+            pass
+
     try:
         opt = WalkForwardOptimizer(param_space=param_space)
         result = await opt.optimize(
             lookback_days=lookback_days,
             n_folds=n_folds,
             train_ratio=train_ratio,
+            progress_callback=_opt_progress,
         )
     except asyncio.CancelledError:
         async with async_session_maker() as session:
@@ -656,8 +771,7 @@ async def _run_optimizer_task(run_id: int):
                 row.error_message = "Insufficient trade data for optimization"
                 row.completed_at = datetime.utcnow()
                 await session.commit()
-        if run_id in _backtest_tasks:
-            del _backtest_tasks[run_id]
+        _backtest_tasks.pop(run_id, None)
         return
 
     result_dict = result.to_dict()
@@ -675,13 +789,13 @@ async def _run_optimizer_task(run_id: int):
             row.completed_at = datetime.utcnow()
             await session.commit()
 
-    if run_id in _backtest_tasks:
-        del _backtest_tasks[run_id]
+    _backtest_tasks.pop(run_id, None)
 
 
 @router.post("/optimizer", response_model=BacktestRunResponse, dependencies=[Depends(RequireAuth())])
 async def start_optimizer(body: OptimizerRequest):
     """Start walk-forward parameter optimization as a background task."""
+    _check_concurrent_limit()
     config_json = {
         "lookback_days": body.lookback_days,
         "n_folds": body.n_folds,

@@ -62,11 +62,13 @@ async def lifespan(app: FastAPI):
     setup_logging()
     logger.info("Starting ICT Trading Bot API Server")
     
-    # Initialize database
     from .database import init_db
     await init_db()
     logger.info("Database initialized")
-    
+
+    from .routes.backtest import cleanup_orphaned_runs
+    await cleanup_orphaned_runs()
+
     # Initialize MT5 client
     from ..mt5.client import MT5Client
     _mt5_client = MT5Client()
@@ -123,9 +125,12 @@ async def lifespan(app: FastAPI):
     release_instance_lock()
     logger.info("Cleared any stale instance lock from previous run")
     
-    # Auto-start the trading bot as a background task
-    logger.info("Starting trading bot as background task...")
-    _bot_task = asyncio.create_task(_run_bot_background())
+    # Auto-start the trading bot (unless disabled in config)
+    if settings.trading.auto_start_bot:
+        logger.info("Starting trading bot as background task...")
+        _bot_task = asyncio.create_task(_run_bot_background())
+    else:
+        logger.info("Bot auto-start DISABLED (TRADING_AUTO_START_BOT=false). Use dashboard to start manually.")
     
     # Start Telegram command handler (polling for /commands)
     global _command_handler

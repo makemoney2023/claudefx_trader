@@ -345,6 +345,10 @@ class TradingSettings(BaseSettings):
         extra="ignore"
     )
     
+    auto_start_bot: bool = Field(
+        default=True,
+        description="Auto-start the trading bot when the API server launches. Set False for backtest-only mode."
+    )
     symbols: List[str] = Field(
         default=["BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD"],
         description="List of trading symbols (override via TRADING_SYMBOLS env var)"
