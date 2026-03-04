@@ -7688,7 +7688,6 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                     f"Analyzing reversal re-entry in opposite direction...",
                     flush=True
                 )
-                import asyncio
                 asyncio.create_task(self._analyze_reversal_entry(position))
                     
         except Exception as e:
@@ -8455,7 +8454,6 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
         self.running = False
         # Try to save state synchronously
         try:
-            import asyncio
             loop = asyncio.get_event_loop()
             if loop.is_running():
                 asyncio.create_task(self._async_save_state())
