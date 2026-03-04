@@ -1,46 +1,37 @@
 'use client'
 
-import { useEffect, useState, useCallback } from 'react'
+import { useState, useCallback } from 'react'
 import { api, Position, Trade } from '@/lib/api'
-import { useWebSocket } from '@/hooks/useWebSocket'
-import type { WebSocketMessage } from '@/lib/wsTypes'
+import { useWebSocketWithPolling } from '@/hooks/useWebSocketWithPolling'
 import { cn } from '@/lib/utils'
 import { ArrowUpRight, ArrowDownRight, Clock } from 'lucide-react'
 
+interface TradeData {
+  positions: Position[]
+  trades: Trade[]
+}
+
 export function TradeMonitor() {
-  const [positions, setPositions] = useState<Position[]>([])
-  const [recentTrades, setRecentTrades] = useState<Trade[]>([])
-  const [loading, setLoading] = useState(true)
   const [tab, setTab] = useState<'open' | 'recent'>('open')
 
-  const { lastMessage, isConnected } = useWebSocket('trades')
-
-  const fetchData = useCallback(async () => {
-    try {
-      const [positionsData, tradesData] = await Promise.all([
-        api.getOpenPositions(),
-        api.getTrades({ page_size: 10 }),
-      ])
-      setPositions(positionsData)
-      setRecentTrades(tradesData.trades)
-    } catch (error) {
-      console.error('Error fetching trades:', error)
-    } finally {
-      setLoading(false)
-    }
+  const fetchData = useCallback(async (): Promise<TradeData> => {
+    const [positionsData, tradesData] = await Promise.all([
+      api.getOpenPositions(),
+      api.getTrades({ page_size: 10 }),
+    ])
+    return { positions: positionsData, trades: tradesData.trades }
   }, [])
 
-  useEffect(() => {
-    if (lastMessage && lastMessage.type === 'trade_update') {
-      fetchData()
-    }
-  }, [lastMessage, fetchData])
+  const { data } = useWebSocketWithPolling<TradeData>({
+    channel: 'trades',
+    fetchFn: fetchData,
+    fastInterval: 10000,
+    slowInterval: 60000,
+  })
 
-  useEffect(() => {
-    fetchData()
-    const interval = setInterval(fetchData, isConnected ? 60000 : 10000)
-    return () => clearInterval(interval)
-  }, [fetchData, isConnected])
+  const positions = data?.positions ?? []
+  const recentTrades = data?.trades ?? []
+  const loading = data === null
 
   return (
     <div className="card">

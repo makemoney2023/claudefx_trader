@@ -514,6 +514,7 @@ class ScalingManager:
         
         if win_rate < 40:
             logger.warning(f"BLOCKING {symbol}/{session}: Win rate {win_rate:.0f}% (< 40%) over {stats['trades']} trades")
+            add_activity("win_rate_blocked", f"{symbol}/{session} blocked: win rate {win_rate:.0f}% below 40%", symbol=symbol, details={"win_rate": win_rate, "trades": stats['trades'], "session": session})
             return 0.0
         elif win_rate < 45:
             logger.info(f"REDUCING {symbol}/{session}: Win rate {win_rate:.0f}% (< 45%) -> 40% size")

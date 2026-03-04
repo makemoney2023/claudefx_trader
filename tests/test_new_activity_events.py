@@ -66,9 +66,10 @@ class TestTierChangeActivities:
 
         with patch("trading_bot.execution.scaling_position_sizer.add_activity") as mock_add:
             result = sizer.check_tier_transition(500.0)
-            if result and result.get("tier_changed"):
-                demotion_calls = [c for c in mock_add.call_args_list if c[0][0] == "tier_change"]
-                assert len(demotion_calls) >= 1
+            assert result["tier_changed"] is True, "Tier transition should have occurred"
+            assert result["direction"] == "demotion"
+            demotion_calls = [c for c in mock_add.call_args_list if c[0][0] == "tier_change"]
+            assert len(demotion_calls) >= 1
 
     def test_tier_promotion_fires_activity(self):
         """A tier promotion should emit a tier_change activity."""
@@ -81,6 +82,42 @@ class TestTierChangeActivities:
 
         with patch("trading_bot.execution.scaling_position_sizer.add_activity") as mock_add:
             result = sizer.check_tier_transition(3000.0)
-            if result and result.get("tier_changed"):
-                promo_calls = [c for c in mock_add.call_args_list if c[0][0] == "tier_change"]
-                assert len(promo_calls) >= 1
+            assert result["tier_changed"] is True, "Tier transition should have occurred"
+            assert result["direction"] == "promotion"
+            promo_calls = [c for c in mock_add.call_args_list if c[0][0] == "tier_change"]
+            assert len(promo_calls) >= 1
+
+    def test_lockout_cleared_promotion_fires_activity(self):
+        """A promotion after lockout is cleared should emit a tier_change activity with lockout info."""
+        from trading_bot.execution.scaling_position_sizer import ScalingPositionSizer
+
+        sizer = ScalingPositionSizer()
+        sizer._current_tier_index = 1
+        sizer._highest_tier_index = 1
+        sizer._promotion_lockout = True
+        sizer._consecutive_winners = 5
+
+        with patch("trading_bot.execution.scaling_position_sizer.add_activity") as mock_add:
+            result = sizer.check_tier_transition(3000.0)
+            assert result["tier_changed"] is True, "Tier transition should have occurred after lockout cleared"
+            assert result["direction"] == "promotion"
+            assert result["lockout_active"] is False
+            promo_calls = [c for c in mock_add.call_args_list if c[0][0] == "tier_change"]
+            assert len(promo_calls) >= 1
+            assert "lockout cleared" in str(promo_calls[0])
+
+    def test_blocked_promotion_no_activity(self):
+        """A promotion blocked by lockout should NOT emit a tier_change activity."""
+        from trading_bot.execution.scaling_position_sizer import ScalingPositionSizer
+
+        sizer = ScalingPositionSizer()
+        sizer._current_tier_index = 1
+        sizer._highest_tier_index = 1
+        sizer._promotion_lockout = True
+        sizer._consecutive_winners = 2
+
+        with patch("trading_bot.execution.scaling_position_sizer.add_activity") as mock_add:
+            result = sizer.check_tier_transition(3000.0)
+            assert result["tier_changed"] is False, "Tier should not change while lockout is active"
+            tier_calls = [c for c in mock_add.call_args_list if c[0][0] == "tier_change"]
+            assert len(tier_calls) == 0

@@ -106,7 +106,7 @@ export function useWebSocketWithPolling<T>({
   }, [doFetch])
 
   const refresh = useCallback(() => {
-    doFetch()
+    return doFetch()
   }, [doFetch])
 
   return { data, isWsConnected, lastWsMessage, refresh }

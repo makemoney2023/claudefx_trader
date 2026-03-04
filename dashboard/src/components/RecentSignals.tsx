@@ -1,9 +1,8 @@
 'use client'
 
-import { useEffect, useState, useCallback } from 'react'
+import { useState, useCallback } from 'react'
 import { cn } from '@/lib/utils'
-import { useWebSocket } from '@/hooks/useWebSocket'
-import type { WebSocketMessage } from '@/lib/wsTypes'
+import { useWebSocketWithPolling } from '@/hooks/useWebSocketWithPolling'
 import { ArrowUpRight, ArrowDownRight, Minus, AlertTriangle, RefreshCw } from 'lucide-react'
 
 interface Signal {
@@ -21,42 +20,28 @@ interface Signal {
 }
 
 export function RecentSignals() {
-  const [signals, setSignals] = useState<Signal[]>([])
-  const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   
   const apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
-  const { lastMessage, isConnected } = useWebSocket('analysis')
-
-  const fetchSignals = useCallback(async () => {
-    try {
-      setError(null)
-      const response = await fetch(`${apiBase}/api/analysis/signals?limit=10`)
-      if (!response.ok) {
-        throw new Error(`Failed to fetch signals: ${response.status}`)
-      }
-      const data = await response.json()
-      setSignals(data)
-    } catch (err) {
-      console.error('Error fetching signals:', err)
+  const fetchSignals = useCallback(async (): Promise<Signal[]> => {
+    setError(null)
+    const response = await fetch(`${apiBase}/api/analysis/signals?limit=10`)
+    if (!response.ok) {
       setError('Could not fetch signals')
-    } finally {
-      setLoading(false)
+      throw new Error(`Failed to fetch signals: ${response.status}`)
     }
+    return await response.json()
   }, [apiBase])
 
-  useEffect(() => {
-    if (lastMessage && lastMessage.type === 'analysis_update') {
-      fetchSignals()
-    }
-  }, [lastMessage, fetchSignals])
+  const { data: signals, refresh } = useWebSocketWithPolling<Signal[]>({
+    channel: 'analysis',
+    fetchFn: fetchSignals,
+    fastInterval: 30000,
+    slowInterval: 120000,
+  })
 
-  useEffect(() => {
-    fetchSignals()
-    const interval = setInterval(fetchSignals, isConnected ? 120000 : 30000)
-    return () => clearInterval(interval)
-  }, [fetchSignals, isConnected])
+  const loading = signals === null && !error
 
   const getDirectionIcon = (direction: string) => {
     switch (direction) {
@@ -85,7 +70,7 @@ export function RecentSignals() {
       <div className="card-header flex items-center justify-between">
         <h2 className="font-semibold">Recent Signals</h2>
         <button
-          onClick={fetchSignals}
+          onClick={refresh}
           className="p-1 hover:bg-slate-700 rounded transition-colors"
           title="Refresh signals"
         >
@@ -100,13 +85,13 @@ export function RecentSignals() {
             <AlertTriangle className="w-6 h-6 mx-auto mb-2 text-yellow-500" />
             <p>{error}</p>
             <button
-              onClick={fetchSignals}
+              onClick={refresh}
               className="mt-2 text-sm text-blue-400 hover:text-blue-300"
             >
               Retry
             </button>
           </div>
-        ) : signals.length === 0 ? (
+        ) : (signals ?? []).length === 0 ? (
           <div className="p-8 text-center text-slate-400">
             <p>No signals yet</p>
             <p className="text-sm mt-2">
@@ -115,7 +100,7 @@ export function RecentSignals() {
           </div>
         ) : (
           <div className="divide-y divide-slate-700">
-            {signals.map((signal) => (
+            {(signals ?? []).map((signal) => (
               <div key={signal.id} className="p-4 hover:bg-slate-700/30 transition-colors">
                 <div className="flex items-center justify-between mb-2">
                   <div className="flex items-center gap-2">

@@ -2,8 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { Bell, ArrowUpRight, ArrowDownRight, AlertTriangle, Info, TrendingUp, X } from 'lucide-react'
-import { useWebSocket } from '@/hooks/useWebSocket'
-import type { WebSocketMessage } from '@/lib/wsTypes'
+import { useWebSocketWithPolling } from '@/hooks/useWebSocketWithPolling'
 import { cn } from '@/lib/utils'
 
 interface Activity {
@@ -15,11 +14,13 @@ interface Activity {
   details?: Record<string, any>
 }
 
+interface ActivityData {
+  activities: Activity[]
+  recentCount: number
+}
+
 export function NotificationDropdown() {
-  const [activities, setActivities] = useState<Activity[]>([])
-  const [recentCount, setRecentCount] = useState(0)
   const [isOpen, setIsOpen] = useState(false)
-  const [loading, setLoading] = useState(true)
   const dropdownRef = useRef<HTMLDivElement>(null)
 
   // Close dropdown when clicking outside
@@ -36,42 +37,28 @@ export function NotificationDropdown() {
 
   const apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
-  const { lastMessage, isConnected } = useWebSocket('activity')
+  const fetchActivities = useCallback(async (): Promise<ActivityData> => {
+    const [activitiesRes, countRes] = await Promise.all([
+      fetch(`${apiBase}/api/activities?limit=20`),
+      fetch(`${apiBase}/api/activities/count`)
+    ])
 
-  const fetchActivities = useCallback(async () => {
-    try {
-      const [activitiesRes, countRes] = await Promise.all([
-        fetch(`${apiBase}/api/activities?limit=20`),
-        fetch(`${apiBase}/api/activities/count`)
-      ])
-      
-      if (activitiesRes.ok) {
-        const activitiesData = await activitiesRes.json()
-        setActivities(activitiesData)
-      }
-      
-      if (countRes.ok) {
-        const countData = await countRes.json()
-        setRecentCount(countData.recent_count)
-      }
-    } catch (error) {
-      console.error('Error fetching activities:', error)
-    } finally {
-      setLoading(false)
-    }
+    const activities = activitiesRes.ok ? await activitiesRes.json() : []
+    const countData = countRes.ok ? await countRes.json() : { recent_count: 0 }
+
+    return { activities, recentCount: countData.recent_count }
   }, [apiBase])
 
-  useEffect(() => {
-    if (lastMessage && lastMessage.type === 'activity') {
-      fetchActivities()
-    }
-  }, [lastMessage, fetchActivities])
+  const { data: activityData, refresh } = useWebSocketWithPolling<ActivityData>({
+    channel: 'activity',
+    fetchFn: fetchActivities,
+    fastInterval: 10000,
+    slowInterval: 60000,
+  })
 
-  useEffect(() => {
-    fetchActivities()
-    const interval = setInterval(fetchActivities, isConnected ? 60000 : 10000)
-    return () => clearInterval(interval)
-  }, [fetchActivities, isConnected])
+  const activities = activityData?.activities ?? []
+  const recentCount = activityData?.recentCount ?? 0
+  const loading = activityData === null
 
   const getIcon = (type: string) => {
     switch (type) {
@@ -209,7 +196,7 @@ export function NotificationDropdown() {
           {activities.length > 0 && (
             <div className="p-2 border-t border-slate-700 text-center">
               <button
-                onClick={fetchActivities}
+                onClick={refresh}
                 className="text-sm text-blue-400 hover:text-blue-300 transition-colors"
               >
                 Refresh

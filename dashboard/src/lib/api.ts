@@ -13,7 +13,7 @@ interface FetchOptions extends RequestInit {
 }
 
 // API key for protected endpoints - loaded from environment or localStorage
-function getApiKey(): string {
+export function getApiKey(): string {
   if (typeof window !== 'undefined') {
     return localStorage.getItem('bot_api_key') || process.env.NEXT_PUBLIC_BOT_API_KEY || ''
   }

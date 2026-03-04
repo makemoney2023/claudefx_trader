@@ -1155,6 +1155,8 @@ class TradingBot:
                     logger.warning(f"📰 NEWS BLACKOUT: {reason} - skipping new forex trades")
                     if bot_state:
                         bot_state.error(None, f"News blackout: {reason}")
+                    from .api.routes.activity import add_activity
+                    add_activity("news_blackout", f"News blackout active: {reason}", details={"reason": reason})
                     # During news blackout, only allow crypto (unaffected by forex news)
                     cycle_symbols = [s for s in cycle_symbols if s in self.CRYPTO_SYMBOLS]
                     if not cycle_symbols:
@@ -1322,6 +1324,8 @@ class TradingBot:
                     logger.info(f"[LOSS-COOLDOWN] {symbol}: Skipping — {remaining:.0f}min cooldown remaining")
                     if bot_state:
                         bot_state.symbol_complete(symbol, "loss_cooldown")
+                    from .api.routes.activity import add_activity
+                    add_activity("symbol_cooldown_skip", f"{symbol}: Skipped — {remaining:.0f}min loss cooldown remaining", symbol=symbol, details={"remaining_minutes": round(remaining)})
                     return
                 else:
                     # Cooldown expired — flag this symbol for higher confidence bar
@@ -7438,6 +7442,8 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                     f"(cooldown until {cooldown_until.strftime('%H:%M:%S')})",
                     flush=True
                 )
+                from .api.routes.activity import add_activity
+                add_activity("loss_cooldown_set", f"{position.symbol}: {_cooldown_min}-min cooldown set after loss", symbol=position.symbol, details={"cooldown_minutes": _cooldown_min, "until": cooldown_until.isoformat()})
             
             # Add to activity feed
             from .api.routes.activity import add_activity
@@ -7718,6 +7724,8 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                         f"({minutes_since:.0f}m since last reversal attempt)",
                         flush=True
                     )
+                    from .api.routes.activity import add_activity
+                    add_activity("reversal_cooldown_skip", f"{symbol}: Skipped — reversal cooldown ({minutes_since:.0f}m < 60m)", symbol=symbol, details={"minutes_since": round(minutes_since)})
                     return
             
             # ---- Safeguard 2: No existing position for this symbol ----

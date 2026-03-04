@@ -1,7 +1,7 @@
 'use client'
 
 import { useRef, useState, useEffect, useCallback } from 'react'
-import { createWebSocket } from '../lib/api'
+import { createWebSocket, getApiKey } from '../lib/api'
 import type { WebSocketMessage } from '../lib/wsTypes'
 
 interface UseWebSocketOptions {
@@ -51,7 +51,7 @@ export function useWebSocket(channel: string, options: UseWebSocketOptions = {})
       wsRef.current = null
     }
 
-    const ws = createWebSocket(channel)
+    const ws = createWebSocket(channel, getApiKey())
     wsRef.current = ws
 
     ws.onopen = () => {

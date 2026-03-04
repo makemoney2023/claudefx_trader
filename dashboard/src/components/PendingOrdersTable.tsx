@@ -1,9 +1,8 @@
 'use client'
 
-import { useEffect, useState, useCallback } from 'react'
+import { useState, useCallback } from 'react'
 import { api, PendingOrder, OrderResult } from '@/lib/api'
-import { useWebSocket } from '@/hooks/useWebSocket'
-import type { WebSocketMessage } from '@/lib/wsTypes'
+import { useWebSocketWithPolling } from '@/hooks/useWebSocketWithPolling'
 import { cn } from '@/lib/utils'
 import {
   Clock,
@@ -29,43 +28,28 @@ export function PendingOrdersTable({
   showTitle = true,
   maxOrders 
 }: PendingOrdersTableProps) {
-  const [orders, setOrders] = useState<PendingOrder[]>([])
-  const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [actionMessage, setActionMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
 
-  const { lastMessage, isConnected } = useWebSocket('trades')
-
-  const fetchOrders = useCallback(async () => {
-    try {
-      const data = await api.getPendingOrders()
-      // Ensure data is always an array
-      const ordersArray = Array.isArray(data) ? data : (data?.orders || [])
-      setOrders(maxOrders ? ordersArray.slice(0, maxOrders) : ordersArray)
-    } catch (error) {
-      console.error('Error fetching pending orders:', error)
-      setOrders([]) // Reset to empty array on error
-    } finally {
-      setLoading(false)
-    }
+  const fetchOrders = useCallback(async (): Promise<PendingOrder[]> => {
+    const data = await api.getPendingOrders()
+    const ordersArray = Array.isArray(data) ? data : (data?.orders || [])
+    return maxOrders ? ordersArray.slice(0, maxOrders) : ordersArray
   }, [maxOrders])
 
-  useEffect(() => {
-    fetchOrders()
-    const interval = setInterval(fetchOrders, isConnected ? 60000 : 10000)
-    return () => clearInterval(interval)
-  }, [fetchOrders, isConnected])
+  const { data: ordersData, refresh } = useWebSocketWithPolling<PendingOrder[]>({
+    channel: 'trades',
+    fetchFn: fetchOrders,
+    fastInterval: 10000,
+    slowInterval: 60000,
+  })
 
-  useEffect(() => {
-    if (!lastMessage || lastMessage.type !== 'trade_update') return
-    if (lastMessage.data.event?.includes('pending_order')) {
-      fetchOrders()
-    }
-  }, [lastMessage, fetchOrders])
+  const orders = ordersData ?? []
+  const loading = ordersData === null
 
   const handleRefresh = async () => {
     setRefreshing(true)
-    await fetchOrders()
+    await refresh()
     setRefreshing(false)
   }
 
@@ -78,7 +62,7 @@ export function PendingOrdersTable({
         type: result.success ? 'success' : 'error',
         text: result.message,
       })
-      await fetchOrders()
+      refresh()
     } catch (error) {
       setActionMessage({ type: 'error', text: `Failed to cancel order ${ticket}` })
     }

@@ -19,12 +19,14 @@ MetaTrader 5 (execution)
   ├── 10 Services (risk, learning, scaling, news, intelligence)
   ├── Execution Engine (orders, positions, trailing, multi-TP)
   ├── Backtesting Suite (standard, AI replay, walk-forward)
-  └── SQLite Database (9 tables, WAL mode)
+  ├── SQLite Database (9 tables, WAL mode)
+  └── WebSocket Server (5 channels, real-time push)
        |
   Next.js 14 Dashboard (TypeScript, Tailwind)
   ├── 17 Pages (monitoring, analytics, config)
   ├── 12 Components (charts, signals, intelligence)
-  └── 30+ API Endpoints across 18 route groups
+  ├── 30+ API Endpoints across 18 route groups
+  └── WebSocket Client (auto-reconnect, adaptive polling)
 ```
 
 ---
@@ -127,12 +129,13 @@ This is not a prototype. The system includes:
 
 - **Database**: SQLite with WAL mode for concurrent reads, automatic pre-migration backups, schema migrations for forward compatibility
 - **Reliability**: Single-instance file locking, graceful shutdown handlers (SIGINT/SIGTERM), async event loop with separate position management and trading cycles
-- **Security**: API key authentication, CORS configuration, rate limiting (slowapi)
+- **Security**: API key authentication (REST + WebSocket), CORS configuration, rate limiting (slowapi)
+- **Real-time communication**: WebSocket server with 5 channels (trades, prices, analysis, activity, all), broadcasting 30+ event types from trade lifecycle, signal generation, and bot state changes. Frontend hooks with auto-reconnect, exponential backoff, and ping/pong keepalive
 - **Notifications**: Telegram bot integration for trade alerts, errors, and status updates
 - **State persistence**: Full bot state serialized to JSON for crash recovery (streaks, scaling mode, signal hashes, pending orders, goal tracker snapshots)
-- **Testing**: 33 test modules covering critical paths, edge protection, live readiness, learning system integration, and individual analysis modules
+- **Testing**: 36 test modules covering critical paths, edge protection, live readiness, learning system integration, WebSocket infrastructure, and individual analysis modules
 - **Duplicate prevention**: Signal hashing prevents the same setup from being traded twice
-- **Cooldowns**: Post-loss cooldown (30 min) and per-symbol analysis cooldown (5 min) prevent revenge trading and API waste
+- **Cooldowns**: Post-loss cooldown (15-30 min) and per-symbol analysis cooldown (5 min) prevent revenge trading and API waste
 
 ---
 
@@ -176,9 +179,27 @@ The dashboard is a 17-page, dark-themed trading control center built with Next.j
 | **PendingOrdersTable** | Active pending orders with expiration countdown and cancel action |
 | **NotificationDropdown** | Activity feed of trades, signals, and system events |
 
-### Real-Time Monitoring
+### Real-Time Communication
 
-All data refreshes automatically via polling at intervals tuned to each data type's volatility: positions every 5 seconds, bot logs every 3 seconds, equity and intelligence every 60 seconds. WebSocket infrastructure is in place for future upgrade to push-based updates.
+The dashboard receives real-time updates through a **hybrid WebSocket + adaptive polling** architecture:
+
+**WebSocket Layer (5 channels):**
+
+| Channel | Events Pushed |
+|---------|--------------|
+| **trades** | Trade opened/closed, pending order placed/filled/cancelled, position management actions (TP hits, trailing stop moves, protection closes) |
+| **prices** | Live bid/ask streaming every 2 seconds for symbols with open positions |
+| **analysis** | New signal generated, AI analysis complete |
+| **activity** | 30+ bot events: mode changes, news blackouts, cooldowns, edge health shifts, tier promotions/demotions, symbol blocks |
+| **all** | Aggregated feed of all channels |
+
+**Frontend Hooks:**
+
+- `useWebSocket`: Core hook with auto-reconnect (exponential backoff up to 30s), ping/pong keepalive, API key authentication, and typed message parsing
+- `useWebSocketWithPolling`: Hybrid hook that combines WebSocket events with adaptive polling -- slow intervals (60-120s) when connected, fast fallback (3-30s) when disconnected, with immediate debounced re-fetches on relevant WebSocket messages
+- Connection status indicator in the Header shows live WebSocket connectivity
+
+**Resilience:** If the WebSocket connection drops, components automatically fall back to fast polling and re-synchronize state on reconnect. No data is lost -- WebSocket accelerates delivery, polling guarantees eventual consistency.
 
 ---
 
@@ -218,10 +239,11 @@ Every symbol has defined contract size, pip size, pip value, minimum SL distance
 | ICT strategy documents | 21 |
 | Backend services | 10 |
 | API route groups | 18 |
+| WebSocket channels | 5 |
 | Database tables | 9 |
 | Dashboard pages | 17 |
 | Dashboard components | 12 |
-| Test modules | 33 |
+| Test modules | 36 |
 | Python dependencies | 20+ |
 
 ---
