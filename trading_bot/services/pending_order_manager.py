@@ -117,6 +117,10 @@ class PendingOrderManager:
         
         # History of completed orders
         self.order_history: List[PendingOrder] = []
+
+        # Maps position ticket -> original order ticket for filled pending orders.
+        # Consumed by position_manager to set order_ticket on Position objects.
+        self.filled_order_map: Dict[int, int] = {}
         
         logger.info("PendingOrderManager initialized")
     
@@ -361,6 +365,9 @@ class PendingOrderManager:
                     for p in mt5_positions:
                         if p.symbol == order.symbol:
                             order.fill_price = p.price_open
+                            pos_ticket = getattr(p, 'ticket', None)
+                            if pos_ticket and pos_ticket != ticket:
+                                self.filled_order_map[pos_ticket] = ticket
                             break
                     
                     filled.append(ticket)
@@ -568,6 +575,10 @@ class PendingOrderManager:
                 )
                 
         except Exception as e:
+            try:
+                await session.rollback()
+            except Exception:
+                pass
             logger.error(
                 f"Error updating trade DB for filled-then-closed order {ticket}: {e}"
             )

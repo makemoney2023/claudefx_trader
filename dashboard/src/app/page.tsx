@@ -8,6 +8,7 @@ import { SessionStatus } from '@/components/SessionStatus'
 import { RecentSignals } from '@/components/RecentSignals'
 import { MarketIntelligence } from '@/components/MarketIntelligence'
 import { PendingOrdersTable } from '@/components/PendingOrdersTable'
+import { EdgeHealthCard } from '@/components/EdgeHealthCard'
 import { api, ScalingStatus, GoalProgress, CurrentSessionResponse } from '@/lib/api'
 import { Scale, Target, Clock, TrendingUp, DollarSign } from 'lucide-react'
 
@@ -136,8 +137,9 @@ export default function Dashboard() {
         />
       </div>
 
-      {/* Enhanced Status Row - Profit Target, Scaling, Goal, Session */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+      {/* Edge Health + Enhanced Status Row */}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
+        <EdgeHealthCard />
         {/* Daily Profit Target */}
         <div className="bg-slate-800 rounded-lg border border-slate-700 p-4">
           <div className="flex items-center gap-2 mb-3">

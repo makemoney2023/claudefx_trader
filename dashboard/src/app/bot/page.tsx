@@ -1,7 +1,9 @@
 'use client'
 
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useState, useRef, useCallback } from 'react'
 import { api, BotStatus, BotLog } from '@/lib/api'
+import { useWebSocket } from '@/hooks/useWebSocket'
+import type { WebSocketMessage } from '@/lib/wsTypes'
 import { cn } from '@/lib/utils'
 import { 
   Activity, 
@@ -56,7 +58,9 @@ export default function BotActivityPage() {
   const [filterType, setFilterType] = useState<string>('')
   const logsEndRef = useRef<HTMLDivElement>(null)
 
-  const fetchData = async () => {
+  const { lastMessage, isConnected } = useWebSocket('activity')
+
+  const fetchData = useCallback(async () => {
     try {
       const [statusData, logsData] = await Promise.all([
         api.getBotStatus(),
@@ -69,7 +73,7 @@ export default function BotActivityPage() {
     } finally {
       setLoading(false)
     }
-  }
+  }, [filterType])
 
   const syncSymbols = async () => {
     setSyncing(true)
@@ -119,13 +123,19 @@ export default function BotActivityPage() {
   }
 
   useEffect(() => {
+    if (lastMessage && (lastMessage.type === 'activity' || lastMessage.type === 'trade_update')) {
+      fetchData()
+    }
+  }, [lastMessage, fetchData])
+
+  useEffect(() => {
     fetchData()
     
     if (autoRefresh) {
-      const interval = setInterval(fetchData, 3000) // Refresh every 3 seconds
+      const interval = setInterval(fetchData, isConnected ? 15000 : 3000)
       return () => clearInterval(interval)
     }
-  }, [autoRefresh, filterType])
+  }, [autoRefresh, fetchData, isConnected])
 
   const getLogIcon = (type: string) => {
     switch (type) {

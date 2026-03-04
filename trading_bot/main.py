@@ -56,6 +56,7 @@ from .utils.notifications import notify, NotificationType, get_notifier
 from .utils.state_persistence import save_full_state, load_full_state, get_persistence
 from .utils.market_hours import is_market_open, should_avoid_new_trades, get_next_market_open
 from .utils.instance_lock import ensure_single_instance, release_instance_lock
+from .api.websocket import broadcast_trade_update, broadcast_analysis_update
 
 # Import bot state for activity tracking
 try:
@@ -109,13 +110,13 @@ async def save_trade_to_db(
         async with async_session() as session:
             trade = TradeModel(
                 trade_id=str(ticket),
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(timezone.utc),
                 symbol=symbol,
                 direction=direction,
                 timeframe=timeframe,
                 session=session_name,
                 entry_price=entry_price,
-                entry_time=datetime.utcnow(),
+                entry_time=datetime.now(timezone.utc),
                 entry_reason=reasoning[:1000] if reasoning else f"ICT Signal - Confidence: {confidence:.0%}",
                 stop_loss=stop_loss,
                 take_profit=take_profit,
@@ -141,6 +142,10 @@ async def save_trade_to_db(
             await session.commit()
             logger.info(f"Trade {ticket} saved to database (judge={judge_verdict}, type={trade_type}, confluence={confluence_count})")
     except Exception as e:
+        try:
+            await session.rollback()
+        except Exception:
+            pass
         logger.error(f"Failed to save trade to database: {e}")
 
 
@@ -170,7 +175,7 @@ async def save_signal_to_db(
     try:
         async with async_session() as session:
             log = AnalysisLogModel(
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(timezone.utc),
                 symbol=symbol,
                 timeframe="M15",
                 session="",
@@ -196,6 +201,10 @@ async def save_signal_to_db(
             await session.commit()
             logger.debug(f"Signal logged to DB: {symbol} {direction} — judge={judge_verdict}")
     except Exception as e:
+        try:
+            await session.rollback()
+        except Exception:
+            pass
         logger.warning(f"Failed to save signal to analysis_logs: {e}")
 
 
@@ -258,7 +267,7 @@ class TradingBot:
         # Track daily statistics
         self.daily_trades = 0
         self.daily_pnl = 0.0
-        self.last_reset_date = datetime.now().date()
+        self.last_reset_date = datetime.now(timezone.utc).date()
         
         # Gap 20: Thread-safe trade execution
         self._trade_lock = asyncio.Lock()
@@ -527,6 +536,8 @@ class TradingBot:
             from .services.scaling_manager import TradingMode
             self.scaling_manager.current_mode = TradingMode.AGGRESSIVE
             logger.info("Scaling mode set to AGGRESSIVE (demo data collection)")
+            from .api.routes.activity import add_activity
+            add_activity("mode_change", "Trading mode set to AGGRESSIVE (init)", details={"mode": "AGGRESSIVE", "reason": "demo data collection"})
             
             # Session Analytics - track performance by session
             logger.info("Initializing session analytics...")
@@ -830,6 +841,8 @@ class TradingBot:
                             None,
                             action
                         )
+                    if actions:
+                        asyncio.create_task(broadcast_trade_update({"event": "position_actions", "actions": actions}))
                     
                     # Check for high volatility
                     try:
@@ -1102,23 +1115,34 @@ class TradingBot:
             self._day_of_week_mode_locked = False  # Reset each cycle
             if _weekday == 0:  # Monday - manipulation day
                 if self.scaling_manager:
+                    _prev_mode = self.scaling_manager.current_mode
                     self.scaling_manager.current_mode = TradingMode.CONSERVATIVE
                     self._day_of_week_mode_locked = True
                     logger.info("Monday: CONSERVATIVE mode (manipulation day, A+ setups only)")
+                    if self.scaling_manager.current_mode != _prev_mode:
+                        from .api.routes.activity import add_activity
+                        add_activity("mode_change", f"Trading mode changed to CONSERVATIVE (Monday manipulation day)", details={"mode": "CONSERVATIVE", "previous": _prev_mode.value, "reason": "monday"})
             elif _weekday == 4:  # Friday - profit-taking day
                 if self.scaling_manager:
+                    _prev_mode = self.scaling_manager.current_mode
                     self.scaling_manager.current_mode = TradingMode.CONSERVATIVE
                     self._day_of_week_mode_locked = True
                     logger.info("Friday: CONSERVATIVE mode (profit-taking day)")
+                    if self.scaling_manager.current_mode != _prev_mode:
+                        from .api.routes.activity import add_activity
+                        add_activity("mode_change", f"Trading mode changed to CONSERVATIVE (Friday profit-taking day)", details={"mode": "CONSERVATIVE", "previous": _prev_mode.value, "reason": "friday"})
             else:
                 # Tuesday-Thursday and weekends (crypto trading) - use normal mode determination
                 if self.scaling_manager:
                     try:
                         account = await self.mt5_client.get_account_info()
                         if account:
-                            # Use balance (realized P/L) not equity for mode determination
+                            _prev_mode = self.scaling_manager.current_mode
                             mode = self.scaling_manager.determine_mode(account.balance)
                             self.scaling_manager.current_mode = mode
+                            if self.scaling_manager.current_mode != _prev_mode:
+                                from .api.routes.activity import add_activity
+                                add_activity("mode_change", f"Trading mode changed to {mode.value}", details={"mode": mode.value, "previous": _prev_mode.value, "reason": "performance_based"})
                     except Exception as e:
                         logger.warning(f"Scaling manager mode determination failed: {e}")
             
@@ -2511,6 +2535,15 @@ class TradingBot:
             
             # Save signal to the signals store (for dashboard display)
             self._save_signal(symbol, trade_signal, analysis_results)
+            asyncio.create_task(broadcast_analysis_update(symbol, {
+                "direction": trade_signal.direction,
+                "confidence": trade_signal.confidence,
+                "rr_ratio": trade_signal.risk_reward,
+                "entry_price": trade_signal.entry_price,
+                "stop_loss": trade_signal.stop_loss,
+                "take_profit": trade_signal.take_profit,
+                "market_structure": trade_signal.market_structure
+            }))
             
             # Add signal to activity feed
             from .api.routes.activity import add_activity
@@ -2850,6 +2883,137 @@ class TradingBot:
                     return
             
             # ============================================
+            # ZONE-AWARE DIRECTION GATE (ALL TRADE TYPES)
+            # ICT principle: sell from premium, buy from discount.
+            # Uses PremiumDiscountAnalyzer when available,
+            # falls back to legacy D1 bias gate otherwise.
+            # ============================================
+            _regime_data = market_data.get('regime', {}) if market_data else {}
+            _regime_type = _regime_data.get('regime', '').lower() if isinstance(_regime_data, dict) else ''
+
+            _zone_gate_mode = settings.trading.zone_gate_mode
+            _use_zone_gate_live = (
+                pd_analysis is not None
+                and _zone_gate_mode in ('active', 'shadow')
+                and symbol not in settings.trading.zone_gate_disabled_symbols
+                and not _is_counter_trend_scalp
+            )
+
+            if _use_zone_gate_live:
+                _zone_str = pd_analysis.current_zone.value
+                _retrace = pd_analysis.retracement_percent
+                _zone_aligned = (
+                    (_dir == 'short' and _retrace >= 0.5)
+                    or (_dir == 'long' and _retrace <= 0.5)
+                )
+                _zone_misaligned = (
+                    (_dir == 'long' and _retrace >= 0.618)
+                    or (_dir == 'short' and _retrace <= 0.382)
+                )
+
+                _zone_blocked = False
+                if _zone_misaligned:
+                    _zm_conf = settings.trading.zone_misaligned_min_confidence
+                    _zm_rr = settings.trading.zone_misaligned_min_rr
+                    if trade_signal.confidence < _zm_conf or actual_rr < _zm_rr:
+                        _zone_blocked = True
+                        _block_reason = (
+                            f"[ZONE-GATE] {symbol}: {_dir.upper()} from {_zone_str} "
+                            f"(retrace={_retrace:.0%}). conf={trade_signal.confidence:.0%} "
+                            f"(need {_zm_conf:.0%}), RR={actual_rr:.1f} (need {_zm_rr:.0f}:1). Rejected."
+                        )
+                elif not _zone_aligned:
+                    _eq_conf = settings.trading.zone_equilibrium_min_confidence
+                    if trade_signal.confidence < _eq_conf:
+                        _zone_blocked = True
+                        _block_reason = (
+                            f"[ZONE-GATE] {symbol}: {_dir.upper()} from {_zone_str} "
+                            f"(equilibrium). conf={trade_signal.confidence:.0%} "
+                            f"(need {_eq_conf:.0%}). Rejected."
+                        )
+
+                if _zone_blocked and _zone_gate_mode == 'shadow':
+                    logger.info(f"[ZONE-GATE-SHADOW] Would block: {_block_reason}")
+                    _zone_blocked = False
+
+                if _zone_blocked:
+                    logger.warning(_block_reason)
+                    print(_block_reason, flush=True)
+                    return
+                elif _zone_aligned:
+                    logger.info(
+                        f"[ZONE-GATE] {symbol}: {_dir.upper()} zone-aligned in {_zone_str} "
+                        f"(retrace={_retrace:.0%}) — allowed"
+                    )
+
+            elif not _is_counter_trend_scalp:
+                # Legacy D1 direction gate fallback
+                _is_counter_d1 = (
+                    _d1_bias in ('bullish', 'bearish')
+                    and (
+                        (_d1_bias == 'bullish' and _dir == 'short')
+                        or (_d1_bias == 'bearish' and _dir == 'long')
+                    )
+                )
+                if _is_counter_d1:
+                    _ct_min_conf = 0.70
+                    _ct_min_rr = 3.0
+                    if trade_signal.confidence < _ct_min_conf or actual_rr < _ct_min_rr:
+                        logger.warning(
+                            f"[DIRECTION-GATE] {symbol}: {_dir.upper()} opposes D1 bias "
+                            f"({_d1_bias}). Confidence {trade_signal.confidence:.0%} "
+                            f"(need {_ct_min_conf:.0%}), R:R {actual_rr:.2f} "
+                            f"(need {_ct_min_rr:.1f}). Rejected."
+                        )
+                        print(
+                            f"[DIRECTION-GATE] {symbol}: {_dir.upper()} vs D1 {_d1_bias}. "
+                            f"Need {_ct_min_conf:.0%} conf + {_ct_min_rr:.0f}:1 RR for counter-trend. "
+                            f"Got {trade_signal.confidence:.0%} / {actual_rr:.1f}:1. Skipping.",
+                            flush=True
+                        )
+                        return
+                    else:
+                        logger.info(
+                            f"[DIRECTION-GATE] {symbol}: Counter-D1 {_dir.upper()} ALLOWED "
+                            f"— high conf ({trade_signal.confidence:.0%}) + strong R:R ({actual_rr:.1f}:1)"
+                        )
+
+            if _regime_type == 'volatile_ranging':
+                _vr_min_conf = 0.70
+                if trade_signal.confidence < _vr_min_conf:
+                    logger.warning(
+                        f"[REGIME-GATE] {symbol}: Volatile ranging regime — "
+                        f"confidence {trade_signal.confidence:.0%} below {_vr_min_conf:.0%} minimum. Rejected."
+                    )
+                    print(
+                        f"[REGIME-GATE] {symbol}: VOLATILE RANGING detected. "
+                        f"Need {_vr_min_conf:.0%} confidence, got {trade_signal.confidence:.0%}. Skipping.",
+                        flush=True
+                    )
+                    return
+
+            # ============================================
+            # TIME-OF-DAY PERFORMANCE GATE
+            # Skip historically weak hours unless confidence
+            # is elevated. Based on backtest analysis.
+            # ============================================
+            _current_utc_hour = datetime.now(timezone.utc).hour
+            _weak_hours = settings.trading.weak_hours_by_symbol.get(symbol, [])
+            if _current_utc_hour in _weak_hours:
+                _tod_min_conf = 0.68
+                if trade_signal.confidence < _tod_min_conf:
+                    logger.warning(
+                        f"[TOD-GATE] {symbol}: Hour {_current_utc_hour:02d}:00 UTC is a weak hour. "
+                        f"Confidence {trade_signal.confidence:.0%} below {_tod_min_conf:.0%}. Rejected."
+                    )
+                    print(
+                        f"[TOD-GATE] {symbol}: Weak hour ({_current_utc_hour:02d}:00 UTC). "
+                        f"Need {_tod_min_conf:.0%} confidence, got {trade_signal.confidence:.0%}. Skipping.",
+                        flush=True
+                    )
+                    return
+
+            # ============================================
             # M15 EXECUTION TIMEFRAME STRUCTURE GATE
             # M15 is the execution TF — trading against it means
             # fighting the current price action.
@@ -3153,8 +3317,12 @@ class TradingBot:
                     daily_dd = self.scaling_manager.calculate_daily_drawdown(current_equity)
                     weekly_dd = self.scaling_manager.calculate_weekly_drawdown(current_equity)
                     if weekly_dd >= self.scaling_manager.max_weekly_drawdown or daily_dd >= self.scaling_manager.max_daily_drawdown:
+                        _prev_mode = self.scaling_manager.current_mode
                         self.scaling_manager.current_mode = TradingMode.DEFENSIVE
                         print(f"[SCALING] {symbol}: DEFENSIVE (drawdown override on locked day), equity={current_equity}", flush=True)
+                        if TradingMode.DEFENSIVE != _prev_mode:
+                            from .api.routes.activity import add_activity
+                            add_activity("mode_change", f"Trading mode changed to DEFENSIVE (drawdown override)", details={"mode": "DEFENSIVE", "previous": _prev_mode.value, "reason": "drawdown_override", "daily_dd": f"{daily_dd:.2%}", "weekly_dd": f"{weekly_dd:.2%}"})
                     else:
                         print(f"[SCALING] {symbol}: Mode={self.scaling_manager.current_mode.value} (day-of-week locked), equity={current_equity}", flush=True)
                 else:
@@ -3179,11 +3347,15 @@ class TradingBot:
                         print(f"[SCALING] {symbol}: AGGRESSIVE mode locked (data collection) — skipping Claude mode assessment", flush=True)
                     
                     # Determine current trading mode (uses equity for drawdown watermarks)
+                    _prev_mode = self.scaling_manager.current_mode
                     mode = self.scaling_manager.determine_mode(current_equity, claude_mode)
                     print(f"[SCALING] {symbol}: Mode={mode.value}, equity={current_equity}", flush=True)
                     if mode != self.scaling_manager.current_mode:
                         self.scaling_manager.current_mode = mode
                         logger.info(f"Trading mode changed to: {mode.value}")
+                    if self.scaling_manager.current_mode != _prev_mode:
+                        from .api.routes.activity import add_activity
+                        add_activity("mode_change", f"Trading mode changed to {self.scaling_manager.current_mode.value}", details={"mode": self.scaling_manager.current_mode.value, "previous": _prev_mode.value, "symbol": symbol, "equity": current_equity})
                 
                 # Determine setup grade from confidence
                 if trade_signal.confidence >= 0.85:
@@ -4591,6 +4763,18 @@ class TradingBot:
                                     "confidence": trade_signal.confidence
                                 }
                             )
+                            asyncio.create_task(broadcast_trade_update({
+                                "event": "pending_order_placed",
+                                "ticket": result.ticket,
+                                "symbol": symbol,
+                                "order_type": order_type,
+                                "direction": trade_signal.direction,
+                                "entry_price": entry_price,
+                                "stop_loss": trade_signal.stop_loss,
+                                "take_profit": trade_signal.take_profit,
+                                "lots": position_size.lots,
+                                "confidence": trade_signal.confidence
+                            }))
                             
                             # Save to database with full analysis context
                             await save_trade_to_db(
@@ -4702,6 +4886,17 @@ class TradingBot:
                                     "confidence": trade_signal.confidence
                                 }
                             )
+                            asyncio.create_task(broadcast_trade_update({
+                                "event": "trade_opened",
+                                "ticket": result.ticket,
+                                "symbol": symbol,
+                                "direction": trade_signal.direction,
+                                "entry_price": result.fill_price or current_price,
+                                "stop_loss": trade_signal.stop_loss,
+                                "take_profit": trade_signal.take_profit,
+                                "lots": position_size.lots,
+                                "confidence": trade_signal.confidence
+                            }))
                             
                             # Save trade to database with full analysis context
                             await save_trade_to_db(
@@ -4871,6 +5066,15 @@ class TradingBot:
             # Save signal for dashboard (even in simulation mode)
             trade_signal = claude_result.signal
             self._save_signal(symbol, trade_signal, analysis_results)
+            asyncio.create_task(broadcast_analysis_update(symbol, {
+                "direction": trade_signal.direction,
+                "confidence": trade_signal.confidence,
+                "rr_ratio": trade_signal.risk_reward,
+                "entry_price": trade_signal.entry_price,
+                "stop_loss": trade_signal.stop_loss,
+                "take_profit": trade_signal.take_profit,
+                "market_structure": trade_signal.market_structure
+            }))
             
             logger.info(f"[SIMULATION] Analysis complete for {symbol}: {trade_signal.direction} ({trade_signal.confidence:.0%})")
             
@@ -5520,7 +5724,7 @@ class TradingBot:
                 self._daily_start_balance = account.balance
             
             # Reset daily start balance on new day
-            today = datetime.now().date()
+            today = datetime.now(timezone.utc).date()
             if hasattr(self, '_drawdown_date') and self._drawdown_date != today:
                 self._daily_start_balance = account.balance
                 self._drawdown_date = today
@@ -6303,6 +6507,7 @@ Include brief reasoning.
                                                 open_time=datetime.now(),
                                             )
                                             upgraded_pos.trade_type = 'intraday'
+                                            upgraded_pos.order_ticket = ticket
                                             self.position_manager.add_position(upgraded_pos)
                                         except Exception as pos_err:
                                             logger.warning(f"[PENDING-REEVAL] Could not create Position for upgrade: {pos_err}")
@@ -6622,6 +6827,11 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                         take_profit=mt5_pos.tp,
                         open_time=datetime.now()
                     )
+                    if hasattr(self, 'pending_order_manager') and self.pending_order_manager:
+                        _orig_order = self.pending_order_manager.filled_order_map.get(ticket)
+                        if _orig_order:
+                            position.order_ticket = _orig_order
+                            logger.info(f"  Linked position {ticket} to original order {_orig_order}")
                     self.position_manager.add_position(position)
                     logger.info(f"Added MT5 bot position {ticket} to tracking (comment='{mt5_comment}')")
             
@@ -6638,7 +6848,7 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                     # Clear the flag so future restarts behave normally
                     _persistence.set('skip_mt5_trade_recount', False)
                 else:
-                    today_start = datetime.combine(datetime.now().date(), datetime.min.time())
+                    today_start = datetime.combine(datetime.now(timezone.utc).date(), datetime.min.time())
                     today_deals = await self.mt5_client.get_history(today_start, datetime.now())
                     # Count only entry deals (entry=0 is trade-in) placed by THIS bot (magic=12345)
                     entry_deals = [
@@ -6813,8 +7023,14 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                                 )
                             )
                             if _needs_update:
+                                _exit_dt = close_time if isinstance(close_time, datetime) else datetime.now(timezone.utc)
+                                _open_dt = getattr(trade, 'entry_time', None) or getattr(trade, 'timestamp', None)
+                                if _open_dt and isinstance(_open_dt, datetime) and _exit_dt < _open_dt:
+                                    logger.warning(f"[SYNC] Trade {trade_id}: close_time ({_exit_dt}) < open_time ({_open_dt}), adjusting")
+                                    _exit_dt = datetime.now(timezone.utc)
+
                                 trade.exit_price = price
-                                trade.exit_time = close_time if isinstance(close_time, datetime) else datetime.now()
+                                trade.exit_time = _exit_dt
                                 trade.profit_loss = total_pnl
                                 trade.pnl_source = "mt5"
                                 trade.exit_reason = "Closed on MT5 (TP/SL/manual)"
@@ -6824,6 +7040,10 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                                 print(f"[SYNC] Updated trade {trade_id} ({open_trade_tickets[trade_id]['symbol']}): P/L=${total_pnl:.2f}", flush=True)
                                 logger.info(f"Updated trade {trade_id} with MT5 close data: P/L=${total_pnl:.2f}")
                     except Exception as e:
+                        try:
+                            await session.rollback()
+                        except Exception:
+                            pass
                         logger.warning(f"Could not update trade {trade_id}: {e}")
             
             # ── STEP 2: Detect pending orders that no longer exist on MT5 ──
@@ -6892,9 +7112,15 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                                     select(TradeModel).where(TradeModel.trade_id == trade_id)
                                 )
                                 trade = result.scalar_one_or_none()
-                                if trade and (trade.exit_price is None or trade.exit_price == 0 or
-                                              (trade.profit_loss == 0 and trade.exit_price == trade.entry_price)):
-                                    
+                                _needs_fix = (
+                                    trade and (
+                                        trade.exit_price is None or
+                                        trade.exit_price == 0 or
+                                        (trade.profit_loss == 0 and trade.exit_price == trade.entry_price) or
+                                        getattr(trade, 'pnl_source', None) in (None, 'fallback')
+                                    )
+                                )
+                                if _needs_fix:
                                     if opening_deal and closing_deal:
                                         # Order was FILLED then CLOSED -- record real P/L
                                         fill_price = opening_deal.get('price', trade.entry_price)
@@ -6909,6 +7135,7 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                                         trade.entry_price = fill_price
                                         trade.exit_price = close_price
                                         trade.profit_loss = total_pnl
+                                        trade.pnl_source = "mt5"
                                         trade.exit_time = close_time if isinstance(close_time, datetime) else datetime.now()
                                         trade.exit_reason = "SL/TP hit (filled-then-closed, detected via trade sync)"
                                         await session.commit()
@@ -6922,13 +7149,17 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                                     else:
                                         # Truly cancelled -- no fill deal found
                                         trade.exit_price = trade.entry_price
-                                        trade.exit_time = datetime.utcnow()
+                                        trade.exit_time = datetime.now(timezone.utc)
                                         trade.profit_loss = 0.0
                                         trade.exit_reason = "Cancelled/deleted (not found on MT5)"
                                         await session.commit()
                                         cancelled_count += 1
                                         print(f"[SYNC] Marked trade {trade_id} ({symbol}) as cancelled (not on MT5)", flush=True)
                         except Exception as e:
+                            try:
+                                await session.rollback()
+                            except Exception:
+                                pass
                             logger.warning(f"Could not process trade {trade_id}: {e}")
                 
                 if cancelled_count > 0:
@@ -6997,9 +7228,9 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
             
             if hasattr(self, 'mt5_client') and self.mt5_client and not self.mt5_client.is_simulation:
                 try:
-                    # Wide window (24h back) to avoid timezone mismatch between local and broker time
+                    # Wide window (7 days back) so trades that closed while the bot was offline are found
                     history = await self.mt5_client.get_history(
-                        close_time - timedelta(hours=24), close_time + timedelta(hours=1)
+                        close_time - timedelta(days=7), close_time + timedelta(hours=1)
                     )
                     print(f"[CLOSE] {position.symbol}: Searching {len(history)} deals for ticket #{position.ticket}...", flush=True)
                     total_profit = 0.0
@@ -7007,10 +7238,13 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                     total_swap = 0.0
                     close_deal_count = 0
                     _last_deal_time = None
+                    _order_tkt = getattr(position, 'order_ticket', None)
                     for deal in history:
                         _matches_ticket = (
                             deal.get('position_id') == position.ticket
                             or deal.get('order') == position.ticket
+                            or (_order_tkt and deal.get('position_id') == _order_tkt)
+                            or (_order_tkt and deal.get('order') == _order_tkt)
                         )
                         if _matches_ticket and deal.get('entry') == 1:
                             actual_close_price = deal.get('price', position.current_price)
@@ -7110,14 +7344,62 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                             )
                         )
                         trade_record = result.scalar_one_or_none()
+
+                        if not trade_record:
+                            _fallback_ticket = getattr(position, 'order_ticket', None)
+                            if _fallback_ticket:
+                                result2 = await db_sess.execute(
+                                    select(TradeModel).where(
+                                        TradeModel.trade_id == str(_fallback_ticket)
+                                    )
+                                )
+                                trade_record = result2.scalar_one_or_none()
+                                if trade_record:
+                                    logger.info(
+                                        f"[CLOSE] {position.symbol}: Found DB record via "
+                                        f"order_ticket={_fallback_ticket} (position ticket={position.ticket})"
+                                    )
+
+                        if not trade_record:
+                            try:
+                                history = await self.mt5_client.get_history(
+                                    datetime.now() - timedelta(days=7), datetime.now()
+                                )
+                                for deal in history:
+                                    if deal.get('position_id') == position.ticket and deal.get('entry') == 0:
+                                        _orig_order = str(deal.get('order', 0))
+                                        if _orig_order != '0' and _orig_order != str(position.ticket):
+                                            result3 = await db_sess.execute(
+                                                select(TradeModel).where(
+                                                    TradeModel.trade_id == _orig_order
+                                                )
+                                            )
+                                            trade_record = result3.scalar_one_or_none()
+                                            if trade_record:
+                                                logger.info(
+                                                    f"[CLOSE] {position.symbol}: Found DB record via "
+                                                    f"deal history order={_orig_order} (position ticket={position.ticket})"
+                                                )
+                                        break
+                            except Exception as _hist_err:
+                                logger.debug(f"Deal history fallback failed: {_hist_err}")
+
                         if trade_record:
+                            _open_time = getattr(trade_record, 'entry_time', None) or getattr(trade_record, 'timestamp', None)
+                            if _open_time and close_time and isinstance(_open_time, datetime) and isinstance(close_time, datetime):
+                                if close_time < _open_time:
+                                    logger.warning(
+                                        f"[CLOSE] {position.symbol}: close_time ({close_time}) < open_time ({_open_time}) — "
+                                        f"adjusting close_time to now"
+                                    )
+                                    close_time = datetime.now(timezone.utc)
+
                             trade_record.exit_price = actual_close_price
                             trade_record.exit_time = close_time
                             trade_record.exit_reason = getattr(position, 'close_reason', 'position_closed')
                             trade_record.profit_loss = profit_loss
                             trade_record.profit_loss_pips = pips
                             trade_record.pnl_source = "mt5" if mt5_profit_found else "fallback"
-                            # R-multiple
                             if position.stop_loss and position.entry_price:
                                 risk_pips = abs(position.entry_price - position.stop_loss) / pip_size
                                 if risk_pips > 0:
@@ -7127,6 +7409,10 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                         else:
                             print(f"[CLOSE] {position.symbol}: No DB record found for ticket {position.ticket}", flush=True)
                 except Exception as e:
+                    try:
+                        await db_sess.rollback()
+                    except Exception:
+                        pass
                     logger.warning(f"Could not update trade in database: {e}")
             
             # Update daily P&L tracker
@@ -7170,6 +7456,17 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                     "r_multiple": position.current_r_multiple
                 }
             )
+            asyncio.create_task(broadcast_trade_update({
+                "event": "trade_closed",
+                "ticket": position.ticket,
+                "symbol": position.symbol,
+                "direction": position.direction,
+                "entry_price": position.entry_price,
+                "exit_price": actual_close_price,
+                "profit_loss": profit_loss,
+                "pips": pips,
+                "r_multiple": position.current_r_multiple
+            }))
             
             # Dynamic learning update: refresh trading_learnings.md after each close
             # Throttled to at most once per hour to avoid excessive disk writes
@@ -7810,8 +8107,12 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                                 db_sess.add(trade_record)
                                 await db_sess.commit()
                         except Exception as e:
+                            try:
+                                await db_sess.rollback()
+                            except Exception:
+                                pass
                             logger.warning(f"[REVERSAL] DB store error: {e}")
-                    
+
                     # Telegram notification
                     try:
                         from .notifications import notify, NotificationType
@@ -7911,10 +8212,16 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
     
     async def _check_daily_reset(self):
         """Check and reset daily counters if new day."""
-        today = datetime.now().date()
+        today = datetime.now(timezone.utc).date()
         if today != self.last_reset_date:
             logger.info("New trading day - resetting daily counters")
-            
+
+            try:
+                from trading_bot.api.database import backup_database
+                backup_database()
+            except Exception as _bk_err:
+                logger.warning(f"Daily DB backup failed: {_bk_err}")
+
             # Send daily summary for previous day before reset
             if self.daily_trades > 0 or self.daily_pnl != 0:
                 await self._send_daily_summary()
@@ -8079,7 +8386,7 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
         # Uptime
         uptime = "N/A"
         if self.last_reset_date:
-            delta = datetime.now().date() - self.last_reset_date
+            delta = datetime.now(timezone.utc).date() - self.last_reset_date
             if delta.days > 0:
                 uptime = f"{delta.days}d"
             else:

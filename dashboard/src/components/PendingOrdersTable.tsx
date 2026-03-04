@@ -2,6 +2,8 @@
 
 import { useEffect, useState, useCallback } from 'react'
 import { api, PendingOrder, OrderResult } from '@/lib/api'
+import { useWebSocket } from '@/hooks/useWebSocket'
+import type { WebSocketMessage } from '@/lib/wsTypes'
 import { cn } from '@/lib/utils'
 import {
   Clock,
@@ -32,6 +34,8 @@ export function PendingOrdersTable({
   const [refreshing, setRefreshing] = useState(false)
   const [actionMessage, setActionMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
 
+  const { lastMessage, isConnected } = useWebSocket('trades')
+
   const fetchOrders = useCallback(async () => {
     try {
       const data = await api.getPendingOrders()
@@ -48,9 +52,16 @@ export function PendingOrdersTable({
 
   useEffect(() => {
     fetchOrders()
-    const interval = setInterval(fetchOrders, 10000) // Refresh every 10 seconds
+    const interval = setInterval(fetchOrders, isConnected ? 60000 : 10000)
     return () => clearInterval(interval)
-  }, [fetchOrders])
+  }, [fetchOrders, isConnected])
+
+  useEffect(() => {
+    if (!lastMessage || lastMessage.type !== 'trade_update') return
+    if (lastMessage.data.event?.includes('pending_order')) {
+      fetchOrders()
+    }
+  }, [lastMessage, fetchOrders])
 
   const handleRefresh = async () => {
     setRefreshing(true)

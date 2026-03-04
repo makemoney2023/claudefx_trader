@@ -1,7 +1,9 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useCallback } from 'react'
 import { cn } from '@/lib/utils'
+import { useWebSocket } from '@/hooks/useWebSocket'
+import type { WebSocketMessage } from '@/lib/wsTypes'
 import { ArrowUpRight, ArrowDownRight, Minus, AlertTriangle, RefreshCw } from 'lucide-react'
 
 interface Signal {
@@ -25,7 +27,9 @@ export function RecentSignals() {
   
   const apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
-  const fetchSignals = async () => {
+  const { lastMessage, isConnected } = useWebSocket('analysis')
+
+  const fetchSignals = useCallback(async () => {
     try {
       setError(null)
       const response = await fetch(`${apiBase}/api/analysis/signals?limit=10`)
@@ -40,14 +44,19 @@ export function RecentSignals() {
     } finally {
       setLoading(false)
     }
-  }
+  }, [apiBase])
+
+  useEffect(() => {
+    if (lastMessage && lastMessage.type === 'analysis_update') {
+      fetchSignals()
+    }
+  }, [lastMessage, fetchSignals])
 
   useEffect(() => {
     fetchSignals()
-    // Refresh signals every 30 seconds
-    const interval = setInterval(fetchSignals, 30000)
+    const interval = setInterval(fetchSignals, isConnected ? 120000 : 30000)
     return () => clearInterval(interval)
-  }, [])
+  }, [fetchSignals, isConnected])
 
   const getDirectionIcon = (direction: string) => {
     switch (direction) {

@@ -9,7 +9,7 @@ Provides endpoints for:
 """
 
 from typing import List, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel, Field
@@ -509,11 +509,11 @@ async def sync_positions_from_mt5():
                 
                 trade = TradeRecord(
                     trade_id=trade_id,
-                    timestamp=datetime.utcnow(),
+                    timestamp=datetime.now(timezone.utc),
                     symbol=str(p.symbol),
                     direction='long' if p.type == 'buy' else 'short',
                     entry_price=float(p.price_open),
-                    entry_time=datetime.utcnow(),
+                    entry_time=datetime.now(timezone.utc),
                     stop_loss=float(p.sl) if p.sl else 0.0,
                     take_profit=float(p.tp) if p.tp else 0.0,
                     position_size=float(p.volume),
@@ -537,7 +537,7 @@ async def sync_positions_from_mt5():
                         entry_price=p.price_open,
                         stop_loss=p.sl if p.sl else 0.0,
                         take_profit=p.tp if p.tp else 0.0,
-                        open_time=datetime.utcnow()
+                        open_time=datetime.now(timezone.utc)
                     )
                     bot.position_manager.add_position(position)
                     position_manager_synced += 1
@@ -584,7 +584,7 @@ async def sync_trade_history(
         from ..database import AsyncSessionLocal, TradeModel
         from sqlalchemy import select
         
-        end_time = datetime.utcnow()
+        end_time = datetime.now(timezone.utc)
         start_time = end_time - timedelta(days=days)
         
         # Get closed deals from MT5

@@ -30,20 +30,6 @@ def setup_logging(log_level: Optional[str] = None) -> None:
     if settings.logging.file_path:
         log_path = Path(settings.logging.file_path)
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Gap 43: Setup log rotation - keep 7 days of logs, 10MB max per file
-        file_handler = RotatingFileHandler(
-            log_path,
-            maxBytes=10*1024*1024,  # 10 MB
-            backupCount=7,
-            encoding='utf-8'
-        )
-        file_handler.setLevel(numeric_level)
-        file_handler.setFormatter(logging.Formatter(settings.logging.format))
-        
-        # Add file handler to root logger
-        root_logger = logging.getLogger()
-        root_logger.addHandler(file_handler)
     
     # Configure structlog
     structlog.configure(
@@ -77,11 +63,14 @@ def setup_logging(log_level: Optional[str] = None) -> None:
     handlers = [stream_handler]
     
     if settings.logging.file_path:
-        file_handler = logging.FileHandler(settings.logging.file_path, encoding='utf-8')
-        file_handler.setFormatter(logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        ))
-        handlers.append(file_handler)
+        rot_handler = RotatingFileHandler(
+            settings.logging.file_path,
+            maxBytes=10 * 1024 * 1024,
+            backupCount=7,
+            encoding='utf-8',
+        )
+        rot_handler.setFormatter(logging.Formatter(settings.logging.format))
+        handlers.append(rot_handler)
     
     logging.basicConfig(
         format=settings.logging.format,

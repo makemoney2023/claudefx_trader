@@ -14,7 +14,7 @@ Features:
 """
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Any, Optional, TYPE_CHECKING
 
@@ -145,6 +145,10 @@ class TradeLearningService:
                 return learning
                 
         except Exception as e:
+            try:
+                await db_session.rollback()
+            except Exception:
+                pass
             logger.error(f"Failed to store trade review: {e}")
             return None
     
@@ -170,7 +174,7 @@ class TradeLearningService:
             List of learning dictionaries
         """
         try:
-            cutoff = datetime.utcnow() - timedelta(days=days_back)
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
             
             async with async_session_maker() as db_session:
                 result = await db_session.execute(
@@ -218,7 +222,7 @@ class TradeLearningService:
             List of mistake descriptions
         """
         try:
-            cutoff = datetime.utcnow() - timedelta(days=KNOWLEDGE_RETENTION_DAYS)
+            cutoff = datetime.now(timezone.utc) - timedelta(days=KNOWLEDGE_RETENTION_DAYS)
             
             async with async_session_maker() as db_session:
                 result = await db_session.execute(
@@ -263,7 +267,7 @@ class TradeLearningService:
             List of winning pattern descriptions
         """
         try:
-            cutoff = datetime.utcnow() - timedelta(days=KNOWLEDGE_RETENTION_DAYS)
+            cutoff = datetime.now(timezone.utc) - timedelta(days=KNOWLEDGE_RETENTION_DAYS)
             
             async with async_session_maker() as db_session:
                 result = await db_session.execute(
@@ -318,7 +322,7 @@ class TradeLearningService:
                 query = select(KnowledgeBaseModel)
                 
                 if not include_expired:
-                    query = query.where(KnowledgeBaseModel.expires_at > datetime.utcnow())
+                    query = query.where(KnowledgeBaseModel.expires_at > datetime.now(timezone.utc))
                 
                 if category:
                     query = query.where(KnowledgeBaseModel.category == category)
@@ -360,7 +364,7 @@ class TradeLearningService:
         - How many REJECT signals would have won (false rejections)
         """
         try:
-            cutoff = datetime.utcnow() - timedelta(days=days_back)
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
             
             async with async_session_maker() as db_session:
                 # --- EXECUTED TRADES (from trades table) ---
@@ -469,7 +473,7 @@ class TradeLearningService:
         Returns: number of signals updated
         """
         try:
-            cutoff = datetime.utcnow() - timedelta(hours=lookback_hours)
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
             
             async with async_session_maker() as db_session:
                 result = await db_session.execute(
@@ -548,6 +552,10 @@ class TradeLearningService:
                     await db_session.commit()
                     
                 except Exception:
+                    try:
+                        await db_session.rollback()
+                    except Exception:
+                        pass
                     logger.debug("MT5 not available for rejected signal outcome tracking")
                 
                 if updated > 0:
@@ -555,6 +563,10 @@ class TradeLearningService:
                 return updated
                 
         except Exception as e:
+            try:
+                await db_session.rollback()
+            except Exception:
+                pass
             logger.error(f"Failed to check rejected signal outcomes: {e}")
             return 0
     
@@ -690,7 +702,7 @@ class TradeLearningService:
         try:
             from sqlalchemy import select, func, case, cast, Integer
             async with async_session_maker() as session:
-                cutoff = datetime.utcnow() - timedelta(days=30)
+                cutoff = datetime.now(timezone.utc) - timedelta(days=30)
                 stmt = (
                     select(
                         TradeModel.claude_confidence,
@@ -751,7 +763,7 @@ class TradeLearningService:
         try:
             from sqlalchemy import select, func, case
             async with async_session_maker() as session:
-                cutoff = datetime.utcnow() - timedelta(days=90)
+                cutoff = datetime.now(timezone.utc) - timedelta(days=90)
                 stmt = (
                     select(
                         TradeModel.direction,
@@ -814,8 +826,8 @@ class TradeLearningService:
                 logger.debug(f"Rejected signal outcome check skipped: {e}")
             
             # Get this week's learnings
-            week_start = datetime.utcnow() - timedelta(days=7)
-            week_end = datetime.utcnow()
+            week_start = datetime.now(timezone.utc) - timedelta(days=7)
+            week_end = datetime.now(timezone.utc)
             
             async with async_session_maker() as db_session:
                 result = await db_session.execute(
@@ -965,6 +977,10 @@ class TradeLearningService:
             return review
             
         except Exception as e:
+            try:
+                await db_session.rollback()
+            except Exception:
+                pass
             logger.error(f"Failed to consolidate weekly: {e}")
             import traceback
             traceback.print_exc()
@@ -977,27 +993,26 @@ class TradeLearningService:
     ):
         """Update knowledge base from weekly insights."""
         try:
-            expires_at = datetime.utcnow() + timedelta(days=KNOWLEDGE_RETENTION_DAYS)
+            expires_at = datetime.now(timezone.utc) + timedelta(days=KNOWLEDGE_RETENTION_DAYS)
             
             async with async_session_maker() as db_session:
-                # Update symbol insights
+                # Update symbol insights (atomic upsert via INSERT OR REPLACE)
                 symbol_insights = insights.get('symbol_insights', {})
                 for symbol, insight in symbol_insights.items():
                     if isinstance(insight, str) and insight:
                         key = f"{symbol}_weekly_insight"
-                        
-                        # Check if exists
-                        result = await db_session.execute(
-                            select(KnowledgeBaseModel).where(KnowledgeBaseModel.key == key)
-                        )
-                        existing = result.scalar_one_or_none()
-                        
+
                         symbol_learnings = [l for l in learnings if l.symbol == symbol]
                         sample_size = len(symbol_learnings)
                         wins = len([l for l in symbol_learnings if l.outcome == 'win'])
                         win_rate = wins / sample_size if sample_size > 0 else 0
                         avg_r = sum(self._sanitize_r(l.r_multiple) for l in symbol_learnings) / sample_size if sample_size > 0 else 0
-                        
+
+                        result = await db_session.execute(
+                            select(KnowledgeBaseModel).where(KnowledgeBaseModel.key == key)
+                        )
+                        existing = result.scalar_one_or_none()
+
                         if existing:
                             existing.insight = insight
                             existing.sample_size += sample_size
@@ -1017,27 +1032,43 @@ class TradeLearningService:
                                 expires_at=expires_at
                             )
                             db_session.add(knowledge)
+                        await db_session.flush()
                 
                 # Update recurring mistakes
                 mistakes = insights.get('recurring_mistakes', [])
                 for i, mistake in enumerate(mistakes[:5]):
                     if isinstance(mistake, str) and mistake:
-                        key = f"mistake_{i}_{datetime.utcnow().strftime('%Y%m%d')}"
-                        
-                        knowledge = KnowledgeBaseModel(
-                            category="mistake",
-                            key=key,
-                            insight=mistake,
-                            confidence=0.7,
-                            sample_size=len(learnings),
-                            expires_at=expires_at
+                        key = f"mistake_{i}_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+
+                        result = await db_session.execute(
+                            select(KnowledgeBaseModel).where(KnowledgeBaseModel.key == key)
                         )
-                        db_session.add(knowledge)
+                        existing = result.scalar_one_or_none()
+                        if existing:
+                            existing.insight = mistake
+                            existing.confidence = 0.7
+                            existing.sample_size = len(learnings)
+                            existing.expires_at = expires_at
+                        else:
+                            knowledge = KnowledgeBaseModel(
+                                category="mistake",
+                                key=key,
+                                insight=mistake,
+                                confidence=0.7,
+                                sample_size=len(learnings),
+                                expires_at=expires_at
+                            )
+                            db_session.add(knowledge)
+                        await db_session.flush()
                 
                 await db_session.commit()
                 logger.info("Updated knowledge base from weekly insights")
                 
         except Exception as e:
+            try:
+                await db_session.rollback()
+            except Exception:
+                pass
             logger.error(f"Failed to update knowledge base: {e}")
     
     # =========================================================================
@@ -1060,7 +1091,7 @@ class TradeLearningService:
                         and_(
                             KnowledgeBaseModel.confidence >= HIGH_CONFIDENCE_THRESHOLD,
                             KnowledgeBaseModel.sample_size >= MIN_SAMPLE_SIZE_FOR_DOCS,
-                            KnowledgeBaseModel.expires_at > datetime.utcnow()
+                            KnowledgeBaseModel.expires_at > datetime.now(timezone.utc)
                         )
                     )
                     .order_by(desc(KnowledgeBaseModel.confidence))
@@ -1096,7 +1127,7 @@ class TradeLearningService:
         """Generate markdown content for trading_learnings.md."""
         lines = [
             "# Trading Learnings (Auto-Generated)",
-            f"Last Updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC",
+            f"Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC",
             "",
             "> This file is automatically generated by the learning system.",
             "> Do not edit manually - changes will be overwritten.",
@@ -1223,7 +1254,7 @@ Total R: {review.total_r:.1f}R
             async with async_session_maker() as db_session:
                 result = await db_session.execute(
                     select(KnowledgeBaseModel)
-                    .where(KnowledgeBaseModel.expires_at <= datetime.utcnow())
+                    .where(KnowledgeBaseModel.expires_at <= datetime.now(timezone.utc))
                 )
                 
                 expired = result.scalars().all()
@@ -1240,6 +1271,10 @@ Total R: {review.total_r:.1f}R
                 return count
                 
         except Exception as e:
+            try:
+                await db_session.rollback()
+            except Exception:
+                pass
             logger.error(f"Failed to prune expired knowledge: {e}")
             return 0
     

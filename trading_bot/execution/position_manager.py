@@ -70,6 +70,9 @@ class Position:
     
     # Close metadata (set before closing for reversal re-entry)
     close_reason: str = ""  # "tp_hit", "sl_hit", "giveback_protection", "near_tp_reversal", "trailing_stop", "claude_close", "manual"
+
+    # Original order ticket (differs from position ticket for filled pending orders)
+    order_ticket: Optional[int] = None
     
     def __post_init__(self):
         self.initial_sl = self.stop_loss
@@ -697,10 +700,14 @@ class PositionManager:
                 )
                 result_action["success"] = True
                 
-                # Remove from tracking immediately
                 self.remove_position(position.ticket)
                 
-                # Fire reversal callback if registered
+                if self.on_position_close:
+                    try:
+                        await self.on_position_close(position)
+                    except Exception as e:
+                        logger.error(f"Error in position close callback for protection close: {e}")
+                
                 if self.on_reversal_close:
                     try:
                         await self.on_reversal_close(position)

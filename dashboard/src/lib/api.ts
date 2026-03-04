@@ -348,6 +348,11 @@ export const api = {
   getPerformanceReport: () =>
     fetchApi<any>('/api/performance/report'),
 
+  getEdgeTracker: (window?: number) =>
+    fetchApi<EdgeTrackerResponse>('/api/performance/edge-tracker', {
+      params: window ? { window } : undefined,
+    }),
+
   getSilverLevels: () =>
     fetchApi<SilverKeyLevels>('/api/silver/levels'),
   
@@ -781,9 +786,10 @@ export const api = {
     }),
 }
 
-export function createWebSocket(channel: string): WebSocket {
-  const wsUrl = API_BASE.replace('http', 'ws')
-  return new WebSocket(`${wsUrl}/ws/${channel}`)
+export function createWebSocket(channel: string, apiKey?: string): WebSocket {
+  const wsBase = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000'
+  const params = apiKey ? `?api_key=${apiKey}` : ''
+  return new WebSocket(`${wsBase}/ws/${channel}${params}`)
 }
 
 export interface Trade {
@@ -980,6 +986,35 @@ export interface PerformanceStats {
   profit_factor: number
   largest_win: number
   largest_loss: number
+}
+
+export interface SymbolEdge {
+  symbol: string
+  trades: number
+  win_rate: number
+  avg_r: number
+  total_r: number
+  score: number
+  status: 'healthy' | 'warning' | 'critical' | 'blocked'
+}
+
+export interface EdgeAlert {
+  level: 'info' | 'warning' | 'critical'
+  message: string
+  symbol?: string
+}
+
+export interface EdgeTrackerResponse {
+  overall_score: number
+  overall_status: string
+  rolling_win_rate: number
+  rolling_avg_r: number
+  rolling_total_r: number
+  rolling_trades: number
+  window_label: string
+  symbols: SymbolEdge[]
+  alerts: EdgeAlert[]
+  recent_wr_trend: number[]
 }
 
 export interface DailySummary {

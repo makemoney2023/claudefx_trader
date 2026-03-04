@@ -11,6 +11,7 @@ from typing import Dict, Any, List, Optional
 from enum import Enum
 
 from ..utils.logging import get_logger
+from ..api.routes.activity import add_activity
 
 logger = get_logger(__name__)
 
@@ -115,6 +116,10 @@ class ScalingManager:
         # Equity curve tracking for max drawdown (T3-4)
         self._equity_snapshots: List[Dict[str, Any]] = []
         self._peak_equity: float = starting_equity
+        
+        # Edge health integration (updated externally via set_edge_health)
+        self._edge_health_score: float = 100.0
+        self._blocked_symbols: set = set()
         
         logger.info(f"Scaling manager initialized: ${starting_equity:,.0f} -> ${target_equity:,.0f}")
     
@@ -305,6 +310,14 @@ class ScalingManager:
         # If aggressive locked, skip all other mode-changing rules
         if aggressive_locked:
             return TradingMode.AGGRESSIVE
+        
+        # Rule 2b: Edge health auto-protection
+        if self._edge_health_score < 30:
+            logger.warning(f"[EDGE] Score {self._edge_health_score:.0f} < 30 — DEFENSIVE")
+            return TradingMode.DEFENSIVE
+        if self._edge_health_score < 40:
+            logger.warning(f"[EDGE] Score {self._edge_health_score:.0f} < 40 — CONSERVATIVE")
+            return TradingMode.CONSERVATIVE
         
         # Rule 3: Use Claude's recommendation if available
         if claude_recommendation:
@@ -502,12 +515,18 @@ class ScalingManager:
         if win_rate < 40:
             logger.warning(f"BLOCKING {symbol}/{session}: Win rate {win_rate:.0f}% (< 40%) over {stats['trades']} trades")
             return 0.0
+        elif win_rate < 45:
+            logger.info(f"REDUCING {symbol}/{session}: Win rate {win_rate:.0f}% (< 45%) -> 40% size")
+            return 0.4
         elif win_rate < 50:
-            logger.info(f"REDUCING {symbol}/{session}: Win rate {win_rate:.0f}% (< 50%) -> 50% size")
-            return 0.5
-        elif win_rate >= 60:
-            logger.info(f"BOOSTING {symbol}/{session}: Win rate {win_rate:.0f}% (>= 60%) -> 120% size")
-            return 1.2
+            logger.info(f"REDUCING {symbol}/{session}: Win rate {win_rate:.0f}% (< 50%) -> 60% size")
+            return 0.6
+        elif win_rate >= 60 and stats['trades'] >= 15:
+            logger.info(f"BOOSTING {symbol}/{session}: Win rate {win_rate:.0f}% (>= 60%) -> 130% size")
+            return 1.3
+        elif win_rate >= 55:
+            logger.info(f"BOOSTING {symbol}/{session}: Win rate {win_rate:.0f}% (>= 55%) -> 115% size")
+            return 1.15
         else:
             return 1.0
     
@@ -528,6 +547,52 @@ class ScalingManager:
         
         return True, "Approved", multiplier
     
+    def set_edge_health(self, overall_score: float, symbol_scores: Dict[str, float]):
+        """
+        Update edge health from the edge tracker API data.
+        Called periodically by the main trading loop.
+        
+        Auto-protection rules:
+        - overall < 40 -> force CONSERVATIVE
+        - overall < 30 -> force DEFENSIVE
+        - per-symbol < 30 -> block that symbol
+        - per-symbol < 50 -> reduce risk on that symbol
+        """
+        prev = self._edge_health_score
+        self._edge_health_score = overall_score
+        prev_blocked = set(self._blocked_symbols)
+        self._blocked_symbols = set()
+        
+        for sym, score in symbol_scores.items():
+            if score < 30:
+                self._blocked_symbols.add(sym)
+                logger.warning(f"[EDGE] {sym} auto-blocked (score {score:.0f} < 30)")
+                if sym not in prev_blocked:
+                    add_activity("edge_blocked", f"{sym} auto-blocked: edge score {score:.0f} collapsed below 30", symbol=sym, details={"score": score, "threshold": 30})
+        
+        if abs(overall_score - prev) > 10:
+            logger.info(f"[EDGE] Health updated: {prev:.0f} -> {overall_score:.0f}")
+            add_activity("edge_health", f"Edge health score changed: {prev:.0f} → {overall_score:.0f}", details={"previous_score": round(prev, 1), "new_score": round(overall_score, 1), "change": round(overall_score - prev, 1)})
+        elif abs(overall_score - prev) > 5:
+            logger.info(f"[EDGE] Health updated: {prev:.0f} -> {overall_score:.0f}")
+    
+    def is_symbol_edge_blocked(self, symbol: str) -> bool:
+        """Check if a symbol is blocked due to collapsed edge."""
+        return symbol in self._blocked_symbols
+    
+    def get_edge_risk_multiplier(self) -> float:
+        """
+        Get risk multiplier based on edge health.
+        Score >= 60: 1.0 (full risk)
+        Score 40-60: 0.75 (reduced)
+        Score < 40: 0.5 (half risk, mode override handles the rest)
+        """
+        if self._edge_health_score >= 60:
+            return 1.0
+        elif self._edge_health_score >= 40:
+            return 0.75
+        return 0.5
+
     def get_all_symbol_stats(self) -> Dict[str, Dict[str, Any]]:
         """Get all symbol/session performance stats."""
         result = {}

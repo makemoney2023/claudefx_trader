@@ -2,6 +2,8 @@
 
 import { useEffect, useState, useCallback } from 'react'
 import { api, ManagedPosition, ManagedPositionsResponse, BotStatus, AccountInfo } from '@/lib/api'
+import { useWebSocket } from '@/hooks/useWebSocket'
+import type { WebSocketMessage } from '@/lib/wsTypes'
 import { cn } from '@/lib/utils'
 import { 
   AlertTriangle, 
@@ -33,6 +35,8 @@ export default function PositionsPage() {
   const [editingPosition, setEditingPosition] = useState<number | null>(null)
   const [editValues, setEditValues] = useState<{ sl: string; tp: string }>({ sl: '', tp: '' })
   const [actionMessage, setActionMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+
+  const { lastMessage, isConnected } = useWebSocket('trades')
 
   const fetchPositions = useCallback(async () => {
     try {
@@ -70,15 +74,22 @@ export default function PositionsPage() {
     }
     loadData()
 
-    // Auto-refresh every 5 seconds
     const interval = setInterval(() => {
       fetchPositions()
       fetchBotStatus()
       fetchAccountInfo()
-    }, 5000)
+    }, isConnected ? 30000 : 5000)
 
     return () => clearInterval(interval)
-  }, [fetchPositions, fetchBotStatus, fetchAccountInfo])
+  }, [fetchPositions, fetchBotStatus, fetchAccountInfo, isConnected])
+
+  useEffect(() => {
+    if (lastMessage && lastMessage.type === 'trade_update') {
+      fetchPositions()
+      fetchBotStatus()
+      fetchAccountInfo()
+    }
+  }, [lastMessage, fetchPositions, fetchBotStatus, fetchAccountInfo])
 
   const handleRefresh = async () => {
     setRefreshing(true)

@@ -29,7 +29,7 @@ except ImportError:
 from ..config import settings
 from ..utils.logging import setup_logging, get_logger
 from .routes import trades, analysis, config, performance
-from .websocket import router as ws_router
+from .websocket import router as ws_router, broadcast_price_update, manager as ws_manager
 from .auth import get_api_key, is_protected_endpoint
 
 logger = get_logger(__name__)
@@ -46,6 +46,7 @@ _bot_task: Optional[asyncio.Task] = None
 _firecrawl_service = None
 _intelligence_task: Optional[asyncio.Task] = None
 _command_handler = None
+_price_stream_task: Optional[asyncio.Task] = None
 
 
 @asynccontextmanager
@@ -56,7 +57,7 @@ async def lifespan(app: FastAPI):
     Handles startup and shutdown events for the FastAPI app.
     The trading bot runs as a background task within this process.
     """
-    global _bot_instance, _trade_journal, _mt5_client, _bot_task
+    global _bot_instance, _trade_journal, _mt5_client, _bot_task, _price_stream_task
     
     # Startup
     setup_logging()
@@ -132,6 +133,10 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Bot auto-start DISABLED (TRADING_AUTO_START_BOT=false). Use dashboard to start manually.")
     
+    # Start price streaming background task
+    _price_stream_task = asyncio.create_task(_price_streaming_loop())
+    logger.info("Price streaming background task started (2s interval)")
+    
     # Start Telegram command handler (polling for /commands)
     global _command_handler
     try:
@@ -176,6 +181,14 @@ async def lifespan(app: FastAPI):
         _intelligence_task.cancel()
         try:
             await _intelligence_task
+        except asyncio.CancelledError:
+            pass
+    
+    # Stop price streaming task
+    if _price_stream_task:
+        _price_stream_task.cancel()
+        try:
+            await _price_stream_task
         except asyncio.CancelledError:
             pass
     
@@ -318,6 +331,49 @@ async def _refresh_intelligence_background():
         
         # Wait 5 minutes before next cycle (Tier 2 interval)
         await asyncio.sleep(CYCLE_DURATION)
+
+
+async def _price_streaming_loop():
+    """
+    Stream live bid/ask prices to WebSocket clients for symbols with open positions.
+    
+    Only fetches from MT5 when there are active WebSocket listeners on the
+    prices or all channels, avoiding unnecessary MT5 calls when nobody is watching.
+    """
+    while True:
+        try:
+            await asyncio.sleep(2)
+
+            listeners = (
+                ws_manager.get_connection_count("prices")
+                + ws_manager.get_connection_count("all")
+            )
+            if listeners == 0:
+                continue
+
+            if not _bot_instance or not hasattr(_bot_instance, 'position_manager') or not _bot_instance.position_manager:
+                continue
+
+            if not _mt5_client or not _mt5_client.is_connected:
+                continue
+
+            positions = _bot_instance.position_manager.positions
+            if not positions:
+                continue
+
+            for symbol in list(positions.keys()):
+                try:
+                    info = await _mt5_client.get_symbol_info(symbol)
+                    if info and hasattr(info, 'bid') and hasattr(info, 'ask'):
+                        await broadcast_price_update(symbol, info.bid, info.ask)
+                except Exception as e:
+                    logger.debug(f"Price fetch failed for {symbol}: {e}")
+
+        except asyncio.CancelledError:
+            logger.info("Price streaming task cancelled")
+            break
+        except Exception as e:
+            logger.warning(f"Price streaming loop error: {e}")
 
 
 async def _run_bot_background():

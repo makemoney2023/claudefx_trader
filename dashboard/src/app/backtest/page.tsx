@@ -88,6 +88,33 @@ export default function BacktestPage() {
     fetchPastRuns()
   }, [fetchPastRuns])
 
+  // Resume tracking any already-running backtest on page load / navigation
+  useEffect(() => {
+    const resumeRunning = async () => {
+      try {
+        const runs = await api.listBacktestRuns({ limit: 10 })
+        for (const run of runs) {
+          if (run.status !== 'running') continue
+          if (run.run_type === 'ict' && !ictRunning) {
+            setIctRunId(run.id)
+            setIctRunning(true)
+            setIctProgress({ pct: run.progress_pct ?? 0, step: run.current_step ?? '' })
+          } else if (run.run_type === 'replay' && !replayRunning) {
+            setReplayRunId(run.id)
+            setReplayRunning(true)
+            setReplayProgress({ pct: run.progress_pct ?? 0, step: run.current_step ?? '' })
+          } else if (run.run_type === 'optimizer' && !optRunning) {
+            setOptRunId(run.id)
+            setOptRunning(true)
+            setOptProgress({ pct: run.progress_pct ?? 0, step: run.current_step ?? '' })
+          }
+          break
+        }
+      } catch {}
+    }
+    resumeRunning()
+  }, [])
+
   useEffect(() => {
     const fetchSymbols = async () => {
       let loaded = false

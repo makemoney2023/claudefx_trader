@@ -342,6 +342,11 @@ class ClaudeReplayBacktester:
         step_idx = 0
 
         while current <= end_date and signals_processed < max_signals:
+            if current.weekday() >= 5 or (current.weekday() == 4 and current.hour >= 19):
+                current += timedelta(hours=interval_hours)
+                step_idx += 1
+                continue
+
             window_end = current
             lookback_bars = 100
             m15_window = m15_data[m15_data.index <= window_end].tail(lookback_bars)
@@ -461,6 +466,7 @@ class ClaudeReplayBacktester:
                     logger.debug(f"[REPLAY] Analysis enrichment failed: {_analysis_err}")
                     _m15_overlays = {}
 
+                _pd_h1_result = None
                 if h1_data is not None and not h1_data.empty:
                     h1_window = h1_data[h1_data.index <= window_end].tail(100)
                     if len(h1_window) >= 20:
@@ -476,7 +482,14 @@ class ClaudeReplayBacktester:
                                 _bar_extreme_zones.append({"top": h1_be.demand_zone.top, "bottom": h1_be.demand_zone.bottom, "type": "demand", "tf": "H1"})
                         except Exception:
                             pass
+                        try:
+                            from ..analysis.premium_discount import PremiumDiscountAnalyzer as _PDA_H1
+                            _pd_h1_result = _PDA_H1(swing_lookback=20).analyze(h1_window, current_price=current_price)
+                            analysis_data["h1_premium_discount"] = _pd_h1_result.to_dict()
+                        except Exception:
+                            pass
 
+                _pd_d1_result = None
                 if d1_data is not None and not d1_data.empty:
                     d1_window = d1_data[d1_data.index <= window_end].tail(60)
                     if len(d1_window) >= 10:
@@ -484,6 +497,12 @@ class ClaudeReplayBacktester:
                             from ..analysis.market_structure import MarketStructureAnalyzer as _MSA2
                             d1_ms = _MSA2().analyze(d1_window)
                             analysis_data["d1_bias"] = d1_ms.trend.value
+                        except Exception:
+                            pass
+                        try:
+                            from ..analysis.premium_discount import PremiumDiscountAnalyzer as _PDA
+                            _pd_d1_result = _PDA(swing_lookback=20).analyze(d1_window, current_price=current_price)
+                            analysis_data["premium_discount"] = _pd_d1_result.to_dict()
                         except Exception:
                             pass
 
@@ -530,6 +549,13 @@ class ClaudeReplayBacktester:
                 if _be_m15:
                     market_data['bar_extreme_m15'] = _be_m15.to_dict()
 
+                if _pd_d1_result:
+                    market_data['premium_discount'] = _pd_d1_result.to_dict()
+                    market_data['fibonacci_zone'] = _pd_d1_result.current_zone.value
+                    market_data['in_ote'] = _pd_d1_result.in_ote
+                if _pd_h1_result:
+                    market_data['h1_premium_discount'] = _pd_h1_result.to_dict()
+
                 claude_result = await self._claude.analyze_chart_async(
                     chart_image_base64=chart_b64,
                     symbol=symbol,
@@ -540,7 +566,144 @@ class ClaudeReplayBacktester:
                 )
 
                 sig = claude_result.signal
+                _zone_gate_decision = "no_gate"
                 if sig.direction != 'no_trade' and sig.entry_price and sig.stop_loss and sig.take_profit:
+                    from ..config import settings as _bt_settings
+
+                    _sl_dist_bt = abs(sig.entry_price - sig.stop_loss)
+                    _tp_dist_bt = abs(sig.take_profit - sig.entry_price)
+                    _rr_bt = _tp_dist_bt / _sl_dist_bt if _sl_dist_bt > 0 else 0
+                    _d1_bias_bt = (analysis_data.get('d1_bias') or '').lower()
+                    _gate_mode = _bt_settings.trading.zone_gate_mode
+                    _gate_blocked = False
+
+                    # --- Zone-aware gate (replaces legacy D1 direction gate) ---
+                    _use_zone_gate = (
+                        _pd_d1_result is not None
+                        and _gate_mode in ('active', 'shadow')
+                        and symbol not in _bt_settings.trading.zone_gate_disabled_symbols
+                    )
+
+                    if _use_zone_gate:
+                        _zone_str = _pd_d1_result.current_zone.value
+                        _retrace = _pd_d1_result.retracement_percent
+                        _zone_aligned = (
+                            (sig.direction == 'short' and _retrace >= 0.5)
+                            or (sig.direction == 'long' and _retrace <= 0.5)
+                        )
+                        _zone_misaligned = (
+                            (sig.direction == 'long' and _retrace >= 0.618)
+                            or (sig.direction == 'short' and _retrace <= 0.382)
+                        )
+
+                        if _zone_misaligned:
+                            _zm_conf = _bt_settings.trading.zone_misaligned_min_confidence
+                            _zm_rr = _bt_settings.trading.zone_misaligned_min_rr
+                            if sig.confidence < _zm_conf or _rr_bt < _zm_rr:
+                                _gate_blocked = True
+                                _zone_gate_decision = "blocked_misaligned"
+                                _block_msg = (
+                                    f"ZONE-GATE blocked {sig.direction.upper()} from {_zone_str} "
+                                    f"(retrace={_retrace:.0%}, conf={sig.confidence:.0%}, RR={_rr_bt:.1f}, "
+                                    f"need {_zm_conf:.0%}/{_zm_rr:.0f}:1)"
+                                )
+                            else:
+                                _zone_gate_decision = "allowed_misaligned_high_conf"
+                        elif not _zone_aligned:
+                            _eq_conf = _bt_settings.trading.zone_equilibrium_min_confidence
+                            if sig.confidence < _eq_conf:
+                                _gate_blocked = True
+                                _zone_gate_decision = "blocked_equilibrium"
+                                _block_msg = (
+                                    f"ZONE-GATE blocked {sig.direction.upper()} from {_zone_str} "
+                                    f"(equilibrium, conf={sig.confidence:.0%}, need {_eq_conf:.0%})"
+                                )
+                            else:
+                                _zone_gate_decision = "allowed_equilibrium"
+                        else:
+                            _zone_gate_decision = "allowed_zone_aligned"
+
+                        if _gate_blocked and _gate_mode == 'shadow':
+                            logger.info(
+                                f"[REPLAY] {current.strftime('%m/%d %H:%M')} "
+                                f"ZONE-GATE-SHADOW: would block — {_block_msg}"
+                            )
+                            _gate_blocked = False
+                            _zone_gate_decision = f"shadow_{_zone_gate_decision}"
+
+                        if _gate_blocked:
+                            logger.info(f"[REPLAY] {current.strftime('%m/%d %H:%M')} {_block_msg}")
+                            if progress_callback:
+                                try:
+                                    await progress_callback(
+                                        pct,
+                                        f"Zone-blocked {sig.direction} from {_zone_str} @ {current.strftime('%m/%d %H:%M')}"
+                                    )
+                                except Exception:
+                                    pass
+                            signals_processed += 1
+                            current += timedelta(hours=interval_hours)
+                            step_idx += 1
+                            continue
+
+                        if _zone_gate_decision.startswith("allowed"):
+                            logger.info(
+                                f"[REPLAY] {current.strftime('%m/%d %H:%M')} "
+                                f"ZONE-GATE: {_zone_gate_decision} {sig.direction.upper()} "
+                                f"from {_zone_str} (retrace={_retrace:.0%})"
+                            )
+
+                    elif _gate_mode != 'active' or not _use_zone_gate:
+                        # Legacy D1 direction gate fallback
+                        _is_counter_bt = (
+                            _d1_bias_bt in ('bullish', 'bearish')
+                            and (
+                                (_d1_bias_bt == 'bullish' and sig.direction == 'short')
+                                or (_d1_bias_bt == 'bearish' and sig.direction == 'long')
+                            )
+                        )
+                        if _is_counter_bt and (sig.confidence < 0.70 or _rr_bt < 3.0):
+                            logger.info(
+                                f"[REPLAY] {current.strftime('%m/%d %H:%M')} "
+                                f"DIRECTION-GATE blocked {sig.direction.upper()} "
+                                f"(D1={_d1_bias_bt}, conf={sig.confidence:.0%}, RR={_rr_bt:.1f})"
+                            )
+                            _zone_gate_decision = "legacy_blocked"
+                            if progress_callback:
+                                try:
+                                    await progress_callback(
+                                        pct,
+                                        f"Blocked counter-trend {sig.direction} @ {current.strftime('%m/%d %H:%M')}"
+                                    )
+                                except Exception:
+                                    pass
+                            signals_processed += 1
+                            current += timedelta(hours=interval_hours)
+                            step_idx += 1
+                            continue
+                        _zone_gate_decision = "legacy_allowed"
+
+                    # --- Time-of-day gate: skip weak hours unless elevated confidence ---
+                    _weak_hrs = _bt_settings.trading.weak_hours_by_symbol.get(symbol, [])
+                    if current.hour in _weak_hrs and sig.confidence < 0.68:
+                        logger.info(
+                            f"[REPLAY] {current.strftime('%m/%d %H:%M')} "
+                            f"TOD-GATE blocked {sig.direction.upper()} "
+                            f"(weak hour {current.hour:02d}:00, conf={sig.confidence:.0%})"
+                        )
+                        if progress_callback:
+                            try:
+                                await progress_callback(
+                                    pct,
+                                    f"Blocked weak hour {sig.direction} @ {current.strftime('%m/%d %H:%M')}"
+                                )
+                            except Exception:
+                                pass
+                        signals_processed += 1
+                        current += timedelta(hours=interval_hours)
+                        step_idx += 1
+                        continue
+
                     replay_sig = ReplaySignal(
                         timestamp=current,
                         symbol=symbol,
@@ -595,6 +758,10 @@ class ClaudeReplayBacktester:
                         "running_wr": round(wr, 1),
                         "running_r": round(r_sum, 2),
                         "trade_num": result.total_trades,
+                        "zone": _pd_d1_result.current_zone.value if _pd_d1_result else "unknown",
+                        "retracement_pct": round(_pd_d1_result.retracement_percent, 3) if _pd_d1_result else None,
+                        "in_ote": _pd_d1_result.in_ote if _pd_d1_result else False,
+                        "zone_gate_decision": _zone_gate_decision,
                     }
                     if progress_callback:
                         try:
@@ -602,10 +769,15 @@ class ClaudeReplayBacktester:
                         except Exception:
                             pass
                 else:
-                    logger.debug(
+                    logger.info(
                         f"[REPLAY] {current.strftime('%m/%d %H:%M')} No trade signal "
                         f"({snapshot_session} session, price={current_price:.5f})"
                     )
+                    if progress_callback:
+                        try:
+                            await progress_callback(pct, f"No signal @ {current.strftime('%m/%d %H:%M')}")
+                        except Exception:
+                            pass
 
                 signals_processed += 1
 

@@ -7,7 +7,9 @@ Uses SQLAlchemy with async support for:
 - Configuration storage
 """
 
-from datetime import datetime
+import shutil
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional, List, AsyncGenerator
 
 from sqlalchemy import String, Float, Integer, DateTime, Boolean, Text, JSON, ForeignKey
@@ -37,7 +39,7 @@ class TradeModel(Base):
     
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     trade_id: Mapped[str] = mapped_column(String(50), unique=True, index=True)
-    timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     
     # Trade details
     symbol: Mapped[str] = mapped_column(String(20), index=True)
@@ -107,7 +109,7 @@ class AnalysisLogModel(Base):
     __tablename__ = "analysis_logs"
     
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
     
     # Analysis context
     symbol: Mapped[str] = mapped_column(String(20), index=True)
@@ -151,7 +153,7 @@ class ConfigSnapshotModel(Base):
     __tablename__ = "config_snapshots"
     
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     
     # Config data
     config_type: Mapped[str] = mapped_column(String(50))  # 'trading', 'timeframes', etc.
@@ -231,8 +233,8 @@ class PositionStateModel(Base):
     close_reason: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, default=None)
     
     # Timestamps
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
 
 class TradeLearningModel(Base):
@@ -245,7 +247,7 @@ class TradeLearningModel(Base):
     
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     trade_id: Mapped[str] = mapped_column(String(50), index=True)
-    timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
     
     # Trade context
     symbol: Mapped[str] = mapped_column(String(20), index=True)
@@ -277,7 +279,7 @@ class TradeLearningModel(Base):
     confluence_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     
     # Timestamps
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
 class KnowledgeBaseModel(Base):
@@ -305,8 +307,8 @@ class KnowledgeBaseModel(Base):
     avg_r: Mapped[float] = mapped_column(Float, default=0)
     
     # Timestamps and expiry
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
     expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)  # 90 days from last update
     
     # Reference to last contributing trade
@@ -349,7 +351,7 @@ class WeeklyReviewModel(Base):
     best_setup: Mapped[str] = mapped_column(String(100), default="")
     
     # Timestamp
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
 class BacktestRunModel(Base):
@@ -386,7 +388,7 @@ class BacktestRunModel(Base):
 
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
@@ -399,9 +401,37 @@ AsyncSessionLocal = async_session_maker
 async_session = async_session_maker  # Another common alias
 
 
+def backup_database(max_backups: int = 7) -> Optional[Path]:
+    """Create a timestamped backup of the trading database. Keeps the last `max_backups`."""
+    db_path = Path("trading_bot.db")
+    if not db_path.exists():
+        return None
+    backup_dir = Path("backups/db")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    backup_path = backup_dir / f"trading_bot_{timestamp}.db"
+    try:
+        shutil.copy2(db_path, backup_path)
+        logger.info(f"Database backed up to {backup_path}")
+    except Exception as e:
+        logger.error(f"Database backup failed: {e}")
+        return None
+    backups = sorted(backup_dir.glob("trading_bot_*.db"))
+    for old in backups[:-max_backups]:
+        try:
+            old.unlink()
+        except Exception:
+            pass
+    return backup_path
+
+
 async def init_db():
     """Initialize the database (create tables and migrate new columns)."""
+    backup_database()
+
     async with engine.begin() as conn:
+        await conn.execute(text("PRAGMA journal_mode=WAL"))
+        await conn.execute(text("PRAGMA synchronous=NORMAL"))
         await conn.run_sync(Base.metadata.create_all)
     
     # Migrate: add missing columns to existing tables (SQLite ALTER TABLE)
@@ -655,7 +685,7 @@ class PerformanceRepository:
     ) -> List[PerformanceSnapshotModel]:
         """Get equity curve data for the last N days."""
         from datetime import timedelta
-        cutoff = datetime.utcnow() - timedelta(days=days)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         
         result = await self.session.execute(
             select(PerformanceSnapshotModel)
@@ -672,28 +702,13 @@ class PositionStateRepository:
         self.session = session
     
     async def save_position(self, position_data: dict) -> PositionStateModel:
-        """Save or update a position state."""
-        ticket = position_data.get('ticket')
-        
-        # Check if position already exists
-        existing = await self.get_by_ticket(ticket)
-        
-        if existing:
-            # Update existing
-            for key, value in position_data.items():
-                if hasattr(existing, key):
-                    setattr(existing, key, value)
-            existing.updated_at = datetime.utcnow()
-            await self.session.commit()
-            await self.session.refresh(existing)
-            return existing
-        else:
-            # Create new
-            position = PositionStateModel(**position_data)
-            self.session.add(position)
-            await self.session.commit()
-            await self.session.refresh(position)
-            return position
+        """Save or update a position state (atomic upsert via merge)."""
+        position_data['updated_at'] = datetime.now(timezone.utc)
+        position = PositionStateModel(**position_data)
+        merged = await self.session.merge(position)
+        await self.session.commit()
+        await self.session.refresh(merged)
+        return merged
     
     async def get_by_ticket(self, ticket: int) -> Optional[PositionStateModel]:
         """Get position by ticket."""

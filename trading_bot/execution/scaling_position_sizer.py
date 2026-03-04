@@ -11,6 +11,7 @@ from enum import Enum
 
 from ..config import get_symbol_spec
 from ..utils.logging import get_logger
+from ..api.routes.activity import add_activity
 
 logger = get_logger(__name__)
 
@@ -160,6 +161,7 @@ class ScalingPositionSizer:
             result['tier_changed'] = True
             result['direction'] = 'demotion'
             result['lockout_active'] = True
+            add_activity("tier_change", f"Scaling tier demoted to {result['new_tier']}", details={"direction": "demotion", "new_tier": result['new_tier'], "equity": equity})
         
         # Check for tier promotion
         elif new_index > self._current_tier_index:
@@ -177,6 +179,7 @@ class ScalingPositionSizer:
                     result['tier_changed'] = True
                     result['direction'] = 'promotion'
                     result['lockout_active'] = False
+                    add_activity("tier_change", f"Scaling tier promoted to {result['new_tier']} (lockout cleared)", details={"direction": "promotion", "new_tier": result['new_tier'], "equity": equity, "consecutive_wins": self._lockout_win_threshold})
                 else:
                     # Still in lockout - use demoted tier
                     logger.info(
@@ -194,6 +197,7 @@ class ScalingPositionSizer:
                 self._highest_tier_index = max(self._highest_tier_index, new_index)
                 result['tier_changed'] = True
                 result['direction'] = 'promotion'
+                add_activity("tier_change", f"Scaling tier promoted to {result['new_tier']}", details={"direction": "promotion", "new_tier": result['new_tier'], "equity": equity})
         
         return result
     

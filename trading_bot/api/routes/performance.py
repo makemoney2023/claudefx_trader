@@ -8,7 +8,7 @@ Provides endpoints for:
 """
 
 from typing import List, Optional, Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Query
 from pydantic import BaseModel
@@ -16,10 +16,6 @@ from pydantic import BaseModel
 from ...utils.logging import get_logger
 
 # Lazy imports to avoid circular dependency
-def get_trade_journal():
-    from ..main import get_trade_journal as _get_trade_journal
-    return _get_trade_journal()
-
 def get_mt5_client():
     from ..main import get_mt5_client as _get_mt5_client
     return _get_mt5_client()
@@ -158,7 +154,7 @@ async def get_performance_stats(
             )
             
             if period_days:
-                cutoff = datetime.utcnow() - timedelta(days=period_days)
+                cutoff = datetime.now(timezone.utc) - timedelta(days=period_days)
                 query = query.where(TradeModel.timestamp >= cutoff)
             
             result = await session.execute(query)
@@ -203,23 +199,11 @@ async def get_performance_stats(
             )
     except Exception as e:
         logger.error(f"Error getting performance stats: {e}")
-        # Fall back to journal
-        journal = get_trade_journal()
-        stats = journal.get_statistics(period_days)
-        
         return PerformanceStats(
-            total_trades=stats.get("total_trades", 0),
-            wins=stats.get("wins", 0),
-            losses=stats.get("losses", 0),
-            win_rate=stats.get("win_rate", 0),
-            total_profit=stats.get("total_profit", 0),
-            total_r=stats.get("total_r", 0),
-            avg_r=stats.get("avg_r", 0),
-            avg_win=stats.get("avg_win", 0),
-            avg_loss=stats.get("avg_loss", 0),
-            profit_factor=stats.get("profit_factor", 0),
-            largest_win=stats.get("largest_win", 0),
-            largest_loss=stats.get("largest_loss", 0)
+            total_trades=0, wins=0, losses=0, win_rate=0.0,
+            total_profit=0.0, total_r=0.0, avg_r=0.0,
+            avg_win=0.0, avg_loss=0.0, profit_factor=0.0,
+            largest_win=0.0, largest_loss=0.0
         )
 
 
@@ -228,48 +212,95 @@ async def get_daily_summaries(
     days: int = Query(30, ge=1, le=365, description="Number of days to include")
 ):
     """
-    Get daily trading summaries.
+    Get daily trading summaries from database.
     """
-    journal = get_trade_journal()
-    summaries = []
-    
-    for i in range(days):
-        date = datetime.now() - timedelta(days=i)
-        summary = journal.get_daily_summary(date)
-        
-        # Only include days with activity
-        if summary["trades_opened"] > 0 or summary["trades_closed"] > 0:
-            summaries.append(DailySummary(
-                date=summary["date"],
-                trades_opened=summary["trades_opened"],
-                trades_closed=summary["trades_closed"],
-                daily_pnl=summary["daily_pnl"],
-                daily_r=summary["daily_r"]
-            ))
-    
-    return summaries
+    try:
+        from ..database import AsyncSessionLocal, TradeModel
+        from sqlalchemy import select, func, cast, Date
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        summaries = []
+
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(TradeModel).where(TradeModel.timestamp >= cutoff)
+            )
+            trades = result.scalars().all()
+
+        daily: Dict[str, Dict[str, Any]] = {}
+        for t in trades:
+            ts = t.exit_time or t.timestamp
+            if ts is None:
+                continue
+            day_key = ts.strftime("%Y-%m-%d")
+            if day_key not in daily:
+                daily[day_key] = {"opened": 0, "closed": 0, "pnl": 0.0, "r": 0.0}
+
+            if t.exit_time:
+                daily[day_key]["closed"] += 1
+                daily[day_key]["pnl"] += t.profit_loss or 0
+                daily[day_key]["r"] += t.r_multiple or 0
+            else:
+                daily[day_key]["opened"] += 1
+
+        for day_key in sorted(daily.keys(), reverse=True):
+            d = daily[day_key]
+            if d["opened"] > 0 or d["closed"] > 0:
+                summaries.append(DailySummary(
+                    date=day_key,
+                    trades_opened=d["opened"],
+                    trades_closed=d["closed"],
+                    daily_pnl=d["pnl"],
+                    daily_r=d["r"]
+                ))
+
+        return summaries
+    except Exception as e:
+        logger.error(f"Error getting daily summaries: {e}")
+        return []
 
 
 @router.get("/ict-concepts", response_model=List[ICTConceptStats])
 async def get_ict_concept_stats():
     """
-    Get performance breakdown by ICT concept.
+    Get performance breakdown by ICT concept from database.
     """
-    journal = get_trade_journal()
-    stats = journal.get_statistics()
-    
-    ict_stats = stats.get("ict_concept_stats", {})
-    
-    return [
-        ICTConceptStats(
-            concept=concept,
-            trades=data["trades"],
-            wins=data["wins"],
-            win_rate=data["win_rate"],
-            avg_r=data["avg_r"]
-        )
-        for concept, data in ict_stats.items()
-    ]
+    try:
+        from ..database import AsyncSessionLocal, TradeModel
+        from sqlalchemy import select
+
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(TradeModel).where(TradeModel.profit_loss.isnot(None))
+            )
+            trades = result.scalars().all()
+
+        concept_stats: Dict[str, Dict[str, Any]] = {}
+        for t in trades:
+            concepts = t.ict_concepts if t.ict_concepts else ["unknown"]
+            if isinstance(concepts, str):
+                concepts = [concepts]
+            for concept in concepts:
+                if concept not in concept_stats:
+                    concept_stats[concept] = {"trades": 0, "wins": 0, "total_r": 0.0}
+                concept_stats[concept]["trades"] += 1
+                if t.profit_loss and t.profit_loss > 0:
+                    concept_stats[concept]["wins"] += 1
+                concept_stats[concept]["total_r"] += t.r_multiple or 0
+
+        return [
+            ICTConceptStats(
+                concept=concept,
+                trades=data["trades"],
+                wins=data["wins"],
+                win_rate=data["wins"] / data["trades"] if data["trades"] > 0 else 0,
+                avg_r=data["total_r"] / data["trades"] if data["trades"] > 0 else 0
+            )
+            for concept, data in concept_stats.items()
+        ]
+    except Exception as e:
+        logger.error(f"Error getting ICT concept stats: {e}")
+        return []
 
 
 @router.get("/equity-curve", response_model=List[EquityPoint])
@@ -277,16 +308,15 @@ async def get_equity_curve(
     days: int = Query(90, ge=1, le=365, description="Number of days")
 ):
     """
-    Get equity curve data for charting.
-    
+    Get equity curve data for charting from database.
+
     Shows real-time account equity from MT5, plus historical equity
-    based on closed trades from the journal.
+    based on closed trades from the DB.
     """
-    # Get current account info from MT5
     mt5_client = get_mt5_client()
-    current_equity = 10000.0  # Default fallback
+    current_equity = 10000.0
     current_balance = 10000.0
-    
+
     if mt5_client and mt5_client.is_connected:
         try:
             account = await mt5_client.get_account_info()
@@ -295,167 +325,375 @@ async def get_equity_curve(
                 current_balance = float(account.balance)
         except Exception as e:
             logger.warning(f"Could not get account info: {e}")
-    
-    journal = get_trade_journal()
-    closed_trades = journal.get_closed_trades()
-    
-    cutoff = datetime.now() - timedelta(days=days)
-    
-    # If no closed trades, just return current equity point
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    try:
+        from ..database import AsyncSessionLocal, TradeModel
+        from sqlalchemy import select, and_
+
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(TradeModel).where(
+                    and_(
+                        TradeModel.exit_time.isnot(None),
+                        TradeModel.profit_loss.isnot(None),
+                        TradeModel.exit_time >= cutoff,
+                    )
+                ).order_by(TradeModel.exit_time)
+            )
+            closed_trades = result.scalars().all()
+    except Exception as e:
+        logger.error(f"Error querying trades for equity curve: {e}")
+        closed_trades = []
+
     if not closed_trades:
         return [
+            EquityPoint(timestamp=cutoff, equity=current_balance, drawdown=0.0),
             EquityPoint(
-                timestamp=cutoff,
-                equity=current_balance,
-                drawdown=0.0
-            ),
-            EquityPoint(
-                timestamp=datetime.now(),
+                timestamp=datetime.now(timezone.utc),
                 equity=current_equity,
                 drawdown=0.0 if current_equity >= current_balance else (current_balance - current_equity) / current_balance
             )
         ]
-    
-    # Sort by exit time
-    sorted_trades = sorted(
-        [t for t in closed_trades if t.exit_time],
-        key=lambda x: x.exit_time
-    )
-    
-    # Filter by date range
-    sorted_trades = [t for t in sorted_trades if t.exit_time >= cutoff]
-    
-    # Calculate starting equity by working backwards from current balance
-    total_pnl = sum(t.profit_loss or 0 for t in sorted_trades)
+
+    total_pnl = sum(t.profit_loss or 0 for t in closed_trades)
     starting_equity = current_balance - total_pnl
-    
+
     equity = starting_equity
     peak_equity = equity
-    
-    equity_points = [
-        EquityPoint(
-            timestamp=cutoff,
-            equity=starting_equity,
-            drawdown=0.0
-        )
-    ]
-    
-    for trade in sorted_trades:
+
+    equity_points = [EquityPoint(timestamp=cutoff, equity=starting_equity, drawdown=0.0)]
+
+    for trade in closed_trades:
         equity += trade.profit_loss or 0
         peak_equity = max(peak_equity, equity)
         drawdown = (peak_equity - equity) / peak_equity if peak_equity > 0 else 0
-        
-        equity_points.append(EquityPoint(
-            timestamp=trade.exit_time,
-            equity=equity,
-            drawdown=drawdown
-        ))
-    
-    # Add current real-time equity point
+        equity_points.append(EquityPoint(timestamp=trade.exit_time, equity=equity, drawdown=drawdown))
+
     peak_equity = max(peak_equity, current_equity)
     current_drawdown = (peak_equity - current_equity) / peak_equity if peak_equity > 0 else 0
-    
-    equity_points.append(EquityPoint(
-        timestamp=datetime.now(),
-        equity=current_equity,
-        drawdown=current_drawdown
-    ))
-    
+    equity_points.append(EquityPoint(timestamp=datetime.now(timezone.utc), equity=current_equity, drawdown=current_drawdown))
+
     return equity_points
 
 
 @router.get("/report")
 async def get_performance_report():
     """
-    Get a text-based performance report.
+    Get a text-based performance report from database.
     """
-    journal = get_trade_journal()
-    report = journal.generate_report()
-    
+    try:
+        stats = await get_performance_stats()
+        lines = [
+            "=== Trading Performance Report ===",
+            f"Total Trades: {stats.total_trades}",
+            f"Win Rate: {stats.win_rate:.1%}  ({stats.wins}W / {stats.losses}L)",
+            f"Total Profit: ${stats.total_profit:+.2f}",
+            f"Total R: {stats.total_r:+.1f}R  (Avg: {stats.avg_r:+.2f}R)",
+            f"Profit Factor: {stats.profit_factor:.2f}",
+            f"Avg Win: ${stats.avg_win:+.2f}  |  Avg Loss: ${stats.avg_loss:+.2f}",
+            f"Largest Win: ${stats.largest_win:+.2f}  |  Largest Loss: ${stats.largest_loss:+.2f}",
+        ]
+        report = "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error generating performance report: {e}")
+        report = "Report generation failed."
+
     return {
         "report": report,
-        "generated_at": datetime.now().isoformat()
+        "generated_at": datetime.now(timezone.utc).isoformat()
     }
 
 
 @router.get("/by-symbol")
 async def get_performance_by_symbol():
     """
-    Get performance breakdown by trading symbol.
+    Get performance breakdown by trading symbol from database.
     """
-    journal = get_trade_journal()
-    closed_trades = journal.get_closed_trades()
-    
-    symbol_stats: Dict[str, Dict[str, Any]] = {}
-    
-    for trade in closed_trades:
-        symbol = trade.symbol
-        
-        if symbol not in symbol_stats:
-            symbol_stats[symbol] = {
-                "trades": 0,
-                "wins": 0,
-                "total_pnl": 0,
-                "total_r": 0
-            }
-        
-        symbol_stats[symbol]["trades"] += 1
-        if trade.profit_loss and trade.profit_loss > 0:
-            symbol_stats[symbol]["wins"] += 1
-        symbol_stats[symbol]["total_pnl"] += trade.profit_loss or 0
-        symbol_stats[symbol]["total_r"] += trade.r_multiple or 0
-    
-    # Calculate win rates
-    result = []
-    for symbol, data in symbol_stats.items():
-        result.append({
-            "symbol": symbol,
-            "trades": data["trades"],
-            "wins": data["wins"],
-            "win_rate": data["wins"] / data["trades"] if data["trades"] > 0 else 0,
-            "total_pnl": data["total_pnl"],
-            "avg_r": data["total_r"] / data["trades"] if data["trades"] > 0 else 0
-        })
-    
-    return sorted(result, key=lambda x: x["total_pnl"], reverse=True)
+    try:
+        from ..database import AsyncSessionLocal, TradeModel
+        from sqlalchemy import select
+
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(TradeModel).where(TradeModel.profit_loss.isnot(None))
+            )
+            trades = result.scalars().all()
+
+        symbol_stats: Dict[str, Dict[str, Any]] = {}
+        for t in trades:
+            symbol = t.symbol
+            if symbol not in symbol_stats:
+                symbol_stats[symbol] = {"trades": 0, "wins": 0, "total_pnl": 0.0, "total_r": 0.0}
+            symbol_stats[symbol]["trades"] += 1
+            if t.profit_loss and t.profit_loss > 0:
+                symbol_stats[symbol]["wins"] += 1
+            symbol_stats[symbol]["total_pnl"] += t.profit_loss or 0
+            symbol_stats[symbol]["total_r"] += t.r_multiple or 0
+
+        items = []
+        for symbol, data in symbol_stats.items():
+            items.append({
+                "symbol": symbol,
+                "trades": data["trades"],
+                "wins": data["wins"],
+                "win_rate": data["wins"] / data["trades"] if data["trades"] > 0 else 0,
+                "total_pnl": data["total_pnl"],
+                "avg_r": data["total_r"] / data["trades"] if data["trades"] > 0 else 0,
+            })
+        return sorted(items, key=lambda x: x["total_pnl"], reverse=True)
+    except Exception as e:
+        logger.error(f"Error getting performance by symbol: {e}")
+        return []
 
 
 @router.get("/by-session")
 async def get_performance_by_session():
     """
-    Get performance breakdown by trading session.
+    Get performance breakdown by trading session from database.
     """
-    journal = get_trade_journal()
-    closed_trades = journal.get_closed_trades()
-    
-    session_stats: Dict[str, Dict[str, Any]] = {}
-    
-    for trade in closed_trades:
-        session = trade.session or "unknown"
-        
-        if session not in session_stats:
-            session_stats[session] = {
-                "trades": 0,
-                "wins": 0,
-                "total_pnl": 0,
-                "total_r": 0
-            }
-        
-        session_stats[session]["trades"] += 1
-        if trade.profit_loss and trade.profit_loss > 0:
-            session_stats[session]["wins"] += 1
-        session_stats[session]["total_pnl"] += trade.profit_loss or 0
-        session_stats[session]["total_r"] += trade.r_multiple or 0
-    
-    result = []
-    for session, data in session_stats.items():
-        result.append({
-            "session": session,
-            "trades": data["trades"],
-            "wins": data["wins"],
-            "win_rate": data["wins"] / data["trades"] if data["trades"] > 0 else 0,
-            "total_pnl": data["total_pnl"],
-            "avg_r": data["total_r"] / data["trades"] if data["trades"] > 0 else 0
-        })
-    
-    return sorted(result, key=lambda x: x["total_pnl"], reverse=True)
+    try:
+        from ..database import AsyncSessionLocal, TradeModel
+        from sqlalchemy import select
+
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(TradeModel).where(TradeModel.profit_loss.isnot(None))
+            )
+            trades = result.scalars().all()
+
+        session_stats: Dict[str, Dict[str, Any]] = {}
+        for t in trades:
+            sess_name = getattr(t, 'session', None) or "unknown"
+            if sess_name not in session_stats:
+                session_stats[sess_name] = {"trades": 0, "wins": 0, "total_pnl": 0.0, "total_r": 0.0}
+            session_stats[sess_name]["trades"] += 1
+            if t.profit_loss and t.profit_loss > 0:
+                session_stats[sess_name]["wins"] += 1
+            session_stats[sess_name]["total_pnl"] += t.profit_loss or 0
+            session_stats[sess_name]["total_r"] += t.r_multiple or 0
+
+        items = []
+        for sess_name, data in session_stats.items():
+            items.append({
+                "session": sess_name,
+                "trades": data["trades"],
+                "wins": data["wins"],
+                "win_rate": data["wins"] / data["trades"] if data["trades"] > 0 else 0,
+                "total_pnl": data["total_pnl"],
+                "avg_r": data["total_r"] / data["trades"] if data["trades"] > 0 else 0,
+            })
+        return sorted(items, key=lambda x: x["total_pnl"], reverse=True)
+    except Exception as e:
+        logger.error(f"Error getting performance by session: {e}")
+        return []
+
+
+# ============================================
+# EDGE TRACKER
+# ============================================
+
+class SymbolEdge(BaseModel):
+    symbol: str
+    trades: int
+    win_rate: float
+    avg_r: float
+    total_r: float
+    score: float
+    status: str
+
+class EdgeAlert(BaseModel):
+    level: str
+    message: str
+    symbol: Optional[str] = None
+
+class EdgeTrackerResponse(BaseModel):
+    overall_score: float
+    overall_status: str
+    rolling_win_rate: float
+    rolling_avg_r: float
+    rolling_total_r: float
+    rolling_trades: int
+    window_label: str
+    symbols: List[SymbolEdge]
+    alerts: List[EdgeAlert]
+    recent_wr_trend: List[float]
+
+
+def _compute_edge_score(win_rate: float, avg_r: float, n_trades: int) -> float:
+    """
+    Composite edge health score 0-100.
+    WR contributes 50%, avg_r contributes 35%, sample size 15%.
+    """
+    wr_score = min(win_rate / 0.60, 1.0) * 50
+    r_score = min(avg_r / 1.0, 1.0) * 35 if avg_r > 0 else 0
+    n_score = min(n_trades / 30, 1.0) * 15
+    return round(wr_score + r_score + n_score, 1)
+
+
+def _status_from_score(score: float) -> str:
+    if score >= 60:
+        return "healthy"
+    elif score >= 40:
+        return "warning"
+    elif score >= 25:
+        return "critical"
+    return "blocked"
+
+
+@router.get("/edge-tracker", response_model=EdgeTrackerResponse)
+async def get_edge_tracker(
+    window: int = Query(50, ge=10, le=500, description="Rolling trade window size"),
+):
+    """
+    Rolling edge health tracker with per-symbol breakdown and alerts.
+    Uses the most recent N closed trades.
+    """
+    try:
+        from ..database import AsyncSessionLocal, TradeModel
+        from sqlalchemy import select, and_, or_, desc as sa_desc
+
+        async with AsyncSessionLocal() as session:
+            query = (
+                select(TradeModel)
+                .where(
+                    and_(
+                        TradeModel.profit_loss.isnot(None),
+                        or_(
+                            TradeModel.profit_loss >= 0.10,
+                            TradeModel.profit_loss <= -0.10,
+                        ),
+                    )
+                )
+                .order_by(sa_desc(TradeModel.timestamp))
+                .limit(window)
+            )
+            result = await session.execute(query)
+            trades = list(result.scalars().all())
+
+        if not trades:
+            return EdgeTrackerResponse(
+                overall_score=0,
+                overall_status="blocked",
+                rolling_win_rate=0,
+                rolling_avg_r=0,
+                rolling_total_r=0,
+                rolling_trades=0,
+                window_label=f"Last {window} trades (0 available)",
+                symbols=[],
+                alerts=[EdgeAlert(level="critical", message="No closed trades found")],
+                recent_wr_trend=[],
+            )
+
+        def _sanitize_r(r) -> float:
+            val = r or 0.0
+            return val if abs(val) <= 10 else 0.0
+
+        wins = [t for t in trades if t.profit_loss and t.profit_loss > 0]
+        losses = [t for t in trades if t.profit_loss and t.profit_loss < 0]
+        n = len(wins) + len(losses)
+        wr = len(wins) / n if n > 0 else 0.0
+        r_vals = [_sanitize_r(t.r_multiple) for t in trades]
+        avg_r = sum(r_vals) / len(r_vals) if r_vals else 0.0
+        total_r = sum(r_vals)
+
+        overall_score = _compute_edge_score(wr, avg_r, n)
+        overall_status = _status_from_score(overall_score)
+
+        sym_data: Dict[str, Dict[str, Any]] = {}
+        for t in trades:
+            s = t.symbol
+            if s not in sym_data:
+                sym_data[s] = {"wins": 0, "losses": 0, "r_vals": []}
+            if t.profit_loss and t.profit_loss > 0:
+                sym_data[s]["wins"] += 1
+            elif t.profit_loss and t.profit_loss < 0:
+                sym_data[s]["losses"] += 1
+            sym_data[s]["r_vals"].append(_sanitize_r(t.r_multiple))
+
+        symbol_edges = []
+        for s, d in sym_data.items():
+            sn = d["wins"] + d["losses"]
+            swr = d["wins"] / sn if sn > 0 else 0.0
+            sar = sum(d["r_vals"]) / len(d["r_vals"]) if d["r_vals"] else 0.0
+            str_r = sum(d["r_vals"])
+            ss = _compute_edge_score(swr, sar, sn)
+            symbol_edges.append(SymbolEdge(
+                symbol=s, trades=sn, win_rate=round(swr, 4),
+                avg_r=round(sar, 3), total_r=round(str_r, 2),
+                score=ss, status=_status_from_score(ss),
+            ))
+        symbol_edges.sort(key=lambda x: x.score, reverse=True)
+
+        recent_wr_trend = []
+        chunk = 10
+        for i in range(0, min(len(trades), 50), chunk):
+            batch = trades[i:i + chunk]
+            bw = sum(1 for t in batch if t.profit_loss and t.profit_loss > 0)
+            bl = sum(1 for t in batch if t.profit_loss and t.profit_loss < 0)
+            bn = bw + bl
+            recent_wr_trend.append(round(bw / bn, 4) if bn > 0 else 0.0)
+
+        alerts: List[EdgeAlert] = []
+        if overall_score < 30:
+            alerts.append(EdgeAlert(
+                level="critical",
+                message=f"Edge health critically low ({overall_score:.0f}/100). Consider pausing trading."
+            ))
+        elif overall_score < 50:
+            alerts.append(EdgeAlert(
+                level="warning",
+                message=f"Edge health declining ({overall_score:.0f}/100). Reduced risk recommended."
+            ))
+
+        for se in symbol_edges:
+            if se.status == "blocked":
+                alerts.append(EdgeAlert(
+                    level="critical",
+                    message=f"{se.symbol} edge collapsed (score {se.score:.0f}). Auto-blocked.",
+                    symbol=se.symbol,
+                ))
+            elif se.status == "critical":
+                alerts.append(EdgeAlert(
+                    level="warning",
+                    message=f"{se.symbol} edge degrading (score {se.score:.0f}). Watch closely.",
+                    symbol=se.symbol,
+                ))
+
+        if len(recent_wr_trend) >= 3 and all(
+            recent_wr_trend[i] < recent_wr_trend[i + 1]
+            for i in range(min(2, len(recent_wr_trend) - 1))
+        ):
+            alerts.append(EdgeAlert(
+                level="warning",
+                message="Win rate declining across recent trade batches."
+            ))
+
+        return EdgeTrackerResponse(
+            overall_score=overall_score,
+            overall_status=overall_status,
+            rolling_win_rate=round(wr, 4),
+            rolling_avg_r=round(avg_r, 3),
+            rolling_total_r=round(total_r, 2),
+            rolling_trades=n,
+            window_label=f"Last {window} trades ({n} closed)",
+            symbols=symbol_edges,
+            alerts=alerts,
+            recent_wr_trend=recent_wr_trend,
+        )
+
+    except Exception as e:
+        logger.error(f"Edge tracker error: {e}")
+        return EdgeTrackerResponse(
+            overall_score=0,
+            overall_status="blocked",
+            rolling_win_rate=0,
+            rolling_avg_r=0,
+            rolling_total_r=0,
+            rolling_trades=0,
+            window_label=f"Error: {str(e)[:50]}",
+            symbols=[],
+            alerts=[EdgeAlert(level="critical", message=f"Error computing edge: {str(e)[:100]}")],
+            recent_wr_trend=[],
+        )

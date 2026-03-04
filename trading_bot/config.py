@@ -419,6 +419,35 @@ class TradingSettings(BaseSettings):
         default=2.5,
         description="Minimum R:R for counter-trend scalps"
     )
+    weak_hours_by_symbol: Dict[str, List[int]] = Field(
+        default={
+            "BTCUSD": [12, 13],
+            "XRPUSD": [5, 6, 7, 8, 20],
+        },
+        description="UTC hours with historically weak win rates per symbol. Trades during these hours require 68%+ confidence."
+    )
+
+    # Zone-aware gate settings (replaces legacy D1 direction gate)
+    zone_gate_mode: str = Field(
+        default="active",
+        description="Zone gate mode: 'active' blocks zone-misaligned trades, 'shadow' logs only (legacy D1 gate still blocks), 'disabled' uses legacy D1 gate"
+    )
+    zone_misaligned_min_confidence: float = Field(
+        default=0.75,
+        description="Min confidence for zone-misaligned trades (long from premium, short from discount)"
+    )
+    zone_misaligned_min_rr: float = Field(
+        default=3.0,
+        description="Min R:R for zone-misaligned trades"
+    )
+    zone_equilibrium_min_confidence: float = Field(
+        default=0.65,
+        description="Min confidence for trades from equilibrium zone"
+    )
+    zone_gate_disabled_symbols: List[str] = Field(
+        default=[],
+        description="Symbols where zone gate is disabled (falls back to legacy D1 gate)"
+    )
 
 
 class TimeframeSettings(BaseSettings):

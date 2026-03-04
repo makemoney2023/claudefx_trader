@@ -1078,6 +1078,10 @@ class MT5Client:
                     "is_pending": is_pending_sim
                 }
             
+            # Ensure MT5 connection before critical order operation
+            if not await self.ensure_connected():
+                return {"success": False, "error": "MT5 connection lost and reconnection failed"}
+
             # Real MT5 call (non-blocking)
             mt5 = self._mcp_client
             
@@ -1433,6 +1437,10 @@ class MT5Client:
             if self._use_simulation:
                 return {"success": True, "simulated": True}
             
+            # Ensure MT5 connection before critical modification
+            if not await self.ensure_connected():
+                return {"success": False, "error": "MT5 connection lost and reconnection failed"}
+
             # Real MT5 call (non-blocking)
             mt5 = self._mcp_client
             

@@ -4,7 +4,7 @@ Market Hours Utility.
 Handles market open/close times, weekends, and holidays.
 """
 
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 from typing import Optional, Tuple
 from enum import Enum
 
@@ -117,7 +117,7 @@ def is_market_open(symbol: str, current_time: Optional[datetime] = None) -> Tupl
         Tuple of (is_open, reason)
     """
     if current_time is None:
-        current_time = datetime.utcnow()
+        current_time = datetime.now(timezone.utc)
     
     market_type = get_market_type(symbol)
     hours = MARKET_HOURS[market_type]
@@ -167,7 +167,7 @@ def get_next_market_open(symbol: str, current_time: Optional[datetime] = None) -
         Datetime of next market open, or None if always open
     """
     if current_time is None:
-        current_time = datetime.utcnow()
+        current_time = datetime.now(timezone.utc)
     
     market_type = get_market_type(symbol)
     
@@ -216,7 +216,7 @@ def get_time_until_close(symbol: str, current_time: Optional[datetime] = None) -
         Timedelta until close, or None if always open
     """
     if current_time is None:
-        current_time = datetime.utcnow()
+        current_time = datetime.now(timezone.utc)
     
     market_type = get_market_type(symbol)
     
@@ -260,7 +260,7 @@ def should_avoid_new_trades(symbol: str, current_time: Optional[datetime] = None
         Tuple of (should_avoid, reason)
     """
     if current_time is None:
-        current_time = datetime.utcnow()
+        current_time = datetime.now(timezone.utc)
     
     is_open, reason = is_market_open(symbol, current_time)
     if not is_open:

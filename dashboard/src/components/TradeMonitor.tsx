@@ -1,7 +1,9 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useCallback } from 'react'
 import { api, Position, Trade } from '@/lib/api'
+import { useWebSocket } from '@/hooks/useWebSocket'
+import type { WebSocketMessage } from '@/lib/wsTypes'
 import { cn } from '@/lib/utils'
 import { ArrowUpRight, ArrowDownRight, Clock } from 'lucide-react'
 
@@ -11,26 +13,34 @@ export function TradeMonitor() {
   const [loading, setLoading] = useState(true)
   const [tab, setTab] = useState<'open' | 'recent'>('open')
 
-  useEffect(() => {
-    const fetchData = async () => {
-      try {
-        const [positionsData, tradesData] = await Promise.all([
-          api.getOpenPositions(),
-          api.getTrades({ page_size: 10 }),
-        ])
-        setPositions(positionsData)
-        setRecentTrades(tradesData.trades)
-      } catch (error) {
-        console.error('Error fetching trades:', error)
-      } finally {
-        setLoading(false)
-      }
-    }
+  const { lastMessage, isConnected } = useWebSocket('trades')
 
-    fetchData()
-    const interval = setInterval(fetchData, 10000)
-    return () => clearInterval(interval)
+  const fetchData = useCallback(async () => {
+    try {
+      const [positionsData, tradesData] = await Promise.all([
+        api.getOpenPositions(),
+        api.getTrades({ page_size: 10 }),
+      ])
+      setPositions(positionsData)
+      setRecentTrades(tradesData.trades)
+    } catch (error) {
+      console.error('Error fetching trades:', error)
+    } finally {
+      setLoading(false)
+    }
   }, [])
+
+  useEffect(() => {
+    if (lastMessage && lastMessage.type === 'trade_update') {
+      fetchData()
+    }
+  }, [lastMessage, fetchData])
+
+  useEffect(() => {
+    fetchData()
+    const interval = setInterval(fetchData, isConnected ? 60000 : 10000)
+    return () => clearInterval(interval)
+  }, [fetchData, isConnected])
 
   return (
     <div className="card">

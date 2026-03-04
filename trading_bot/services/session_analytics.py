@@ -6,7 +6,7 @@ to identify optimal trading times.
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime, time
+from datetime import datetime, time, timezone
 from typing import Dict, Any, List, Optional
 from enum import Enum
 
@@ -155,9 +155,9 @@ class SessionAnalytics:
                     try:
                         entry_time = datetime.fromisoformat(str(entry_time_str))
                     except (ValueError, TypeError):
-                        entry_time = datetime.utcnow()
+                        entry_time = datetime.now(timezone.utc)
                 else:
-                    entry_time = datetime.utcnow()
+                    entry_time = datetime.now(timezone.utc)
                 
                 # Use stored r_multiple, but sanity-check it
                 r_mult = float(r_multiple) if r_multiple else 0.0
@@ -192,7 +192,7 @@ class SessionAnalytics:
             Current TradingSession
         """
         if utc_time is None:
-            utc_time = datetime.utcnow()
+            utc_time = datetime.now(timezone.utc)
         
         current_time = utc_time.time()
         
@@ -230,7 +230,7 @@ class SessionAnalytics:
             entry_time: UTC time of trade entry
         """
         if entry_time is None:
-            entry_time = datetime.utcnow()
+            entry_time = datetime.now(timezone.utc)
         
         session = self.get_current_session(entry_time)
         stats = self.session_stats[session]

@@ -1,1 +1,74 @@
-{}
+{
+  "streaks": {
+    "win_streak": 5,
+    "loss_streak": 0
+  },
+  "last_saved": "2026-02-26T19:28:44.385822",
+  "daily_stats": {
+    "trades": 0,
+    "pnl": 0.0,
+    "date": "2026-02-26",
+    "daily_risk_used": 0.0
+  },
+  "notified_milestones": [
+    "milestone_1000",
+    "milestone_750",
+    "milestone_500",
+    "milestone_250",
+    "milestone_2500"
+  ],
+  "scaling_manager": {
+    "recent_trades": [
+      {
+        "symbol": "ETHUSD",
+        "direction": "short",
+        "profit_loss": 5.139999999999873,
+        "r_multiple": 0.29204545454544883,
+        "timestamp": "2026-02-22 14:06:13.063583"
+      },
+      {
+        "symbol": "SOLUSD",
+        "direction": "short",
+        "profit_loss": 5.39999999999992,
+        "r_multiple": 0.72972972972971,
+        "timestamp": "2026-02-22 14:44:55.524189"
+      },
+      {
+        "symbol": "XRPUSD",
+        "direction": "short",
+        "profit_loss": 3.4000000000000696,
+        "r_multiple": 0.6538461538461555,
+        "timestamp": "2026-02-22 17:56:51.452560"
+      },
+      {
+        "symbol": "BTCUSD",
+        "direction": "short",
+        "profit_loss": 4.493999999998778,
+        "r_multiple": 0.07300194931771997,
+        "timestamp": "2026-02-22 17:56:51.561712"
+      },
+      {
+        "symbol": "BTCUSD",
+        "direction": "short",
+        "profit_loss": 6.517999999999302,
+        "r_multiple": 0.1889275362318638,
+        "timestamp": "2026-02-23 07:43:49.669589"
+      }
+    ],
+    "daily_high_equity": 2842.27,
+    "weekly_high_equity": 2906.31,
+    "current_mode": "aggressive"
+  },
+  "goal_tracker": {
+    "snapshots": [
+      {
+        "equity": 2842.27,
+        "timestamp": "2026-02-26T19:28:35.428781"
+      }
+    ]
+  },
+  "signal_hashes": {
+    "BTCUSD_short_66150.0": "2026-02-23T07:32:31.544163"
+  },
+  "pending_orders": {}
+}

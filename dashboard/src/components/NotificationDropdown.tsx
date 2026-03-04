@@ -1,7 +1,9 @@
 'use client'
 
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { Bell, ArrowUpRight, ArrowDownRight, AlertTriangle, Info, TrendingUp, X } from 'lucide-react'
+import { useWebSocket } from '@/hooks/useWebSocket'
+import type { WebSocketMessage } from '@/lib/wsTypes'
 import { cn } from '@/lib/utils'
 
 interface Activity {
@@ -34,7 +36,9 @@ export function NotificationDropdown() {
 
   const apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
-  const fetchActivities = async () => {
+  const { lastMessage, isConnected } = useWebSocket('activity')
+
+  const fetchActivities = useCallback(async () => {
     try {
       const [activitiesRes, countRes] = await Promise.all([
         fetch(`${apiBase}/api/activities?limit=20`),
@@ -55,13 +59,19 @@ export function NotificationDropdown() {
     } finally {
       setLoading(false)
     }
-  }
+  }, [apiBase])
+
+  useEffect(() => {
+    if (lastMessage && lastMessage.type === 'activity') {
+      fetchActivities()
+    }
+  }, [lastMessage, fetchActivities])
 
   useEffect(() => {
     fetchActivities()
-    const interval = setInterval(fetchActivities, 10000) // Refresh every 10s
+    const interval = setInterval(fetchActivities, isConnected ? 60000 : 10000)
     return () => clearInterval(interval)
-  }, [])
+  }, [fetchActivities, isConnected])
 
   const getIcon = (type: string) => {
     switch (type) {

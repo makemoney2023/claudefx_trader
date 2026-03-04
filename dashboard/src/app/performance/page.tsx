@@ -1,14 +1,15 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import { api, PerformanceStats, ICTConceptStats, SymbolStats } from '@/lib/api'
+import { api, PerformanceStats, ICTConceptStats, SymbolStats, EdgeTrackerResponse } from '@/lib/api'
 import { cn } from '@/lib/utils'
-import { TrendingUp, TrendingDown, Target, Award } from 'lucide-react'
+import { TrendingUp, TrendingDown, Target, Award, Shield } from 'lucide-react'
 
 export default function PerformancePage() {
   const [stats, setStats] = useState<PerformanceStats | null>(null)
   const [ictStats, setIctStats] = useState<ICTConceptStats[]>([])
   const [symbolStats, setSymbolStats] = useState<SymbolStats[]>([])
+  const [edge, setEdge] = useState<EdgeTrackerResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [period, setPeriod] = useState<number | undefined>(undefined)
 
@@ -16,14 +17,16 @@ export default function PerformancePage() {
     const fetchData = async () => {
       setLoading(true)
       try {
-        const [statsData, ictData, symbolData] = await Promise.all([
+        const [statsData, ictData, symbolData, edgeData] = await Promise.all([
           api.getPerformanceStats(period),
           api.getICTConceptStats(),
           api.getPerformanceBySymbol(),
+          api.getEdgeTracker(50).catch(() => null),
         ])
         setStats(statsData)
         setIctStats(ictData)
         setSymbolStats(symbolData)
+        if (edgeData) setEdge(edgeData)
       } catch (error) {
         console.error('Error fetching performance data:', error)
       } finally {
@@ -284,6 +287,151 @@ export default function PerformancePage() {
           </div>
         </div>
       </div>
+
+      {/* Edge Tracker Section */}
+      {edge && (
+        <div className="bg-slate-800 rounded-lg border border-slate-700 p-6">
+          <div className="flex items-center gap-2 mb-4">
+            <Shield className="h-5 w-5 text-blue-400" />
+            <h2 className="text-lg font-bold">Edge Tracker</h2>
+            <span className="text-xs text-slate-400 ml-2">{edge.window_label}</span>
+          </div>
+
+          {/* Overall stats */}
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-6">
+            <div>
+              <p className="text-xs text-slate-400">Score</p>
+              <p className={cn(
+                'text-2xl font-bold tabular-nums',
+                edge.overall_score >= 60 ? 'text-green-400' :
+                edge.overall_score >= 40 ? 'text-yellow-400' : 'text-red-400'
+              )}>
+                {edge.overall_score.toFixed(0)}
+              </p>
+            </div>
+            <div>
+              <p className="text-xs text-slate-400">Win Rate</p>
+              <p className="text-2xl font-bold tabular-nums">{(edge.rolling_win_rate * 100).toFixed(1)}%</p>
+            </div>
+            <div>
+              <p className="text-xs text-slate-400">Avg R</p>
+              <p className="text-2xl font-bold tabular-nums">{edge.rolling_avg_r.toFixed(2)}</p>
+            </div>
+            <div>
+              <p className="text-xs text-slate-400">Total R</p>
+              <p className={cn(
+                'text-2xl font-bold tabular-nums',
+                edge.rolling_total_r >= 0 ? 'text-green-400' : 'text-red-400'
+              )}>
+                {edge.rolling_total_r >= 0 ? '+' : ''}{edge.rolling_total_r.toFixed(1)}
+              </p>
+            </div>
+            <div>
+              <p className="text-xs text-slate-400">Trades</p>
+              <p className="text-2xl font-bold tabular-nums">{edge.rolling_trades}</p>
+            </div>
+          </div>
+
+          {/* WR Trend bars */}
+          {edge.recent_wr_trend.length > 1 && (
+            <div className="mb-6">
+              <p className="text-xs text-slate-400 mb-2">Win Rate Trend (newest left, batches of 10)</p>
+              <div className="flex items-end gap-1 h-16">
+                {edge.recent_wr_trend.map((wr, i) => (
+                  <div key={i} className="flex flex-col items-center flex-1 gap-0.5">
+                    <span className="text-[10px] text-slate-400">{(wr * 100).toFixed(0)}%</span>
+                    <div
+                      className={cn(
+                        'w-full rounded-t',
+                        wr >= 0.55 ? 'bg-green-500/70' : wr >= 0.45 ? 'bg-yellow-500/70' : 'bg-red-500/70',
+                      )}
+                      style={{ height: `${Math.max(wr * 100, 5)}%` }}
+                    />
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Per-symbol breakdown table */}
+          {edge.symbols.length > 0 && (
+            <div className="mb-4">
+              <p className="text-xs text-slate-400 mb-2">Per-Symbol Breakdown</p>
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-slate-400">
+                    <th className="px-3 py-2 text-left">Symbol</th>
+                    <th className="px-3 py-2 text-right">Trades</th>
+                    <th className="px-3 py-2 text-right">Win %</th>
+                    <th className="px-3 py-2 text-right">Avg R</th>
+                    <th className="px-3 py-2 text-right">Total R</th>
+                    <th className="px-3 py-2 text-right">Score</th>
+                    <th className="px-3 py-2 text-right">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-700">
+                  {edge.symbols.map((s) => (
+                    <tr key={s.symbol}>
+                      <td className="px-3 py-2 font-medium">{s.symbol}</td>
+                      <td className="px-3 py-2 text-right">{s.trades}</td>
+                      <td className={cn(
+                        'px-3 py-2 text-right',
+                        s.win_rate >= 0.55 ? 'text-green-400' : s.win_rate >= 0.45 ? 'text-yellow-400' : 'text-red-400'
+                      )}>
+                        {(s.win_rate * 100).toFixed(0)}%
+                      </td>
+                      <td className="px-3 py-2 text-right">{s.avg_r.toFixed(2)}</td>
+                      <td className={cn(
+                        'px-3 py-2 text-right',
+                        s.total_r >= 0 ? 'text-green-400' : 'text-red-400'
+                      )}>
+                        {s.total_r >= 0 ? '+' : ''}{s.total_r.toFixed(1)}
+                      </td>
+                      <td className={cn(
+                        'px-3 py-2 text-right font-bold',
+                        s.score >= 60 ? 'text-green-400' : s.score >= 40 ? 'text-yellow-400' : 'text-red-400'
+                      )}>
+                        {s.score.toFixed(0)}
+                      </td>
+                      <td className="px-3 py-2 text-right">
+                        <span className={cn(
+                          'text-xs px-2 py-0.5 rounded-full',
+                          s.status === 'healthy' ? 'bg-green-500/10 text-green-400' :
+                          s.status === 'warning' ? 'bg-yellow-500/10 text-yellow-400' :
+                          'bg-red-500/10 text-red-400'
+                        )}>
+                          {s.status}
+                        </span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {/* Alerts */}
+          {edge.alerts.length > 0 && (
+            <div className="space-y-2">
+              <p className="text-xs text-slate-400 mb-1">Active Alerts</p>
+              {edge.alerts.map((a, i) => (
+                <div
+                  key={i}
+                  className={cn(
+                    'text-sm px-3 py-2 rounded',
+                    a.level === 'critical' ? 'bg-red-500/10 text-red-400' :
+                    a.level === 'warning' ? 'bg-yellow-500/10 text-yellow-400' :
+                    'bg-blue-500/10 text-blue-400'
+                  )}
+                >
+                  {a.symbol && <span className="font-bold mr-1">[{a.symbol}]</span>}
+                  {a.message}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }

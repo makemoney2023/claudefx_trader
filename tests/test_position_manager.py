@@ -406,3 +406,91 @@ class TestPositionManagerCallbacks:
         
         assert len(closed_positions) == 1
         assert closed_positions[0].ticket == 12345
+
+
+class TestProtectionCloseCallback:
+    """Tests that _protection_close calls on_position_close."""
+
+    @pytest.mark.asyncio
+    async def test_giveback_protection_close_fires_callback(self, mock_order_manager):
+        """Giveback protection close should call on_position_close."""
+        pm = PositionManager(order_manager=mock_order_manager)
+        closed_positions = []
+
+        async def on_close(position):
+            closed_positions.append(position)
+
+        pm.on_position_close = on_close
+
+        pos = Position(
+            ticket=99999,
+            symbol="XAUUSD",
+            direction="long",
+            volume=0.05,
+            entry_price=2000.0,
+            stop_loss=1990.0,
+            take_profit=2030.0,
+            open_time=datetime.now(),
+        )
+        pos.peak_r_multiple = 2.0
+        pos.be_triggered = True
+        pm.add_position(pos)
+
+        result = await pm._protection_close(pos, "giveback_protection")
+
+        assert result["success"] is True
+        assert result["action"] == "protection_close_giveback_protection"
+        assert len(closed_positions) == 1
+        assert closed_positions[0].ticket == 99999
+
+    @pytest.mark.asyncio
+    async def test_near_tp_reversal_close_fires_callback(self, mock_order_manager):
+        """Near-TP reversal close should call on_position_close."""
+        pm = PositionManager(order_manager=mock_order_manager)
+        closed_positions = []
+
+        async def on_close(position):
+            closed_positions.append(position)
+
+        pm.on_position_close = on_close
+
+        pos = Position(
+            ticket=88888,
+            symbol="EURUSD",
+            direction="short",
+            volume=0.10,
+            entry_price=1.1000,
+            stop_loss=1.1050,
+            take_profit=1.0900,
+            open_time=datetime.now(),
+        )
+        pos.peak_r_multiple = 1.8
+        pos.be_triggered = True
+        pos.near_tp_reached = True
+        pm.add_position(pos)
+
+        result = await pm._protection_close(pos, "near_tp_reversal")
+
+        assert result["success"] is True
+        assert len(closed_positions) == 1
+        assert closed_positions[0].symbol == "EURUSD"
+
+    @pytest.mark.asyncio
+    async def test_protection_close_without_callback_doesnt_crash(self, mock_order_manager):
+        """Protection close works even if on_position_close is not set."""
+        pm = PositionManager(order_manager=mock_order_manager)
+
+        pos = Position(
+            ticket=77777,
+            symbol="BTCUSD",
+            direction="long",
+            volume=0.01,
+            entry_price=50000.0,
+            stop_loss=49000.0,
+            take_profit=53000.0,
+            open_time=datetime.now(),
+        )
+        pm.add_position(pos)
+
+        result = await pm._protection_close(pos, "giveback_protection")
+        assert result["success"] is True

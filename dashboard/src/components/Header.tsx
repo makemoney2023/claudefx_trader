@@ -1,9 +1,10 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import { RefreshCw } from 'lucide-react'
+import { RefreshCw, Wifi, WifiOff } from 'lucide-react'
 import { api } from '@/lib/api'
 import { NotificationDropdown } from './NotificationDropdown'
+import { useWebSocket } from '@/hooks/useWebSocket'
 
 export function Header() {
   const [session, setSession] = useState<{
@@ -12,8 +13,9 @@ export function Header() {
     is_tradeable: boolean
     minutes_remaining: number
   } | null>(null)
-  const [time, setTime] = useState<Date | null>(null) // Start with null to avoid hydration mismatch
+  const [time, setTime] = useState<Date | null>(null)
   const [mounted, setMounted] = useState(false)
+  const { isConnected } = useWebSocket('all')
 
   useEffect(() => {
     setMounted(true)
@@ -72,6 +74,14 @@ export function Header() {
 
       {/* Right - Actions */}
       <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1.5 px-2 py-1 rounded-md" title={isConnected ? 'WebSocket connected' : 'Polling fallback'}>
+          {isConnected ? (
+            <Wifi className="w-3.5 h-3.5 text-green-400" />
+          ) : (
+            <WifiOff className="w-3.5 h-3.5 text-amber-400" />
+          )}
+          <div className={`w-1.5 h-1.5 rounded-full ${isConnected ? 'bg-green-400' : 'bg-amber-400'}`} />
+        </div>
         <button className="p-2 text-slate-400 hover:text-white hover:bg-slate-700 rounded-lg transition-colors">
           <RefreshCw className="w-5 h-5" />
         </button>

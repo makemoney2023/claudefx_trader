@@ -5,8 +5,11 @@ Provides endpoints for:
 - Getting recent activities
 - Adding activities (internal use)
 - Activity counts for notification bell
+
+Activities are automatically broadcast via WebSocket to the 'activity' channel.
 """
 
+import asyncio
 from typing import List, Optional
 from datetime import datetime, timedelta
 
@@ -14,6 +17,7 @@ from fastapi import APIRouter, Query
 from pydantic import BaseModel
 
 from ...utils.logging import get_logger
+from ..websocket import broadcast_activity
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -74,6 +78,11 @@ def add_activity(
     
     print(f"[ACTIVITY] #{activity['id']} [{activity_type}] {message} (feed size: {len(_activity_feed)})", flush=True)
     logger.debug(f"Activity added: [{activity_type}] {message}")
+
+    try:
+        asyncio.get_running_loop().create_task(broadcast_activity(activity))
+    except RuntimeError:
+        pass
 
 
 def get_activities(limit: int = 20) -> List[dict]:

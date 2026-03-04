@@ -6,7 +6,7 @@ Long-running runs are executed as background tasks with progress persisted to Ba
 """
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -62,11 +62,15 @@ async def cleanup_orphaned_runs():
             for r in rows:
                 r.status = "failed"
                 r.error_message = "Server restarted while backtest was running"
-                r.completed_at = datetime.utcnow()
+                r.completed_at = datetime.now(timezone.utc)
             if rows:
                 await session.commit()
                 logger.info(f"[BACKTEST] Cleaned up {len(rows)} orphaned 'running' backtest rows")
     except Exception as e:
+        try:
+            await session.rollback()
+        except Exception:
+            pass
         logger.warning(f"[BACKTEST] Orphan cleanup failed: {e}")
 
 
@@ -182,7 +186,7 @@ async def _feed_replay_learnings(run_id: int, result: Any, learning_service=None
             learning_service = TradeLearningService()
         count = 0
         for i, t in enumerate(result.trades):
-            if t.outcome == "loss" or (t.outcome == "win" and t.r_multiple >= 2.0):
+            if t.outcome == "loss" or (t.outcome == "win" and t.r_multiple >= 1.5):
                 trade_id = f"bt-replay-{run_id}-{result.symbol}-{i:03d}"
 
                 ts = t.signal.timestamp
@@ -196,13 +200,49 @@ async def _feed_replay_learnings(run_id: int, result: Any, learning_service=None
                 else:
                     session_name = "new_york_pm"
 
+                if t.outcome == "win" and t.r_multiple >= 2.5:
+                    grade = "A"
+                elif t.outcome == "win" and t.r_multiple >= 1.5:
+                    grade = "B"
+                elif t.outcome == "win":
+                    grade = "C"
+                elif t.outcome == "loss" and t.bars_held <= 2:
+                    grade = "D"
+                else:
+                    grade = "C"
+
+                right = []
+                wrong = []
+                lessons = []
+
+                if t.outcome == "win":
+                    right.append(f"R-multiple: {t.r_multiple:+.2f}")
+                    if t.r_multiple >= 2.0:
+                        right.append("Hit 2R+ target — strong setup")
+                    if t.signal.confidence >= 0.68:
+                        right.append(f"High confidence entry ({t.signal.confidence:.0%})")
+                    lessons.append(
+                        f"{t.signal.direction.upper()} {result.symbol} during "
+                        f"{session_name} — R={t.r_multiple:+.2f}, bars_held={t.bars_held}"
+                    )
+                else:
+                    wrong.append(f"SL hit, R: {t.r_multiple:+.2f}")
+                    if t.bars_held <= 2:
+                        wrong.append("Stopped out within 2 bars — possible poor entry timing")
+                    if t.signal.confidence < 0.65:
+                        wrong.append(f"Low confidence entry ({t.signal.confidence:.0%})")
+                    lessons.append(
+                        f"Loss on {t.signal.direction.upper()} {result.symbol} during "
+                        f"{session_name} — stopped in {t.bars_held} bars"
+                    )
+
                 review = {
-                    "grade": "B" if t.outcome == "win" else "C",
+                    "grade": grade,
                     "outcome": t.outcome,
                     "analysis": (t.signal.reasoning or "")[:5000],
-                    "what_went_right": [f"R-multiple: {t.r_multiple:.2f}"] if t.outcome == "win" else [],
-                    "what_went_wrong": [f"SL hit, R: {t.r_multiple:.2f}"] if t.outcome == "loss" else [],
-                    "learnings": [f"Backtest trade {t.signal.direction} {result.symbol} | bars_held={t.bars_held}"],
+                    "what_went_right": right,
+                    "what_went_wrong": wrong,
+                    "learnings": lessons,
                     "source": "backtest",
                 }
                 await learning_service.store_trade_review(
@@ -415,7 +455,7 @@ async def _run_ict_task(run_id: int):
                 row.sharpe_ratio = metrics.get("sharpe_ratio")
                 row.profit_factor = metrics.get("profit_factor")
                 row.max_drawdown = metrics.get("max_drawdown")
-                row.completed_at = datetime.utcnow()
+                row.completed_at = datetime.now(timezone.utc)
                 await session.commit()
     except asyncio.CancelledError:
         async with async_session_maker() as session:
@@ -424,7 +464,7 @@ async def _run_ict_task(run_id: int):
             if row:
                 row.status = "cancelled"
                 row.current_step = "Cancelled"
-                row.completed_at = datetime.utcnow()
+                row.completed_at = datetime.now(timezone.utc)
                 await session.commit()
         return
     except Exception as e:
@@ -435,7 +475,7 @@ async def _run_ict_task(run_id: int):
             if row:
                 row.status = "failed"
                 row.error_message = str(e)[:2000]
-                row.completed_at = datetime.utcnow()
+                row.completed_at = datetime.now(timezone.utc)
                 await session.commit()
     finally:
         _backtest_tasks.pop(run_id, None)
@@ -544,7 +584,7 @@ async def _run_replay_task(run_id: int):
             if row:
                 row.status = "failed"
                 row.error_message = "MT5 not connected"
-                row.completed_at = datetime.utcnow()
+                row.completed_at = datetime.now(timezone.utc)
                 await session.commit()
         return
 
@@ -559,7 +599,7 @@ async def _run_replay_task(run_id: int):
             if row:
                 row.status = "failed"
                 row.error_message = "Claude API key not configured"
-                row.completed_at = datetime.utcnow()
+                row.completed_at = datetime.now(timezone.utc)
                 await session.commit()
         return
 
@@ -587,7 +627,10 @@ async def _run_replay_task(run_id: int):
                     flag_modified(row, "config_json")
                     await sess.commit()
         except Exception:
-            pass
+            try:
+                await sess.rollback()
+            except Exception:
+                pass
 
     logger.info(f"[REPLAY-TASK] Run {run_id}: launching bt.run({symbol}, {start_date}, {end_date}, interval={interval_hours}h)")
     try:
@@ -607,7 +650,7 @@ async def _run_replay_task(run_id: int):
             if row:
                 row.status = "cancelled"
                 row.current_step = "Cancelled"
-                row.completed_at = datetime.utcnow()
+                row.completed_at = datetime.now(timezone.utc)
                 await session.commit()
         return
     except Exception as e:
@@ -618,7 +661,7 @@ async def _run_replay_task(run_id: int):
             if row:
                 row.status = "failed"
                 row.error_message = str(e)[:2000]
-                row.completed_at = datetime.utcnow()
+                row.completed_at = datetime.now(timezone.utc)
                 await session.commit()
         return
 
@@ -643,7 +686,7 @@ async def _run_replay_task(run_id: int):
             row.max_drawdown = getattr(result, "max_drawdown_r", None)
             row.estimated_cost = result.estimated_cost
             row.actual_cost = result.estimated_cost
-            row.completed_at = datetime.utcnow()
+            row.completed_at = datetime.now(timezone.utc)
             await session.commit()
 
     _backtest_tasks.pop(run_id, None)
@@ -741,7 +784,10 @@ async def _run_optimizer_task(run_id: int):
                     row.current_step = step
                     await sess.commit()
         except Exception:
-            pass
+            try:
+                await sess.rollback()
+            except Exception:
+                pass
 
     try:
         opt = WalkForwardOptimizer(param_space=param_space)
@@ -758,7 +804,7 @@ async def _run_optimizer_task(run_id: int):
             if row:
                 row.status = "cancelled"
                 row.current_step = "Cancelled"
-                row.completed_at = datetime.utcnow()
+                row.completed_at = datetime.now(timezone.utc)
                 await session.commit()
         return
     except Exception as e:
@@ -769,7 +815,7 @@ async def _run_optimizer_task(run_id: int):
             if row:
                 row.status = "failed"
                 row.error_message = str(e)[:2000]
-                row.completed_at = datetime.utcnow()
+                row.completed_at = datetime.now(timezone.utc)
                 await session.commit()
         return
 
@@ -780,7 +826,7 @@ async def _run_optimizer_task(run_id: int):
             if row:
                 row.status = "failed"
                 row.error_message = "Insufficient trade data for optimization"
-                row.completed_at = datetime.utcnow()
+                row.completed_at = datetime.now(timezone.utc)
                 await session.commit()
         _backtest_tasks.pop(run_id, None)
         return
@@ -797,7 +843,7 @@ async def _run_optimizer_task(run_id: int):
             row.total_trades = result_dict.get("out_of_sample_trades") or result_dict.get("in_sample_trades")
             row.win_rate = result_dict.get("out_of_sample_win_rate") or result_dict.get("in_sample_win_rate")
             row.sharpe_ratio = result_dict.get("out_of_sample_sharpe") or result_dict.get("in_sample_sharpe")
-            row.completed_at = datetime.utcnow()
+            row.completed_at = datetime.now(timezone.utc)
             await session.commit()
 
     _backtest_tasks.pop(run_id, None)
@@ -819,8 +865,8 @@ async def start_optimizer(body: OptimizerRequest):
             status="running",
             symbol=None,
             timeframe=None,
-            start_date=datetime.utcnow(),
-            end_date=datetime.utcnow(),
+            start_date=datetime.now(timezone.utc),
+            end_date=datetime.now(timezone.utc),
             config_json=config_json,
             progress_pct=0,
             current_step="Running walk-forward optimization...",
