@@ -316,10 +316,10 @@ export default function BotActivityPage() {
                 Sync from MT5
               </button>
             </div>
-            <p className="font-medium text-lg">{status?.config.trading_symbols.length || 0} symbols</p>
+            <p className="font-medium text-lg">{status?.config?.trading_symbols?.length || 0} symbols</p>
             <p className="text-xs text-slate-500 mt-1 truncate">
-              {status?.config.trading_symbols.slice(0, 5).join(', ')}
-              {(status?.config.trading_symbols.length || 0) > 5 && '...'}
+              {(status?.config?.trading_symbols ?? []).slice(0, 5).join(', ')}
+              {(status?.config?.trading_symbols?.length || 0) > 5 && '...'}
             </p>
           </div>
         </div>
@@ -330,34 +330,34 @@ export default function BotActivityPage() {
         <div className="card-header flex items-center justify-between">
           <h2 className="font-semibold">Symbols Being Traded</h2>
           <span className="text-sm text-slate-400">
-            {status?.config.trading_symbols.length || 0} active
+            {status?.config?.trading_symbols?.length || 0} active
           </span>
         </div>
         <div className="card-body">
           <div className="flex flex-wrap gap-2">
-            {status?.config.trading_symbols.map((symbol) => (
+            {(status?.config?.trading_symbols ?? []).map((symbol) => (
               <span
                 key={symbol}
                 className={cn(
                   'px-3 py-1.5 rounded-lg text-sm font-medium',
-                  status.cycle_info.symbols_this_cycle.includes(symbol)
+                  status?.cycle_info?.symbols_this_cycle?.includes(symbol)
                     ? 'bg-green-500/20 text-green-400 border border-green-500/30'
-                    : status.current_symbol === symbol
+                    : status?.current_symbol === symbol
                     ? 'bg-blue-500/20 text-blue-400 border border-blue-500/30 animate-pulse'
                     : 'bg-slate-700 text-slate-300'
                 )}
               >
                 {symbol}
-                {status.current_symbol === symbol && (
+                {status?.current_symbol === symbol && (
                   <span className="ml-2 text-xs">⟳</span>
                 )}
-                {status.cycle_info.symbols_this_cycle.includes(symbol) && status.current_symbol !== symbol && (
+                {status?.cycle_info?.symbols_this_cycle?.includes(symbol) && status?.current_symbol !== symbol && (
                   <span className="ml-2 text-xs">✓</span>
                 )}
               </span>
             ))}
           </div>
-          {status?.config.trading_symbols.length === 0 && (
+          {status?.config?.trading_symbols?.length === 0 && (
             <p className="text-slate-400 text-center py-4">
               No symbols configured. Click "Sync from MT5" to add your Market Watch symbols.
             </p>

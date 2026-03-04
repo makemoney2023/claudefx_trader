@@ -39,8 +39,8 @@ export function useWebSocketWithPolling<T>({
       if (mountedRef.current) {
         setData(result)
       }
-    } catch {
-      // Silently ignore — polling will retry
+    } catch (e) {
+      console.error('Polling fetch error:', e)
     }
   }, [])
 

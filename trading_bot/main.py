@@ -108,45 +108,43 @@ async def save_trade_to_db(
     
     try:
         async with async_session() as session:
-            trade = TradeModel(
-                trade_id=str(ticket),
-                timestamp=datetime.now(timezone.utc),
-                symbol=symbol,
-                direction=direction,
-                timeframe=timeframe,
-                session=session_name,
-                entry_price=entry_price,
-                entry_time=datetime.now(timezone.utc),
-                entry_reason=reasoning[:1000] if reasoning else f"ICT Signal - Confidence: {confidence:.0%}",
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                position_size=position_size,
-                risk_amount=0.0,
-                claude_confidence=confidence,
-                claude_reasoning=reasoning[:5000] if reasoning else "",
-                # Judge analysis
-                judge_verdict=judge_verdict,
-                judge_reason=judge_reason[:1000] if judge_reason else None,
-                judge_risk_flags=judge_risk_flags,
-                # Trade classification
-                trade_type=trade_type,
-                order_type=order_type,
-                amd_phase=amd_phase,
-                market_structure=market_structure or "",
-                ict_concepts=ict_concepts,
-                confluence_factors=confluence_factors,
-                confluence_count=confluence_count,
-                risk_percent=risk_percent,
-            )
-            session.add(trade)
-            await session.commit()
-            logger.info(f"Trade {ticket} saved to database (judge={judge_verdict}, type={trade_type}, confluence={confluence_count})")
+            try:
+                trade = TradeModel(
+                    trade_id=str(ticket),
+                    timestamp=datetime.now(timezone.utc),
+                    symbol=symbol,
+                    direction=direction,
+                    timeframe=timeframe,
+                    session=session_name,
+                    entry_price=entry_price,
+                    entry_time=datetime.now(timezone.utc),
+                    entry_reason=reasoning[:1000] if reasoning else f"ICT Signal - Confidence: {confidence:.0%}",
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    position_size=position_size,
+                    risk_amount=0.0,
+                    claude_confidence=confidence,
+                    claude_reasoning=reasoning[:5000] if reasoning else "",
+                    judge_verdict=judge_verdict,
+                    judge_reason=judge_reason[:1000] if judge_reason else None,
+                    judge_risk_flags=judge_risk_flags,
+                    trade_type=trade_type,
+                    order_type=order_type,
+                    amd_phase=amd_phase,
+                    market_structure=market_structure or "",
+                    ict_concepts=ict_concepts,
+                    confluence_factors=confluence_factors,
+                    confluence_count=confluence_count,
+                    risk_percent=risk_percent,
+                )
+                session.add(trade)
+                await session.commit()
+                logger.info(f"Trade {ticket} saved to database (judge={judge_verdict}, type={trade_type}, confluence={confluence_count})")
+            except Exception as e:
+                await session.rollback()
+                logger.error(f"Failed to save trade to database: {e}")
     except Exception as e:
-        try:
-            await session.rollback()
-        except Exception:
-            pass
-        logger.error(f"Failed to save trade to database: {e}")
+        logger.error(f"Failed to open database session for trade save: {e}")
 
 
 async def save_signal_to_db(
@@ -174,38 +172,38 @@ async def save_signal_to_db(
     
     try:
         async with async_session() as session:
-            log = AnalysisLogModel(
-                timestamp=datetime.now(timezone.utc),
-                symbol=symbol,
-                timeframe="M15",
-                session="",
-                market_structure=market_structure or "",
-                trend="",
-                signal_direction=direction,
-                confidence=confidence,
-                entry_price=entry_price,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                analysis_data=None,
-                reasoning=reasoning[:2000] if reasoning else "",
-                warnings=None,
-                judge_verdict=judge_verdict,
-                judge_reason=judge_reason[:1000] if judge_reason else None,
-                judge_risk_flags=judge_risk_flags,
-                confluence_factors=confluence_factors,
-                confluence_count=confluence_count,
-                trade_type=trade_type,
-                trade_id=trade_id,
-            )
-            session.add(log)
-            await session.commit()
-            logger.debug(f"Signal logged to DB: {symbol} {direction} — judge={judge_verdict}")
+            try:
+                log = AnalysisLogModel(
+                    timestamp=datetime.now(timezone.utc),
+                    symbol=symbol,
+                    timeframe="M15",
+                    session="",
+                    market_structure=market_structure or "",
+                    trend="",
+                    signal_direction=direction,
+                    confidence=confidence,
+                    entry_price=entry_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    analysis_data=None,
+                    reasoning=reasoning[:2000] if reasoning else "",
+                    warnings=None,
+                    judge_verdict=judge_verdict,
+                    judge_reason=judge_reason[:1000] if judge_reason else None,
+                    judge_risk_flags=judge_risk_flags,
+                    confluence_factors=confluence_factors,
+                    confluence_count=confluence_count,
+                    trade_type=trade_type,
+                    trade_id=trade_id,
+                )
+                session.add(log)
+                await session.commit()
+                logger.debug(f"Signal logged to DB: {symbol} {direction} — judge={judge_verdict}")
+            except Exception as e:
+                await session.rollback()
+                logger.warning(f"Failed to save signal to analysis_logs: {e}")
     except Exception as e:
-        try:
-            await session.rollback()
-        except Exception:
-            pass
-        logger.warning(f"Failed to save signal to analysis_logs: {e}")
+        logger.warning(f"Failed to open database session for signal save: {e}")
 
 
 class TradingBot:
@@ -585,7 +583,7 @@ class TradingBot:
                                 if meta and meta.get('expiration'):
                                     try:
                                         original_exp = datetime.fromisoformat(meta['expiration'])
-                                        if original_exp > datetime.now():
+                                        if original_exp > datetime.now(timezone.utc):
                                             order.expiration = original_exp
                                             _restored_exp += 1
                                     except (ValueError, TypeError):
@@ -671,7 +669,7 @@ class TradingBot:
                         f"💰 Equity: ${starting_equity:,.2f}\n"
                         f"🎯 Goal: $10,000\n"
                         f"📊 Symbols: {symbols_str}\n"
-                        f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                        f"⏰ Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
                     )
                     print(f"[INIT] Telegram startup notification sent: {sent}", flush=True)
                 except Exception as e:
@@ -1026,13 +1024,13 @@ class TradingBot:
                 if not hasattr(self, '_last_firecrawl_refresh'):
                     self._last_firecrawl_refresh = datetime.min
                 
-                time_since_refresh = (datetime.now() - self._last_firecrawl_refresh).total_seconds() / 60
+                time_since_refresh = (datetime.now(timezone.utc) - self._last_firecrawl_refresh).total_seconds() / 60
                 refresh_min = getattr(getattr(settings, 'firecrawl', None), 'refresh_minutes', 15)
                 
                 if time_since_refresh >= refresh_min:
                     try:
                         await self.firecrawl_service.refresh_all(cycle_symbols)
-                        self._last_firecrawl_refresh = datetime.now()
+                        self._last_firecrawl_refresh = datetime.now(timezone.utc)
                         self._firecrawl_consecutive_failures = 0
                         logger.info("Firecrawl intelligence refreshed")
                     except Exception as e:
@@ -1264,7 +1262,7 @@ class TradingBot:
                         
                         # ANALYSIS COOLDOWN: Only call Claude once per 5 minutes per symbol
                         last_run = self._last_analysis_time.get(sym)
-                        now = datetime.now()
+                        now = datetime.now(timezone.utc)
                         if last_run is not None:
                             elapsed = (now - last_run).total_seconds()
                             if elapsed < self._analysis_cooldown_seconds:
@@ -1319,8 +1317,8 @@ class TradingBot:
             # POST-LOSS COOLDOWN: Prevent revenge trading
             cooldown_expiry = self._symbol_loss_cooldowns.get(symbol)
             if cooldown_expiry:
-                if datetime.now() < cooldown_expiry:
-                    remaining = (cooldown_expiry - datetime.now()).total_seconds() / 60
+                if datetime.now(timezone.utc) < cooldown_expiry:
+                    remaining = (cooldown_expiry - datetime.now(timezone.utc)).total_seconds() / 60
                     logger.info(f"[LOSS-COOLDOWN] {symbol}: Skipping — {remaining:.0f}min cooldown remaining")
                     if bot_state:
                         bot_state.symbol_complete(symbol, "loss_cooldown")
@@ -2024,8 +2022,8 @@ class TradingBot:
                 if _atr_current:
                     market_data["atr_14"] = round(_atr_current, 6)
                     market_data["atr_min_sl"] = round(_atr_current * 1.5, 6)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"ATR calculation failed for context: {e}")
             
             # Add market regime classification
             if self.regime_classifier:
@@ -2300,10 +2298,10 @@ class TradingBot:
                 try:
                     if not hasattr(self, '_playbook_cache') or not self._playbook_cache:
                         self._playbook_cache = await self.learning_service.build_setup_playbook()
-                        self._playbook_cache_time = datetime.now()
-                    elif hasattr(self, '_playbook_cache_time') and (datetime.now() - self._playbook_cache_time).total_seconds() > 86400:
+                        self._playbook_cache_time = datetime.now(timezone.utc)
+                    elif hasattr(self, '_playbook_cache_time') and (datetime.now(timezone.utc) - self._playbook_cache_time).total_seconds() > 86400:
                         self._playbook_cache = await self.learning_service.build_setup_playbook()
-                        self._playbook_cache_time = datetime.now()
+                        self._playbook_cache_time = datetime.now(timezone.utc)
                     if self._playbook_cache:
                         market_data["setup_playbook"] = self._playbook_cache
                 except Exception as e:
@@ -2524,7 +2522,7 @@ class TradingBot:
                 "direction": trade_signal.direction,
                 "confidence": trade_signal.confidence,
                 "trade_type": getattr(trade_signal, 'trade_type', 'intraday'),
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "reasoning": trade_signal.reasoning or "",
             }
             
@@ -3426,7 +3424,7 @@ class TradingBot:
                 )
             elif symbol in self._last_signal_direction:
                 last_dir, last_time = self._last_signal_direction[symbol]
-                minutes_since = (datetime.now() - last_time).total_seconds() / 60
+                minutes_since = (datetime.now(timezone.utc) - last_time).total_seconds() / 60
                 
                 if (last_dir != trade_signal.direction and 
                     last_dir != 'no_trade' and 
@@ -3471,7 +3469,7 @@ class TradingBot:
                         )
             
             # Track this signal direction for future flip detection
-            self._last_signal_direction[symbol] = (trade_signal.direction, datetime.now())
+            self._last_signal_direction[symbol] = (trade_signal.direction, datetime.now(timezone.utc))
             
             # Gap 21: Track signal hashes for dedup, but DON'T hard-block.
             # Multiple trades per symbol are allowed if the analysis supports it.
@@ -4698,7 +4696,7 @@ class TradingBot:
                     
                     # Gap 21: Track signal hash to prevent duplicates
                     self._recent_signal_hashes.add(signal_hash)
-                    self._signal_hash_expiry[signal_hash] = datetime.now()
+                    self._signal_hash_expiry[signal_hash] = datetime.now(timezone.utc)
                     
                     logger.info(f"✓ Trade executed: {trade_signal.direction.upper()} {symbol}")
                     logger.info(f"  Ticket: {result.ticket}, Fill Price: {result.fill_price}")
@@ -4827,7 +4825,7 @@ class TradingBot:
                                 entry_price=result.fill_price or current_price,
                                 stop_loss=tracked_sl or (result.fill_price or current_price),  # Fallback to entry (0 risk) rather than 0.0
                                 take_profit=tracked_tp or 0.0,
-                                open_time=datetime.now(),
+                                open_time=datetime.now(timezone.utc),
                                 trade_type=getattr(trade_signal, 'trade_type', 'intraday') or 'intraday',
                             )
                             
@@ -5286,7 +5284,7 @@ class TradingBot:
                         if open_dt.tzinfo:
                             delta = datetime.now(timezone.utc) - open_dt
                         else:
-                            delta = datetime.now() - open_dt
+                            delta = datetime.now(timezone.utc) - open_dt.replace(tzinfo=timezone.utc)
                         hours_open = delta.total_seconds() / 3600
                     except Exception:
                         hours_open = 0
@@ -5950,7 +5948,7 @@ class TradingBot:
                 try:
                     _pos_age = ""
                     if position.open_time:
-                        _pos_age = f"{(datetime.now() - position.open_time).total_seconds() / 60:.0f}min"
+                        _pos_age = f"{(datetime.now(timezone.utc) - position.open_time).total_seconds() / 60:.0f}min"
                     _pos_pnl = getattr(position, 'unrealized_pnl', None) or 0
                     print(
                         f"[POS-REEVAL] #{position.ticket} {position.symbol} {position.direction} "
@@ -5962,7 +5960,7 @@ class TradingBot:
                     # Throttle: if last decision was HOLD and cooldown hasn't elapsed, skip
                     last_state = self._position_reeval_state.get(position.ticket)
                     if last_state and last_state.get("decision") == "HOLD":
-                        since_last = (datetime.now() - last_state["time"]).total_seconds()
+                        since_last = (datetime.now(timezone.utc) - last_state["time"]).total_seconds()
                         _hrs = last_state.get("hours_open", 0)
                         if _hrs > 8:
                             cooldown_secs = 900
@@ -5999,7 +5997,7 @@ class TradingBot:
                             if open_dt.tzinfo:
                                 delta = datetime.now(timezone.utc) - open_dt
                             else:
-                                delta = datetime.now() - open_dt
+                                delta = datetime.now(timezone.utc) - open_dt.replace(tzinfo=timezone.utc)
                             hours_open = delta.total_seconds() / 3600
                     except Exception:
                         pass
@@ -6157,7 +6155,7 @@ Include brief reasoning.
                     # Record the re-eval state for throttling (cooldown before next call)
                     self._position_reeval_state[position.ticket] = {
                         "decision": decision,
-                        "time": datetime.now(),
+                        "time": datetime.now(timezone.utc),
                         "hours_open": hours_open,
                     }
                     
@@ -6281,7 +6279,7 @@ Include brief reasoning.
                 try:
                     symbol = order.symbol
                     order_direction = order.direction  # 'long' or 'short'
-                    age_str = f"{(datetime.now() - order.created_at).total_seconds() / 60:.0f}min"
+                    age_str = f"{(datetime.now(timezone.utc) - order.created_at).total_seconds() / 60:.0f}min"
                     print(
                         f"[PENDING-REEVAL] #{order.ticket} {symbol} {order.order_type} "
                         f"@ {order.price:.5f} | dir={order_direction} | age={age_str} "
@@ -6365,7 +6363,7 @@ Include brief reasoning.
                     # If we placed a buy_limit below market hoping for a dip, but price
                     # ran UP and our thesis was right, the limit will never fill. Detect
                     # this and convert to a market entry while the move is still live.
-                    age_minutes = (datetime.now() - order.created_at).total_seconds() / 60
+                    age_minutes = (datetime.now(timezone.utc) - order.created_at).total_seconds() / 60
                     
                     # Get current price (needed for both Tier 1.5 and Tier 2)
                     current_price = 0.0
@@ -6508,7 +6506,7 @@ Include brief reasoning.
                                                 entry_price=fill_price,
                                                 stop_loss=_new_sl or fill_price,
                                                 take_profit=_new_tp or 0,
-                                                open_time=datetime.now(),
+                                                open_time=datetime.now(timezone.utc),
                                             )
                                             upgraded_pos.trade_type = 'intraday'
                                             upgraded_pos.order_ticket = ticket
@@ -6829,7 +6827,7 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                         entry_price=mt5_pos.price_open,
                         stop_loss=mt5_pos.sl,
                         take_profit=mt5_pos.tp,
-                        open_time=datetime.now()
+                        open_time=datetime.now(timezone.utc)
                     )
                     if hasattr(self, 'pending_order_manager') and self.pending_order_manager:
                         _orig_order = self.pending_order_manager.filled_order_map.get(ticket)
@@ -6853,7 +6851,7 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                     _persistence.set('skip_mt5_trade_recount', False)
                 else:
                     today_start = datetime.combine(datetime.now(timezone.utc).date(), datetime.min.time())
-                    today_deals = await self.mt5_client.get_history(today_start, datetime.now())
+                    today_deals = await self.mt5_client.get_history(today_start, datetime.now(timezone.utc))
                     # Count only entry deals (entry=0 is trade-in) placed by THIS bot (magic=12345)
                     entry_deals = [
                         d for d in today_deals
@@ -6915,7 +6913,7 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
             return
         
         if not DB_AVAILABLE:
-            self._last_history_sync = datetime.now()
+            self._last_history_sync = datetime.now(timezone.utc)
             return
         
         try:
@@ -6950,12 +6948,12 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
             
             if not open_trade_tickets:
                 logger.debug("No open trades in DB to check for MT5 closes")
-                self._last_history_sync = datetime.now()
+                self._last_history_sync = datetime.now(timezone.utc)
                 return
             
             print(f"[SYNC] Checking {len(open_trade_tickets)} open DB trades against MT5...", flush=True)
             
-            end_time = datetime.now()
+            end_time = datetime.now(timezone.utc)
             start_time = end_time - timedelta(days=days_back)
             
             # Get closed deals from MT5 history
@@ -7010,7 +7008,7 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                     swap = float(close_deal.get('swap', 0))
                     total_pnl = profit + commission + swap
                     price = float(close_deal.get('price', 0))
-                    close_time = close_deal.get('time', datetime.now())
+                    close_time = close_deal.get('time', datetime.now(timezone.utc))
                     
                     try:
                         async with async_session() as session:
@@ -7065,8 +7063,8 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                     if positions:
                         for p in positions:
                             current_positions.add(str(p.ticket))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Failed to fetch MT5 positions during sync: {e}")
                 
                 try:
                     import MetaTrader5 as mt5
@@ -7074,8 +7072,8 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                     if orders:
                         for o in orders:
                             current_orders.add(str(o.ticket))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Failed to fetch MT5 orders during sync: {e}")
                 
                 cancelled_count = 0
                 filled_closed_count = 0
@@ -7086,9 +7084,9 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                         try:
                             # Check deal history to see if the order actually filled then closed
                             symbol = open_trade_tickets[trade_id]['symbol']
-                            deal_check_start = datetime.now() - timedelta(days=days_back)
+                            deal_check_start = datetime.now(timezone.utc) - timedelta(days=days_back)
                             deals_for_symbol = await self.mt5_client.get_history(
-                                deal_check_start, datetime.now(), symbol=symbol
+                                deal_check_start, datetime.now(timezone.utc), symbol=symbol
                             )
                             
                             # Look for an opening deal (entry=0) with order == trade_id
@@ -7134,13 +7132,13 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                                         open_commission = float(opening_deal.get('commission', 0))
                                         swap = float(closing_deal.get('swap', 0))
                                         total_pnl = profit + commission + open_commission + swap
-                                        close_time = closing_deal.get('time', datetime.now())
+                                        close_time = closing_deal.get('time', datetime.now(timezone.utc))
                                         
                                         trade.entry_price = fill_price
                                         trade.exit_price = close_price
                                         trade.profit_loss = total_pnl
                                         trade.pnl_source = "mt5"
-                                        trade.exit_time = close_time if isinstance(close_time, datetime) else datetime.now()
+                                        trade.exit_time = close_time if isinstance(close_time, datetime) else datetime.now(timezone.utc)
                                         trade.exit_reason = "SL/TP hit (filled-then-closed, detected via trade sync)"
                                         await session.commit()
                                         filled_closed_count += 1
@@ -7171,7 +7169,7 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                 if filled_closed_count > 0:
                     logger.info(f"Detected {filled_closed_count} filled-then-closed trades via deal history")
             
-            self._last_history_sync = datetime.now()
+            self._last_history_sync = datetime.now(timezone.utc)
             
             total_updates = updated_count + cancelled_count + (filled_closed_count if 'filled_closed_count' in dir() else 0)
             if total_updates > 0:
@@ -7194,11 +7192,23 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
             import traceback
             traceback.print_exc()
     
+    @staticmethod
+    def _safe_duration(close_time, open_time) -> str:
+        """Safely compute duration string between two datetimes (handles naive/aware mismatch)."""
+        if not open_time:
+            return 'Unknown'
+        try:
+            return str(close_time - open_time)
+        except TypeError:
+            ct = close_time.replace(tzinfo=None) if close_time.tzinfo else close_time
+            ot = open_time.replace(tzinfo=None) if open_time.tzinfo else open_time
+            return str(ct - ot)
+
     def _should_sync_history(self) -> bool:
         """Check if it's time to sync trade history."""
         if self._last_history_sync is None:
             return True
-        return datetime.now() - self._last_history_sync >= self._history_sync_interval
+        return datetime.now(timezone.utc) - self._last_history_sync >= self._history_sync_interval
 
     async def _handle_position_close(self, position):
         """
@@ -7215,7 +7225,7 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
             logger.info(f"Position {position.ticket} closed, updating journal...")
             
             # Get closing details from MT5 (if available)
-            close_time = datetime.now()
+            close_time = datetime.now(timezone.utc)
             
             # =============================================
             # GET ACTUAL P/L FROM MT5 HISTORY (authoritative)
@@ -7367,7 +7377,7 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                         if not trade_record:
                             try:
                                 history = await self.mt5_client.get_history(
-                                    datetime.now() - timedelta(days=7), datetime.now()
+                                    datetime.now(timezone.utc) - timedelta(days=7), datetime.now(timezone.utc)
                                 )
                                 for deal in history:
                                     if deal.get('position_id') == position.ticket and deal.get('entry') == 0:
@@ -7431,7 +7441,7 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                 self.win_streak = 0
                 _is_crypto_sym = any(c in position.symbol.upper() for c in ['BTC', 'ETH', 'XRP', 'SOL', 'ADA', 'DOGE'])
                 _cooldown_min = 15 if _is_crypto_sym else 30
-                cooldown_until = datetime.now() + timedelta(minutes=_cooldown_min)
+                cooldown_until = datetime.now(timezone.utc) + timedelta(minutes=_cooldown_min)
                 self._symbol_loss_cooldowns[position.symbol] = cooldown_until
                 logger.info(
                     f"[LOSS-COOLDOWN] {position.symbol}: {_cooldown_min}-min cooldown set until "
@@ -7480,11 +7490,11 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                 try:
                     should_update = (
                         self._last_learnings_update is None
-                        or (datetime.now() - self._last_learnings_update).total_seconds() >= 3600
+                        or (datetime.now(timezone.utc) - self._last_learnings_update).total_seconds() >= 3600
                     )
                     if should_update:
                         await self.learning_service.update_learnings_documentation()
-                        self._last_learnings_update = datetime.now()
+                        self._last_learnings_update = datetime.now(timezone.utc)
                         logger.info("[LEARNINGS] Updated trading_learnings.md after trade close")
                 except Exception as learn_err:
                     logger.debug(f"Could not update learnings doc: {learn_err}")
@@ -7626,7 +7636,7 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                         'profit_loss': profit_loss,
                         'pips': pips,
                         'r_multiple': position.current_r_multiple,
-                        'duration': str(close_time - position.open_time) if position.open_time else 'Unknown',
+                        'duration': self._safe_duration(close_time, position.open_time),
                         'entry_reason': entry_reason,
                         'original_confidence': original_confidence,
                         'timeframe': trade_timeframe,
@@ -7712,7 +7722,7 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
             
             last_reversal = self._reversal_cooldowns.get(symbol)
             if last_reversal:
-                minutes_since = (datetime.now() - last_reversal).total_seconds() / 60
+                minutes_since = (datetime.now(timezone.utc) - last_reversal).total_seconds() / 60
                 if minutes_since < 60:
                     logger.info(
                         f"[REVERSAL] {symbol}: Skipping — reversal cooldown active "
@@ -7751,7 +7761,7 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                 return
             
             # Record the reversal attempt timestamp
-            self._reversal_cooldowns[symbol] = datetime.now()
+            self._reversal_cooldowns[symbol] = datetime.now(timezone.utc)
             
             # ---- Fetch fresh market data ----
             df = await self.data_fetcher.get_ohlcv(
@@ -8077,7 +8087,7 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                             entry_price=entry_price,
                             stop_loss=stop_loss,
                             take_profit=trade_signal.take_profit or 0,
-                            open_time=datetime.now(),
+                            open_time=datetime.now(timezone.utc),
                             trade_type=getattr(trade_signal, 'trade_type', 'intraday'),
                         )
                         # Set up multi-TP levels
@@ -8105,7 +8115,7 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                                     stop_loss=stop_loss,
                                     take_profit=trade_signal.take_profit,
                                     volume=position_size,
-                                    entry_time=datetime.now(),
+                                    entry_time=datetime.now(timezone.utc),
                                     entry_reason=f"Reversal re-entry ({closed_position.close_reason})",
                                     claude_confidence=trade_signal.confidence,
                                     timeframe=settings.timeframes.execution_tf,
@@ -8208,7 +8218,7 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
     
     def _cleanup_expired_signal_hashes(self):
         """Remove signal hashes older than 1 hour."""
-        one_hour_ago = datetime.now() - timedelta(hours=1)
+        one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
         expired = [
             hash_key for hash_key, timestamp in self._signal_hash_expiry.items()
             if timestamp < one_hour_ago

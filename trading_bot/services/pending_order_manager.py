@@ -9,7 +9,7 @@ Tracks and manages pending orders (limit/stop orders) with:
 
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 
 from ..utils.logging import get_logger
@@ -55,13 +55,13 @@ class PendingOrder:
     
     @property
     def is_expired(self) -> bool:
-        return datetime.now() > self.expiration and self.status == PendingOrderStatus.ACTIVE
+        return datetime.now(timezone.utc) > self.expiration and self.status == PendingOrderStatus.ACTIVE
     
     @property
     def time_remaining(self) -> timedelta:
         if self.status != PendingOrderStatus.ACTIVE:
             return timedelta(0)
-        remaining = self.expiration - datetime.now()
+        remaining = self.expiration - datetime.now(timezone.utc)
         return max(remaining, timedelta(0))
     
     @property
@@ -173,15 +173,15 @@ class PendingOrderManager:
                 # SessionInfo is a dataclass — use getattr, not .get()
                 session_remaining = getattr(session, 'minutes_remaining', 0) if session else 0
                 if session_remaining > 30:  # Only shorten if session has meaningful time left
-                    expiration = datetime.now() + timedelta(minutes=min(session_remaining, expiration_minutes))
+                    expiration = datetime.now(timezone.utc) + timedelta(minutes=min(session_remaining, expiration_minutes))
                 else:
                     # Session ending soon — use full expiration to survive into next session
-                    expiration = datetime.now() + timedelta(minutes=expiration_minutes)
+                    expiration = datetime.now(timezone.utc) + timedelta(minutes=expiration_minutes)
             except Exception as e:
                 logger.warning(f"Could not get session for expiration: {e}")
-                expiration = datetime.now() + timedelta(minutes=expiration_minutes)
+                expiration = datetime.now(timezone.utc) + timedelta(minutes=expiration_minutes)
         else:
-            expiration = datetime.now() + timedelta(minutes=expiration_minutes)
+            expiration = datetime.now(timezone.utc) + timedelta(minutes=expiration_minutes)
         
         order = PendingOrder(
             ticket=ticket,
@@ -192,7 +192,7 @@ class PendingOrderManager:
             price=price,
             stop_loss=stop_loss,
             take_profit=take_profit,
-            created_at=datetime.now(),
+            created_at=datetime.now(timezone.utc),
             expiration=expiration,
             status=PendingOrderStatus.ACTIVE,
             risk_percent=risk_percent,
@@ -361,7 +361,7 @@ class PendingOrderManager:
                 if position_found:
                     # Order was filled and position is still open
                     order.status = PendingOrderStatus.FILLED
-                    order.fill_time = datetime.now()
+                    order.fill_time = datetime.now(timezone.utc)
                     for p in mt5_positions:
                         if p.symbol == order.symbol:
                             order.fill_price = p.price_open
@@ -384,7 +384,7 @@ class PendingOrderManager:
                 if deal_result:
                     # Order filled then closed
                     order.status = PendingOrderStatus.FILLED
-                    order.fill_time = deal_result.get('fill_time', datetime.now())
+                    order.fill_time = deal_result.get('fill_time', datetime.now(timezone.utc))
                     order.fill_price = deal_result.get('fill_price', order.price)
                     
                     filled_closed.append(ticket)
@@ -456,7 +456,7 @@ class PendingOrderManager:
         try:
             # Search deals from when the order was created
             start_time = order.created_at - timedelta(minutes=5)
-            end_time = datetime.now()
+            end_time = datetime.now(timezone.utc)
             
             deals = await self.mt5_client.get_history(
                 start_time, end_time, symbol=order.symbol
@@ -489,7 +489,7 @@ class PendingOrderManager:
             result = {
                 'filled': True,
                 'fill_price': opening_deal.get('price', order.price),
-                'fill_time': opening_deal.get('time', datetime.now()),
+                'fill_time': opening_deal.get('time', datetime.now(timezone.utc)),
                 'position_id': position_id,
                 'opening_deal_ticket': opening_deal.get('ticket'),
             }
@@ -504,7 +504,7 @@ class PendingOrderManager:
                 result.update({
                     'closed': True,
                     'close_price': closing_deal.get('price', 0),
-                    'close_time': closing_deal.get('time', datetime.now()),
+                    'close_time': closing_deal.get('time', datetime.now(timezone.utc)),
                     'profit': profit,
                     'commission': commission + open_commission,
                     'swap': swap,
@@ -553,13 +553,13 @@ class PendingOrderManager:
                 
                 close_price = deal_result.get('close_price', 0)
                 total_pnl = deal_result.get('total_pnl', 0)
-                close_time = deal_result.get('close_time', datetime.now())
+                close_time = deal_result.get('close_time', datetime.now(timezone.utc))
                 fill_price = deal_result.get('fill_price', order.price)
                 
                 trade.entry_price = fill_price
                 trade.exit_price = close_price
                 trade.profit_loss = total_pnl
-                trade.exit_time = close_time if isinstance(close_time, datetime) else datetime.now()
+                trade.exit_time = close_time if isinstance(close_time, datetime) else datetime.now(timezone.utc)
                 trade.exit_reason = "SL/TP hit (filled-then-closed, detected via deal history)"
                 
                 await session.commit()
@@ -631,21 +631,20 @@ class PendingOrderManager:
                 time_setup = o.get('time_setup')
                 if time_setup:
                     try:
-                        created_at = datetime.fromtimestamp(time_setup)
-                        # Clamp: if MT5 server is ahead of local clock, use now()
-                        if created_at > datetime.now():
-                            created_at = datetime.now()
+                        created_at = datetime.fromtimestamp(time_setup, tz=timezone.utc)
+                        if created_at > datetime.now(timezone.utc):
+                            created_at = datetime.now(timezone.utc)
                     except Exception:
-                        created_at = datetime.now()
+                        created_at = datetime.now(timezone.utc)
                 else:
-                    created_at = datetime.now()
+                    created_at = datetime.now(timezone.utc)
                 
                 # Default expiration: 8 hours from creation (max kill-zone window)
                 default_expiry = created_at + timedelta(hours=8)
                 # If already past that, set expiry to 2 hours from now
                 # so Claude re-eval has a chance to evaluate before they auto-expire
-                if default_expiry < datetime.now():
-                    default_expiry = datetime.now() + timedelta(hours=2)
+                if default_expiry < datetime.now(timezone.utc):
+                    default_expiry = datetime.now(timezone.utc) + timedelta(hours=2)
                 
                 order = PendingOrder(
                     ticket=ticket,
@@ -665,7 +664,7 @@ class PendingOrderManager:
                 imported += 1
                 print(
                     f"[PENDING-IMPORT] #{ticket} {order.symbol} {order.order_type} "
-                    f"@ {order.price} (age: {(datetime.now() - created_at).total_seconds()/60:.0f}min, "
+                    f"@ {order.price} (age: {(datetime.now(timezone.utc) - created_at).total_seconds()/60:.0f}min, "
                     f"expires in {order.minutes_remaining:.0f}min)",
                     flush=True
                 )

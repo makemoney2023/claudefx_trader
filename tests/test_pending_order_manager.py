@@ -10,7 +10,7 @@ Updated to match current PendingOrderManager API which uses:
 """
 
 import pytest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
@@ -134,8 +134,8 @@ class TestPendingOrderManager:
             price=1.0800,
             stop_loss=1.0750,
             take_profit=1.0900,
-            created_at=datetime.now() - timedelta(hours=2),
-            expiration=datetime.now() - timedelta(minutes=5),  # Expired
+            created_at=datetime.now(timezone.utc) - timedelta(hours=2),
+            expiration=datetime.now(timezone.utc) - timedelta(minutes=5),  # Expired
             status=PendingOrderStatus.ACTIVE
         )
         manager.pending_orders[11111] = expired_order
@@ -150,8 +150,8 @@ class TestPendingOrderManager:
             price=1.2500,
             stop_loss=1.2600,
             take_profit=1.2400,
-            created_at=datetime.now(),
-            expiration=datetime.now() + timedelta(hours=1),  # Still valid
+            created_at=datetime.now(timezone.utc),
+            expiration=datetime.now(timezone.utc) + timedelta(hours=1),  # Still valid
             status=PendingOrderStatus.ACTIVE
         )
         manager.pending_orders[22222] = valid_order
@@ -236,8 +236,8 @@ class TestOrderTypeProperties:
             price=1.0800,
             stop_loss=1.0750,
             take_profit=1.0900,
-            created_at=datetime.now(),
-            expiration=datetime.now() + timedelta(hours=1),
+            created_at=datetime.now(timezone.utc),
+            expiration=datetime.now(timezone.utc) + timedelta(hours=1),
             status=PendingOrderStatus.ACTIVE
         )
         
@@ -261,8 +261,8 @@ class TestOrderTypeProperties:
             price=1.0800,
             stop_loss=1.0750,
             take_profit=1.0900,
-            created_at=datetime.now() - timedelta(hours=2),
-            expiration=datetime.now() - timedelta(minutes=5),
+            created_at=datetime.now(timezone.utc) - timedelta(hours=2),
+            expiration=datetime.now(timezone.utc) - timedelta(minutes=5),
             status=PendingOrderStatus.ACTIVE
         )
         
@@ -281,8 +281,8 @@ class TestOrderTypeProperties:
             price=1.0800,  # Below current price for buy limit
             stop_loss=1.0750,
             take_profit=1.0900,
-            created_at=datetime.now(),
-            expiration=datetime.now() + timedelta(hours=1)
+            created_at=datetime.now(timezone.utc),
+            expiration=datetime.now(timezone.utc) + timedelta(hours=1)
         )
         
         assert order.order_type == "buy_limit"
@@ -301,8 +301,8 @@ class TestOrderTypeProperties:
             price=1.0800,  # Below current for sell stop
             stop_loss=1.0900,
             take_profit=1.0700,
-            created_at=datetime.now(),
-            expiration=datetime.now() + timedelta(hours=1)
+            created_at=datetime.now(timezone.utc),
+            expiration=datetime.now(timezone.utc) + timedelta(hours=1)
         )
         
         assert order.order_type == "sell_stop"
@@ -329,8 +329,8 @@ class TestExpirationHandling:
             price=1.0800,
             stop_loss=1.0750,
             take_profit=1.0900,
-            created_at=datetime.now(),
-            expiration=datetime.now() + timedelta(minutes=60)
+            created_at=datetime.now(timezone.utc),
+            expiration=datetime.now(timezone.utc) + timedelta(minutes=60)
         )
         
         # Should have about 60 minutes remaining (with some tolerance)
@@ -383,8 +383,8 @@ class TestExpirationHandling:
             price=1.0800,
             stop_loss=1.0750,
             take_profit=1.0900,
-            created_at=datetime.now(),
-            expiration=datetime.now() + timedelta(hours=1)
+            created_at=datetime.now(timezone.utc),
+            expiration=datetime.now(timezone.utc) + timedelta(hours=1)
         )
         
         data = order.to_dict()
@@ -414,8 +414,8 @@ class TestSyncWithMT5:
             price=price,
             stop_loss=price + 100,
             take_profit=price - 500,
-            created_at=datetime.now() - timedelta(minutes=30),
-            expiration=datetime.now() + timedelta(hours=1),
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=30),
+            expiration=datetime.now(timezone.utc) + timedelta(hours=1),
             status=PendingOrderStatus.ACTIVE
         )
     
@@ -485,7 +485,7 @@ class TestSyncWithMT5:
                 'profit': 0.0,
                 'commission': -0.5,
                 'swap': 0.0,
-                'time': datetime.now() - timedelta(minutes=20),
+                'time': datetime.now(timezone.utc) - timedelta(minutes=20),
                 'type': 'sell',
             },
             {
@@ -499,7 +499,7 @@ class TestSyncWithMT5:
                 'profit': -10.0,
                 'commission': -0.5,
                 'swap': 0.0,
-                'time': datetime.now() - timedelta(minutes=10),
+                'time': datetime.now(timezone.utc) - timedelta(minutes=10),
                 'type': 'buy',
             },
         ]
@@ -571,7 +571,7 @@ class TestSyncWithMT5:
                 'profit': 0.0,
                 'commission': 0.0,
                 'swap': 0.0,
-                'time': datetime.now() - timedelta(minutes=20),
+                'time': datetime.now(timezone.utc) - timedelta(minutes=20),
                 'type': 'sell',
             },
         ]
@@ -606,7 +606,7 @@ class TestSyncWithMT5:
                 'profit': 0.0,
                 'commission': -0.5,
                 'swap': 0.0,
-                'time': datetime.now() - timedelta(minutes=5),
+                'time': datetime.now(timezone.utc) - timedelta(minutes=5),
                 'type': 'sell',
             },
         ]
@@ -648,11 +648,11 @@ class TestSyncWithMT5:
                     {'ticket': 90001, 'order': 33333, 'entry': 0,
                      'position_id': 55555, 'symbol': 'BTCUSD', 'price': 67500.0,
                      'volume': 0.01, 'profit': 0.0, 'commission': 0.0, 'swap': 0.0,
-                     'time': datetime.now(), 'type': 'sell'},
+                     'time': datetime.now(timezone.utc), 'type': 'sell'},
                     {'ticket': 90002, 'order': 88888, 'entry': 1,
                      'position_id': 55555, 'symbol': 'BTCUSD', 'price': 67600.0,
                      'volume': 0.01, 'profit': -10.0, 'commission': 0.0, 'swap': 0.0,
-                     'time': datetime.now(), 'type': 'buy'},
+                     'time': datetime.now(timezone.utc), 'type': 'buy'},
                 ]
             return []  # No deals for EURUSD (order 44444)
         
@@ -683,8 +683,8 @@ class TestCheckDealHistoryForOrder:
             ticket=ticket, symbol=symbol, order_type="sell_limit",
             direction="short", volume=0.01, price=price,
             stop_loss=price + 100, take_profit=price - 500,
-            created_at=datetime.now() - timedelta(minutes=30),
-            expiration=datetime.now() + timedelta(hours=1),
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=30),
+            expiration=datetime.now(timezone.utc) + timedelta(hours=1),
             status=PendingOrderStatus.ACTIVE
         )
     
@@ -708,7 +708,7 @@ class TestCheckDealHistoryForOrder:
         from trading_bot.services.pending_order_manager import PendingOrderManager
         
         mock_mt5 = AsyncMock()
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         mock_mt5.get_history.return_value = [
             {
                 'ticket': 90001, 'order': 12345, 'entry': 0,
@@ -751,7 +751,7 @@ class TestCheckDealHistoryForOrder:
                 'position_id': 55555, 'symbol': 'BTCUSD',
                 'price': 67500.0, 'volume': 0.01,
                 'profit': 0.0, 'commission': -0.5, 'swap': 0.0,
-                'time': datetime.now(), 'type': 'sell',
+                'time': datetime.now(timezone.utc), 'type': 'sell',
             },
         ]
         

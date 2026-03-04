@@ -10,7 +10,7 @@ Monitors and manages open positions including:
 
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 
 from ..utils.logging import get_logger
@@ -421,14 +421,13 @@ class PositionManager:
                 ticket = mt5_pos.ticket
                 if ticket not in self.positions:
                     logger.warning(f"Position {ticket} in MT5 but not tracked - adding to tracking")
-                    from datetime import datetime
                     _mt5_time = getattr(mt5_pos, 'time', None)
                     if isinstance(_mt5_time, datetime):
                         _open_time = _mt5_time
                     elif isinstance(_mt5_time, (int, float)):
                         _open_time = datetime.fromtimestamp(_mt5_time)
                     else:
-                        _open_time = datetime.now()
+                        _open_time = datetime.now(timezone.utc)
                     position = Position(
                         ticket=ticket,
                         symbol=mt5_pos.symbol,

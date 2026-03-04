@@ -11,11 +11,12 @@ Provides WebSocket endpoints for:
 import asyncio
 import json
 from typing import Dict, Set, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from ..utils.logging import get_logger
+from ..utils.json_helpers import sanitize_for_json
 from .auth import get_api_key
 
 logger = get_logger(__name__)
@@ -64,7 +65,7 @@ class ConnectionManager:
         if channel not in self.active_connections:
             return
 
-        message_json = json.dumps(message, default=str)
+        message_json = json.dumps(sanitize_for_json(message), default=str)
         disconnected = set()
 
         for connection in self.active_connections[channel]:
@@ -156,7 +157,7 @@ async def broadcast_trade_update(trade_data: dict):
     """Broadcast a trade update to all connected clients."""
     await manager.broadcast("trades", {
         "type": "trade_update",
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "data": trade_data
     })
 
@@ -165,7 +166,7 @@ async def broadcast_price_update(symbol: str, bid: float, ask: float):
     """Broadcast a price update to all connected clients."""
     await manager.broadcast("prices", {
         "type": "price_update",
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "data": {
             "symbol": symbol,
             "bid": bid,
@@ -179,7 +180,7 @@ async def broadcast_analysis_update(symbol: str, analysis_data: dict):
     """Broadcast an analysis update to all connected clients."""
     await manager.broadcast("analysis", {
         "type": "analysis_update",
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "data": {
             "symbol": symbol,
             **analysis_data
@@ -191,7 +192,7 @@ async def broadcast_activity(activity_data: dict):
     """Broadcast an activity event to all connected clients."""
     await manager.broadcast("activity", {
         "type": "activity",
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "data": activity_data
     })
 

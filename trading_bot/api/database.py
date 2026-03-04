@@ -420,8 +420,8 @@ def backup_database(max_backups: int = 7) -> Optional[Path]:
     for old in backups[:-max_backups]:
         try:
             old.unlink()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Failed to remove old backup {old}: {e}")
     return backup_path
 
 
@@ -481,8 +481,11 @@ async def init_db():
             try:
                 await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"))
                 logger.info(f"Added column {table}.{column}")
-            except Exception:
-                pass  # Column already exists
+            except Exception as e:
+                if "duplicate column" in str(e).lower() or "already exists" in str(e).lower():
+                    pass
+                else:
+                    logger.debug(f"Migration {table}.{column}: {e}")
     
     logger.info("Database initialized")
 

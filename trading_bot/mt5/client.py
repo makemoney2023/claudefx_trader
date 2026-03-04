@@ -10,7 +10,7 @@ Uses the Model Context Protocol (MCP) to communicate with MT5.
 import asyncio
 import json
 from typing import Optional, Dict, Any, List
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 
 from ..config import settings
@@ -328,8 +328,8 @@ class MT5Client:
                     info = await asyncio.to_thread(mt5.terminal_info)
                 if info is not None:
                     return True
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"ensure_connected check failed: {e}")
             
             # Connection lost - try to reconnect
             logger.warning("MT5 connection lost, attempting reconnect...")
@@ -996,7 +996,7 @@ class MT5Client:
         base_price = self._get_simulated_symbol(symbol).bid
         
         bars = []
-        current_time = datetime.now()
+        current_time = datetime.now(timezone.utc)
         price = base_price
         
         for i in range(count - 1, -1, -1):
@@ -1067,7 +1067,7 @@ class MT5Client:
                     fill_price = price
                 
                 import random
-                sim_ticket = int(datetime.now().timestamp() * 1000) + random.randint(0, 999)
+                sim_ticket = int(datetime.now(timezone.utc).timestamp() * 1000) + random.randint(0, 999)
                 return {
                     "success": True,
                     "order_id": sim_ticket,

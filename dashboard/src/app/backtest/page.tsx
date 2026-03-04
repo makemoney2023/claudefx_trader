@@ -110,7 +110,7 @@ export default function BacktestPage() {
           }
           break
         }
-      } catch {}
+      } catch (e) { console.error('Failed to resume running backtest:', e) }
     }
     resumeRunning()
   }, [])
@@ -128,7 +128,7 @@ export default function BacktestPage() {
           }
           loaded = true
         }
-      } catch {}
+      } catch (e) { console.error('Failed to fetch market watch symbols:', e) }
       if (!loaded) {
         try {
           const configData = await api.getConfig()
@@ -145,7 +145,7 @@ export default function BacktestPage() {
             setIctConfig((prev) => ({ ...prev, symbol: fallback[0].name }))
             setReplayConfig((prev) => ({ ...prev, symbol: fallback[0].name }))
           }
-        } catch {}
+        } catch (e) { console.error('Failed to fetch config symbols fallback:', e) }
       }
       setSymbolsLoading(false)
     }
@@ -165,7 +165,7 @@ export default function BacktestPage() {
           setIctResult(run)
           fetchPastRuns()
         }
-      } catch {}
+      } catch (e) { console.error('ICT poll error:', e) }
     }, POLL_INTERVAL_MS)
     return () => clearInterval(t)
   }, [ictRunId, ictRunning, fetchPastRuns])
@@ -185,7 +185,7 @@ export default function BacktestPage() {
           setReplayResult(run)
           fetchPastRuns()
         }
-      } catch {}
+      } catch (e) { console.error('Replay poll error:', e) }
     }, POLL_INTERVAL_MS)
     return () => clearInterval(t)
   }, [replayRunId, replayRunning, fetchPastRuns])
@@ -203,7 +203,7 @@ export default function BacktestPage() {
           setOptResult(run)
           fetchPastRuns()
         }
-      } catch {}
+      } catch (e) { console.error('Optimizer poll error:', e) }
     }, POLL_INTERVAL_MS)
     return () => clearInterval(t)
   }, [optRunId, optRunning, fetchPastRuns])

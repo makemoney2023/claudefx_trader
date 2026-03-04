@@ -8,7 +8,7 @@ through the MT5 MCP server.
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 from enum import Enum
-from datetime import datetime
+from datetime import datetime, timezone
 
 from ..utils.logging import get_logger
 
@@ -239,7 +239,7 @@ class OrderManager:
                     status=OrderStatus.FILLED,
                     message="Order filled successfully",
                     fill_price=result.get('price'),
-                    fill_time=datetime.now()
+                    fill_time=datetime.now(timezone.utc)
                 )
             else:
                 return self._error_result(result.get('error', 'Unknown error'))
@@ -565,7 +565,7 @@ class OrderManager:
                     status=OrderStatus.FILLED,
                     message="Position closed",
                     fill_price=result.get('price'),
-                    fill_time=datetime.now()
+                    fill_time=datetime.now(timezone.utc)
                 )
             else:
                 return self._error_result(result.get('error', 'Unknown error'))

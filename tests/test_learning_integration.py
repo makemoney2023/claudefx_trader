@@ -5,7 +5,7 @@ Tests the full flow from trade close -> review -> storage -> context injection.
 """
 
 import pytest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 import json
 
@@ -30,7 +30,7 @@ class TestLossTradeTriggersReview:
         mock_position.current_price = 1.0970  # Below stop loss
         mock_position.current_r_multiple = -1.5  # Loss
         mock_position.volume = 0.01
-        mock_position.open_time = datetime.utcnow() - timedelta(hours=2)
+        mock_position.open_time = datetime.now(timezone.utc) - timedelta(hours=2)
         
         # Create bot instance with mocked services
         bot = TradingBot()
@@ -97,7 +97,7 @@ class TestWinTradeReviewBehavior:
         mock_position.current_price = 1.2450  # Small win
         mock_position.current_r_multiple = 1.0  # Only 1R win
         mock_position.volume = 0.01
-        mock_position.open_time = datetime.utcnow() - timedelta(hours=1)
+        mock_position.open_time = datetime.now(timezone.utc) - timedelta(hours=1)
         
         bot = TradingBot()
         bot.claude_client = MagicMock()
@@ -138,7 +138,7 @@ class TestWinTradeReviewBehavior:
         mock_position.current_price = 1.1050  # Big win
         mock_position.current_r_multiple = 2.5  # 2.5R win
         mock_position.volume = 0.01
-        mock_position.open_time = datetime.utcnow() - timedelta(hours=3)
+        mock_position.open_time = datetime.now(timezone.utc) - timedelta(hours=3)
         
         bot = TradingBot()
         bot.claude_client = MagicMock()
@@ -321,7 +321,7 @@ class TestAPIReturnsLearnings:
         mock_learning = MagicMock()
         mock_learning.id = 1
         mock_learning.trade_id = "123"
-        mock_learning.timestamp = datetime.utcnow()
+        mock_learning.timestamp = datetime.now(timezone.utc)
         mock_learning.symbol = "EURUSD"
         mock_learning.direction = "long"
         mock_learning.session = "london"

@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from ..auth import RequireAuth
 from ..database import async_session_maker, BacktestRunModel
 from ...utils.logging import get_logger
+from ...utils.json_helpers import sanitize_for_json
 
 logger = get_logger(__name__)
 
@@ -439,7 +440,7 @@ async def _run_ict_task(run_id: int):
         )
         backtester = Backtester(config)
         result = await asyncio.to_thread(backtester.run, None, True)
-        res_dict = result.to_dict()
+        res_dict = sanitize_for_json(result.to_dict())
         metrics = res_dict.get("metrics", {})
         async with async_session_maker() as session:
             from sqlalchemy import select
@@ -611,26 +612,25 @@ async def _run_replay_task(run_id: int):
     async def _update_progress(pct: int, step: str, log_entry=None):
         try:
             if log_entry:
-                _live_log.append(log_entry)
+                _live_log.append(sanitize_for_json(log_entry))
                 if len(_live_log) > 50:
                     _live_log.pop(0)
             async with async_session_maker() as sess:
-                from sqlalchemy import select
-                row = (await sess.execute(select(BacktestRunModel).where(BacktestRunModel.id == run_id))).scalar_one_or_none()
-                if row:
-                    row.progress_pct = pct
-                    row.current_step = step
-                    cfg = row.config_json or {}
-                    cfg["live_log"] = list(_live_log)
-                    row.config_json = cfg
-                    from sqlalchemy.orm.attributes import flag_modified
-                    flag_modified(row, "config_json")
-                    await sess.commit()
-        except Exception:
-            try:
-                await sess.rollback()
-            except Exception:
-                pass
+                from sqlalchemy import select, update
+                existing = (await sess.execute(
+                    select(BacktestRunModel.config_json).where(BacktestRunModel.id == run_id)
+                )).scalar_one_or_none()
+                cfg = dict(existing) if existing else {}
+                cfg["live_log"] = list(_live_log)
+                await sess.execute(
+                    update(BacktestRunModel)
+                    .where(BacktestRunModel.id == run_id)
+                    .values(progress_pct=pct, current_step=step, config_json=sanitize_for_json(cfg))
+                )
+                await sess.commit()
+            print(f"[PROGRESS] run={run_id} pct={pct} step={step[:50]} log_entries={len(_live_log)}", flush=True)
+        except Exception as _prog_err:
+            print(f"[PROGRESS-ERR] run={run_id}: {_prog_err}", flush=True)
 
     logger.info(f"[REPLAY-TASK] Run {run_id}: launching bt.run({symbol}, {start_date}, {end_date}, interval={interval_hours}h)")
     try:
@@ -665,8 +665,8 @@ async def _run_replay_task(run_id: int):
                 await session.commit()
         return
 
-    result_dict = result.to_dict()
-    result_dict["trades"] = [_replay_trade_to_dict(t) for t in result.trades]
+    result_dict = sanitize_for_json(result.to_dict())
+    result_dict["trades"] = [sanitize_for_json(_replay_trade_to_dict(t)) for t in result.trades]
     learnings_stored = await _feed_replay_learnings(run_id, result, learning_service=learning_service)
     result_dict["learnings_stored"] = learnings_stored
 
@@ -831,7 +831,7 @@ async def _run_optimizer_task(run_id: int):
         _backtest_tasks.pop(run_id, None)
         return
 
-    result_dict = result.to_dict()
+    result_dict = sanitize_for_json(result.to_dict())
     async with async_session_maker() as session:
         from sqlalchemy import select
         row = (await session.execute(select(BacktestRunModel).where(BacktestRunModel.id == run_id))).scalar_one_or_none()

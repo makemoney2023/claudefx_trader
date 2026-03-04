@@ -20,6 +20,7 @@ import numpy as np
 
 from ..utils.logging import get_logger
 from ..utils.candle_utils import calculate_atr
+from ..utils.json_helpers import sanitize_for_json
 
 logger = get_logger(__name__)
 
@@ -332,8 +333,8 @@ class ClaudeReplayBacktester:
         try:
             from ..llm.context_builder import ContextBuilder
             context_builder = ContextBuilder()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[REPLAY] ContextBuilder unavailable: {e}")
 
         total_steps = min(
             int((end_date - start_date).total_seconds() / 3600 / interval_hours) + 1,
@@ -373,8 +374,8 @@ class ClaudeReplayBacktester:
             if progress_callback and step_idx % 3 == 0:
                 try:
                     await progress_callback(pct, step_desc, None)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"[REPLAY] Progress callback error: {e}")
 
             try:
                 current_price = float(m15_window['close'].iloc[-1])
@@ -444,7 +445,7 @@ class ClaudeReplayBacktester:
                         _bar_extreme_zones.append({"top": _be_m15.demand_zone.top, "bottom": _be_m15.demand_zone.bottom, "type": "demand", "tf": "M15"})
 
                     # Chart overlays for M15 panel
-                    _m15_overlays = {
+                    _m15_overlays = sanitize_for_json({
                         "order_blocks": (
                             [{"top": float(o.high), "bottom": float(o.low), "type": "bullish"} for o in ob.bullish_obs[-5:]]
                             + [{"top": float(o.high), "bottom": float(o.low), "type": "bearish"} for o in ob.bearish_obs[-5:]]
@@ -458,10 +459,10 @@ class ClaudeReplayBacktester:
                             + [{"price": float(p.price), "label": "SSL", "color": "purple"} for p in liq.ssl_pools[-5:]]
                         ),
                         "swing_points": (
-                            [{"price": float(sh.price), "type": "high", "index": sh.index} for sh in ms.swing_highs[-8:]]
-                            + [{"price": float(sl_.price), "type": "low", "index": sl_.index} for sl_ in ms.swing_lows[-8:]]
+                            [{"price": float(sh.price), "type": "high", "index": int(sh.index)} for sh in ms.swing_highs[-8:]]
+                            + [{"price": float(sl_.price), "type": "low", "index": int(sl_.index)} for sl_ in ms.swing_lows[-8:]]
                         ),
-                    }
+                    })
                 except Exception as _analysis_err:
                     logger.debug(f"[REPLAY] Analysis enrichment failed: {_analysis_err}")
                     _m15_overlays = {}
@@ -480,14 +481,14 @@ class ClaudeReplayBacktester:
                                 _bar_extreme_zones.append({"top": h1_be.supply_zone.top, "bottom": h1_be.supply_zone.bottom, "type": "supply", "tf": "H1"})
                             if h1_be.demand_zone:
                                 _bar_extreme_zones.append({"top": h1_be.demand_zone.top, "bottom": h1_be.demand_zone.bottom, "type": "demand", "tf": "H1"})
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug(f"[REPLAY] H1 bar-extreme/structure analysis failed: {e}")
                         try:
                             from ..analysis.premium_discount import PremiumDiscountAnalyzer as _PDA_H1
                             _pd_h1_result = _PDA_H1(swing_lookback=20).analyze(h1_window, current_price=current_price)
                             analysis_data["h1_premium_discount"] = _pd_h1_result.to_dict()
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug(f"[REPLAY] H1 premium/discount analysis failed: {e}")
 
                 _pd_d1_result = None
                 if d1_data is not None and not d1_data.empty:
@@ -497,14 +498,14 @@ class ClaudeReplayBacktester:
                             from ..analysis.market_structure import MarketStructureAnalyzer as _MSA2
                             d1_ms = _MSA2().analyze(d1_window)
                             analysis_data["d1_bias"] = d1_ms.trend.value
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug(f"[REPLAY] D1 market structure analysis failed: {e}")
                         try:
                             from ..analysis.premium_discount import PremiumDiscountAnalyzer as _PDA
                             _pd_d1_result = _PDA(swing_lookback=20).analyze(d1_window, current_price=current_price)
                             analysis_data["premium_discount"] = _pd_d1_result.to_dict()
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug(f"[REPLAY] D1 premium/discount analysis failed: {e}")
 
                 # --- Generate composite chart (M15 + H1 if available) ---
                 from ..utils.chart_screenshot import create_composite_chart, create_simple_chart
@@ -519,7 +520,8 @@ class ClaudeReplayBacktester:
                         create_composite_chart, chart_panels, symbol,
                         bar_extreme_zones=_bar_extreme_zones if _bar_extreme_zones else None,
                     )
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"[REPLAY] Composite chart failed, falling back to simple: {e}")
                     chart_b64 = await asyncio.to_thread(
                         create_simple_chart, m15_window, symbol, 'M15'
                     )
@@ -543,18 +545,18 @@ class ClaudeReplayBacktester:
                         lctx = await self._learning_service.build_context_for_claude(symbol, snapshot_session)
                         if lctx:
                             market_data['learning_context'] = lctx
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"[REPLAY] Learning context build failed: {e}")
 
                 if _be_m15:
                     market_data['bar_extreme_m15'] = _be_m15.to_dict()
 
                 if _pd_d1_result:
-                    market_data['premium_discount'] = _pd_d1_result.to_dict()
+                    market_data['premium_discount'] = sanitize_for_json(_pd_d1_result.to_dict())
                     market_data['fibonacci_zone'] = _pd_d1_result.current_zone.value
-                    market_data['in_ote'] = _pd_d1_result.in_ote
+                    market_data['in_ote'] = bool(_pd_d1_result.in_ote)
                 if _pd_h1_result:
-                    market_data['h1_premium_discount'] = _pd_h1_result.to_dict()
+                    market_data['h1_premium_discount'] = sanitize_for_json(_pd_h1_result.to_dict())
 
                 claude_result = await self._claude.analyze_chart_async(
                     chart_image_base64=chart_b64,
@@ -639,8 +641,8 @@ class ClaudeReplayBacktester:
                                         pct,
                                         f"Zone-blocked {sig.direction} from {_zone_str} @ {current.strftime('%m/%d %H:%M')}"
                                     )
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    logger.debug(f"[REPLAY] Progress callback error: {e}")
                             signals_processed += 1
                             current += timedelta(hours=interval_hours)
                             step_idx += 1
@@ -675,8 +677,8 @@ class ClaudeReplayBacktester:
                                         pct,
                                         f"Blocked counter-trend {sig.direction} @ {current.strftime('%m/%d %H:%M')}"
                                     )
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    logger.debug(f"[REPLAY] Progress callback error: {e}")
                             signals_processed += 1
                             current += timedelta(hours=interval_hours)
                             step_idx += 1
@@ -697,8 +699,8 @@ class ClaudeReplayBacktester:
                                     pct,
                                     f"Blocked weak hour {sig.direction} @ {current.strftime('%m/%d %H:%M')}"
                                 )
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logger.debug(f"[REPLAY] Progress callback error: {e}")
                         signals_processed += 1
                         current += timedelta(hours=interval_hours)
                         step_idx += 1
@@ -744,30 +746,30 @@ class ClaudeReplayBacktester:
                         f"WR={wr:.0f}% totalR={r_sum:+.1f}"
                     )
 
-                    log_entry = {
+                    log_entry = sanitize_for_json({
                         "type": "trade",
                         "time": current.strftime("%m/%d %H:%M"),
                         "direction": sig.direction,
-                        "confidence": round(sig.confidence, 2),
-                        "entry": round(sig.entry_price, 5),
-                        "sl": round(sig.stop_loss, 5),
-                        "tp": round(sig.take_profit, 5),
+                        "confidence": round(float(sig.confidence), 2),
+                        "entry": round(float(sig.entry_price), 5),
+                        "sl": round(float(sig.stop_loss), 5),
+                        "tp": round(float(sig.take_profit), 5),
                         "outcome": trade.outcome,
-                        "r": round(trade.r_multiple, 2),
-                        "bars": trade.bars_held,
-                        "running_wr": round(wr, 1),
-                        "running_r": round(r_sum, 2),
-                        "trade_num": result.total_trades,
+                        "r": round(float(trade.r_multiple), 2),
+                        "bars": int(trade.bars_held),
+                        "running_wr": round(float(wr), 1),
+                        "running_r": round(float(r_sum), 2),
+                        "trade_num": int(result.total_trades),
                         "zone": _pd_d1_result.current_zone.value if _pd_d1_result else "unknown",
-                        "retracement_pct": round(_pd_d1_result.retracement_percent, 3) if _pd_d1_result else None,
-                        "in_ote": _pd_d1_result.in_ote if _pd_d1_result else False,
+                        "retracement_pct": round(float(_pd_d1_result.retracement_percent), 3) if _pd_d1_result else None,
+                        "in_ote": bool(_pd_d1_result.in_ote) if _pd_d1_result else False,
                         "zone_gate_decision": _zone_gate_decision,
-                    }
+                    })
                     if progress_callback:
                         try:
                             await progress_callback(pct, step_desc, log_entry)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug(f"[REPLAY] Progress callback error: {e}")
                 else:
                     logger.info(
                         f"[REPLAY] {current.strftime('%m/%d %H:%M')} No trade signal "
@@ -776,8 +778,8 @@ class ClaudeReplayBacktester:
                     if progress_callback:
                         try:
                             await progress_callback(pct, f"No signal @ {current.strftime('%m/%d %H:%M')}")
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug(f"[REPLAY] Progress callback error: {e}")
 
                 signals_processed += 1
 
