@@ -1870,17 +1870,12 @@ class TradingBot:
                 except Exception as _rl_err:
                     logger.debug(f"[REACTIVE] Error fetching reactive levels for {symbol}: {_rl_err}")
                 
-                # Compute volume profile for M15 chart
+                # Compute volume profile for M15 chart (assigned to market_data later)
                 _vp_data = None
                 try:
                     from .analysis.volume_profile import compute_volume_profile
                     _vp_data = compute_volume_profile(df, num_bins=50)
                     if _vp_data:
-                        market_data["volume_profile_levels"] = {
-                            'poc': _vp_data['poc'],
-                            'vah': _vp_data['vah'],
-                            'val': _vp_data['val'],
-                        }
                         logger.info(
                             f"[VP] {symbol}: POC={_vp_data['poc']:.5f}, "
                             f"VAH={_vp_data['vah']:.5f}, VAL={_vp_data['val']:.5f}"
@@ -1888,8 +1883,9 @@ class TradingBot:
                 except Exception as _vp_err:
                     logger.debug(f"[VP] Volume profile error for {symbol}: {_vp_err}")
 
-                # Detect bar extreme supply/demand zones on available timeframes
+                # Detect bar extreme supply/demand zones (assigned to market_data later)
                 _bar_extreme_zones = []
+                _bar_extreme_results: dict = {}
                 try:
                     from .analysis.bar_extreme_zones import BarExtremeZoneDetector
                     _be_detector = BarExtremeZoneDetector()
@@ -1897,7 +1893,7 @@ class TradingBot:
                     for _be_tf, _be_df in [('D1', _mtf_dfs.get('D1')), ('H1', _mtf_dfs.get('H1')), ('M15', df), ('M5', _mtf_dfs.get('M5'))]:
                         if _be_df is not None and len(_be_df) > 20:
                             _be_result = _be_detector.detect(_be_df, _current_price, _be_tf)
-                            market_data[f"bar_extreme_{_be_tf.lower()}"] = _be_result.to_dict()
+                            _bar_extreme_results[f"bar_extreme_{_be_tf.lower()}"] = _be_result.to_dict()
                             if _be_result.supply_zone:
                                 _bar_extreme_zones.append({"top": _be_result.supply_zone.top, "bottom": _be_result.supply_zone.bottom, "type": "supply", "tf": _be_tf})
                             if _be_result.demand_zone:
@@ -2013,6 +2009,16 @@ class TradingBot:
                 "volume_max": _sym_spec.volume_max,
                 "volume_step": _sym_spec.volume_step,
             }
+
+            # Assign pre-computed volume profile and bar extreme data
+            if _vp_data:
+                market_data["volume_profile_levels"] = {
+                    'poc': _vp_data['poc'],
+                    'vah': _vp_data['vah'],
+                    'val': _vp_data['val'],
+                }
+            for _be_key, _be_val in _bar_extreme_results.items():
+                market_data[_be_key] = _be_val
             
             # Add ATR context for Claude's SL placement awareness
             try:
@@ -2151,8 +2157,8 @@ class TradingBot:
                 market_data["currency_strength"] = analysis_results["currency_strength"]
             
             # TradingView technical
-            if 'tradingview_technical' in analysis_results:
-                market_data["tradingview_technical"] = analysis_results["tradingview_technical"]
+            if 'tv_technical' in analysis_results:
+                market_data["tradingview_technical"] = analysis_results["tv_technical"]
             
             # Rate expectations
             if 'rate_expectations' in analysis_results:
@@ -2904,14 +2910,42 @@ class TradingBot:
             if _use_zone_gate_live:
                 _zone_str = pd_analysis.current_zone.value
                 _retrace = pd_analysis.retracement_percent
-                _zone_aligned = (
+
+                _in_correct_zone = (
                     (_dir == 'short' and _retrace >= 0.5)
                     or (_dir == 'long' and _retrace <= 0.5)
                 )
-                _zone_misaligned = (
-                    (_dir == 'long' and _retrace >= 0.618)
-                    or (_dir == 'short' and _retrace <= 0.382)
+                from .config import get_symbol_spec
+                _sym_spec = get_symbol_spec(symbol)
+                _is_index = _sym_spec.category == 'index' if _sym_spec else False
+
+                _counter_trend = (
+                    (_d1_bias == 'bullish' and _dir == 'short')
+                    or (_d1_bias == 'bearish' and _dir == 'long')
                 )
+                _index_counter = False
+                if _is_index and _in_correct_zone:
+                    _index_counter = (
+                        (_dir == 'short' and _d1_bias != 'bearish')
+                        or (_dir == 'long' and _d1_bias != 'bullish')
+                    )
+
+                if _in_correct_zone and (_counter_trend or _index_counter) and _is_index:
+                    _zone_aligned = False
+                    _zone_misaligned = True
+                    logger.info(
+                        f"ZONE-GATE index counter-trend: "
+                        f"d1={_d1_bias!r} dir={_dir} retrace={_retrace:.0%}"
+                    )
+                elif _in_correct_zone and _counter_trend:
+                    _zone_aligned = False
+                    _zone_misaligned = False
+                else:
+                    _zone_aligned = _in_correct_zone
+                    _zone_misaligned = (
+                        (_dir == 'long' and _retrace >= 0.618)
+                        or (_dir == 'short' and _retrace <= 0.382)
+                    )
 
                 _zone_blocked = False
                 if _zone_misaligned:

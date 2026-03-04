@@ -341,6 +341,7 @@ class ClaudeReplayBacktester:
             max_signals,
         )
         step_idx = 0
+        _last_signal_for_symbol: Dict[str, Dict[str, Any]] = {}
 
         while current <= end_date and signals_processed < max_signals:
             if current.weekday() >= 5 or (current.weekday() == 4 and current.hour >= 19):
@@ -399,6 +400,7 @@ class ClaudeReplayBacktester:
                     _pip = _spec.pip_size
 
                     ms = MarketStructureAnalyzer().analyze(m15_window)
+                    _last_m15_break = ms.structure_breaks[-1] if ms.structure_breaks else None
                     analysis_data["market_structure"] = {
                         "trend": ms.trend.value,
                         "structure_breaks": len(ms.structure_breaks),
@@ -409,6 +411,11 @@ class ClaudeReplayBacktester:
                         "swing_highs": [float(sh.price) for sh in ms.swing_highs[-5:]],
                         "swing_lows": [float(sl_.price) for sl_ in ms.swing_lows[-5:]],
                     }
+                    analysis_data["m15_structure"] = (
+                        f"{_last_m15_break.type.value.upper()} at {float(_last_m15_break.price):.5f}"
+                        if _last_m15_break else "No recent breaks"
+                    )
+                    analysis_data["m15_trend"] = ms.trend.value
 
                     fvg = FVGDetector(pip_value=_pip).detect(m15_window)
                     analysis_data["fvg"] = {
@@ -476,6 +483,12 @@ class ClaudeReplayBacktester:
                             from ..analysis.bar_extreme_zones import BarExtremeZoneDetector as _BED
                             h1_ms = _MSA().analyze(h1_window)
                             analysis_data["h1_bias"] = h1_ms.trend.value
+                            _last_h1_break = h1_ms.structure_breaks[-1] if h1_ms.structure_breaks else None
+                            analysis_data["h1_structure"] = (
+                                f"{_last_h1_break.type.value.upper()} at {float(_last_h1_break.price):.5f}"
+                                if _last_h1_break else "No recent breaks"
+                            )
+                            analysis_data["h1_trend"] = h1_ms.trend.value
                             h1_be = _BED().detect(h1_window, current_price, 'H1')
                             if h1_be.supply_zone:
                                 _bar_extreme_zones.append({"top": h1_be.supply_zone.top, "bottom": h1_be.supply_zone.bottom, "type": "supply", "tf": "H1"})
@@ -498,6 +511,12 @@ class ClaudeReplayBacktester:
                             from ..analysis.market_structure import MarketStructureAnalyzer as _MSA2
                             d1_ms = _MSA2().analyze(d1_window)
                             analysis_data["d1_bias"] = d1_ms.trend.value
+                            _last_d1_break = d1_ms.structure_breaks[-1] if d1_ms.structure_breaks else None
+                            analysis_data["d1_structure"] = (
+                                f"{_last_d1_break.type.value.upper()} at {float(_last_d1_break.price):.5f}"
+                                if _last_d1_break else "No recent breaks"
+                            )
+                            analysis_data["d1_trend"] = d1_ms.trend.value
                         except Exception as e:
                             logger.debug(f"[REPLAY] D1 market structure analysis failed: {e}")
                         try:
@@ -558,6 +577,38 @@ class ClaudeReplayBacktester:
                 if _pd_h1_result:
                     market_data['h1_premium_discount'] = sanitize_for_json(_pd_h1_result.to_dict())
 
+                # Enrich market_data with HTF/LTF context so Claude prompt
+                # includes the Multi-Timeframe Analysis and LTF Execution sections
+                _d1_b = analysis_data.get('d1_bias', '')
+                _h1_b = analysis_data.get('h1_bias', '')
+                _m15_b = analysis_data.get('market_structure', {}).get('trend', '')
+                if _d1_b:
+                    market_data['d1_bias'] = _d1_b
+                    market_data['htf_bias'] = _d1_b
+                    market_data['d1_structure'] = analysis_data.get('d1_structure')
+                    market_data['d1_trend'] = analysis_data.get('d1_trend')
+                if _h1_b:
+                    market_data['h1_bias'] = _h1_b
+                    market_data['h1_structure'] = analysis_data.get('h1_structure')
+                    market_data['h1_trend'] = analysis_data.get('h1_trend')
+                if _m15_b:
+                    market_data['m15_bias'] = _m15_b
+                    market_data['m15_structure'] = analysis_data.get('m15_structure')
+                    market_data['m15_trend'] = analysis_data.get('m15_trend')
+                if _d1_b and _h1_b:
+                    market_data['htf_alignment'] = (_d1_b == _h1_b)
+                    market_data['htf_can_trade_long'] = (
+                        'preferred' if _d1_b == 'bullish'
+                        else ('counter_trend' if _d1_b == 'bearish' else 'no_data')
+                    )
+                    market_data['htf_can_trade_short'] = (
+                        'preferred' if _d1_b == 'bearish'
+                        else ('counter_trend' if _d1_b == 'bullish' else 'no_data')
+                    )
+
+                if symbol in _last_signal_for_symbol:
+                    market_data['last_signal'] = _last_signal_for_symbol[symbol]
+
                 claude_result = await self._claude.analyze_chart_async(
                     chart_image_base64=chart_b64,
                     symbol=symbol,
@@ -589,14 +640,42 @@ class ClaudeReplayBacktester:
                     if _use_zone_gate:
                         _zone_str = _pd_d1_result.current_zone.value
                         _retrace = _pd_d1_result.retracement_percent
-                        _zone_aligned = (
+
+                        _in_correct_zone = (
                             (sig.direction == 'short' and _retrace >= 0.5)
                             or (sig.direction == 'long' and _retrace <= 0.5)
                         )
-                        _zone_misaligned = (
-                            (sig.direction == 'long' and _retrace >= 0.618)
-                            or (sig.direction == 'short' and _retrace <= 0.382)
+                        from ..config import get_symbol_spec
+                        _sym_spec = get_symbol_spec(symbol)
+                        _is_index = _sym_spec.category == 'index' if _sym_spec else False
+
+                        _counter_trend = (
+                            (_d1_bias_bt == 'bullish' and sig.direction == 'short')
+                            or (_d1_bias_bt == 'bearish' and sig.direction == 'long')
                         )
+                        _index_counter = False
+                        if _is_index and _in_correct_zone:
+                            _index_counter = (
+                                (sig.direction == 'short' and _d1_bias_bt != 'bearish')
+                                or (sig.direction == 'long' and _d1_bias_bt != 'bullish')
+                            )
+
+                        if _in_correct_zone and (_counter_trend or _index_counter) and _is_index:
+                            _zone_aligned = False
+                            _zone_misaligned = True
+                            logger.info(
+                                f"[REPLAY] ZONE-GATE index counter-trend: "
+                                f"d1={_d1_bias_bt!r} dir={sig.direction} retrace={_retrace:.0%}"
+                            )
+                        elif _in_correct_zone and _counter_trend:
+                            _zone_aligned = False
+                            _zone_misaligned = False
+                        else:
+                            _zone_aligned = _in_correct_zone
+                            _zone_misaligned = (
+                                (sig.direction == 'long' and _retrace >= 0.618)
+                                or (sig.direction == 'short' and _retrace <= 0.382)
+                            )
 
                         if _zone_misaligned:
                             _zm_conf = _bt_settings.trading.zone_misaligned_min_confidence
@@ -719,6 +798,13 @@ class ClaudeReplayBacktester:
                         market_structure=sig.market_structure or 'unknown',
                     )
                     result.total_signals += 1
+
+                    _last_signal_for_symbol[symbol] = {
+                        'direction': sig.direction,
+                        'confidence': sig.confidence,
+                        'entry_price': sig.entry_price,
+                        'timestamp': current.isoformat(),
+                    }
 
                     future = m15_data[m15_data.index > window_end].head(200)
                     trade = _simulate_trade(replay_sig, future)

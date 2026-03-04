@@ -1382,12 +1382,16 @@ Unicorn/Breaker setups, buy_stop/sell_stop breakouts):
         if analysis_data:
             prompt += f"""
 ## Pre-computed Analysis
-- Market Structure: {analysis_data.get('market_structure', {})}
+- D1 Bias: {analysis_data.get('d1_bias', 'N/A')}
+- H1 Bias: {analysis_data.get('h1_bias', 'N/A')}
+- Market Structure (M15): {analysis_data.get('market_structure', {})}
 - Fair Value Gaps: {analysis_data.get('fvg', {})}
 - Order Blocks: {analysis_data.get('order_blocks', [])}
 - Liquidity Levels: {analysis_data.get('liquidity', {})}
 - Volume Metrics: {analysis_data.get('volume', {})}
 """
+            if analysis_data.get('h1_premium_discount'):
+                prompt += f"- H1 Premium/Discount: {analysis_data['h1_premium_discount']}\n"
         
         prompt += """
 ## Analysis Required
