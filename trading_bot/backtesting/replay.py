@@ -147,6 +147,7 @@ def _simulate_trade(
     signal: ReplaySignal,
     future_data: pd.DataFrame,
     max_bars: int = 200,
+    pip_size: float = 0.0001,
 ) -> ReplayTrade:
     """
     Simulate a trade outcome using price data after the signal.
@@ -164,6 +165,7 @@ def _simulate_trade(
     is_long = signal.direction == 'long'
 
     sl_dist = abs(entry - sl) if sl is not None else 1.0
+    _pip = pip_size if pip_size > 0 else 1.0
     mfe = 0.0
     mae = 0.0
 
@@ -183,8 +185,8 @@ def _simulate_trade(
             fav = entry - low
             adv = high - entry
 
-        mfe = max(mfe, fav)
-        mae = max(mae, adv)
+        mfe = max(mfe, fav / _pip)
+        mae = max(mae, adv / _pip)
 
         sl_hit = (is_long and low <= sl) or (not is_long and high >= sl)
         tp_hit = (is_long and high >= tp) or (not is_long and low <= tp)
@@ -198,32 +200,32 @@ def _simulate_trade(
                 sl_hit, tp_hit = False, True
 
         if sl_hit:
-            pnl = (sl - entry) if is_long else (entry - sl)
+            pnl_raw = (sl - entry) if is_long else (entry - sl)
             return ReplayTrade(
                 signal=signal, outcome='loss', exit_price=sl,
                 exit_time=bar.name if hasattr(bar, 'name') else None,
-                pnl_pips=pnl, r_multiple=-1.0,
+                pnl_pips=pnl_raw / _pip, r_multiple=-1.0,
                 mfe_pips=mfe, mae_pips=mae, bars_held=i + 1,
             )
 
         if tp_hit:
-            pnl = (tp - entry) if is_long else (entry - tp)
-            r = pnl / sl_dist if sl_dist > 0 else 0
+            pnl_raw = (tp - entry) if is_long else (entry - tp)
+            r = pnl_raw / sl_dist if sl_dist > 0 else 0
             return ReplayTrade(
                 signal=signal, outcome='win', exit_price=tp,
                 exit_time=bar.name if hasattr(bar, 'name') else None,
-                pnl_pips=pnl, r_multiple=r,
+                pnl_pips=pnl_raw / _pip, r_multiple=r,
                 mfe_pips=mfe, mae_pips=mae, bars_held=i + 1,
             )
 
     last_close = float(future_data.iloc[-1]['close'])
-    pnl = (last_close - entry) if is_long else (entry - last_close)
-    r = pnl / sl_dist if sl_dist > 0 else 0
+    pnl_raw = (last_close - entry) if is_long else (entry - last_close)
+    r = pnl_raw / sl_dist if sl_dist > 0 else 0
     return ReplayTrade(
         signal=signal,
         outcome='timeout',
         exit_price=last_close,
-        pnl_pips=pnl,
+        pnl_pips=pnl_raw / _pip,
         r_multiple=r,
         mfe_pips=mfe,
         mae_pips=mae,
@@ -388,6 +390,7 @@ class ClaudeReplayBacktester:
                 _bar_extreme_zones: list = []
                 _be_m15 = None
                 _m15_overlays: Dict[str, Any] = {}
+                _pip = 0.0001
                 try:
                     from ..analysis.market_structure import MarketStructureAnalyzer
                     from ..analysis.fair_value_gap import FVGDetector
@@ -807,7 +810,7 @@ class ClaudeReplayBacktester:
                     }
 
                     future = m15_data[m15_data.index > window_end].head(200)
-                    trade = _simulate_trade(replay_sig, future)
+                    trade = _simulate_trade(replay_sig, future, pip_size=_pip)
                     result.trades.append(trade)
                     result.total_trades += 1
 

@@ -233,6 +233,14 @@ def save_full_state(bot) -> bool:
             }
             persistence.save_reversal_cooldowns(cooldowns)
         
+        # Save loss cooldowns
+        if hasattr(bot, '_symbol_loss_cooldowns') and bot._symbol_loss_cooldowns:
+            loss_cds = {
+                symbol: ts.isoformat()
+                for symbol, ts in bot._symbol_loss_cooldowns.items()
+            }
+            persistence.set('loss_cooldowns', loss_cds)
+        
         # Save pending order metadata (expiration times)
         if hasattr(bot, 'pending_order_manager') and bot.pending_order_manager:
             po_meta = {}
@@ -386,6 +394,24 @@ def load_full_state(bot) -> bool:
                     logger.info(
                         f"Restored reversal cooldowns for: "
                         f"{list(bot._reversal_cooldowns.keys())}"
+                    )
+        
+        # Load loss cooldowns (filter expired)
+        if hasattr(bot, '_symbol_loss_cooldowns'):
+            saved_loss_cds = persistence.get('loss_cooldowns', {})
+            if saved_loss_cds:
+                now = datetime.now()
+                for symbol, ts_str in saved_loss_cds.items():
+                    try:
+                        ts = datetime.fromisoformat(ts_str)
+                        if ts > now:
+                            bot._symbol_loss_cooldowns[symbol] = ts
+                    except (ValueError, TypeError):
+                        pass
+                if bot._symbol_loss_cooldowns:
+                    logger.info(
+                        f"Restored loss cooldowns for: "
+                        f"{list(bot._symbol_loss_cooldowns.keys())}"
                     )
         
         logger.info("Bot state loaded successfully")

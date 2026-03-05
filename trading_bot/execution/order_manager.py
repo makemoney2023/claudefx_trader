@@ -45,6 +45,7 @@ class OrderResult:
     message: str
     fill_price: Optional[float] = None
     fill_time: Optional[datetime] = None
+    fill_volume: Optional[float] = None
     
     def to_dict(self) -> dict:
         return {
@@ -54,7 +55,8 @@ class OrderResult:
             "status": self.status.value,
             "message": self.message,
             "fill_price": self.fill_price,
-            "fill_time": self.fill_time.isoformat() if self.fill_time else None
+            "fill_time": self.fill_time.isoformat() if self.fill_time else None,
+            "fill_volume": self.fill_volume,
         }
 
 
@@ -239,7 +241,8 @@ class OrderManager:
                     status=OrderStatus.FILLED,
                     message="Order filled successfully",
                     fill_price=result.get('price'),
-                    fill_time=datetime.now(timezone.utc)
+                    fill_time=datetime.now(timezone.utc),
+                    fill_volume=result.get('volume'),
                 )
             else:
                 return self._error_result(result.get('error', 'Unknown error'))

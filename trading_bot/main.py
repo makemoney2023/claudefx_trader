@@ -336,6 +336,7 @@ class TradingBot:
         self._last_history_sync: Optional[datetime] = None
         self._history_sync_interval = timedelta(minutes=5)
         self._synced_deal_ids: set = set()  # Track already synced deals
+        self._max_synced_deal_ids = 10000
     
     async def initialize(self) -> bool:
         """
@@ -734,10 +735,20 @@ class TradingBot:
         self._position_mgr_task = asyncio.create_task(self._position_management_loop())
         logger.info("Independent position management loop launched (10s interval)")
         
+        self._last_state_save = datetime.now(timezone.utc)
+
         try:
             while self.running:
                 await self._trading_cycle()
-                
+
+                # Periodic state save every 60 seconds
+                if (datetime.now(timezone.utc) - self._last_state_save).total_seconds() >= 60:
+                    try:
+                        save_full_state(self)
+                        self._last_state_save = datetime.now(timezone.utc)
+                    except Exception as e:
+                        logger.debug(f"Periodic state save failed: {e}")
+
                 # Wait before next cycle (configurable interval)
                 await asyncio.sleep(15)  # Check every 15 seconds for faster ICT timing
                 
@@ -929,6 +940,8 @@ class TradingBot:
         """
         try:
             print(f"[CYCLE] Starting trading cycle...", flush=True)
+            # Cleanup expired signal hashes every cycle (they expire hourly)
+            self._cleanup_expired_signal_hashes()
             # Reset daily counters if new day
             await self._check_daily_reset()
             
@@ -1981,7 +1994,8 @@ class TradingBot:
                     _real_ask = _sym_info.ask
                     _real_spread = _real_ask - _real_bid
                     _spread_pct = _real_spread / ((_real_ask + _real_bid) / 2) if (_real_ask + _real_bid) > 0 else 0
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Could not get real spread: {e}")
                 pass
             
             market_data = {
@@ -3301,7 +3315,8 @@ class TradingBot:
                     _rel_vol = _vol_data.get("relative_volume", 1.0) or 1.0
                 elif hasattr(_vol_data, 'relative_volume'):
                     _rel_vol = getattr(_vol_data, 'relative_volume', 1.0) or 1.0
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Could not compute relative volume: {e}")
                 pass
             
             if _rel_vol < 0.3:
@@ -4501,7 +4516,8 @@ class TradingBot:
                         elif hasattr(_pd_data, 'current_zone'):
                             _zone_str = _pd_data.current_zone.value if hasattr(_pd_data.current_zone, 'value') else str(_pd_data.current_zone)
                             _retrace_pct = getattr(_pd_data, 'retracement_percent', None)
-                    except Exception:
+                    except Exception as e:
+                        logger.debug(f"Could not compute premium/discount zone: {e}")
                         pass
 
                     if _zone_str and _retrace_pct is not None:
@@ -4855,9 +4871,9 @@ class TradingBot:
                                 ticket=result.ticket,
                                 symbol=symbol,
                                 direction=trade_signal.direction,
-                                volume=position_size.lots,
+                                volume=result.fill_volume or position_size.lots,
                                 entry_price=result.fill_price or current_price,
-                                stop_loss=tracked_sl or (result.fill_price or current_price),  # Fallback to entry (0 risk) rather than 0.0
+                                stop_loss=tracked_sl or (result.fill_price or current_price),
                                 take_profit=tracked_tp or 0.0,
                                 open_time=datetime.now(timezone.utc),
                                 trade_type=getattr(trade_signal, 'trade_type', 'intraday') or 'intraday',
@@ -5654,7 +5670,8 @@ class TradingBot:
                     acct = await self.mt5_client.get_account_info()
                     if acct:
                         account_balance = acct.balance
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"Could not get account balance: {e}")
                     pass
             
             position_size_pct = 0.0
@@ -6033,8 +6050,8 @@ class TradingBot:
                             else:
                                 delta = datetime.now(timezone.utc) - open_dt.replace(tzinfo=timezone.utc)
                             hours_open = delta.total_seconds() / 3600
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"Could not compute hours_open for re-eval: {e}")
                     
                     r_mult = getattr(position, 'current_r_multiple', 0) or 0
                     pnl = getattr(position, 'unrealized_pnl', 0) or 0
@@ -6050,7 +6067,8 @@ class TradingBot:
                             _reeval_extra += f"- D1 Bias: {_mtf.get('d1_bias', 'unknown')}\n"
                             _reeval_extra += f"- H4 Bias: {_mtf.get('h4_bias', 'unknown')}\n"
                             _reeval_extra += f"- HTF Alignment: {_mtf.get('alignment', 'unknown')}\n"
-                    except Exception:
+                    except Exception as e:
+                        logger.debug(f"Could not get MTF bias for re-eval: {e}")
                         pass
                     try:
                         # Learning context
@@ -6062,7 +6080,8 @@ class TradingBot:
                             )
                             if _learn_ctx:
                                 _reeval_extra += f"\n## Lessons from Past Trades\n{_learn_ctx[:800]}\n"
-                    except Exception:
+                    except Exception as e:
+                        logger.debug(f"Could not get learning context: {e}")
                         pass
                     try:
                         # Real spread
@@ -6071,7 +6090,8 @@ class TradingBot:
                             _spread = _sym_info.ask - _sym_info.bid
                             _spread_pct = _spread / ((_sym_info.ask + _sym_info.bid) / 2) * 100
                             _reeval_extra += f"\n- Current Spread: {_spread:.5f} ({_spread_pct:.3f}%)\n"
-                    except Exception:
+                    except Exception as e:
+                        logger.debug(f"Could not get spread for re-eval: {e}")
                         pass
                     
                     # Build context for Claude
@@ -6407,7 +6427,8 @@ Include brief reasoning.
                         )
                         if df is not None and not df.empty:
                             current_price = float(df['close'].iloc[-1])
-                    except Exception:
+                    except Exception as e:
+                        logger.debug(f"Could not fetch current price: {e}")
                         pass
                     
                     if current_price > 0 and age_minutes >= 10:
@@ -6651,7 +6672,8 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                                         "data": _pending_chart_b64
                                     }
                                 })
-                    except Exception:
+                    except Exception as e:
+                        logger.debug(f"Could not generate pending order chart: {e}")
                         pass
                     
                     pending_chart_content.append({"type": "text", "text": prompt})
@@ -6897,6 +6919,25 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
             except Exception as e:
                 logger.warning(f"Could not initialize daily trades from history: {e}")
             
+            # Recompute daily_pnl from today's closed trades in DB
+            try:
+                if DB_AVAILABLE:
+                    from sqlalchemy import select, func
+                    async with async_session() as sess:
+                        today_start = datetime.combine(datetime.now(timezone.utc).date(), datetime.min.time())
+                        result = await sess.execute(
+                            select(func.coalesce(func.sum(TradeModel.profit_loss), 0.0))
+                            .where(TradeModel.exit_time >= today_start)
+                            .where(TradeModel.exit_price.isnot(None))
+                            .where(TradeModel.exit_price != 0)
+                        )
+                        db_daily_pnl = float(result.scalar() or 0.0)
+                        if db_daily_pnl != 0:
+                            self.daily_pnl = db_daily_pnl
+                            logger.info(f"Recomputed daily_pnl from DB: ${db_daily_pnl:.2f}")
+            except Exception as e:
+                logger.debug(f"Could not recompute daily_pnl from DB: {e}")
+            
             # Log positions in DB but not in MT5 (closed while bot was down)
             for db_pos in db_positions:
                 if db_pos.ticket not in mt5_tickets:
@@ -6955,7 +6996,7 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
             # 1. Truly open trades (no exit_price)
             # 2. Trades wrongly marked as cancelled (exit_price == entry_price, profit_loss == 0)
             #    These happen when manual close removes position before sync detects the close.
-            from sqlalchemy import or_, and_
+            from sqlalchemy import or_, and_, func
             open_trade_tickets = {}  # trade_id -> TradeModel data
             async with async_session() as session:
                 from sqlalchemy import select
@@ -6964,10 +7005,9 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                         or_(
                             TradeModel.exit_price.is_(None),
                             TradeModel.exit_price == 0,
-                            # Wrongly cancelled: exit == entry and P/L is zero
                             and_(
-                                TradeModel.profit_loss == 0,
-                                TradeModel.exit_price == TradeModel.entry_price,
+                                func.abs(TradeModel.profit_loss) < 0.00001,
+                                func.abs(TradeModel.exit_price - TradeModel.entry_price) < 0.00001,
                             )
                         )
                     )
@@ -7052,9 +7092,10 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                             trade = result.scalar_one_or_none()
                             _needs_update = (
                                 trade and (
-                                    trade.exit_price is None or 
+                                    trade.exit_price is None or
                                     trade.exit_price == 0 or
-                                    (trade.profit_loss == 0 and trade.exit_price == trade.entry_price) or
+                                    (abs(trade.profit_loss or 0) < 1e-5 and
+                                     abs((trade.exit_price or 0) - (trade.entry_price or 0)) < 1e-5) or
                                     getattr(trade, 'pnl_source', None) == 'fallback'
                                 )
                             )
@@ -7086,7 +7127,8 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
             # These were deleted/expired externally — mark them as cancelled in the DB
             unmatched_tickets = set(open_trade_tickets.keys()) - matched_tickets
             cancelled_count = 0
-            
+            filled_closed_count = 0
+
             if unmatched_tickets:
                 # Get current open positions and pending orders from MT5
                 current_positions = set()
@@ -7152,7 +7194,8 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                                     trade and (
                                         trade.exit_price is None or
                                         trade.exit_price == 0 or
-                                        (trade.profit_loss == 0 and trade.exit_price == trade.entry_price) or
+                                        (abs(trade.profit_loss or 0) < 1e-5 and
+                                         abs((trade.exit_price or 0) - (trade.entry_price or 0)) < 1e-5) or
                                         getattr(trade, 'pnl_source', None) in (None, 'fallback')
                                     )
                                 )
@@ -7205,18 +7248,17 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
             
             self._last_history_sync = datetime.now(timezone.utc)
             
-            total_updates = updated_count + cancelled_count + (filled_closed_count if 'filled_closed_count' in dir() else 0)
+            total_updates = updated_count + cancelled_count + filled_closed_count
             if total_updates > 0:
-                fc = filled_closed_count if 'filled_closed_count' in dir() else 0
-                logger.info(f"Trade sync: {updated_count} closed, {fc} filled-then-closed, {cancelled_count} cancelled")
-                print(f"[SYNC] Done: {updated_count} trades updated with close data, {fc} filled-then-closed, {cancelled_count} cancelled/orphaned", flush=True)
+                logger.info(f"Trade sync: {updated_count} closed, {filled_closed_count} filled-then-closed, {cancelled_count} cancelled")
+                print(f"[SYNC] Done: {updated_count} trades updated with close data, {filled_closed_count} filled-then-closed, {cancelled_count} cancelled/orphaned", flush=True)
                 
                 from .api.routes.activity import add_activity
                 add_activity(
                     "info",
-                    f"Trade sync: {updated_count} closed, {fc} filled-then-closed, {cancelled_count} cancelled",
+                    f"Trade sync: {updated_count} closed, {filled_closed_count} filled-then-closed, {cancelled_count} cancelled",
                     None,
-                    {"updated_count": updated_count, "filled_closed": fc, "cancelled": cancelled_count, "days_back": days_back}
+                    {"updated_count": updated_count, "filled_closed": filled_closed_count, "cancelled": cancelled_count, "days_back": days_back}
                 )
             else:
                 logger.debug("No open bot trades needed MT5 close updates")
@@ -7307,8 +7349,8 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                             if _deal_ts:
                                 try:
                                     _last_deal_time = datetime.fromtimestamp(_deal_ts) if isinstance(_deal_ts, (int, float)) else _deal_ts
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    logger.debug(f"Could not parse deal timestamp: {e}")
                         elif _matches_ticket and deal.get('entry') == 0:
                             total_commission += deal.get('commission', 0) or 0
                     if close_deal_count > 0:
@@ -7369,10 +7411,12 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                     flush=True
                 )
             
-            # Calculate pips using actual close price and symbol spec
             pip_size = _spec.pip_size
             
-            raw_pips = (actual_close_price - position.entry_price) / pip_size
+            if pip_size <= 0:
+                raw_pips = 0.0
+            else:
+                raw_pips = (actual_close_price - position.entry_price) / pip_size
             
             if position.direction == 'short':
                 pips = -raw_pips  # Short profits when price drops (negative raw_pips)
@@ -7612,7 +7656,8 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                                 _rec = _tr.scalar_one_or_none()
                                 if _rec and getattr(_rec, 'risk_percent', None):
                                     _reclaim_pct = _rec.risk_percent
-                        except Exception:
+                        except Exception as e:
+                            logger.debug(f"Could not reclaim risk percent: {e}")
                             pass
                     self.risk_manager.update_daily_risk(-_reclaim_pct)
                     print(
@@ -7859,7 +7904,8 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                 if account_info:
                     market_data["account_equity"] = account_info.equity
                     market_data["account_balance"] = account_info.balance
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Could not get account equity: {e}")
                 pass
             
             # ---- Run ICT analysis on fresh data ----
@@ -8012,7 +8058,8 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                                 direction=trade_signal.direction,
                                 trade_type=getattr(trade_signal, 'trade_type', 'intraday'),
                             )
-                        except Exception:
+                        except Exception as e:
+                            logger.debug(f"Could not get learning context for reversal judge: {e}")
                             pass
                     
                     judge_result = await self.claude_client.judge_trade(
@@ -8178,7 +8225,8 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                             volume=position_size,
                             confidence=trade_signal.confidence,
                         )
-                    except Exception:
+                    except Exception as e:
+                        logger.debug(f"Could not send reversal trade notification: {e}")
                         pass
                 else:
                     logger.warning(
@@ -8332,6 +8380,13 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
             
             # Also cleanup old signal hashes
             self._cleanup_expired_signal_hashes()
+            
+            # Prune _synced_deal_ids to prevent unbounded growth
+            if len(self._synced_deal_ids) > self._max_synced_deal_ids:
+                excess = len(self._synced_deal_ids) - self._max_synced_deal_ids
+                to_discard = sorted(self._synced_deal_ids)[:excess]
+                self._synced_deal_ids -= set(to_discard)
+                logger.info(f"Pruned {excess} old entries from _synced_deal_ids")
     
     async def _send_daily_summary(self):
         """Send end-of-day summary notification."""
@@ -8421,7 +8476,8 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
             try:
                 current = self.session_analytics.get_current_session()
                 session = current.value
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Could not get current session: {e}")
                 pass
         
         # Open positions count

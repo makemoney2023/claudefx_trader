@@ -153,6 +153,7 @@ class FirecrawlIntelligenceService:
         self.refresh_minutes = refresh_minutes
         self.enabled = enabled
         self._cache: Dict[str, IntelligenceCache] = {}
+        self._max_cache_size = 50
         
         if FIRECRAWL_AVAILABLE and self.api_key and self.enabled:
             # Use new Firecrawl class (v2 SDK)
@@ -796,8 +797,19 @@ class FirecrawlIntelligenceService:
         
         return not cache_entry.is_expired()
     
+    def _evict_expired_cache(self):
+        """Remove all expired entries from cache."""
+        expired_keys = [k for k, v in self._cache.items() if v.is_expired()]
+        for k in expired_keys:
+            del self._cache[k]
+        if len(self._cache) > self._max_cache_size:
+            by_age = sorted(self._cache.items(), key=lambda x: x[1].timestamp)
+            for k, _ in by_age[:len(self._cache) - self._max_cache_size]:
+                del self._cache[k]
+
     def _update_cache(self, key: str, data: Any, ttl_override: Optional[int] = None):
-        """Update cache with new data."""
+        """Update cache with new data, evicting expired entries first."""
+        self._evict_expired_cache()
         ttl = ttl_override if ttl_override else self.refresh_minutes
         self._cache[key] = IntelligenceCache(
             data=data,

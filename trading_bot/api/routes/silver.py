@@ -121,15 +121,21 @@ async def get_targets(entry_price: float):
     targets = silver_analyzer.calculate_silver_targets(entry_price)
     stop_loss = silver_analyzer.calculate_silver_stop_loss(entry_price)
     
+    risk_dist = entry_price - stop_loss
+    if abs(risk_dist) < 1e-9:
+        rr = {'to_tp1': 0, 'to_tp2': 0, 'to_tp3': 0}
+    else:
+        rr = {
+            'to_tp1': round((targets['tp1'] - entry_price) / risk_dist, 2),
+            'to_tp2': round((targets['tp2'] - entry_price) / risk_dist, 2),
+            'to_tp3': round((targets['tp3'] - entry_price) / risk_dist, 2),
+        }
+
     return {
         'entry_price': entry_price,
         'stop_loss': stop_loss,
         'targets': targets,
-        'risk_reward': {
-            'to_tp1': round((targets['tp1'] - entry_price) / (entry_price - stop_loss), 2),
-            'to_tp2': round((targets['tp2'] - entry_price) / (entry_price - stop_loss), 2),
-            'to_tp3': round((targets['tp3'] - entry_price) / (entry_price - stop_loss), 2),
-        }
+        'risk_reward': rr,
     }
 
 

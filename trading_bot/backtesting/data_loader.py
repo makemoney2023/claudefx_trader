@@ -7,6 +7,7 @@ Supports loading data from:
 - Sample data generation
 """
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -37,10 +38,11 @@ class DataLoader:
     Supports multiple data sources and handles data preprocessing.
     """
     
-    def __init__(self, data_dir: str = "data"):
+    def __init__(self, data_dir: str = "data", max_cache_size: int = 20):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.cache: Dict[str, pd.DataFrame] = {}
+        self._max_cache_size = max_cache_size
+        self.cache: OrderedDict[str, pd.DataFrame] = OrderedDict()
         logger.info(f"DataLoader initialized with data_dir: {data_dir}")
     
     def load(self, config: DataConfig) -> pd.DataFrame:
@@ -56,6 +58,7 @@ class DataLoader:
         cache_key = f"{config.symbol}_{config.timeframe}_{config.start_date}_{config.end_date}"
         
         if cache_key in self.cache:
+            self.cache.move_to_end(cache_key)
             logger.debug(f"Returning cached data for {cache_key}")
             return self.cache[cache_key].copy()
         
@@ -69,8 +72,10 @@ class DataLoader:
         # Preprocess data
         df = self._preprocess(df, config)
         
-        # Cache the result
+        # Cache the result with LRU eviction
         self.cache[cache_key] = df
+        while len(self.cache) > self._max_cache_size:
+            self.cache.popitem(last=False)
         
         logger.info(f"Loaded {len(df)} bars for {config.symbol} {config.timeframe}")
         return df

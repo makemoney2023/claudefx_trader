@@ -293,10 +293,10 @@ export default function BotActivityPage() {
         <div className="card">
           <div className="card-body">
             <p className="text-sm text-slate-400 mb-1">Cycles Completed</p>
-            <p className="font-medium text-lg">{status?.cycle_info.count || 0}</p>
-            {status?.cycle_info.last_cycle_time && (
+            <p className="font-medium text-lg">{status?.cycle_info?.count || 0}</p>
+            {status?.cycle_info?.last_cycle_time && (
               <p className="text-sm text-slate-400 mt-1">
-                Last: {new Date(status.cycle_info.last_cycle_time).toLocaleTimeString()}
+                Last: {new Date(status.cycle_info!.last_cycle_time).toLocaleTimeString()}
               </p>
             )}
           </div>

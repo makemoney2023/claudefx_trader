@@ -115,15 +115,30 @@ class PendingOrderManager:
         # Track pending orders by ticket
         self.pending_orders: Dict[int, PendingOrder] = {}
         
-        # History of completed orders
+        # History of completed orders (bounded to prevent memory leaks)
+        self._max_history_size = 500
         self.order_history: List[PendingOrder] = []
 
         # Maps position ticket -> original order ticket for filled pending orders.
         # Consumed by position_manager to set order_ticket on Position objects.
+        self._max_filled_map_size = 200
         self.filled_order_map: Dict[int, int] = {}
         
         logger.info("PendingOrderManager initialized")
     
+    def _append_history(self, order: PendingOrder):
+        """Append to order_history, trimming oldest entries to stay within bounds."""
+        self.order_history.append(order)
+        if len(self.order_history) > self._max_history_size:
+            self.order_history = self.order_history[-self._max_history_size:]
+
+    def _cleanup_filled_order_map(self):
+        """Trim filled_order_map to bounded size, keeping most recent entries."""
+        if len(self.filled_order_map) > self._max_filled_map_size:
+            to_remove = len(self.filled_order_map) - self._max_filled_map_size
+            for key in list(self.filled_order_map.keys())[:to_remove]:
+                del self.filled_order_map[key]
+
     def set_order_manager(self, order_manager):
         """Set the order manager."""
         self.order_manager = order_manager
@@ -293,7 +308,7 @@ class PendingOrderManager:
             order.cancel_reason = reason
             
             # Move to history
-            self.order_history.append(order)
+            self._append_history(order)
             del self.pending_orders[ticket]
             
             logger.info(f"Order {ticket} cancelled: {reason}")
@@ -341,39 +356,74 @@ class PendingOrderManager:
                     continue
                 
                 # Order no longer in MT5 pending list -- check if it became a position
-                # Priority 1: MT5 links positions to originating orders via the 'order' field
-                # Priority 2: Match by symbol + percentage-based price tolerance (0.1%)
-                position_found = False
+                # Priority 1: Direct ticket match (position.ticket == order ticket)
+                # Priority 2: MT5 identifier/order field linkage on position
+                # Priority 3: Deal history deal.order linkage (authoritative MT5 link)
+                # Priority 4: Symbol + price tolerance fallback (least reliable)
+                matched_position = None
+                match_method = None
+
                 for p in mt5_positions:
                     if getattr(p, 'ticket', None) == ticket:
-                        position_found = True
+                        matched_position = p
+                        match_method = "ticket"
                         break
                     mt5_order_link = getattr(p, 'identifier', None) or getattr(p, 'order', None)
                     if mt5_order_link and mt5_order_link == ticket:
-                        position_found = True
+                        matched_position = p
+                        match_method = "order_link"
                         break
-                    if p.symbol == order.symbol and order.price > 0:
-                        price_tol = abs(p.price_open - order.price) / order.price
-                        if price_tol < 0.001:
-                            position_found = True
-                            break
-                
-                if position_found:
-                    # Order was filled and position is still open
+
+                if not matched_position:
+                    try:
+                        start_time = order.created_at - timedelta(minutes=5)
+                        end_time = datetime.now(timezone.utc)
+                        deals = await self.mt5_client.get_history(
+                            start_time, end_time, symbol=order.symbol
+                        )
+                        if deals:
+                            for deal in deals:
+                                if deal.get('entry') == 0 and deal.get('order') == ticket:
+                                    deal_pos_id = deal.get('position_id')
+                                    if deal_pos_id:
+                                        for p in mt5_positions:
+                                            if getattr(p, 'ticket', None) == deal_pos_id:
+                                                matched_position = p
+                                                match_method = "deal_order"
+                                                break
+                                    break
+                    except Exception as e:
+                        logger.debug(f"Deal history lookup failed for order {ticket}: {e}")
+
+                if not matched_position:
+                    for p in mt5_positions:
+                        if p.symbol == order.symbol and order.price > 0:
+                            price_tol = abs(p.price_open - order.price) / order.price
+                            if price_tol < 0.001:
+                                matched_position = p
+                                match_method = "price_tolerance"
+                                logger.info(
+                                    f"Order {ticket} matched to position {p.ticket} via price "
+                                    f"tolerance (order={order.price}, pos={p.price_open})"
+                                )
+                                break
+
+                if matched_position:
                     order.status = PendingOrderStatus.FILLED
                     order.fill_time = datetime.now(timezone.utc)
-                    for p in mt5_positions:
-                        if p.symbol == order.symbol:
-                            order.fill_price = p.price_open
-                            pos_ticket = getattr(p, 'ticket', None)
-                            if pos_ticket and pos_ticket != ticket:
-                                self.filled_order_map[pos_ticket] = ticket
-                            break
-                    
+                    order.fill_price = matched_position.price_open
+                    pos_ticket = getattr(matched_position, 'ticket', None)
+                    if pos_ticket and pos_ticket != ticket:
+                        self.filled_order_map[pos_ticket] = ticket
+
                     filled.append(ticket)
-                    self.order_history.append(order)
+                    self._append_history(order)
                     del self.pending_orders[ticket]
-                    logger.info(f"Order {ticket} filled at {order.fill_price}")
+                    self._cleanup_filled_order_map()
+                    logger.info(
+                        f"Order {ticket} filled at {order.fill_price} "
+                        f"(matched via {match_method}, position={pos_ticket})"
+                    )
                     continue
                 
                 # Not in pending orders, not in open positions.
@@ -388,7 +438,7 @@ class PendingOrderManager:
                     order.fill_price = deal_result.get('fill_price', order.price)
                     
                     filled_closed.append(ticket)
-                    self.order_history.append(order)
+                    self._append_history(order)
                     del self.pending_orders[ticket]
                     
                     pnl = deal_result.get('total_pnl', 0)
@@ -412,7 +462,7 @@ class PendingOrderManager:
                     order.cancel_reason = "external"
                     
                     cancelled.append(ticket)
-                    self.order_history.append(order)
+                    self._append_history(order)
                     del self.pending_orders[ticket]
                     print(
                         f"[PENDING-SYNC] Order {ticket} ({order.symbol}) not found in MT5 "

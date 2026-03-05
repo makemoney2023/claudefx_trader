@@ -1373,6 +1373,28 @@ class MT5Client:
                         "requested_volume": volume,
                         "partial_fill": abs(fill_volume - volume) > 0.001
                     }
+                elif result.retcode == 10014:
+                    logger.error(f"INVALID VOLUME: {volume} lots for {symbol} — {result.comment}")
+                    return {
+                        "success": False,
+                        "error": f"Invalid volume: {volume} lots not accepted for {symbol}",
+                        "retcode": 10014
+                    }
+                elif result.retcode == 10019:
+                    logger.error(f"INSUFFICIENT MARGIN for {volume} lots {symbol} — {result.comment}")
+                    return {
+                        "success": False,
+                        "error": f"Insufficient margin for {volume} lots {symbol}",
+                        "retcode": 10019
+                    }
+                elif result.retcode == 10031:
+                    logger.error(f"POSITION NOT FOUND during order on {symbol} — {result.comment}")
+                    return {
+                        "success": False,
+                        "error": "Position not found",
+                        "retcode": 10031,
+                        "position_not_found": True
+                    }
                 elif result.retcode in (10004, 10006) and attempt < max_retries:
                     # 10004 = requote, 10006 = rejected - retry with refreshed price
                     logger.warning(
@@ -1448,7 +1470,12 @@ class MT5Client:
                 # Get position info
                 position = await asyncio.to_thread(mt5.positions_get, ticket=ticket)
                 if not position:
-                    return {"success": False, "error": "Position not found"}
+                    logger.warning(f"modify_position: position {ticket} not found in MT5 — may have been closed")
+                    return {
+                        "success": False,
+                        "error": "Position not found",
+                        "position_not_found": True
+                    }
                 
                 position = position[0]
                 
@@ -1468,10 +1495,19 @@ class MT5Client:
             
             if result and result.retcode == mt5.TRADE_RETCODE_DONE:
                 return {"success": True}
+            elif result and result.retcode == 10031:
+                logger.warning(f"modify_position: retcode 10031 for ticket {ticket} — position closed between check and send")
+                return {
+                    "success": False,
+                    "error": "Position not found",
+                    "retcode": 10031,
+                    "position_not_found": True
+                }
             else:
                 return {
                     "success": False,
-                    "error": result.comment if result else "Modification failed"
+                    "error": result.comment if result else "Modification failed",
+                    "retcode": result.retcode if result else None
                 }
             
         except Exception as e:

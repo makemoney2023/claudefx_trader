@@ -25,6 +25,13 @@ _backtest_tasks: Dict[int, asyncio.Task] = {}
 MAX_CONCURRENT_BACKTESTS = 2
 
 
+def _remove_done_task(run_id: int):
+    """Return a callback that removes the task entry when it completes."""
+    def _cb(task: asyncio.Task):
+        _backtest_tasks.pop(run_id, None)
+    return _cb
+
+
 def _validate_dates(start_str: str, end_str: str) -> tuple:
     """Parse and validate date strings. Raises HTTPException on invalid input."""
     try:
@@ -516,6 +523,7 @@ async def start_ict_backtest(body: IctBacktestRequest):
         run_id = row.id
 
     task = asyncio.create_task(_run_ict_task(run_id))
+    task.add_done_callback(_remove_done_task(run_id))
     _backtest_tasks[run_id] = task
 
     async with async_session_maker() as session:
@@ -722,6 +730,7 @@ async def start_replay_backtest(body: ReplayBacktestRequest):
         run_id = row.id
 
     task = asyncio.create_task(_run_replay_task(run_id))
+    task.add_done_callback(_remove_done_task(run_id))
     _backtest_tasks[run_id] = task
 
     async with async_session_maker() as session:
@@ -877,6 +886,7 @@ async def start_optimizer(body: OptimizerRequest):
         run_id = row.id
 
     task = asyncio.create_task(_run_optimizer_task(run_id))
+    task.add_done_callback(_remove_done_task(run_id))
     _backtest_tasks[run_id] = task
 
     async with async_session_maker() as session:

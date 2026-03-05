@@ -76,8 +76,8 @@ export function useWebSocket(channel: string, options: UseWebSocketOptions = {})
       reconnectTimerRef.current = setTimeout(connect, delay)
     }
 
-    ws.onerror = () => {
-      // onclose fires after onerror, so reconnect is handled there
+    ws.onerror = (ev) => {
+      console.warn(`[WebSocket] error on channel "${channel}"`, ev)
     }
 
     ws.onmessage = (event: MessageEvent) => {
@@ -86,7 +86,8 @@ export function useWebSocket(channel: string, options: UseWebSocketOptions = {})
       let data: WebSocketMessage
       try {
         data = JSON.parse(event.data) as WebSocketMessage
-      } catch {
+      } catch (e) {
+        console.warn('[WebSocket] malformed JSON message:', event.data, e)
         return
       }
 

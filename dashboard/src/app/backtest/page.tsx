@@ -216,7 +216,7 @@ export default function BacktestPage() {
       setIctRunId(run.id)
       setIctRunning(true)
     } catch (e) {
-      console.error(e)
+      console.error('Failed to start ICT backtest:', e)
     }
   }
 
@@ -230,7 +230,7 @@ export default function BacktestPage() {
         estimated_cost: est.estimated_cost,
       })
     } catch (e) {
-      console.error(e)
+      console.error('Failed to estimate replay cost:', e)
     } finally {
       setReplayEstimating(false)
     }
@@ -245,7 +245,7 @@ export default function BacktestPage() {
       setReplayRunId(run.id)
       setReplayRunning(true)
     } catch (e) {
-      console.error(e)
+      console.error('Failed to start replay backtest:', e)
     }
   }
 
@@ -257,7 +257,7 @@ export default function BacktestPage() {
       setOptRunId(run.id)
       setOptRunning(true)
     } catch (e) {
-      console.error(e)
+      console.error('Failed to start optimizer:', e)
     }
   }
 
@@ -272,7 +272,7 @@ export default function BacktestPage() {
       setSelectedRunId(id)
       setSelectedRunDetail(run)
     } catch (e) {
-      console.error(e)
+      console.error('Failed to load backtest run detail:', e)
     }
   }
 
@@ -286,7 +286,7 @@ export default function BacktestPage() {
       }
       setPastRuns((prev) => prev.filter((r) => r.id !== id))
     } catch (e) {
-      console.error(e)
+      console.error('Failed to delete backtest run:', e)
     }
   }
 
@@ -301,7 +301,7 @@ export default function BacktestPage() {
       if (best.cooldown_minutes != null) payload.gate_cooldown_minutes = best.cooldown_minutes as number
       await api.updateTradingConfig(payload as Parameters<typeof api.updateTradingConfig>[0])
     } catch (e) {
-      console.error(e)
+      console.error('Failed to apply optimizer params:', e)
     }
   }
 
