@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Any
 from datetime import datetime, timezone
 from enum import Enum
+import asyncio
 
 from ..utils.logging import get_logger
 
@@ -46,6 +47,7 @@ class Position:
     
     # Trade classification
     trade_type: str = "intraday"  # scalp, intraday, swing
+    a_plus: bool = False  # High-confidence / HTF-aligned runner
     
     # Management
     initial_sl: float = 0.0
@@ -73,6 +75,11 @@ class Position:
 
     # Original order ticket (differs from position ticket for filled pending orders)
     order_ticket: Optional[int] = None
+    reservation_id: Optional[str] = None
+
+    # Authoritative close data from fast pending sync (broker deal history)
+    closed_profit_loss: Optional[float] = None
+    closed_exit_price: Optional[float] = None
     
     def __post_init__(self):
         self.initial_sl = self.stop_loss
@@ -143,6 +150,8 @@ class PositionManager:
         break_even_trigger_r: float = 1.0,    # Move to BE after TP1 hit
         trailing_start_r: float = 2.0,        # Start trailing after TP2
         trailing_step_r: float = 0.5,         # Trail in 0.5R steps
+        giveback_min_peak_r: float = 1.5,     # Arm giveback protection after this peak R
+        a_plus_skip_tp1: bool = True,         # Skip TP1 partials for runners / A+ trades
         # Legacy compatibility
         partial_close_r: float = 1.0,
         partial_close_percent: float = 0.5
@@ -166,8 +175,12 @@ class PositionManager:
         self.trailing_step_r = trailing_step_r
         self.partial_close_r = partial_close_r
         self.partial_close_percent = partial_close_percent
+        self.giveback_min_peak_r = giveback_min_peak_r
+        self.a_plus_skip_tp1 = a_plus_skip_tp1
         
         self.positions: Dict[int, Position] = {}
+        self._persist_tasks: set = set()
+        self._delete_tasks: set = set()
         self.on_position_close = None  # Callback for when position closes
         self.on_reversal_close = None  # Callback for reversal-type closes (profit protection)
         
@@ -185,28 +198,71 @@ class PositionManager:
         """Add a position to track."""
         self.positions[position.ticket] = position
         logger.info(f"Tracking position {position.ticket}: {position.symbol} {position.direction}")
-        # Persist to database asynchronously (only if event loop is running)
+        self._schedule_persist(position)
+    
+    def _schedule_persist(self, position: Position):
+        """Persist position state after management mutations (restart-safe)."""
         import asyncio
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(self._persist_position(position))
+            task = loop.create_task(self._persist_position_tracked(position))
+            self._persist_tasks.add(task)
+            task.add_done_callback(self._persist_tasks.discard)
         except RuntimeError:
-            # No running event loop - skip persistence (e.g., in tests)
             pass
+
+    async def _persist_position_tracked(self, position: Position):
+        try:
+            await self._persist_position(position)
+        except Exception as e:
+            logger.error(f"Tracked persistence failed for {position.ticket}: {e}")
+
+    async def _persist_and_wait(self, position: Position):
+        """Await durable persistence before destructive transitions complete."""
+        pending = [task for task in self._persist_tasks if not task.done()]
+        if pending:
+            await asyncio.gather(*pending)
+        await self._persist_position(position)
+
+    async def flush_persistence(self):
+        """Drain outstanding persistence and delete tasks (shutdown-safe)."""
+        pending = list(self._persist_tasks) + list(self._delete_tasks)
+        if not pending:
+            return
+        results = await asyncio.gather(*pending, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"Persistence task failed during flush: {result}")
+        self._persist_tasks.clear()
+        self._delete_tasks.clear()
+    
+    def _skip_tp1_partial(self, position: Position) -> bool:
+        """Skip early TP1 partial only for explicit A+ classification."""
+        return bool(getattr(position, "a_plus", False))
     
     def remove_position(self, ticket: int):
         """Remove a position from tracking."""
         if ticket in self.positions:
             del self.positions[ticket]
             logger.info(f"Removed position {ticket} from tracking")
-            # Remove from database asynchronously (only if event loop is running)
-            import asyncio
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(self._delete_position_from_db(ticket))
-            except RuntimeError:
-                # No running event loop - skip persistence (e.g., in tests)
-                pass
+            self._schedule_delete(ticket)
+
+    def _schedule_delete(self, ticket: int):
+        """Delete position state asynchronously with tracked durability."""
+        import asyncio
+        try:
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(self._delete_position_tracked(ticket))
+            self._delete_tasks.add(task)
+            task.add_done_callback(self._delete_tasks.discard)
+        except RuntimeError:
+            pass
+
+    async def _delete_position_tracked(self, ticket: int):
+        try:
+            await self._delete_position_from_db(ticket)
+        except Exception as e:
+            logger.error(f"Tracked delete failed for {ticket}: {e}")
     
     async def _persist_position(self, position: Position):
         """Persist position to database."""
@@ -240,10 +296,21 @@ class PositionManager:
                     'peak_unrealized_pnl': position.peak_unrealized_pnl,
                     'near_tp_reached': position.near_tp_reached,
                     'close_reason': position.close_reason or None,
+                    'a_plus': getattr(position, 'a_plus', False),
+                    'reservation_id': getattr(position, 'reservation_id', None),
+                    'remaining_volume': position.volume,
                 })
                 logger.debug(f"Persisted position {position.ticket} to database")
         except Exception as e:
+            from sqlalchemy.exc import OperationalError
+
+            if isinstance(e, OperationalError):
+                logger.debug(
+                    f"Skipping position persistence for {position.ticket} (database unavailable): {e}"
+                )
+                return
             logger.error(f"Error persisting position {position.ticket}: {e}")
+            raise
     
     async def _delete_position_from_db(self, ticket: int):
         """Delete position from database."""
@@ -279,6 +346,7 @@ class PositionManager:
                         open_time=p.open_time,
                         status=PositionStatus(p.status) if p.status else PositionStatus.OPEN,
                         trade_type=getattr(p, 'trade_type', 'intraday') or 'intraday',
+                        a_plus=getattr(p, 'a_plus', False) or False,
                     )
                     position.initial_sl = p.initial_sl
                     position.be_triggered = p.be_triggered
@@ -295,8 +363,11 @@ class PositionManager:
                     position.peak_r_multiple = getattr(p, 'peak_r_multiple', 0.0) or 0.0
                     position.peak_unrealized_pnl = getattr(p, 'peak_unrealized_pnl', 0.0) or 0.0
                     position.near_tp_reached = getattr(p, 'near_tp_reached', False) or False
-                    # Restore close reason (for reversal re-entry across restarts)
                     position.close_reason = getattr(p, 'close_reason', '') or ''
+                    position.reservation_id = getattr(p, 'reservation_id', None)
+                    remaining = getattr(p, 'remaining_volume', 0.0) or 0.0
+                    if remaining > 0:
+                        position.volume = remaining
                     positions.append(position)
                 
                 logger.info(f"Loaded {len(positions)} positions from database")
@@ -505,6 +576,7 @@ class PositionManager:
             if r_multiple > position.peak_r_multiple:
                 position.peak_r_multiple = r_multiple
                 position.peak_unrealized_pnl = position.unrealized_pnl
+                self._schedule_persist(position)
             
             # Check for management actions
             action = await self._manage_position(position)
@@ -561,6 +633,14 @@ class PositionManager:
                 tp1_reached = True
             
             if tp1_reached:
+                if self._skip_tp1_partial(position):
+                    logger.info(
+                        f"RUNNER: Skipping TP1 partial on {position.ticket} ({position.symbol}) "
+                        f"trade_type={position.trade_type} a_plus={getattr(position, 'a_plus', False)}"
+                    )
+                    position.tp1_hit = True
+                    await self._persist_and_wait(position)
+                    return await self._move_to_break_even(position)
                 if can_partial:
                     return await self._execute_tp1(position)
                 else:
@@ -570,6 +650,7 @@ class PositionManager:
                         f"Position too small for partial ({position.volume} lots) - moving to break-even only"
                     )
                     position.tp1_hit = True
+                    await self._persist_and_wait(position)
                     return await self._move_to_break_even(position)
         
         # Stage 1.5: Dynamic SL trailing between 1R and 2R (fills the dead zone)
@@ -599,6 +680,7 @@ class PositionManager:
                     )
                     position.tp2_hit = True
                     position.status = PositionStatus.TRAILING
+                    await self._persist_and_wait(position)
                     return await self._update_trailing_stop(position)
         
         # Stage 3: Trailing stop on runner (applies to all position sizes)
@@ -612,13 +694,13 @@ class PositionManager:
         Aggressive profit protection — detect reversals and protect gains.
         
         Two triggers:
-        1. GIVEBACK: If peak R >= 1.0 and current R gave back 40%+ from peak, auto-close.
+        1. GIVEBACK: If peak R >= giveback_min_peak_r and current R gave back 55%+ from peak, auto-close.
         2. NEAR-TP REVERSAL: If price reached 85%+ of TP distance then pulls back to 50% of peak R.
         """
         peak_r = position.peak_r_multiple
         
-        # Only activate protection when position was meaningfully in profit (peak >= 1.0R)
-        if peak_r < 1.0:
+        # Only activate protection when position reached meaningful peak R
+        if peak_r < self.giveback_min_peak_r:
             return None
         
         # Must have break-even triggered (we're past 1R management)
@@ -638,6 +720,7 @@ class PositionManager:
             if tp_r_multiple > 0 and peak_r >= 0.85 * tp_r_multiple:
                 if not position.near_tp_reached:
                     position.near_tp_reached = True
+                    self._schedule_persist(position)
                     logger.info(
                         f"[PROFIT-PROTECT] {position.ticket} ({position.symbol}): "
                         f"Near-TP reached! Peak {peak_r:.2f}R >= 85% of TP ({tp_r_multiple:.2f}R)"
@@ -658,7 +741,7 @@ class PositionManager:
                 return await self._protection_close(position, "near_tp_reversal")
         
         _giveback_threshold = 0.65 if _is_crypto else 0.55
-        if peak_r >= 1.0 and r_multiple > 0:
+        if peak_r >= self.giveback_min_peak_r and r_multiple > 0:
             giveback_pct = (peak_r - r_multiple) / peak_r
             if giveback_pct >= _giveback_threshold:
                 logger.warning(
@@ -769,6 +852,7 @@ class PositionManager:
             if result.success:
                 old_sl = position.stop_loss
                 position.stop_loss = new_sl
+                self._schedule_persist(position)
                 logger.info(
                     f"[DYNAMIC-TRAIL] {position.ticket} ({position.symbol}): "
                     f"SL {old_sl:.5f} -> {new_sl:.5f} (locking {locked_profit_r:.2f}R at {r_multiple:.2f}R)"
@@ -806,6 +890,20 @@ class PositionManager:
         )
         
         if self.order_manager:
+            old_volume = position.volume
+            old_tp1_hit = position.tp1_hit
+            old_partial_closed = position.partial_closed
+            position.volume = round(position.volume - close_volume, 2)
+            position.tp1_hit = True
+            position.partial_closed = True
+            try:
+                await self._persist_and_wait(position)
+            except Exception:
+                position.volume = old_volume
+                position.tp1_hit = old_tp1_hit
+                position.partial_closed = old_partial_closed
+                raise
+
             # First: partial close
             result = await self.order_manager.close_position(
                 ticket=position.ticket,
@@ -813,16 +911,26 @@ class PositionManager:
             )
             
             if result.success:
-                position.volume = round(position.volume - close_volume, 2)
-                position.tp1_hit = True
-                position.partial_closed = True
-                
                 _is_crypto_be = any(c in position.symbol.upper() for c in ['BTC', 'ETH', 'XRP', 'SOL', 'ADA', 'DOGE'])
                 buffer = position.risk_pips * (0.30 if _is_crypto_be else 0.25)
                 if position.direction == 'long':
                     new_sl = position.entry_price + buffer
                 else:
                     new_sl = position.entry_price - buffer
+
+                old_sl = position.stop_loss
+                old_be_triggered = position.be_triggered
+                old_status = position.status
+                position.stop_loss = new_sl
+                position.be_triggered = True
+                position.status = PositionStatus.BREAK_EVEN
+                try:
+                    await self._persist_and_wait(position)
+                except Exception:
+                    position.stop_loss = old_sl
+                    position.be_triggered = old_be_triggered
+                    position.status = old_status
+                    raise
                 
                 be_result = await self.order_manager.modify_order(
                     ticket=position.ticket,
@@ -830,19 +938,21 @@ class PositionManager:
                 )
                 
                 if be_result.success:
-                    position.stop_loss = new_sl
-                    position.be_triggered = True
-                    position.status = PositionStatus.BREAK_EVEN
                     logger.info(f"  Break-even set at {new_sl:.5f}")
                 else:
-                    # BE modification failed - log warning, will retry next cycle
-                    # Do NOT mark be_triggered so we retry
+                    position.stop_loss = old_sl
+                    position.be_triggered = old_be_triggered
+                    position.status = old_status
+                    await self._persist_and_wait(position)
                     logger.warning(
                         f"  Break-even modification FAILED for {position.ticket}: "
                         f"{be_result.message if hasattr(be_result, 'message') else 'unknown error'} - will retry next cycle"
                     )
             else:
-                # Partial close failed - revert tp1_hit so we retry
+                position.volume = old_volume
+                position.tp1_hit = old_tp1_hit
+                position.partial_closed = old_partial_closed
+                await self._persist_and_wait(position)
                 logger.warning(f"  TP1 partial close FAILED for {position.ticket} - will retry next cycle")
                 return None
         
@@ -875,6 +985,7 @@ class PositionManager:
                 )
                 position.tp2_hit = True
                 position.status = PositionStatus.TRAILING
+                await self._persist_and_wait(position)
                 return {
                     "action": "tp2_skip_trailing",
                     "ticket": position.ticket,
@@ -888,18 +999,32 @@ class PositionManager:
         )
         
         if self.order_manager:
+            old_volume = position.volume
+            old_tp2_hit = position.tp2_hit
+            old_status = position.status
+            position.volume = round(position.volume - close_volume, 2)
+            position.tp2_hit = True
+            position.status = PositionStatus.TRAILING
+            try:
+                await self._persist_and_wait(position)
+            except Exception:
+                position.volume = old_volume
+                position.tp2_hit = old_tp2_hit
+                position.status = old_status
+                raise
+
             result = await self.order_manager.close_position(
                 ticket=position.ticket,
                 volume=close_volume
             )
             
             if result.success:
-                position.volume = round(position.volume - close_volume, 2)
-                position.tp2_hit = True
-                position.status = PositionStatus.TRAILING
                 logger.info(f"  Runner remaining: {position.volume} lots")
             else:
-                # Partial close failed - do NOT mark tp2_hit so we retry next cycle
+                position.volume = old_volume
+                position.tp2_hit = old_tp2_hit
+                position.status = old_status
+                await self._persist_and_wait(position)
                 logger.warning(f"  TP2 partial close FAILED for {position.ticket} - will retry next cycle")
                 return None
         
@@ -938,15 +1063,26 @@ class PositionManager:
             new_sl = position.entry_price - buffer
         
         if self.order_manager:
+            old_sl = position.stop_loss
+            old_be_triggered = position.be_triggered
+            old_status = position.status
+            position.stop_loss = new_sl
+            position.be_triggered = True
+            position.status = PositionStatus.BREAK_EVEN
+            try:
+                await self._persist_and_wait(position)
+            except Exception:
+                position.stop_loss = old_sl
+                position.be_triggered = old_be_triggered
+                position.status = old_status
+                raise
+
             result = await self.order_manager.modify_order(
                 ticket=position.ticket,
                 stop_loss=new_sl
             )
             
             if result.success:
-                position.stop_loss = new_sl
-                position.be_triggered = True
-                position.status = PositionStatus.BREAK_EVEN
                 return {
                     "action": "break_even",
                     "success": True,
@@ -954,6 +1090,10 @@ class PositionManager:
                     "new_sl": new_sl
                 }
             else:
+                position.stop_loss = old_sl
+                position.be_triggered = old_be_triggered
+                position.status = old_status
+                await self._persist_and_wait(position)
                 logger.warning(
                     f"Break-even modification FAILED for {position.ticket}: "
                     f"{getattr(result, 'message', 'unknown error')}"
@@ -1032,15 +1172,30 @@ class PositionManager:
         logger.info(f"Trailing stop update for {position.ticket}: {new_sl}")
         
         if self.order_manager:
+            old_sl = position.stop_loss
+            old_trailing_active = position.trailing_active
+            old_status = position.status
+            position.stop_loss = new_sl
+            position.trailing_active = True
+            position.status = PositionStatus.TRAILING
+            try:
+                await self._persist_and_wait(position)
+            except Exception:
+                position.stop_loss = old_sl
+                position.trailing_active = old_trailing_active
+                position.status = old_status
+                raise
+
             result = await self.order_manager.modify_order(
                 ticket=position.ticket,
                 stop_loss=new_sl
             )
             
-            if result.success:
-                position.stop_loss = new_sl
-                position.trailing_active = True
-                position.status = PositionStatus.TRAILING
+            if not result.success:
+                position.stop_loss = old_sl
+                position.trailing_active = old_trailing_active
+                position.status = old_status
+                await self._persist_and_wait(position)
         
         return {
             "action": "trailing_stop",

@@ -9,7 +9,7 @@ Provides:
 """
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional, Tuple
 import asyncio
 import re
@@ -83,6 +83,8 @@ class NewsService:
         self._events: List[Dict[str, Any]] = []
         self._last_fetch: Optional[datetime] = None
         self._cache_duration = timedelta(minutes=15)
+        self._max_stale_duration = timedelta(hours=2)
+        self._intelligence_client: Optional[Any] = None
         
         # Geopolitical news
         self._geopolitical_news: List[str] = []
@@ -95,7 +97,57 @@ class NewsService:
     def set_events(self, events: List[Dict[str, Any]]):
         """Set events directly (for testing or manual updates)."""
         self._events = events
-        self._last_fetch = datetime.now()
+        self._last_fetch = datetime.now(timezone.utc)
+
+    def set_intelligence_client(self, client: Any):
+        """Inject configured Firecrawl/intelligence client instead of creating a new one."""
+        self._intelligence_client = client
+
+    def is_calendar_unreliable(self) -> bool:
+        """True when calendar is empty or fetch is stale — treat as unknown risk."""
+        if not self._events:
+            return True
+        if not self._last_fetch:
+            return True
+        last_fetch = self._last_fetch
+        if last_fetch.tzinfo is None:
+            last_fetch = last_fetch.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) - last_fetch > self._max_stale_duration
+
+    def _is_near_typical_release_window(self) -> bool:
+        """US/EU macro release hours (ET) when empty calendar should fail-closed."""
+        try:
+            import pytz
+            now_et = datetime.now(pytz.timezone('US/Eastern'))
+        except Exception:
+            now_et = datetime.now()
+        if now_et.weekday() >= 5:
+            return False
+        return now_et.hour in {7, 8, 9, 10, 13, 14, 15}
+
+    async def refresh_calendar(self, force: bool = False) -> bool:
+        """Refresh economic calendar, bypassing cache when force=True."""
+        previous_fetch = self._last_fetch
+        if force:
+            self._last_fetch = None
+
+        events = await self._fetch_from_firecrawl()
+        if not events:
+            events = await self._fetch_from_forexfactory()
+
+        if events:
+            self._events = events
+            self._last_fetch = datetime.now(timezone.utc)
+            logger.info(f"News calendar refreshed ({len(events)} events)")
+            return True
+
+        if previous_fetch is not None:
+            self._last_fetch = previous_fetch
+        if self.is_calendar_unreliable():
+            logger.warning(
+                "News calendar refresh returned no events — calendar state is UNKNOWN"
+            )
+        return False
     
     def add_geopolitical_news(self, headlines: List[str]):
         """Add geopolitical news headlines."""
@@ -117,47 +169,47 @@ class NewsService:
             List of event dictionaries
         """
         # Check cache
-        if self._last_fetch and datetime.now() - self._last_fetch < self._cache_duration:
+        if self._last_fetch and datetime.now(timezone.utc) - (
+            self._last_fetch if self._last_fetch.tzinfo else self._last_fetch.replace(tzinfo=timezone.utc)
+        ) < self._cache_duration:
             return self._events
         
         try:
-            # Try to fetch from Firecrawl intelligence service
+            # Try to fetch from injected/configured intelligence service
             events = await self._fetch_from_firecrawl(days_ahead)
-            
+
             if events:
                 self._events = events
-                self._last_fetch = datetime.now()
+                self._last_fetch = datetime.now(timezone.utc)
                 logger.info(f"Fetched {len(events)} events from Firecrawl calendar")
                 return self._events
-            
+
             # Fallback: try scraping ForexFactory
             events = await self._fetch_from_forexfactory(days_ahead)
-            
+
             if events:
                 self._events = events
-                self._last_fetch = datetime.now()
+                self._last_fetch = datetime.now(timezone.utc)
                 logger.info(f"Fetched {len(events)} events from ForexFactory")
                 return self._events
-            
-            # Last resort: return cached/set events
-            self._last_fetch = datetime.now()
+
+            # Failed refresh — keep prior cache/timestamp unchanged
             return self._events
-            
+
         except Exception as e:
             logger.error(f"Error fetching economic calendar: {e}")
             return self._events if self._events else []
     
     async def _fetch_from_firecrawl(self, days_ahead: int = 7) -> List[Dict[str, Any]]:
         """
-        Fetch economic calendar from Firecrawl intelligence service.
-        
-        The Firecrawl service may already have a calendar endpoint configured
-        in the trading bot's intelligence layer.
+        Fetch economic calendar from configured Firecrawl intelligence service.
         """
         try:
-            from ..services.firecrawl_intelligence import FirecrawlIntelligenceService
-            
-            firecrawl = FirecrawlIntelligenceService()
+            firecrawl = self._intelligence_client
+            if firecrawl is None:
+                from ..services.firecrawl_intelligence import FirecrawlIntelligenceService
+                firecrawl = FirecrawlIntelligenceService()
+
             calendar_data = await firecrawl.get_economic_calendar()
             
             if not calendar_data:
@@ -335,7 +387,19 @@ class NewsService:
     def should_trade(self) -> bool:
         """Check if trading should be allowed based on news."""
         is_blackout, _ = self.is_blackout_period()
-        return not is_blackout
+        if is_blackout:
+            return False
+        if self.is_calendar_unreliable():
+            if self._is_near_typical_release_window():
+                logger.warning(
+                    "News calendar UNKNOWN near macro release window — blocking trades"
+                )
+            else:
+                logger.warning(
+                    "News calendar UNKNOWN/stale — blocking new trades until refreshed"
+                )
+            return False
+        return True
     
     def get_countdown_to_next_event(self) -> Optional[Dict[str, Any]]:
         """Get countdown to the next high-impact event."""
@@ -495,6 +559,9 @@ class NewsService:
         Returns:
             Tuple of (multiplier, reason_string)
         """
+        if self.is_calendar_unreliable():
+            return 0.5, "Economic calendar unavailable/stale — half size until refreshed"
+
         now = datetime.now()
         worst_multiplier = 1.0
         worst_reason = ""
@@ -545,5 +612,6 @@ class NewsService:
             'next_event': countdown,
             'geopolitical_risk': self.get_geopolitical_risk_level(),
             'total_events_cached': len(self._events),
-            'last_fetch': self._last_fetch.isoformat() if self._last_fetch else None
+            'last_fetch': self._last_fetch.isoformat() if self._last_fetch else None,
+            'calendar_unreliable': self.is_calendar_unreliable(),
         }

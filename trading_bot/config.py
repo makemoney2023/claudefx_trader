@@ -172,7 +172,7 @@ def update_symbol_spec_from_mt5(
     # This is approximate; exact pip_value depends on quote currency
     mt5_pip_value = mt5_pip_size * trade_contract_size
     # Cap at reasonable values (some calcs break with very large pip_values)
-    if mt5_pip_value > 1000:
+    if mt5_pip_value >= 1000:
         mt5_pip_value = base_spec.pip_value  # Keep default if unreasonable
     
     _MT5_RUNTIME_SPECS[symbol] = SymbolSpec(
@@ -367,7 +367,11 @@ class TradingSettings(BaseSettings):
     )
     allowed_sessions: List[str] = Field(
         default=["london", "new_york", "london_close"],
-        description="Allowed trading sessions: 'london', 'new_york', 'london_close', 'asian'. Use ['all'] for 24/7."
+        description=(
+            "Allowed trading sessions: 'london', 'new_york', 'london_close', 'asian'. "
+            "Use ['all'] for 24/7 (not recommended for ICT). "
+            "Documented ICT defaults: london + new_york + london_close kill zones."
+        )
     )
     max_daily_profit_target: float = Field(
         default=0.50,
@@ -515,9 +519,72 @@ class Settings(BaseSettings):
     # Docs directory for strategy reference
     docs_dir: str = Field(default="trading_bot/docs", description="Strategy documentation directory")
 
+    strict_ict_sessions: bool = Field(
+        default=False,
+        description=(
+            "When true, filter trading to ICT kill zones (london, new_york, london_close) "
+            "regardless of TRADING_ALLOWED_SESSIONS. Set via STRICT_ICT_SESSIONS env."
+        ),
+    )
+
 
 # Global settings instance
 settings = Settings()
+
+# ICT kill-zone sessions (London open, NY AM, London close)
+ICT_KILL_ZONE_SESSIONS: List[str] = ["london", "new_york", "london_close"]
+
+
+def get_effective_allowed_sessions() -> List[str]:
+    """Return allowed sessions, optionally forced to ICT kill zones."""
+    if getattr(settings, "strict_ict_sessions", False):
+        return list(ICT_KILL_ZONE_SESSIONS)
+    return list(settings.trading.allowed_sessions)
+
+
+def get_config_risk_warnings() -> List[str]:
+    """Startup warnings for aggressive / non-ICT session configuration."""
+    warnings: List[str] = []
+    sessions = [str(s).lower() for s in settings.trading.allowed_sessions]
+    if "all" in sessions:
+        warnings.append(
+            "TRADING_ALLOWED_SESSIONS includes 'all' (24/7). "
+            "ICT kill zones (london, new_york, london_close) improve signal quality."
+        )
+    if settings.trading.risk_per_trade > 0.01:
+        warnings.append(
+            f"TRADING_RISK_PER_TRADE={settings.trading.risk_per_trade:.1%} exceeds 1% — "
+            "consider lowering risk for live accounts."
+        )
+    if settings.trading.max_daily_trades > 5:
+        warnings.append(
+            f"TRADING_MAX_DAILY_TRADES={settings.trading.max_daily_trades} exceeds 5 — "
+            "ICT style favors fewer, higher-quality setups."
+        )
+    if getattr(settings, "strict_ict_sessions", False):
+        warnings.append(
+            "STRICT_ICT_SESSIONS=true — session filter locked to kill zones only."
+        )
+    return warnings
+
+
+def format_startup_config_banner() -> str:
+    """Format a visible startup banner for risky configuration."""
+    warnings = get_config_risk_warnings()
+    if not warnings:
+        return ""
+    lines = [
+        "=" * 72,
+        "⚠️  ICT TRADING BOT — CONFIGURATION WARNINGS",
+        "=" * 72,
+    ]
+    for w in warnings:
+        lines.append(f"  • {w}")
+    lines.append(
+        "  Tip: set STRICT_ICT_SESSIONS=true to filter to London/NY kill zones."
+    )
+    lines.append("=" * 72)
+    return "\n".join(lines)
 
 
 def save_config_to_env_local(updates: dict, prefix: str = "TRADING_"):

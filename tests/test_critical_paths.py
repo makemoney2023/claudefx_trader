@@ -650,7 +650,7 @@ class TestTradeValidation:
 # ===================================================================
 
 class TestSLTPSwapDetection:
-    """Test SL/TP swap detection in claude_client._validate_trade_signal."""
+    """Test fail-closed signal coherence in claude_client._validate_trade_signal."""
 
     def _make_client(self):
         """Create a ClaudeClient instance for testing."""
@@ -662,62 +662,65 @@ class TestSLTPSwapDetection:
             client.max_tokens = 4096
         return client
 
-    def test_long_swapped_sl_tp_flips_direction(self):
-        """For a LONG trade, if SL > entry and TP < entry, direction should flip to SHORT."""
+    def test_long_swapped_sl_tp_rejected_as_incoherent(self):
+        """LONG label with short-oriented levels is rejected before auto-repair."""
         client = self._make_client()
-        # Entry=100, but SL=102 (above entry) and TP=98 (below entry)
-        # Levels are consistent with a SHORT trade, so direction flips.
         tool_input = {
             'direction': 'long',
             'entry_price': 100.0,
-            'stop_loss': 102.0,   # Above entry — correct for short
-            'take_profit': 98.0,  # Below entry — correct for short
+            'stop_loss': 102.0,
+            'take_profit': 98.0,
             'confidence': 0.8,
             'reasoning': 'test',
         }
         result = client._validate_trade_signal(tool_input)
-        # Direction coherence check should flip to SHORT (levels say short)
-        assert result['direction'] == 'short', f"Direction should flip to short, got {result['direction']}"
-        assert result['stop_loss'] == 102.0, f"SL should stay 102.0, got {result['stop_loss']}"
-        assert result['take_profit'] == 98.0, f"TP should stay 98.0, got {result['take_profit']}"
+        assert result['direction'] == 'no_trade'
+        assert result['confidence'] == 0.0
+        assert 'incoherent' in result.get('reasoning', '').lower()
 
-    def test_short_swapped_sl_tp_flips_direction(self):
-        """For a SHORT trade, if SL < entry and TP > entry, direction should flip to LONG."""
+    def test_short_swapped_sl_tp_rejected_as_incoherent(self):
+        """SHORT label with long-oriented levels is rejected before auto-repair."""
         client = self._make_client()
-        # Levels are consistent with a LONG trade, so direction flips.
         tool_input = {
             'direction': 'short',
             'entry_price': 100.0,
-            'stop_loss': 98.0,    # Below entry — correct for long
-            'take_profit': 102.0, # Above entry — correct for long
+            'stop_loss': 98.0,
+            'take_profit': 102.0,
             'confidence': 0.8,
             'reasoning': 'test',
         }
         result = client._validate_trade_signal(tool_input)
-        # Direction coherence check should flip to LONG (levels say long)
-        assert result['direction'] == 'long', f"Direction should flip to long, got {result['direction']}"
-        assert result['stop_loss'] == 98.0, f"SL should stay 98.0, got {result['stop_loss']}"
-        assert result['take_profit'] == 102.0, f"TP should stay 102.0, got {result['take_profit']}"
+        assert result['direction'] == 'no_trade'
+        assert result['confidence'] == 0.0
+        assert 'incoherent' in result.get('reasoning', '').lower()
 
-    def test_pip_distance_tp_converted_to_absolute_long(self):
-        """TP=0.09 when DASH is at ~36.0 should be detected as pip distance and converted."""
+    def test_pip_distance_tp_converted_when_coherent(self):
+        """Pip-distance TP is repaired only after coherence passes."""
         client = self._make_client()
-        # Simulates DASH example: entry=36.50, SL=36.20 (correct), TP=0.09 (pip distance, not price)
         tool_input = {
             'direction': 'long',
             'entry_price': 36.50,
             'stop_loss': 36.20,
-            'take_profit': 0.09,  # This is a pip distance, NOT a price
+            'take_profit': 0.09,
             'confidence': 0.8,
             'reasoning': 'test',
         }
-        result = client._validate_trade_signal(tool_input)
-        # TP should be converted from pip distance to absolute: 36.50 + 0.09 = 36.59
-        # R:R is bad but we only warn (main.py will auto-extend TP)
-        assert result['take_profit'] > 36.0, f"TP should be an absolute price near 36, got {result['take_profit']}"
-        assert result['stop_loss'] < result['entry_price'], f"SL should be below entry for long"
-        assert result['stop_loss'] == 36.20, f"SL should remain unchanged"
-        assert abs(result['take_profit'] - 36.59) < 0.01, f"TP should be ~36.59, got {result['take_profit']}"
+        # Coherence gate rejects obvious pip-distance mistakes outright.
+        rejected = client._validate_trade_signal(tool_input)
+        assert rejected['direction'] == 'no_trade'
+
+        # Repair path still converts pip distances when levels are otherwise valid.
+        repaired = client._apply_sl_tp_repairs({
+            'direction': 'long',
+            'entry_price': 36.50,
+            'stop_loss': 36.20,
+            'take_profit': 0.09,
+            'confidence': 0.8,
+            'reasoning': 'test',
+        })
+        assert repaired['take_profit'] > 36.0
+        assert repaired['stop_loss'] < repaired['entry_price']
+        assert abs(repaired['take_profit'] - 36.59) < 0.01
 
     def test_pip_distance_sl_converted_to_absolute_short(self):
         """SL=0.05 when DOGE is at 0.25 should be detected as pip distance."""

@@ -28,3 +28,20 @@ export function formatDate(date: string | Date): string {
     minute: '2-digit',
   }).format(new Date(date))
 }
+
+/** Type-safe display for optimizer metric values (number, string, null, or missing). */
+export function formatOptimizerMetric(value: unknown): string {
+  if (value === null || value === undefined) {
+    return '—'
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value.toFixed(3)
+  }
+  if (typeof value === 'string') {
+    return value
+  }
+  if (typeof value === 'boolean') {
+    return value ? 'true' : 'false'
+  }
+  return String(value)
+}

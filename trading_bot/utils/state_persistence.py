@@ -252,6 +252,8 @@ def save_full_state(bot) -> bool:
                         'direction': order.direction,
                         'order_type': order.order_type,
                         'price': order.price,
+                        'risk_percent': getattr(order, 'risk_percent', None),
+                        'reservation_id': getattr(order, 'reservation_id', None),
                     }
             persistence.save_pending_order_metadata(po_meta)
         
@@ -350,6 +352,14 @@ def load_full_state(bot) -> bool:
             
             bot.scaling_manager.daily_high_equity = saved_daily
             bot.scaling_manager.weekly_high_equity = saved_weekly
+            saved_mode = scaling_data.get('current_mode')
+            if saved_mode:
+                try:
+                    from ..services.scaling_manager import TradingMode
+                    bot.scaling_manager.current_mode = TradingMode(saved_mode.lower())
+                    logger.info(f"Restored trading mode: {saved_mode}")
+                except ValueError:
+                    logger.warning(f"Unknown persisted trading mode '{saved_mode}', keeping default")
         
         # Session analytics: Do NOT restore from JSON.
         # SessionAnalytics._load_from_database() is the single source of truth —

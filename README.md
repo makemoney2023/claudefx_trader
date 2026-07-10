@@ -129,6 +129,12 @@ MT5_SERVER=your_broker_server
 # Claude API Configuration
 ANTHROPIC_API_KEY=your_anthropic_api_key
 
+# API authentication for dashboard mutations and expensive LLM actions
+BOT_API_KEY=generate-a-long-random-secret
+
+# ICT session enforcement (block entries outside configured kill zones when true)
+STRICT_ICT_SESSIONS=false
+
 # Trading Configuration
 TRADING_SYMBOLS=EURUSD,GBPUSD,XAUUSD
 RISK_PER_TRADE=0.01
@@ -230,6 +236,21 @@ Maps buy-side and sell-side liquidity pools, including equal highs/lows.
 Uses Claude Opus 4.5 vision API to analyze chart screenshots and generate trade signals.
 
 ## Risk Management
+
+### Operational policies (release hardening)
+
+- **BOT_API_KEY**: Required for POST/PUT/PATCH/DELETE API routes and expensive LLM actions in production. Set in `.env.local`; never commit generated keys.
+- **STRICT_ICT_SESSIONS**: When `true`, entries outside configured ICT kill zones are blocked fail-closed.
+- **Trade Judge failure policy**: Judge timeouts, API errors, malformed verdicts, and missing client all map to `UNAVAILABLE` and **block execution entirely** (reservation released). Only an explicit `DEMOTE` permits reduced/pending execution.
+- **A+ exits**: TP1 skip and accelerated profit protection apply only to positions explicitly classified and persisted as A+ at creation; ordinary intraday/swing trades keep standard multi-TP behavior.
+- **Decision telemetry**: Every terminal gate outcome writes a `decision_records` row; blocked/DEMOTE/unfilled decisions receive MFE/MAE and hypothetical TP/SL outcomes via the outcome worker.
+- **Replay limitations**: Backtest/replay routes shared judge, pending, final-risk, confidence, and exit policy, but Windows MT5 broker fills, hedging ticket identity, and live news freshness are not fully simulated on macOS/Linux.
+
+### Windows MT5 verification
+
+Live execution requires Windows with MetaTrader 5 installed. Run `python test_mt5_connection.py` on the Windows host before paper promotion. macOS/Linux development uses simulation mode only.
+
+## Risk Management (strategy)
 
 - **Fixed percentage risk**: 1% per trade (configurable)
 - **Maximum daily risk**: 6% total

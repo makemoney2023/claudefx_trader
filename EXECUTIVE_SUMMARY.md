@@ -39,6 +39,10 @@ Every potential trade passes through Claude's vision model, which analyzes chart
 
 The output is a structured trade signal: direction, confidence score, entry price, stop loss, take profit, R:R ratio, market structure context, AMD phase, and detailed reasoning. A **Judge system** then evaluates each signal (APPROVE / DEMOTE / REJECT), with the accuracy of these judgments tracked over time to calibrate the system's decision quality.
 
+**Fail-closed judge policy:** infrastructure failures (missing client, timeout, exception, malformed verdict) map to `UNAVAILABLE` and block execution entirely. Only an explicit `DEMOTE` allows reduced-size or pending-order execution. `REJECT` and `UNAVAILABLE` always release reservations.
+
+**API security:** set `BOT_API_KEY` in production to protect mutating routes and expensive LLM endpoints. Set `STRICT_ICT_SESSIONS=true` to enforce ICT kill-zone timing fail-closed.
+
 This is not a black-box AI. The bot provides full transparency into why every trade was taken or rejected, with all reasoning logged and queryable.
 
 ### 2. Institutional-Grade ICT Strategy Engine
@@ -105,8 +109,13 @@ Two protective mechanisms prevent profit giveback:
 
 - **Peak profit protection**: If unrealized profit reaches 1R+ and then gives back more than 55% (65% for crypto), the position is closed
 - **Near-TP reversal protection**: If price reaches 85%+ of TP distance and then reverses 60-70%, the position is closed to capture the move
+- **A+ exits**: Only positions explicitly classified as A+ at creation (high setup grade + confluence) skip TP1 and use accelerated protection; ordinary trades keep standard multi-TP staging
 
 Pending orders receive kill-zone-based expiration (auto-cancel when the active session ends) and are synced with MT5 to handle fills, cancellations, and fast SL/TP hits.
+
+**Decision telemetry schema:** `decision_records` captures every terminal gate outcome (approve, demote, reject, mechanical block, expired, cancelled). The outcome worker attaches MFE/MAE and hypothetical TP/SL results to blocked and unfilled decisions for expectancy analytics.
+
+**Replay limitations:** Backtest/replay shares live judge, pending, final-risk, confidence, and exit policy, but macOS/Linux cannot verify Windows MT5 ticket identity, broker tick values, or live news freshness. Run `python test_mt5_connection.py` on Windows before paper promotion.
 
 ### 6. Market Intelligence Pipeline
 

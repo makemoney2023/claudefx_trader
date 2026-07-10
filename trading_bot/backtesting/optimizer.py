@@ -12,7 +12,7 @@ Usage:
 
 import itertools
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Any, Optional
 
 import numpy as np
@@ -55,6 +55,16 @@ class OptimizationResult:
     out_of_sample_win_rate: float
     parameter_stability: float  # How consistent are results across folds
     all_results: List[Dict[str, Any]] = field(default_factory=list)
+    strategy_in_sample_sharpe: float = 0.0
+    strategy_out_of_sample_sharpe: float = 0.0
+    execution_in_sample_sharpe: float = 0.0
+    execution_out_of_sample_sharpe: float = 0.0
+    bot_owned_trade_count: int = 0
+    holdout_chronological: bool = True
+    multiple_testing_note: str = (
+        "Walk-forward reduces overfitting but does not eliminate multiple-testing risk "
+        "across parameter grid searches."
+    )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -66,6 +76,13 @@ class OptimizationResult:
             'in_sample_win_rate': round(self.in_sample_win_rate, 2),
             'out_of_sample_win_rate': round(self.out_of_sample_win_rate, 2),
             'parameter_stability': round(self.parameter_stability, 3),
+            'strategy_in_sample_sharpe': round(self.strategy_in_sample_sharpe, 3),
+            'strategy_out_of_sample_sharpe': round(self.strategy_out_of_sample_sharpe, 3),
+            'execution_in_sample_sharpe': round(self.execution_in_sample_sharpe, 3),
+            'execution_out_of_sample_sharpe': round(self.execution_out_of_sample_sharpe, 3),
+            'bot_owned_trade_count': self.bot_owned_trade_count,
+            'holdout_chronological': self.holdout_chronological,
+            'multiple_testing_note': self.multiple_testing_note,
         }
 
 
@@ -302,6 +319,12 @@ class WalkForwardOptimizer:
             out_of_sample_win_rate=oos_wins / len(full_oos) * 100 if full_oos else 0,
             parameter_stability=stability,
             all_results=all_results,
+            strategy_in_sample_sharpe=_compute_sharpe(trades[:split]),
+            strategy_out_of_sample_sharpe=_compute_sharpe(trades[split:]),
+            execution_in_sample_sharpe=_compute_sharpe(full_is),
+            execution_out_of_sample_sharpe=_compute_sharpe(full_oos),
+            bot_owned_trade_count=len(trades),
+            holdout_chronological=True,
         )
 
         logger.info(
@@ -333,26 +356,33 @@ class WalkForwardOptimizer:
         return max(0.0, 1.0 - avg_cv)
 
     async def _load_trades(self, lookback_days: int) -> List[Dict[str, Any]]:
-        """Load historical trades from the database."""
+        """Load bot-owned historical trades from the database (chronological)."""
         try:
-            from sqlalchemy import select, and_
+            from sqlalchemy import select, and_, or_
             from ..api.database import async_session_maker, TradeModel
 
-            cutoff = datetime.now() - timedelta(days=lookback_days)
+            cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
 
             async with async_session_maker() as session:
                 q = select(TradeModel).where(
                     and_(
-                        TradeModel.timestamp >= cutoff.isoformat(),
+                        TradeModel.timestamp >= cutoff,
                         TradeModel.exit_price.isnot(None),
+                        or_(
+                            TradeModel.judge_verdict.isnot(None),
+                            TradeModel.claude_confidence > 0,
+                            TradeModel.signal_id.isnot(None),
+                        ),
                     )
-                )
+                ).order_by(TradeModel.timestamp)
                 result = await session.execute(q)
                 trades = result.scalars().all()
 
-            return [
-                {
-                    'timestamp': t.timestamp,
+            loaded = []
+            for t in trades:
+                ts = t.timestamp.isoformat() if hasattr(t.timestamp, "isoformat") else str(t.timestamp)
+                loaded.append({
+                    'timestamp': ts,
                     'symbol': t.symbol,
                     'direction': t.direction,
                     'session': t.session or '',
@@ -366,12 +396,12 @@ class WalkForwardOptimizer:
                     ),
                     'r_multiple': t.r_multiple or 0,
                     'profit_loss': t.profit_loss or 0,
-                    'date': t.timestamp[:10] if t.timestamp else '',
+                    'date': ts[:10] if ts else '',
                     'trade_type': t.trade_type or 'intraday',
                     'trend': getattr(t, 'market_structure', '') or '',
-                }
-                for t in trades
-            ]
+                    'bot_owned': True,
+                })
+            return loaded
 
         except Exception as e:
             logger.error(f"Failed to load trades for optimization: {e}")

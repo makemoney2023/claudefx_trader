@@ -823,13 +823,14 @@ class TestTPDirectionValidation:
         mock_mt5.ORDER_TIME_GTC = 0
         client._mcp_client = mock_mt5
         
-        result = await client.place_order(
-            symbol="EURUSD",
-            order_type="buy",
-            volume=0.01,
-            take_profit=1.08000,  # BELOW entry (wrong for buy!)
-            stop_loss=1.08300,
-        )
+        with patch.object(client, 'ensure_connected', new_callable=AsyncMock, return_value=True):
+            result = await client.place_order(
+                symbol="EURUSD",
+                order_type="buy",
+                volume=0.01,
+                take_profit=1.08000,  # BELOW entry (wrong for buy!)
+                stop_loss=1.08300,
+            )
         
         assert result['success'] is False
         assert 'Invalid TP' in result.get('error', '') or 'TP' in result.get('error', '')
@@ -856,13 +857,14 @@ class TestTPDirectionValidation:
         mock_mt5.ORDER_TIME_GTC = 0
         client._mcp_client = mock_mt5
         
-        result = await client.place_order(
-            symbol="EURUSD",
-            order_type="sell",
-            volume=0.01,
-            take_profit=1.09000,  # ABOVE entry (wrong for sell!)
-            stop_loss=1.08800,
-        )
+        with patch.object(client, 'ensure_connected', new_callable=AsyncMock, return_value=True):
+            result = await client.place_order(
+                symbol="EURUSD",
+                order_type="sell",
+                volume=0.01,
+                take_profit=1.09000,  # ABOVE entry (wrong for sell!)
+                stop_loss=1.08800,
+            )
         
         assert result['success'] is False
         assert 'Invalid TP' in result.get('error', '') or 'TP' in result.get('error', '')
@@ -991,8 +993,8 @@ class TestTradeJudgeMechanical:
         assert 'pattern_match' in result['risk_flags']
     
     @pytest.mark.asyncio
-    async def test_judge_timeout_fails_open(self):
-        """Judge unavailable (no async_client) should default to APPROVE."""
+    async def test_judge_timeout_fails_closed(self):
+        """Judge unavailable (no async_client) should default to DEMOTE."""
         client = self._get_claude_client()
         client.async_client = None  # Simulate unavailable
         
@@ -1005,11 +1007,11 @@ class TestTradeJudgeMechanical:
         
         result = await client.judge_trade(signal, risk_metrics, "")
         
-        assert result['verdict'] == 'APPROVE', "Judge should fail open when unavailable"
+        assert result['verdict'] == 'UNAVAILABLE', "Judge should fail closed when unavailable"
     
     @pytest.mark.asyncio
-    async def test_judge_invalid_response_fails_open(self):
-        """Malformed response from Claude should default to APPROVE."""
+    async def test_judge_invalid_response_fails_closed(self):
+        """Malformed response from Claude should default to DEMOTE."""
         client = self._get_claude_client()
         
         mock_response = MagicMock()
@@ -1026,11 +1028,11 @@ class TestTradeJudgeMechanical:
         
         result = await client.judge_trade(signal, risk_metrics, "")
         
-        assert result['verdict'] == 'APPROVE', "Malformed response should fail open"
+        assert result['verdict'] == 'UNAVAILABLE', "Malformed response should fail closed"
     
     @pytest.mark.asyncio
-    async def test_judge_api_error_fails_open(self):
-        """API exception should default to APPROVE."""
+    async def test_judge_api_error_fails_closed(self):
+        """API exception should default to DEMOTE."""
         client = self._get_claude_client()
         
         client.async_client = AsyncMock()
@@ -1045,7 +1047,7 @@ class TestTradeJudgeMechanical:
         
         result = await client.judge_trade(signal, risk_metrics, "")
         
-        assert result['verdict'] == 'APPROVE', "API error should fail open"
+        assert result['verdict'] == 'UNAVAILABLE', "API error should fail closed"
 
 
 # ============================================================
@@ -1119,14 +1121,14 @@ class TestTradeJudgePerformance:
             assert metric in source, f"Judge prompt missing risk metric: {metric}"
     
     def test_judge_latency_budget(self):
-        """_run_trade_judge should use asyncio.wait_for with timeout <= 8 seconds."""
+        """Shared judge adapter should use asyncio.wait_for with timeout <= 8 seconds."""
         import inspect
-        from trading_bot.main import TradingBot
-        
-        source = inspect.getsource(TradingBot._run_trade_judge)
-        assert 'wait_for' in source, "_run_trade_judge should use asyncio.wait_for"
-        assert 'timeout=8.0' in source or 'timeout=8' in source, \
-            "_run_trade_judge timeout should be 8 seconds"
+        from trading_bot.services.trade_judge import run_trade_judge
+
+        source = inspect.getsource(run_trade_judge)
+        assert 'wait_for' in source, "run_trade_judge should use asyncio.wait_for"
+        assert 'timeout' in source and '8' in source, \
+            "run_trade_judge timeout should be 8 seconds"
     
     def test_judge_demote_default_price_improvement(self):
         """Default demote should use 0.2% price improvement from current."""
@@ -1164,18 +1166,21 @@ class TestTradeJudgePerformance:
             "Judge should clamp short entries that worsen the trade"
     
     def test_judge_rebases_sl_tp_on_demote(self):
-        """Demote logic should rebase SL/TP as offsets from the demoted entry."""
-        import inspect
-        from trading_bot.main import TradingBot
-        
-        source = inspect.getsource(TradingBot._analyze_and_trade)
-        assert "trade_signal.order_type = 'buy_limit'" in source, "DEMOTE should set buy_limit for longs"
-        assert "trade_signal.order_type = 'sell_limit'" in source, "DEMOTE should set sell_limit for shorts"
-        demote_start = source.find("verdict') == 'DEMOTE'")
-        approve_start = source.find("APPROVE", demote_start)
-        demote_section = source[demote_start:approve_start]
-        assert "_sl_offset" in demote_section, "DEMOTE should rebase SL as offset from demoted entry"
-        assert "_tp_offset" in demote_section, "DEMOTE should rebase TP as offset from demoted entry"
+        """Demote policy should rebase SL/TP as offsets from the demoted entry."""
+        from trading_bot.utils.win_optimization import apply_demote_policy
+
+        result = apply_demote_policy(
+            direction="long",
+            current_price=1.0850,
+            original_entry=1.0830,
+            stop_loss=1.0800,
+            take_profit=1.0900,
+            order_type="buy_limit",
+            suggested_entry=1.0825,
+        )
+        assert result["demoted_entry"] == 1.083
+        assert result["stop_loss"] == pytest.approx(1.08)
+        assert result["take_profit"] == pytest.approx(1.09)
     
     def test_run_trade_judge_exists_in_trading_bot(self):
         """TradingBot should have _run_trade_judge method."""

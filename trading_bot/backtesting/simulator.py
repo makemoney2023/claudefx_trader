@@ -16,6 +16,7 @@ import uuid
 
 from ..config import get_symbol_spec
 from ..utils.logging import get_logger
+from .costs import apply_symbol_execution_costs
 
 logger = get_logger(__name__)
 
@@ -300,10 +301,13 @@ class OrderSimulator:
         else:
             position.profit_loss = calculate_pl(position.symbol, position.entry_price - exit_price, position.volume)
         
-        # Calculate R multiple
+        # Calculate R multiple with symbol-specific execution cost adjustment
         risk_pips = abs(position.entry_price - position.stop_loss) / pip_value
         if risk_pips > 0:
             position.r_multiple = position.profit_loss_pips / risk_pips
+            position.r_multiple = apply_symbol_execution_costs(
+                position.symbol, position.r_multiple
+            )
         
         # Update balance
         self.balance += position.profit_loss

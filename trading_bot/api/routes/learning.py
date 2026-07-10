@@ -448,6 +448,23 @@ async def get_learning_stats():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/gate-analytics")
+async def get_gate_analytics(
+    days_back: int = Query(30, ge=1, le=365, description="Days of decision history"),
+):
+    """
+    Read-only aggregate gate expectancy and MFE coverage.
+
+    Exposes false-rejection rates by gate category and hypothetical R expectancy.
+    """
+    try:
+        service = get_learning_service()
+        return await service.get_gate_decision_analytics(days_back=days_back)
+    except Exception as e:
+        logger.error(f"Error getting gate analytics: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.delete("/prune", dependencies=[Depends(RequireAuth())])
 async def prune_expired_knowledge():
     """

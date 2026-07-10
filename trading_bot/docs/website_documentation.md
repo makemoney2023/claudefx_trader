@@ -15,6 +15,14 @@ The ICT Trading Bot is a sophisticated automated trading system designed to capt
 - **Real-Time Intelligence** via Firecrawl integration for sentiment, positioning, and macro data
 - **MetaTrader 5** for reliable trade execution across forex, crypto, and precious metals
 
+### Release hardening notes
+
+- Set `BOT_API_KEY` for production API mutations and expensive LLM routes.
+- Set `STRICT_ICT_SESSIONS=true` to enforce ICT kill-zone timing fail-closed.
+- Judge infrastructure failures (`UNAVAILABLE`) block execution entirely; only explicit `DEMOTE` permits reduced execution.
+- A+ exit behavior, decision telemetry (`decision_records` + outcome worker), and replay policy parity are documented in `risk_management.md`.
+- Windows MT5 verification (`python test_mt5_connection.py`) is required before paper promotion; macOS/Linux use simulation only.
+
 ---
 
 ## ✨ Key Features

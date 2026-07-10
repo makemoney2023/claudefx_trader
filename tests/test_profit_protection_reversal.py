@@ -506,12 +506,35 @@ class TestReversalAnalysisMethod:
         assert 'opposite_direction' in source, \
             "Should validate signal is in opposite direction"
 
-    def test_method_calls_trade_judge(self):
-        import inspect
+    @pytest.mark.asyncio
+    async def test_reversal_judge_adapter_delegates_to_shared_policy(self):
+        """Reversal entries use the shared fail-closed judge adapter."""
         from trading_bot.main import TradingBot
-        source = inspect.getsource(TradingBot._analyze_reversal_entry)
-        assert 'judge_trade' in source, \
-            "Should call Trade Judge for validation"
+
+        bot = TradingBot()
+        bot.claude_client = MagicMock()
+        trade_signal = MagicMock(
+            direction='short',
+            confidence=0.8,
+            entry_price=1.0850,
+            stop_loss=1.0900,
+            take_profit=1.0750,
+            reasoning='Structural reversal',
+            trade_type='intraday',
+        )
+
+        with patch('trading_bot.main.run_trade_judge', new_callable=AsyncMock) as mock_judge:
+            mock_judge.return_value = MagicMock()
+            await bot._run_reversal_trade_judge(
+                symbol='EURUSD',
+                trade_signal=trade_signal,
+                current_price=1.0850,
+                risk_metrics={'risk_amount': 100.0},
+                learning_context='',
+            )
+            mock_judge.assert_called_once()
+            signal_dict = mock_judge.call_args.args[1]
+            assert signal_dict['reversal_reentry'] is True
 
     def test_method_includes_reversal_context(self):
         import inspect

@@ -10,6 +10,7 @@ import asyncio
 import signal
 import sys
 import base64
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict
 
@@ -42,15 +43,23 @@ from .strategy.ict_strategy import ICTStrategy
 from .execution.risk_manager import RiskManager
 from .execution.order_manager import OrderManager
 from .execution.position_manager import PositionManager, Position
-from .execution.scaling_position_sizer import ScalingPositionSizer, SetupGrade
+from .execution.scaling_position_sizer import (
+    ScalingPositionSizer,
+    SetupGrade,
+    enforce_final_risk_cap,
+)
 from .services.news_service import NewsService
 from .services.correlation_service import CorrelationService
+from .services.trade_judge import JudgeOutcome, JudgeVerdict, run_trade_judge
+from .utils.win_optimization import apply_demote_policy, build_confidence_decision, classify_a_plus
 from .services.goal_tracker import GoalTracker
 from .services.scaling_manager import ScalingManager, TradingMode
 from .services.session_analytics import SessionAnalytics
 from .services.trade_learning_service import TradeLearningService
+from .services.gate_funnel import get_gate_funnel
 from .services.claude_trade_manager import ClaudeTradeManager
 from .services.pending_order_manager import PendingOrderManager
+from .services.trade_reservations import TradeReservationLedger, ReservationState
 from .services.firecrawl_intelligence import FirecrawlIntelligenceService
 from .utils.notifications import notify, NotificationType, get_notifier
 from .utils.state_persistence import save_full_state, load_full_state, get_persistence
@@ -240,6 +249,7 @@ class TradingBot:
         self.scaling_manager: Optional[ScalingManager] = None
         self.session_analytics: Optional[SessionAnalytics] = None
         self.learning_service: Optional[TradeLearningService] = None
+        self.gate_funnel = None
         
         # NEW: 100-pip expansion analysis components
         self.amd_analyzer: Optional[AMDCycleAnalyzer] = None
@@ -441,6 +451,12 @@ class TradingBot:
                 risk_per_trade=settings.trading.risk_per_trade,
                 min_risk_reward=settings.trading.min_risk_reward
             )
+            self.reservation_ledger = TradeReservationLedger(
+                risk_manager=self.risk_manager,
+                get_daily_trades=lambda: self.daily_trades,
+                set_daily_trades=lambda v: setattr(self, 'daily_trades', v),
+            )
+            self._processed_pending_close_deals: set = set()
             self.order_manager = OrderManager(self.mt5_client)
             self.position_manager = PositionManager(order_manager=self.order_manager)
             
@@ -545,6 +561,7 @@ class TradingBot:
             # Trade Learning Service - Claude's learning system
             logger.info("Initializing trade learning service...")
             self.learning_service = TradeLearningService()
+            self.gate_funnel = get_gate_funnel()
             
             # Claude Trade Manager - centralized AI trade management with margin validation
             print("[INIT] Claude trade manager...", flush=True)
@@ -565,6 +582,7 @@ class TradingBot:
                 order_manager=self.order_manager,
                 kill_zone_checker=self.kill_zone_checker
             )
+            self._wire_pending_reservation_accounting()
             
             # Import any existing MT5 pending orders into the tracker
             # so they survive restarts and can be re-evaluated by Claude
@@ -589,6 +607,16 @@ class TradingBot:
                                             _restored_exp += 1
                                     except (ValueError, TypeError):
                                         pass
+                                if meta:
+                                    order.risk_percent = meta.get("risk_percent")
+                                    order.reservation_id = meta.get("reservation_id")
+                                    if order.reservation_id:
+                                        self.reservation_ledger.restore_pending(
+                                            reservation_id=order.reservation_id,
+                                            symbol=order.symbol,
+                                            ticket=order.ticket,
+                                            risk_percent=order.risk_percent or 0.0,
+                                        )
                             if _restored_exp > 0:
                                 print(f"[INIT] Restored original expiration for {_restored_exp} pending order(s)", flush=True)
                     except Exception as e:
@@ -906,6 +934,16 @@ class TradingBot:
                         sync_result = await self.pending_order_manager.sync_with_mt5()
                         if sync_result.get('filled', 0) > 0:
                             logger.info(f"POS-MGR: {sync_result['filled']} pending order(s) filled")
+                            await self._apply_pending_fill_transfers(
+                                sync_result.get('filled_position_events', [])
+                            )
+                        if sync_result.get('filled_closed', 0) > 0:
+                            logger.info(
+                                f"POS-MGR: {sync_result['filled_closed']} pending order(s) filled then closed"
+                            )
+                            await self._process_pending_closed_trade_events(
+                                sync_result.get('closed_trade_events', [])
+                            )
                         if sync_result.get('cancelled', 0) > 0:
                             logger.info(f"POS-MGR: {sync_result['cancelled']} pending order(s) cancelled externally")
                         
@@ -1312,6 +1350,201 @@ class TradingBot:
             import traceback
             traceback.print_exc()
     
+    def _wire_pending_reservation_accounting(self) -> None:
+        """Give pending lifecycle operations the authoritative reservation ledger."""
+        self.pending_order_manager.set_budget_reclaim(
+            risk_manager=self.risk_manager,
+            reservation_ledger=self.reservation_ledger,
+            get_daily_trades=lambda: self.daily_trades,
+            set_daily_trades=lambda value: setattr(self, "daily_trades", value),
+        )
+        self.pending_order_manager.set_decision_recorder(
+            self._record_pending_lifecycle_decision
+        )
+
+    async def _record_pending_lifecycle_decision(
+        self, outcome_type: str, order, reason: str
+    ) -> Optional[str]:
+        return await self._record_terminal_decision(
+            outcome_type,
+            order.symbol,
+            direction=order.direction,
+            entry=order.price,
+            sl=order.stop_loss or 0.0,
+            tp=order.take_profit or 0.0,
+            reason=reason,
+        )
+
+    @asynccontextmanager
+    async def _trade_reservation_scope(
+        self,
+        symbol: str,
+        signal_id: Optional[str] = None,
+        risk_percent: float = 0.0,
+    ):
+        """Release an attempt unless ownership transfers to pending/position."""
+        reservation = self.reservation_ledger.reserve(
+            symbol=symbol,
+            signal_id=signal_id,
+            risk_percent=risk_percent,
+        )
+        try:
+            yield reservation
+        finally:
+            if reservation.state == ReservationState.RESERVED:
+                self.reservation_ledger.release(reservation)
+
+    async def _cancel_pending_for_replacement(self, old_order) -> bool:
+        """Cancel the old pending owner without touching the incoming attempt."""
+        return await self.pending_order_manager.cancel_order(
+            old_order.ticket,
+            reason="replaced_by_newer",
+        )
+
+    def _reject_reservation_attempt(self, reservation) -> bool:
+        """Release reservation on post-reservation rejection."""
+        if hasattr(self, "reservation_ledger") and self.reservation_ledger:
+            self.reservation_ledger.release(reservation)
+        return False
+
+    async def _record_terminal_decision(
+        self,
+        outcome_type: str,
+        symbol: str,
+        *,
+        gate_id: Optional[str] = None,
+        direction: str = "",
+        entry: float = 0.0,
+        sl: float = 0.0,
+        tp: float = 0.0,
+        confidence: float = 0.0,
+        session: str = "",
+        mode: str = "",
+        reason: str = "",
+        details: Optional[dict] = None,
+        judge_verdict: Optional[str] = None,
+        market_snapshot_ref: Optional[str] = None,
+        confidence_components: Optional[dict] = None,
+    ) -> Optional[str]:
+        funnel = getattr(self, "gate_funnel", None) or get_gate_funnel()
+        return await funnel.record_decision(
+            outcome_type,
+            symbol,
+            gate_id=gate_id,
+            direction=direction,
+            entry=entry,
+            sl=sl,
+            tp=tp,
+            confidence=confidence,
+            session=session,
+            mode=mode or getattr(self, "_trading_mode", "normal"),
+            reason=reason,
+            details=details,
+            judge_verdict=judge_verdict,
+            market_snapshot_ref=market_snapshot_ref,
+            confidence_components=confidence_components,
+        )
+
+    async def _reject_and_record(
+        self,
+        reservation,
+        outcome_type: str,
+        symbol: str,
+        **fields,
+    ) -> bool:
+        await self._record_terminal_decision(outcome_type, symbol, **fields)
+        return self._reject_reservation_attempt(reservation)
+
+    def _accept_nonzero_lots(self, reservation, lots) -> bool:
+        if lots <= 0:
+            return self._reject_reservation_attempt(reservation)
+        return True
+
+    def _accept_precheck(self, reservation, precheck) -> bool:
+        if not precheck.can_execute:
+            return self._reject_reservation_attempt(reservation)
+        return True
+
+    def _accept_final_rr(self, reservation, entry, sl, tp) -> bool:
+        sl_dist = abs(entry - sl)
+        tp_dist = abs(tp - entry)
+        final_rr = tp_dist / sl_dist if sl_dist > 0 else 0
+        if final_rr < 1.0 and sl_dist > 0:
+            return self._reject_reservation_attempt(reservation)
+        return True
+
+    def _accept_execution_mode(self, reservation, is_blocked) -> bool:
+        if is_blocked:
+            return self._reject_reservation_attempt(reservation)
+        return True
+
+    def _accept_tick_refine(self, reservation, tick_ok) -> bool:
+        if not tick_ok:
+            return self._reject_reservation_attempt(reservation)
+        return True
+
+    def _accept_verified_position(self, reservation, ticket, positions) -> bool:
+        if not positions:
+            return self._reject_reservation_attempt(reservation)
+        return True
+
+    async def _apply_pending_fill_transfers(self, events) -> None:
+        """Transfer reservation ownership from pending ticket to position ticket."""
+        from .services.pending_order_manager import FilledPositionEvent
+
+        if not events:
+            return
+
+        for event in events:
+            if not isinstance(event, FilledPositionEvent):
+                continue
+
+            reservation = None
+            if hasattr(self, "reservation_ledger") and self.reservation_ledger:
+                reservation = self.reservation_ledger.get_for_ticket(event.order_ticket)
+                if not reservation and event.reservation_id:
+                    reservation = self.reservation_ledger.get_by_id(event.reservation_id)
+                if reservation:
+                    self.reservation_ledger.transfer_to_position(
+                        reservation,
+                        event.position_ticket,
+                    )
+
+            if not self.position_manager:
+                continue
+
+            position = self.position_manager.get_position(event.position_ticket)
+            if not position:
+                continue
+
+            position.order_ticket = event.order_ticket
+            position.reservation_id = (
+                event.reservation_id
+                or (reservation.reservation_id if reservation else None)
+            )
+            await self.position_manager._persist_and_wait(position)
+
+            order_snapshot = None
+            if hasattr(self, "pending_order_manager") and self.pending_order_manager:
+                for hist_order in reversed(self.pending_order_manager.order_history):
+                    if hist_order.ticket == event.order_ticket:
+                        order_snapshot = hist_order
+                        break
+            if order_snapshot:
+                await self._record_terminal_decision(
+                    "pending_filled",
+                    order_snapshot.symbol,
+                    direction=order_snapshot.direction,
+                    entry=order_snapshot.fill_price or order_snapshot.price,
+                    sl=order_snapshot.stop_loss or 0.0,
+                    tp=order_snapshot.take_profit or 0.0,
+                    reason="Pending order filled",
+                    details={
+                        "order_ticket": event.order_ticket,
+                        "position_ticket": event.position_ticket,
+                    },
+                )
+
     async def _analyze_and_trade(self, symbol: str, is_crypto: bool = False):
         """
         Analyze a symbol and execute trade if valid setup found.
@@ -1320,6 +1553,8 @@ class TradingBot:
             symbol: Trading symbol to analyze
             is_crypto: Whether this is a crypto symbol (24/7 trading)
         """
+        _trade_reservation = None
+        _trade_reservation_context = None
         try:
             logger.info(f"Analyzing {symbol}...")
             
@@ -2586,6 +2821,20 @@ class TradingBot:
             # Check if we have a valid trade signal
             if trade_signal.direction == "no_trade":
                 logger.info(f"No trade signal for {symbol}: {trade_signal.reasoning[:100] if trade_signal.reasoning else 'No reason given'}")
+                await self._record_terminal_decision(
+                    "no_trade",
+                    symbol,
+                    direction="no_trade",
+                    entry=trade_signal.entry_price or current_price,
+                    sl=trade_signal.stop_loss or 0.0,
+                    tp=trade_signal.take_profit or 0.0,
+                    confidence=trade_signal.confidence,
+                    reason=(
+                        trade_signal.reasoning[:200]
+                        if trade_signal.reasoning
+                        else "No setup"
+                    ),
+                )
                 if bot_state:
                     bot_state.trade_decision(symbol, "no_trade", trade_signal.reasoning[:100] if trade_signal.reasoning else "No setup")
                     bot_state.symbol_complete(symbol, "no_trade")
@@ -3605,14 +3854,19 @@ class TradingBot:
                     return
                 
                 # Reserve this trade slot immediately to prevent over-execution
-                self.daily_trades += 1
+                _trade_reservation_context = self._trade_reservation_scope(
+                    symbol=symbol,
+                    signal_id=signal_hash,
+                    risk_percent=0.0,
+                )
+                _trade_reservation = await _trade_reservation_context.__aenter__()
                 logger.info(f"Trade slot reserved ({self.daily_trades}/{settings.trading.max_daily_trades})")
                 
                 # Get account info for position sizing (fresh, under lock)
                 account_info = await self.mt5_client.get_account_info()
                 if not account_info:
                     logger.error("Failed to get account info")
-                    self.daily_trades = max(0, self.daily_trades - 1)
+                    self._release_trade_reservation(_trade_reservation)
                     return
                 
                 # Calculate position size with scaling
@@ -3711,8 +3965,18 @@ class TradingBot:
                 if not validation.is_valid:
                     print(f"[BLOCKED] {symbol}: Validation failed - {validation.errors}", flush=True)
                     logger.warning(f"Trade validation failed for {symbol}: {validation.errors}")
-                    self.daily_trades = max(0, self.daily_trades - 1)
-                    logger.info(f"Trade slot released after validation failure ({self.daily_trades}/{settings.trading.max_daily_trades})")
+                    await self._reject_and_record(
+                        _trade_reservation,
+                        "mechanical_reject",
+                        symbol,
+                        gate_id="risk_validation_fail",
+                        direction=trade_signal.direction,
+                        entry=_val_entry,
+                        sl=_val_sl or 0.0,
+                        tp=_val_tp or 0.0,
+                        confidence=trade_signal.confidence,
+                        reason="; ".join(validation.errors),
+                    )
                     return
                 
                 # =============================================
@@ -4143,6 +4407,18 @@ class TradingBot:
                             f"(entry={_final_entry}, SL={_final_sl}, TP={_final_tp})",
                             flush=True
                         )
+                        await self._reject_and_record(
+                            _trade_reservation,
+                            "mechanical_reject",
+                            symbol,
+                            gate_id="final_rr_below_1",
+                            direction=_final_dir,
+                            entry=_final_entry,
+                            sl=_final_sl,
+                            tp=_final_tp,
+                            confidence=trade_signal.confidence,
+                            reason=f"Final R:R {_final_rr:.2f}:1 below 1.0",
+                        )
                         return
                     elif _final_rr < min_rr and _final_sl_dist > 0:
                         # Borderline — log warning, Trade Judge will evaluate
@@ -4186,37 +4462,41 @@ class TradingBot:
                 # TRADE JUDGE (pre-execution validation)
                 # =============================================
                 print(f"[JUDGE] {symbol}: Sending to trade judge (confidence={trade_signal.confidence:.0%}, dir={trade_signal.direction}, lots={position_size.lots})...", flush=True)
-                judge_verdict = await self._run_trade_judge(
+                judge_outcome = await self._run_trade_judge(
                     symbol, trade_signal, position_size, current_price
                 )
-                
-                # Handle REJECT verdict — skip trade entirely
-                if judge_verdict.get('verdict') == 'REJECT':
-                    reason = judge_verdict.get('reason', 'Judge rejected')
-                    flags = judge_verdict.get('risk_flags', [])
-                    logger.warning(f"[JUDGE] REJECTED {symbol} {trade_signal.direction}: {reason}")
-                    
+                judge_verdict = judge_outcome.to_dict()
+
+                if judge_outcome.blocks_execution():
+                    verdict_label = judge_outcome.verdict.value
+                    reason = judge_outcome.reason or (
+                        'Judge rejected' if verdict_label == 'REJECT' else 'Judge unavailable'
+                    )
+                    flags = judge_outcome.risk_flags
+                    logger.warning(
+                        f"[JUDGE] {verdict_label} {symbol} {trade_signal.direction}: {reason}"
+                    )
+
                     from .api.routes.activity import add_activity
                     add_activity(
-                        "trade_judge_reject",
-                        f"Judge REJECTED {symbol} {trade_signal.direction}: {reason}",
+                        "trade_judge_reject" if verdict_label == "REJECT" else "trade_judge_unavailable",
+                        f"Judge {verdict_label} {symbol} {trade_signal.direction}: {reason}",
                         symbol,
                         {
-                            "verdict": "REJECT",
+                            "verdict": verdict_label,
                             "reason": reason,
                             "risk_flags": flags,
                             "confidence": trade_signal.confidence,
                         }
                     )
-                    
+
                     flags_str = ", ".join(flags) if flags else "none"
                     print(
-                        f"[JUDGE] ║  REJECT {symbol} — \"{reason}\"  "
+                        f"[JUDGE] ║  {verdict_label} {symbol} — \"{reason}\"  "
                         f"| flags: [{flags_str}]",
                         flush=True
                     )
-                    
-                    # Save rejected signal to DB for correlation (did we miss a winner?)
+
                     await save_signal_to_db(
                         symbol=symbol,
                         direction=trade_signal.direction,
@@ -4225,7 +4505,7 @@ class TradingBot:
                         stop_loss=trade_signal.stop_loss,
                         take_profit=trade_signal.take_profit,
                         reasoning=trade_signal.reasoning if hasattr(trade_signal, 'reasoning') else "",
-                        judge_verdict="REJECT",
+                        judge_verdict=verdict_label,
                         judge_reason=reason,
                         judge_risk_flags=flags,
                         trade_type=getattr(trade_signal, 'trade_type', 'intraday'),
@@ -4233,14 +4513,29 @@ class TradingBot:
                         confluence_factors=confluence_factors if confluence_factors else None,
                         confluence_count=confluence_count if confluence_count else None,
                     )
-                    
-                    self.daily_trades = max(0, self.daily_trades - 1)
-                    logger.info(f"Trade slot released after judge rejection ({self.daily_trades}/{settings.trading.max_daily_trades})")
+
+                    outcome_type = (
+                        "judge_reject" if verdict_label == "REJECT" else "judge_failure"
+                    )
+                    await self._record_terminal_decision(
+                        outcome_type,
+                        symbol,
+                        direction=trade_signal.direction,
+                        entry=trade_signal.entry_price or current_price,
+                        sl=trade_signal.stop_loss or 0.0,
+                        tp=trade_signal.take_profit or 0.0,
+                        confidence=trade_signal.confidence,
+                        reason=reason,
+                        judge_verdict=verdict_label,
+                        details={"risk_flags": flags},
+                    )
+
+                    self._release_trade_reservation(_trade_reservation)
                     return
-                
+
                 # Handle DEMOTE verdict — convert to pending limit order
-                elif judge_verdict.get('verdict') == 'DEMOTE':
-                    suggested = judge_verdict.get('suggested_entry')
+                elif judge_outcome.allows_demote_execution():
+                    suggested = judge_outcome.suggested_entry
                     
                     # Calculate demoted entry price
                     if suggested is not None and suggested > 0:
@@ -4271,8 +4566,19 @@ class TradingBot:
                             f"TP={trade_signal.take_profit:.5f})",
                             flush=True
                         )
-                        self.daily_trades = max(0, self.daily_trades - 1)
-                        logger.info(f"Trade slot released after demote R:R rejection ({self.daily_trades}/{settings.trading.max_daily_trades})")
+                        await self._reject_and_record(
+                            _trade_reservation,
+                            "mechanical_reject",
+                            symbol,
+                            gate_id="demote_rr_below_1",
+                            direction=trade_signal.direction,
+                            entry=demoted_entry,
+                            sl=_sl_for_check,
+                            tp=trade_signal.take_profit or 0.0,
+                            confidence=trade_signal.confidence,
+                            reason=f"DEMOTE R:R {_demote_rr:.2f}:1 below 1.0",
+                            judge_verdict="DEMOTE",
+                        )
                         return
                     
                     # Override to pending limit order
@@ -4311,12 +4617,23 @@ class TradingBot:
                                 f"of entry {demoted_entry:.5f} ({trade_signal.direction}). Skipping.",
                                 flush=True
                             )
-                            self.daily_trades = max(0, self.daily_trades - 1)
-                            logger.info(f"Trade slot released after SL-side rejection ({self.daily_trades}/{settings.trading.max_daily_trades})")
+                            await self._reject_and_record(
+                                _trade_reservation,
+                                "mechanical_reject",
+                                symbol,
+                                gate_id="demote_sl_wrong_side",
+                                direction=trade_signal.direction,
+                                entry=demoted_entry,
+                                sl=_sl_check,
+                                tp=trade_signal.take_profit or 0.0,
+                                confidence=trade_signal.confidence,
+                                reason="DEMOTE SL on wrong side of entry",
+                                judge_verdict="DEMOTE",
+                            )
                             return
                     
-                    reason = judge_verdict.get('reason', 'Judge demoted')
-                    flags = judge_verdict.get('risk_flags', [])
+                    reason = judge_outcome.reason or 'Judge demoted'
+                    flags = judge_outcome.risk_flags
                     logger.info(
                         f"[JUDGE] Demoted {symbol} {trade_signal.direction} market -> "
                         f"{trade_signal.order_type} @ {demoted_entry:.5f} (reason: {reason})"
@@ -4363,10 +4680,22 @@ class TradingBot:
                         confluence_factors=confluence_factors if confluence_factors else None,
                         confluence_count=confluence_count if confluence_count else None,
                     )
+                    await self._record_terminal_decision(
+                        "judge_demote",
+                        symbol,
+                        direction=trade_signal.direction,
+                        entry=demoted_entry,
+                        sl=trade_signal.stop_loss or 0.0,
+                        tp=trade_signal.take_profit or 0.0,
+                        confidence=trade_signal.confidence,
+                        reason=reason,
+                        judge_verdict="DEMOTE",
+                        details={"risk_flags": flags, "order_type": trade_signal.order_type},
+                    )
                 else:
                     # APPROVE — log for visibility
-                    reason = judge_verdict.get('reason', 'Approved')
-                    flags = judge_verdict.get('risk_flags', [])
+                    reason = judge_outcome.reason or 'Approved'
+                    flags = judge_outcome.risk_flags
                     if flags:
                         logger.info(f"[JUDGE] Approved {symbol} with flags: {flags}")
                     
@@ -4434,7 +4763,18 @@ class TradingBot:
                                 f"Blocked {trade_signal.direction} {symbol}: opposite-direction "
                                 f"position exists (ticket={conflicting[0].ticket})"
                             )
-                            self.daily_trades = max(0, self.daily_trades - 1)
+                            await self._reject_and_record(
+                                _trade_reservation,
+                                "mechanical_reject",
+                                symbol,
+                                gate_id="position_conflict",
+                                direction=trade_signal.direction,
+                                entry=trade_signal.entry_price or current_price,
+                                sl=trade_signal.stop_loss or 0.0,
+                                tp=trade_signal.take_profit or 0.0,
+                                confidence=trade_signal.confidence,
+                                reason=f"Opposite {opposite_dir} position open",
+                            )
                             return
                         
                         # Block same-direction stacking
@@ -4453,7 +4793,18 @@ class TradingBot:
                                 f"Blocked {trade_signal.direction} {symbol}: same-direction "
                                 f"position already open (ticket={same_dir[0].ticket})"
                             )
-                            self.daily_trades = max(0, self.daily_trades - 1)
+                            await self._reject_and_record(
+                                _trade_reservation,
+                                "mechanical_reject",
+                                symbol,
+                                gate_id="position_stacking",
+                                direction=trade_signal.direction,
+                                entry=trade_signal.entry_price or current_price,
+                                sl=trade_signal.stop_loss or 0.0,
+                                tp=trade_signal.take_profit or 0.0,
+                                confidence=trade_signal.confidence,
+                                reason="Same-direction position already open",
+                            )
                             return
                 
                 # =============================================
@@ -4528,7 +4879,18 @@ class TradingBot:
                                 flush=True
                             )
                             logger.warning(f"Zone block: buy_limit in premium ({_retrace_pct:.0%}) for {symbol}")
-                            self.daily_trades = max(0, self.daily_trades - 1)
+                            await self._reject_and_record(
+                                _trade_reservation,
+                                "mechanical_reject",
+                                symbol,
+                                gate_id="zone_block",
+                                direction=trade_signal.direction,
+                                entry=entry_price,
+                                sl=_final_sl or 0.0,
+                                tp=_final_tp or 0.0,
+                                confidence=trade_signal.confidence,
+                                reason=f"buy_limit in premium zone ({_retrace_pct:.0%})",
+                            )
                             return
                         elif order_type == 'sell_limit' and _retrace_pct < 0.30:
                             print(
@@ -4537,7 +4899,18 @@ class TradingBot:
                                 flush=True
                             )
                             logger.warning(f"Zone block: sell_limit in discount ({_retrace_pct:.0%}) for {symbol}")
-                            self.daily_trades = max(0, self.daily_trades - 1)
+                            await self._reject_and_record(
+                                _trade_reservation,
+                                "mechanical_reject",
+                                symbol,
+                                gate_id="zone_block",
+                                direction=trade_signal.direction,
+                                entry=entry_price,
+                                sl=_final_sl or 0.0,
+                                tp=_final_tp or 0.0,
+                                confidence=trade_signal.confidence,
+                                reason=f"sell_limit in discount zone ({_retrace_pct:.0%})",
+                            )
                             return
                         elif order_type == 'buy_limit' and _retrace_pct > 0.55:
                             _old_conf = trade_signal.confidence
@@ -4580,6 +4953,36 @@ class TradingBot:
                             )
                 except Exception as e:
                     logger.debug(f"[SPREAD-BUF] Could not adjust SL for spread: {e}")
+
+                from .config import get_symbol_spec as _gss_final
+                _final_spec = _gss_final(symbol)
+                _final_entry = trade_signal.entry_price or current_price
+                _final_lots, _, _final_risk_reason = self._enforce_final_risk_before_order(
+                    symbol=symbol,
+                    entry=_final_entry,
+                    stop_loss=_final_sl,
+                    lots=position_size.lots,
+                    account_equity=account_info.equity,
+                    symbol_spec=_final_spec,
+                    risk_fraction=size_result.risk_percent if hasattr(size_result, 'risk_percent') else None,
+                )
+                if _final_risk_reason:
+                    logger.warning(f"[FINAL-RISK] {symbol}: blocked — {_final_risk_reason}")
+                    print(f"[FINAL-RISK] {symbol}: BLOCKED — {_final_risk_reason}", flush=True)
+                    await self._reject_and_record(
+                        _trade_reservation,
+                        "mechanical_reject",
+                        symbol,
+                        gate_id="final_risk_block",
+                        direction=trade_signal.direction,
+                        entry=_final_entry,
+                        sl=_final_sl or 0.0,
+                        tp=_final_tp or 0.0,
+                        confidence=trade_signal.confidence,
+                        reason=_final_risk_reason,
+                    )
+                    return
+                position_size.lots = _final_lots
                 
                 # DRY-RUN MODE: Log the trade but skip actual execution
                 if settings.trading.dry_run:
@@ -4640,18 +5043,51 @@ class TradingBot:
                         logger.debug(f"[TICK-REFINE] Error for {symbol}: {_tick_err}")
                     
                     if not _tick_ok:
+                        await self._reject_and_record(
+                            _trade_reservation,
+                            "mechanical_reject",
+                            symbol,
+                            gate_id="tick_refine_block",
+                            direction=trade_signal.direction,
+                            entry=trade_signal.entry_price or current_price,
+                            sl=_final_sl or 0.0,
+                            tp=_final_tp or 0.0,
+                            confidence=trade_signal.confidence,
+                            reason="Tick refine blocked: price slipped, R:R degraded",
+                        )
                         return
                     
                     logger.info(f"Executing MARKET order (AMD: {trade_signal.amd_phase})")
                     
-                    result = await self.order_manager.place_market_order(
+                    result = await self._place_market_with_final_risk(
                         symbol=symbol,
                         direction=trade_signal.direction,
-                        volume=position_size.lots,
+                        lots=position_size.lots,
                         stop_loss=_final_sl,
                         take_profit=_final_tp,
-                        comment="ICT_Bot"
+                        account_equity=account_info.equity,
+                        symbol_spec=_final_spec,
+                        risk_fraction=(
+                            size_result.risk_percent
+                            if hasattr(size_result, 'risk_percent')
+                            else None
+                        ),
+                        comment="ICT_Bot",
                     )
+                    if result is None:
+                        await self._reject_and_record(
+                            _trade_reservation,
+                            "mechanical_reject",
+                            symbol,
+                            gate_id="final_risk_block",
+                            direction=trade_signal.direction,
+                            entry=trade_signal.entry_price or current_price,
+                            sl=_final_sl or 0.0,
+                            tp=_final_tp or 0.0,
+                            confidence=trade_signal.confidence,
+                            reason="Final risk blocked market order",
+                        )
+                        return
                 elif order_type in ['buy_limit', 'sell_limit', 'buy_stop', 'sell_stop']:
                     # Use pending order at Claude's specified entry price
                     # Crypto trades 24/7, so give longer expiration
@@ -4675,15 +5111,8 @@ class TradingBot:
                         if o.direction == trade_signal.direction
                     ]
                     for old_order in existing_orders:
-                        old_success = await self.pending_order_manager.cancel_order(
-                            old_order.ticket, reason="replaced_by_newer"
-                        )
+                        old_success = await self._cancel_pending_for_replacement(old_order)
                         if old_success:
-                            self.daily_trades = max(0, self.daily_trades - 1)
-                            # Reclaim risk budget for the old order (use stored risk, not default)
-                            if hasattr(self, 'risk_manager') and self.risk_manager:
-                                _risk_pct = getattr(old_order, 'risk_percent', None) or self.risk_manager.risk_per_trade
-                                self.risk_manager.update_daily_risk(-_risk_pct)
                             # Clear old signal hash
                             old_hash = self._get_signal_hash(symbol, old_order.direction, old_order.price)
                             self._recent_signal_hashes.discard(old_hash)
@@ -4719,7 +5148,13 @@ class TradingBot:
                             take_profit=_final_tp,
                             expiration_minutes=expiration_minutes,
                             risk_percent=size_result.risk_percent if hasattr(size_result, 'risk_percent') else None,
+                            reservation_id=_trade_reservation.reservation_id if _trade_reservation else None,
                         )
+                        if _trade_reservation:
+                            self.reservation_ledger.transfer_to_pending(
+                                _trade_reservation,
+                                result.ticket or result.order_id,
+                            )
                 else:
                     # Fallback to market order if order type unclear
                     logger.info(f"📈 Executing MARKET order (fallback from {order_type})")
@@ -4734,15 +5169,20 @@ class TradingBot:
                     )
                 
                 if result.success:
-                    # Trade slot was already reserved above (daily_trades incremented)
-                    
-                    # Update daily risk tracking so the risk limit is enforced
-                    # Use the scaling manager's risk_percent (the intended risk per trade),
-                    # NOT a manual price-based calculation which can be wildly wrong for crypto/indices.
-                    if hasattr(self, 'risk_manager') and self.risk_manager:
-                        _risk_pct = size_result.risk_percent if hasattr(size_result, 'risk_percent') else self.risk_manager.risk_per_trade
-                        self.risk_manager.update_daily_risk(_risk_pct)
-                        print(f"[RISK] {symbol}: Daily risk +{_risk_pct*100:.1f}%, total: {self.risk_manager.daily_risk_used*100:.1f}%/{self.risk_manager.max_daily_risk*100:.0f}%", flush=True)
+                    _risk_pct = (
+                        size_result.risk_percent
+                        if hasattr(size_result, 'risk_percent')
+                        else self.risk_manager.risk_per_trade
+                    )
+                    if _trade_reservation:
+                        _trade_reservation.risk_percent = _risk_pct
+                        self.reservation_ledger.commit_risk(_trade_reservation)
+                    print(
+                        f"[RISK] {symbol}: Daily risk +{_risk_pct*100:.1f}%, "
+                        f"total: {self.risk_manager.daily_risk_used*100:.1f}%/"
+                        f"{self.risk_manager.max_daily_risk*100:.0f}%",
+                        flush=True,
+                    )
                     
                     # Gap 21: Track signal hash to prevent duplicates
                     self._recent_signal_hashes.add(signal_hash)
@@ -4797,6 +5237,17 @@ class TradingBot:
                             # =============================================
                             print(f"[PENDING] {symbol}: Pending {order_type} placed (ticket={result.ticket}, entry={entry_price:.5f}, SL={trade_signal.stop_loss}, TP={trade_signal.take_profit})", flush=True)
                             logger.info(f"Pending order {result.ticket} tracked by pending_order_manager (NOT position_manager)")
+                            await self._record_terminal_decision(
+                                "pending_placed",
+                                symbol,
+                                direction=trade_signal.direction,
+                                entry=entry_price,
+                                sl=trade_signal.stop_loss or 0.0,
+                                tp=trade_signal.take_profit or 0.0,
+                                confidence=trade_signal.confidence,
+                                reason=f"Pending {order_type} placed",
+                                details={"ticket": result.ticket, "order_type": order_type},
+                            )
                             
                             # Add to activity feed as pending order (not "trade opened")
                             from .api.routes.activity import add_activity
@@ -4877,7 +5328,17 @@ class TradingBot:
                                 take_profit=tracked_tp or 0.0,
                                 open_time=datetime.now(timezone.utc),
                                 trade_type=getattr(trade_signal, 'trade_type', 'intraday') or 'intraday',
+                                reservation_id=_trade_reservation.reservation_id if _trade_reservation else None,
+                                a_plus=classify_a_plus(
+                                    setup_grade.value if hasattr(setup_grade, 'value') else str(setup_grade),
+                                    confluence_count or 0,
+                                ),
                             )
+                            if _trade_reservation:
+                                self.reservation_ledger.transfer_to_position(
+                                    _trade_reservation,
+                                    result.ticket,
+                                )
                             
                             # Set multi-TP levels for partial close management
                             # Scalps: single TP — close full position, no partials
@@ -4915,6 +5376,17 @@ class TradingBot:
                             
                             self.position_manager.add_position(position)
                             print(f"[TRADE] {symbol}: Market order filled (ticket={result.ticket}, fill={result.fill_price})", flush=True)
+                            await self._record_terminal_decision(
+                                "market_filled",
+                                symbol,
+                                direction=trade_signal.direction,
+                                entry=result.fill_price or current_price,
+                                sl=tracked_sl or 0.0,
+                                tp=tracked_tp or 0.0,
+                                confidence=trade_signal.confidence,
+                                reason="Market order filled",
+                                details={"ticket": result.ticket},
+                            )
                             
                             # Track in correlation service
                             if self.correlation_service:
@@ -4995,10 +5467,18 @@ class TradingBot:
                                 ticket=result.ticket
                             )
                 else:
-                    # Release the reserved trade slot since execution failed
-                    self.daily_trades = max(0, self.daily_trades - 1)
                     logger.error(f"✗ Trade execution failed for {symbol}: {result.message}")
-                    logger.info(f"Trade slot released ({self.daily_trades}/{settings.trading.max_daily_trades})")
+                    await self._record_terminal_decision(
+                        "execution_failure",
+                        symbol,
+                        direction=trade_signal.direction,
+                        entry=trade_signal.entry_price or current_price,
+                        sl=trade_signal.stop_loss or 0.0,
+                        tp=trade_signal.take_profit or 0.0,
+                        confidence=trade_signal.confidence,
+                        reason=result.message or "broker rejected order",
+                    )
+                    self._release_trade_reservation(_trade_reservation)
                     
                     # Log error to activity feed
                     from .api.routes.activity import add_activity
@@ -5015,9 +5495,10 @@ class TradingBot:
             import traceback
             traceback.print_exc()
             # Release trade slot if it was reserved before the crash
-            if hasattr(self, '_trade_lock') and self.daily_trades > 0:
-                self.daily_trades = max(0, self.daily_trades - 1)
-                logger.info(f"Trade slot released after crash ({self.daily_trades}/{settings.trading.max_daily_trades})")
+            self._release_trade_reservation(_trade_reservation)
+        finally:
+            if _trade_reservation_context is not None:
+                await _trade_reservation_context.__aexit__(None, None, None)
     
     async def _run_analysis_only(self, symbol: str):
         """
@@ -5626,120 +6107,242 @@ class TradingBot:
         trade_signal,
         position_size,
         current_price: float,
-    ) -> dict:
-        """
-        Run the Trade Judge — a pre-execution validation layer using Claude.
-        
-        Checks the proposed trade against learned patterns and risk math.
-        Returns APPROVE (proceed as-is), DEMOTE (convert to pending limit),
-        or REJECT (skip entirely).
-        
-        Fails closed: timeout or error returns DEMOTE so marginal trades
-        are forced to pending limit orders rather than going straight to market.
-        """
-        default_demote = {"verdict": "DEMOTE", "reason": "Judge timeout/error — defaulting to limit order", "suggested_entry": None, "risk_flags": ["judge_unavailable"]}
-        
-        if not self.claude_client or not self.claude_client.api_key:
-            return default_demote
-        
+    ) -> JudgeOutcome:
+        """Shared fail-closed judge adapter for regular entries."""
+        signal_dict = {
+            'symbol': symbol,
+            'direction': trade_signal.direction,
+            'confidence': trade_signal.confidence,
+            'entry_price': trade_signal.entry_price or current_price,
+            'stop_loss': trade_signal.stop_loss,
+            'take_profit': trade_signal.take_profit,
+            'order_type': getattr(trade_signal, 'order_type', 'market'),
+            'trade_type': getattr(trade_signal, 'trade_type', 'intraday'),
+            'reasoning': getattr(trade_signal, 'reasoning', ''),
+        }
+
+        entry = signal_dict['entry_price']
+        sl = signal_dict['stop_loss'] or 0
+        tp = signal_dict['take_profit'] or 0
+        sl_distance = abs(entry - sl) if sl else 0
+        tp_distance = abs(tp - entry) if tp else 0
+        risk_reward = tp_distance / sl_distance if sl_distance > 0 else 0
+
+        account_balance = 0.0
+        spec = None
+        if hasattr(self, 'mt5_client') and self.mt5_client:
+            try:
+                acct = await self.mt5_client.get_account_info()
+                if acct:
+                    account_balance = acct.balance
+            except Exception as e:
+                logger.debug(f"Could not get account balance: {e}")
+
+        position_size_pct = 0.0
+        _lots = getattr(position_size, 'lots', 0.01)
+        _at_broker_minimum = False
+        if account_balance > 0 and sl_distance > 0:
+            from .config import get_symbol_spec
+            spec = get_symbol_spec(symbol)
+            risk_amount = sl_distance * _lots * spec.contract_size
+            position_size_pct = risk_amount / account_balance
+            _at_broker_minimum = (_lots <= spec.volume_min)
+
+        session_name = ""
+        if self.session_analytics:
+            current_session = self.session_analytics.get_current_session()
+            session_name = current_session.value if current_session else ""
+
+        drawdown_pct = 0.0
+        if self.scaling_manager:
+            weekly_high = getattr(self.scaling_manager, 'weekly_high_equity', account_balance)
+            if weekly_high > 0:
+                drawdown_pct = (weekly_high - account_balance) / weekly_high
+
+        risk_metrics = {
+            'account_balance': account_balance,
+            'daily_pnl': self.daily_pnl,
+            'drawdown_pct': drawdown_pct,
+            'risk_reward': risk_reward,
+            'position_size_pct': position_size_pct,
+            'at_broker_minimum_lots': _at_broker_minimum,
+            'trades_today': self.daily_trades,
+            'max_daily_trades': settings.trading.max_daily_trades if hasattr(settings, 'trading') else 5,
+            'session': session_name,
+            'symbol_category': spec.category if spec else 'unknown',
+            'sl_distance': sl_distance,
+            'tp_distance': abs((trade_signal.take_profit or 0) - (trade_signal.entry_price or current_price)),
+        }
+
+        learning_context = ""
+        if self.learning_service:
+            try:
+                learning_context = await self.learning_service.build_context_for_claude(symbol, session_name)
+            except Exception as e:
+                logger.debug(f"[JUDGE] Could not get learning context: {e}")
+
+        outcome = await run_trade_judge(
+            self.claude_client,
+            signal_dict,
+            risk_metrics,
+            learning_context,
+            timeout=8.0,
+        )
+        logger.info(
+            f"[JUDGE] {symbol} {trade_signal.direction}: {outcome.verdict.value} "
+            f"— {outcome.reason} | flags: {outcome.risk_flags}"
+        )
+        return outcome
+
+    async def _run_reversal_trade_judge(
+        self,
+        symbol: str,
+        trade_signal,
+        current_price: float,
+        risk_metrics: dict,
+        learning_context: str = "",
+    ) -> JudgeOutcome:
+        """Shared fail-closed judge adapter for reversal entries."""
+        signal_dict = {
+            "symbol": symbol,
+            "direction": trade_signal.direction,
+            "confidence": trade_signal.confidence,
+            "entry_price": trade_signal.entry_price or current_price,
+            "stop_loss": trade_signal.stop_loss,
+            "take_profit": trade_signal.take_profit,
+            "reasoning": getattr(trade_signal, "reasoning", ""),
+            "trade_type": getattr(trade_signal, "trade_type", "intraday"),
+            "reversal_reentry": True,
+        }
+        return await run_trade_judge(
+            self.claude_client,
+            signal_dict,
+            risk_metrics,
+            learning_context,
+            timeout=8.0,
+        )
+
+    def _apply_judge_outcome(self, outcome: JudgeOutcome, reservation=None) -> bool:
+        """Release reservation and block when judge is unavailable/reject."""
+        if outcome.blocks_execution():
+            self._release_trade_reservation(reservation)
+            return True
+        return False
+
+    def _enforce_final_risk_before_order(
+        self,
+        *,
+        symbol: str,
+        entry: float,
+        stop_loss: float,
+        lots: float,
+        account_equity: float,
+        symbol_spec,
+        risk_fraction: Optional[float] = None,
+    ):
+        risk_fraction = risk_fraction or (
+            self.risk_manager.risk_per_trade if self.risk_manager else 0.02
+        )
+        return enforce_final_risk_cap(
+            account_equity,
+            risk_fraction,
+            entry,
+            stop_loss,
+            lots,
+            symbol_spec,
+            symbol=symbol,
+        )
+
+    async def _place_market_with_final_risk(
+        self,
+        *,
+        symbol: str,
+        direction: str,
+        lots: float,
+        stop_loss: float,
+        take_profit: float,
+        account_equity: float,
+        symbol_spec,
+        comment: str = "ICT_Bot",
+        risk_fraction: Optional[float] = None,
+    ):
+        allowed, _, reason = self._enforce_final_risk_before_order(
+            symbol=symbol,
+            entry=await self._current_market_entry(symbol, direction),
+            stop_loss=stop_loss,
+            lots=lots,
+            account_equity=account_equity,
+            symbol_spec=symbol_spec,
+            risk_fraction=risk_fraction,
+        )
+        if reason:
+            logger.warning(f"[FINAL-RISK] {symbol}: blocked market order — {reason}")
+            return None
+        result = await self.order_manager.place_market_order(
+            symbol=symbol,
+            direction=direction,
+            volume=allowed,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            comment=comment,
+        )
+        if result and result.success:
+            return result
+        return None
+
+    async def _place_pending_with_final_risk(
+        self,
+        *,
+        symbol: str,
+        direction: str,
+        order_type: str,
+        price: float,
+        lots: float,
+        stop_loss: float,
+        take_profit: float,
+        account_equity: float,
+        symbol_spec,
+        expiration_minutes: Optional[int] = None,
+        comment: str = "ICT_Bot",
+        risk_fraction: Optional[float] = None,
+    ):
+        allowed, _, reason = self._enforce_final_risk_before_order(
+            symbol=symbol,
+            entry=price,
+            stop_loss=stop_loss,
+            lots=lots,
+            account_equity=account_equity,
+            symbol_spec=symbol_spec,
+            risk_fraction=risk_fraction,
+        )
+        if reason:
+            logger.warning(f"[FINAL-RISK] {symbol}: blocked pending order — {reason}")
+            return None
+        kwargs = {
+            "symbol": symbol,
+            "direction": direction,
+            "order_type": order_type,
+            "volume": allowed,
+            "price": price,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "comment": comment,
+        }
+        if expiration_minutes is not None:
+            kwargs["expiration_minutes"] = expiration_minutes
+        result = await self.order_manager.place_pending_order(**kwargs)
+        if result and result.success:
+            return result
+        return None
+
+    async def _current_market_entry(self, symbol: str, direction: str) -> float:
         try:
-            # Build signal summary
-            signal_dict = {
-                'symbol': symbol,
-                'direction': trade_signal.direction,
-                'confidence': trade_signal.confidence,
-                'entry_price': trade_signal.entry_price or current_price,
-                'stop_loss': trade_signal.stop_loss,
-                'take_profit': trade_signal.take_profit,
-                'order_type': getattr(trade_signal, 'order_type', 'market'),
-                'trade_type': getattr(trade_signal, 'trade_type', 'intraday'),
-                'reasoning': getattr(trade_signal, 'reasoning', ''),
-            }
-            
-            # Build risk metrics
-            entry = signal_dict['entry_price']
-            sl = signal_dict['stop_loss'] or 0
-            tp = signal_dict['take_profit'] or 0
-            sl_distance = abs(entry - sl) if sl else 0
-            tp_distance = abs(tp - entry) if tp else 0
-            risk_reward = tp_distance / sl_distance if sl_distance > 0 else 0
-            
-            account_balance = 0.0
-            if hasattr(self, 'mt5_client') and self.mt5_client:
-                try:
-                    acct = await self.mt5_client.get_account_info()
-                    if acct:
-                        account_balance = acct.balance
-                except Exception as e:
-                    logger.debug(f"Could not get account balance: {e}")
-                    pass
-            
-            position_size_pct = 0.0
-            _lots = getattr(position_size, 'lots', 0.01)
-            _at_broker_minimum = False
-            if account_balance > 0 and sl_distance > 0:
-                from .config import get_symbol_spec
-                spec = get_symbol_spec(symbol)
-                risk_amount = sl_distance * _lots * spec.contract_size
-                position_size_pct = risk_amount / account_balance
-                # Check if we're at the broker's minimum lot size
-                _at_broker_minimum = (_lots <= spec.volume_min)
-            
-            # Get current session
-            session_name = ""
-            if self.session_analytics:
-                current_session = self.session_analytics.get_current_session()
-                session_name = current_session.value if current_session else ""
-            
-            # Get drawdown info
-            drawdown_pct = 0.0
-            if self.scaling_manager:
-                weekly_high = getattr(self.scaling_manager, 'weekly_high_equity', account_balance)
-                if weekly_high > 0:
-                    drawdown_pct = (weekly_high - account_balance) / weekly_high
-            
-            risk_metrics = {
-                'account_balance': account_balance,
-                'daily_pnl': self.daily_pnl,
-                'drawdown_pct': drawdown_pct,
-                'risk_reward': risk_reward,
-                'position_size_pct': position_size_pct,
-                'at_broker_minimum_lots': _at_broker_minimum,
-                'trades_today': self.daily_trades,
-                'max_daily_trades': settings.trading.max_daily_trades if hasattr(settings, 'trading') else 5,
-                'session': session_name,
-                'symbol_category': spec.category if spec else 'unknown',
-                'sl_distance': sl_distance,
-                'tp_distance': abs((trade_signal.take_profit or 0) - (trade_signal.entry_price or current_price)),
-            }
-            
-            # Get learning context (past mistakes and winning patterns)
-            learning_context = ""
-            if self.learning_service:
-                try:
-                    learning_context = await self.learning_service.build_context_for_claude(symbol, session_name)
-                except Exception as e:
-                    logger.debug(f"[JUDGE] Could not get learning context: {e}")
-            
-            # Call the judge with a timeout — fail closed (DEMOTE on timeout)
-            verdict = await asyncio.wait_for(
-                self.claude_client.judge_trade(signal_dict, risk_metrics, learning_context),
-                timeout=8.0
-            )
-            
-            logger.info(
-                f"[JUDGE] {symbol} {trade_signal.direction}: {verdict.get('verdict', 'APPROVE')} "
-                f"— {verdict.get('reason', 'N/A')} | flags: {verdict.get('risk_flags', [])}"
-            )
-            
-            return verdict
-            
-        except asyncio.TimeoutError:
-            logger.warning(f"[JUDGE] Timeout for {symbol} — failing closed (DEMOTE to limit order)")
-            return default_demote
-        except Exception as e:
-            logger.warning(f"[JUDGE] Error for {symbol}: {e} — failing closed (DEMOTE to limit order)")
-            return default_demote
+            tick = await self.mt5_client.get_tick(symbol)
+            if tick:
+                return tick.ask if direction == "long" else tick.bid
+        except Exception:
+            pass
+        return 0.0
     
     async def _check_drawdown_circuit_breaker(self) -> bool:
         """
@@ -6363,21 +6966,8 @@ Include brief reasoning.
                             
                             if success:
                                 cancelled_count += 1
-                                
-                                # Reclaim daily risk budget (use stored risk, not default)
-                                if hasattr(self, 'risk_manager') and self.risk_manager:
-                                    _risk_pct = getattr(order, 'risk_percent', None) or self.risk_manager.risk_per_trade
-                                    self.risk_manager.update_daily_risk(-_risk_pct)
-                                    print(
-                                        f"[RISK] {symbol}: Daily risk reclaimed -{_risk_pct*100:.1f}%, "
-                                        f"total: {self.risk_manager.daily_risk_used*100:.1f}%/{self.risk_manager.max_daily_risk*100:.0f}%",
-                                        flush=True
-                                    )
-                                
-                                # Free the daily trade slot (pending never filled)
-                                self.daily_trades = max(0, self.daily_trades - 1)
                                 print(
-                                    f"[TRADES] {symbol}: Trade slot freed, "
+                                    f"[TRADES] {symbol}: Reservation released if owned, "
                                     f"daily_trades={self.daily_trades}/{settings.trading.max_daily_trades}",
                                     flush=True
                                 )
@@ -6469,10 +7059,6 @@ Include brief reasoning.
                                 )
                                 if cancel_ok:
                                     cancelled_count += 1
-                                    self.daily_trades = max(0, self.daily_trades - 1)
-                                    if hasattr(self, 'risk_manager') and self.risk_manager:
-                                        _risk_pct = getattr(order, 'risk_percent', None) or self.risk_manager.risk_per_trade
-                                        self.risk_manager.update_daily_risk(-_risk_pct)
                                     old_hash = self._get_signal_hash(symbol, order_direction, order.price)
                                     self._recent_signal_hashes.discard(old_hash)
                                     self._signal_hash_expiry.pop(old_hash, None)
@@ -6491,19 +7077,22 @@ Include brief reasoning.
                             )
                             
                             # Cancel the stale pending order
+                            old_reservation = self.reservation_ledger.get_by_id(
+                                getattr(order, "reservation_id", None)
+                            )
                             cancel_ok = await self.pending_order_manager.cancel_order(
-                                order.ticket, reason=f"upgrade_to_market (price ran {move_pct:.1f}% away)"
+                                order.ticket,
+                                reason=f"upgrade_to_market (price ran {move_pct:.1f}% away)",
+                                reclaim_budget=False,
                             )
                             
                             if cancel_ok:
                                 cancelled_count += 1
                                 
-                                # Free the trade slot and risk (will be re-used by the market order)
-                                self.daily_trades = max(0, self.daily_trades - 1)
-                                _risk_pct = 0
-                                if hasattr(self, 'risk_manager') and self.risk_manager:
-                                    _risk_pct = getattr(order, 'risk_percent', None) or self.risk_manager.risk_per_trade
-                                    self.risk_manager.update_daily_risk(-_risk_pct)
+                                _risk_pct = (
+                                    getattr(order, 'risk_percent', None)
+                                    or self.risk_manager.risk_per_trade
+                                )
                                 old_hash = self._get_signal_hash(symbol, order_direction, order.price)
                                 self._recent_signal_hashes.discard(old_hash)
                                 self._signal_hash_expiry.pop(old_hash, None)
@@ -6528,22 +7117,31 @@ Include brief reasoning.
                                     )
                                 
                                 try:
-                                    market_result = await self.order_manager.place_market_order(
+                                    from .config import get_symbol_spec as _gss_upgrade
+                                    _upgrade_spec = _gss_upgrade(symbol)
+                                    _upgrade_acct = await self.mt5_client.get_account_info()
+                                    _upgrade_equity = (
+                                        _upgrade_acct.equity if _upgrade_acct else 0.0
+                                    )
+                                    market_result = await self._place_market_with_final_risk(
                                         symbol=symbol,
                                         direction=order_direction,
-                                        volume=order.volume,
+                                        lots=order.volume,
                                         stop_loss=_new_sl,
                                         take_profit=_new_tp,
-                                        comment="ICT_Bot_Upgrade"
+                                        account_equity=_upgrade_equity,
+                                        symbol_spec=_upgrade_spec,
+                                        risk_fraction=_risk_pct,
+                                        comment="ICT_Bot_Upgrade",
                                     )
                                     
-                                    if market_result.success:
-                                        # Re-reserve the trade slot and risk
-                                        self.daily_trades += 1
-                                        if hasattr(self, 'risk_manager') and self.risk_manager and _risk_pct > 0:
-                                            self.risk_manager.update_daily_risk(_risk_pct)
-                                        
+                                    if market_result and market_result.success:
                                         fill_ticket = market_result.ticket or market_result.order_id
+                                        if old_reservation:
+                                            self.reservation_ledger.transfer_to_position(
+                                                old_reservation,
+                                                fill_ticket,
+                                            )
                                         fill_price = market_result.fill_price or current_price
                                         print(
                                             f"[PENDING-REEVAL] MARKET FILL #{fill_ticket} {symbol} {order_direction.upper()} "
@@ -6562,9 +7160,14 @@ Include brief reasoning.
                                                 stop_loss=_new_sl or fill_price,
                                                 take_profit=_new_tp or 0,
                                                 open_time=datetime.now(timezone.utc),
+                                                reservation_id=(
+                                                    old_reservation.reservation_id
+                                                    if old_reservation
+                                                    else None
+                                                ),
                                             )
                                             upgraded_pos.trade_type = 'intraday'
-                                            upgraded_pos.order_ticket = ticket
+                                            upgraded_pos.order_ticket = order.ticket
                                             self.position_manager.add_position(upgraded_pos)
                                         except Exception as pos_err:
                                             logger.warning(f"[PENDING-REEVAL] Could not create Position for upgrade: {pos_err}")
@@ -6601,11 +7204,15 @@ Include brief reasoning.
                                             }
                                         )
                                     else:
+                                        if old_reservation:
+                                            self.reservation_ledger.release(old_reservation)
                                         print(
                                             f"[PENDING-REEVAL] MARKET ENTRY FAILED for {symbol}: {getattr(market_result, 'error', 'unknown')}",
                                             flush=True
                                         )
                                 except Exception as mkt_err:
+                                    if old_reservation:
+                                        self.reservation_ledger.release(old_reservation)
                                     print(f"[PENDING-REEVAL] MARKET ENTRY ERROR for {symbol}: {mkt_err}", flush=True)
                             
                             continue  # Done with this order
@@ -6727,21 +7334,8 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                         
                         if success:
                             cancelled_count += 1
-                            
-                            # Reclaim daily risk budget (use stored risk, not default)
-                            if hasattr(self, 'risk_manager') and self.risk_manager:
-                                _risk_pct = getattr(order, 'risk_percent', None) or self.risk_manager.risk_per_trade
-                                self.risk_manager.update_daily_risk(-_risk_pct)
-                                print(
-                                    f"[RISK] {symbol}: Daily risk reclaimed -{_risk_pct*100:.1f}%, "
-                                    f"total: {self.risk_manager.daily_risk_used*100:.1f}%/{self.risk_manager.max_daily_risk*100:.0f}%",
-                                    flush=True
-                                )
-                            
-                            # Free the daily trade slot (pending never filled)
-                            self.daily_trades = max(0, self.daily_trades - 1)
                             print(
-                                f"[TRADES] {symbol}: Trade slot freed, "
+                                f"[TRADES] {symbol}: Reservation released if owned, "
                                 f"daily_trades={self.daily_trades}/{settings.trading.max_daily_trades}",
                                 flush=True
                             )
@@ -6857,6 +7451,17 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                 if db_match:
                     # Restore position with saved management state
                     self.position_manager.positions[ticket] = db_match
+                    if db_match.reservation_id and hasattr(self, "reservation_ledger"):
+                        _risk_pct = getattr(db_match, "risk_percent", None)
+                        if _risk_pct is None and self.risk_manager:
+                            _risk_pct = self.risk_manager.risk_per_trade
+                        self.reservation_ledger.restore_position(
+                            reservation_id=db_match.reservation_id,
+                            symbol=db_match.symbol,
+                            ticket=db_match.ticket,
+                            risk_percent=_risk_pct or 0.0,
+                            order_ticket=getattr(db_match, "order_ticket", None),
+                        )
                     logger.info(f"Restored position {ticket} from database")
                 else:
                     # Only import positions that were placed by this bot
@@ -7286,6 +7891,52 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
             return True
         return datetime.now(timezone.utc) - self._last_history_sync >= self._history_sync_interval
 
+
+    def _release_trade_reservation(self, reservation) -> None:
+        if reservation and hasattr(self, 'reservation_ledger') and self.reservation_ledger:
+            if self.reservation_ledger.release(reservation):
+                logger.info(
+                    f"Trade slot released ({self.daily_trades}/"
+                    f"{settings.trading.max_daily_trades})"
+                )
+
+    async def _process_pending_closed_trade_events(self, events):
+        """Route fast pending fill→close events through the unified close lifecycle."""
+        from .services.pending_order_manager import ClosedTradeEvent
+        from .execution.position_manager import Position
+
+        for event in events:
+            if not isinstance(event, ClosedTradeEvent):
+                continue
+
+            closing_deal = event.closing_deal_ticket
+            if closing_deal and closing_deal in self._processed_pending_close_deals:
+                logger.info(
+                    f"Skipping duplicate pending close event for deal {closing_deal}"
+                )
+                continue
+            if closing_deal:
+                self._processed_pending_close_deals.add(closing_deal)
+
+            position = Position(
+                ticket=event.position_ticket or event.order_ticket,
+                symbol=event.symbol,
+                direction=event.direction,
+                volume=event.volume,
+                entry_price=event.entry_price,
+                stop_loss=0.0,
+                take_profit=0.0,
+                open_time=event.close_time,
+                current_price=event.exit_price,
+                order_ticket=event.order_ticket,
+                reservation_id=event.reservation_id,
+                close_reason=event.close_reason,
+                closed_profit_loss=event.profit_loss,
+                closed_exit_price=event.exit_price,
+            )
+
+            await self._handle_position_close(position)
+
     async def _handle_position_close(self, position):
         """
         Gap 6: Handle position close - auto-log to journal.
@@ -7315,8 +7966,19 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
             actual_close_price = position.current_price  # fallback
             profit_loss = None  # Will be set from MT5 if possible
             mt5_profit_found = False
-            
-            if hasattr(self, 'mt5_client') and self.mt5_client and not self.mt5_client.is_simulation:
+
+            if getattr(position, 'closed_profit_loss', None) is not None:
+                profit_loss = position.closed_profit_loss
+                actual_close_price = (
+                    getattr(position, 'closed_exit_price', None) or position.current_price
+                )
+                mt5_profit_found = True
+                print(
+                    f"[CLOSE] {position.symbol}: Fast pending close P/L = ${profit_loss:.2f} "
+                    f"(exit={actual_close_price:.5f})",
+                    flush=True,
+                )
+            elif hasattr(self, 'mt5_client') and self.mt5_client and not self.mt5_client.is_simulation:
                 try:
                     # Wide window (7 days back) so trades that closed while the bot was offline are found
                     history = await self.mt5_client.get_history(
@@ -7643,31 +8305,27 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                     logger.warning(f"Could not update scaling manager: {e}")
             
             # Reclaim daily risk budget now that the position is closed
-            if hasattr(self, 'risk_manager') and self.risk_manager:
-                try:
-                    _reclaim_pct = self.risk_manager.risk_per_trade  # default
-                    if DB_AVAILABLE:
-                        try:
-                            from sqlalchemy import select
-                            async with async_session() as db_sess:
-                                _tr = await db_sess.execute(
-                                    select(TradeModel).where(TradeModel.trade_id == str(position.ticket))
-                                )
-                                _rec = _tr.scalar_one_or_none()
-                                if _rec and getattr(_rec, 'risk_percent', None):
-                                    _reclaim_pct = _rec.risk_percent
-                        except Exception as e:
-                            logger.debug(f"Could not reclaim risk percent: {e}")
-                            pass
-                    self.risk_manager.update_daily_risk(-_reclaim_pct)
-                    print(
-                        f"[RISK] {position.symbol}: Daily risk reclaimed -{_reclaim_pct*100:.1f}% "
-                        f"(position closed), total: {self.risk_manager.daily_risk_used*100:.1f}%/"
-                        f"{self.risk_manager.max_daily_risk*100:.0f}%",
-                        flush=True
-                    )
-                except Exception as e:
-                    logger.warning(f"Could not reclaim daily risk for {position.symbol}: {e}")
+            reservation = None
+            if getattr(position, 'reservation_id', None):
+                reservation = self.reservation_ledger.get_by_id(position.reservation_id)
+            if not reservation:
+                reservation = self.reservation_ledger.get_for_ticket(position.ticket)
+            if not reservation and getattr(position, 'order_ticket', None):
+                reservation = self.reservation_ledger.get_for_ticket(position.order_ticket)
+
+            if reservation:
+                self.reservation_ledger.mark_closed(reservation)
+                print(
+                    f"[RISK] {position.symbol}: Daily risk reclaimed via reservation "
+                    f"(position closed), total: {self.risk_manager.daily_risk_used*100:.1f}%/"
+                    f"{self.risk_manager.max_daily_risk*100:.0f}%",
+                    flush=True,
+                )
+            else:
+                logger.info(
+                    f"[RISK] {position.symbol}: No reservation ownership; "
+                    "daily risk unchanged"
+                )
             
             # Have Claude review ALL closed trades for learning
             # (Previously only losses and big wins; now every trade for data collection)
@@ -7793,6 +8451,7 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
         """
         symbol = closed_position.symbol
         opposite_direction = 'short' if closed_position.direction == 'long' else 'long'
+        _reversal_reservation = None
         
         try:
             # ---- Safeguard 1: Per-symbol reversal cooldown (1 hour) ----
@@ -8029,64 +8688,135 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                     return
             
             # ---- Trade Judge ----
-            if self.claude_client and self.claude_client.api_key:
+            judge_signal = {
+                "symbol": symbol,
+                "direction": trade_signal.direction,
+                "confidence": trade_signal.confidence,
+                "entry_price": trade_signal.entry_price or current_price,
+                "stop_loss": trade_signal.stop_loss,
+                "take_profit": trade_signal.take_profit,
+                "reasoning": trade_signal.reasoning or "",
+                "trade_type": getattr(trade_signal, 'trade_type', 'intraday'),
+                "reversal_reentry": True,
+            }
+
+            risk_metrics = {
+                "risk_reward": rr if 'rr' in dir() else 0,
+                "position_size_pct": 1.0,
+                "daily_trades": self.daily_trades,
+                "daily_pnl": self.daily_pnl,
+            }
+
+            learning_context = ""
+            if self.learning_service:
                 try:
-                    judge_signal = {
-                        "symbol": symbol,
-                        "direction": trade_signal.direction,
-                        "confidence": trade_signal.confidence,
-                        "entry_price": trade_signal.entry_price or current_price,
-                        "stop_loss": trade_signal.stop_loss,
-                        "take_profit": trade_signal.take_profit,
-                        "reasoning": trade_signal.reasoning or "",
-                        "trade_type": getattr(trade_signal, 'trade_type', 'intraday'),
-                        "reversal_reentry": True,
-                    }
-                    
-                    risk_metrics = {
-                        "risk_reward": rr if 'rr' in dir() else 0,
-                        "position_size_pct": 1.0,
-                        "daily_trades": self.daily_trades,
-                        "daily_pnl": self.daily_pnl,
-                    }
-                    
-                    learning_context = ""
-                    if self.learning_service:
-                        try:
-                            learning_context = self.learning_service.build_context_for_claude(
-                                symbol=symbol,
-                                direction=trade_signal.direction,
-                                trade_type=getattr(trade_signal, 'trade_type', 'intraday'),
-                            )
-                        except Exception as e:
-                            logger.debug(f"Could not get learning context for reversal judge: {e}")
-                            pass
-                    
-                    judge_result = await self.claude_client.judge_trade(
-                        signal=judge_signal,
-                        risk_metrics=risk_metrics,
-                        learning_context=learning_context,
+                    learning_context = self.learning_service.build_context_for_claude(
+                        symbol=symbol,
+                        direction=trade_signal.direction,
+                        trade_type=getattr(trade_signal, 'trade_type', 'intraday'),
                     )
-                    
-                    verdict = judge_result.get('verdict', 'APPROVE')
-                    reason = judge_result.get('reason', '')
-                    
-                    if verdict == 'REJECT':
-                        logger.info(
-                            f"[REVERSAL] {symbol}: Judge REJECTED — {reason}"
-                        )
-                        print(
-                            f"[REVERSAL] {symbol}: Judge REJECTED reversal — {reason}",
-                            flush=True
-                        )
-                        return
-                    
-                    logger.info(
-                        f"[REVERSAL] {symbol}: Judge verdict: {verdict} — {reason}"
-                    )
-                    
                 except Exception as e:
-                    logger.warning(f"[REVERSAL] Judge call failed, proceeding: {e}")
+                    logger.debug(f"Could not get learning context for reversal judge: {e}")
+
+            judge_outcome = await self._run_reversal_trade_judge(
+                symbol=symbol,
+                trade_signal=trade_signal,
+                current_price=current_price,
+                risk_metrics=risk_metrics,
+                learning_context=learning_context,
+            )
+
+            if judge_outcome.blocks_execution():
+                verdict_label = judge_outcome.verdict.value
+                reason = judge_outcome.reason or (
+                    'Judge rejected' if verdict_label == 'REJECT' else 'Judge unavailable'
+                )
+                outcome_type = (
+                    "judge_reject" if verdict_label == "REJECT" else "judge_failure"
+                )
+                await self._record_terminal_decision(
+                    outcome_type,
+                    symbol,
+                    direction=trade_signal.direction,
+                    entry=trade_signal.entry_price or current_price,
+                    sl=trade_signal.stop_loss or 0.0,
+                    tp=trade_signal.take_profit or 0.0,
+                    confidence=trade_signal.confidence,
+                    reason=reason,
+                    judge_verdict=verdict_label,
+                    details={"risk_flags": judge_outcome.risk_flags},
+                )
+                logger.info(
+                    f"[REVERSAL] {symbol}: Judge {verdict_label} — {reason}"
+                )
+                print(
+                    f"[REVERSAL] {symbol}: Judge {verdict_label} reversal — {reason}",
+                    flush=True
+                )
+                return
+
+            _reversal_size_multiplier = 1.0
+            if judge_outcome.allows_demote_execution():
+                from .config import normalize_lots as _nl_demote
+
+                demote = apply_demote_policy(
+                    trade_signal.direction,
+                    current_price,
+                    trade_signal.entry_price or current_price,
+                    trade_signal.stop_loss or 0.0,
+                    trade_signal.take_profit or 0.0,
+                    getattr(trade_signal, 'order_type', 'market') or 'market',
+                    judge_outcome.suggested_entry,
+                )
+                demoted_entry = demote["demoted_entry"]
+                _demote_sl = demote["stop_loss"]
+                _demote_tp = demote["take_profit"]
+                _demote_sl_dist = abs(demoted_entry - _demote_sl) if _demote_sl else 0
+                _demote_tp_dist = abs(_demote_tp - demoted_entry) if _demote_tp else 0
+                _demote_rr = _demote_tp_dist / _demote_sl_dist if _demote_sl_dist > 0 else 0
+
+                if _demote_rr < 1.0 and _demote_sl_dist > 0:
+                    await self._record_terminal_decision(
+                        "mechanical_reject",
+                        symbol,
+                        gate_id="demote_rr_below_1",
+                        direction=trade_signal.direction,
+                        entry=demoted_entry,
+                        sl=_demote_sl,
+                        tp=_demote_tp,
+                        confidence=trade_signal.confidence,
+                        reason=f"Reversal DEMOTE R:R {_demote_rr:.2f}:1 below 1.0",
+                        judge_verdict="DEMOTE",
+                    )
+                    return
+
+                trade_signal.order_type = demote["order_type"]
+                trade_signal.entry_price = demoted_entry
+                trade_signal.stop_loss = _demote_sl
+                trade_signal.take_profit = _demote_tp
+                _reversal_size_multiplier = demote.get("size_multiplier", 0.75)
+
+                demote_reason = judge_outcome.reason or 'Judge demoted reversal'
+                await self._record_terminal_decision(
+                    "judge_demote",
+                    symbol,
+                    direction=trade_signal.direction,
+                    entry=demoted_entry,
+                    sl=_demote_sl,
+                    tp=_demote_tp,
+                    confidence=trade_signal.confidence,
+                    reason=demote_reason,
+                    judge_verdict="DEMOTE",
+                    details={
+                        "risk_flags": judge_outcome.risk_flags,
+                        "order_type": demote["order_type"],
+                        "reversal": True,
+                    },
+                )
+
+            logger.info(
+                f"[REVERSAL] {symbol}: Judge verdict: {judge_outcome.verdict.value} — {judge_outcome.reason}"
+            )
             
             # ---- Position Sizing ----
             entry_price = trade_signal.entry_price or current_price
@@ -8121,12 +8851,22 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                             position_size = _nl(symbol, position_size * _rmult)
                 except Exception as e:
                     logger.warning(f"[REVERSAL] Position sizing error: {e}")
+
+            if _reversal_size_multiplier != 1.0:
+                from .config import normalize_lots as _nl_rev_demote
+                position_size = _nl_rev_demote(
+                    symbol, position_size * _reversal_size_multiplier
+                )
             
             # ---- Place the order ----
-            self.daily_trades += 1
             _reversal_risk_pct = self.risk_manager.risk_per_trade if self.risk_manager else 0.02
+            _reversal_reservation = self.reservation_ledger.reserve(
+                symbol=symbol,
+                signal_id=f"reversal:{closed_position.ticket}",
+                risk_percent=_reversal_risk_pct,
+            )
+            self.reservation_ledger.commit_risk(_reversal_reservation)
             if hasattr(self, 'risk_manager') and self.risk_manager:
-                self.risk_manager.update_daily_risk(_reversal_risk_pct)
                 print(
                     f"[RISK] {symbol}: Reversal daily risk +{_reversal_risk_pct*100:.1f}%, "
                     f"total: {self.risk_manager.daily_risk_used*100:.1f}%/"
@@ -8135,17 +8875,33 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                 )
             
             order_type = getattr(trade_signal, 'order_type', 'market') or 'market'
+            from .config import get_symbol_spec as _gss_reversal
+            _reversal_spec = _gss_reversal(symbol)
+            try:
+                _rev_acct = await self.mt5_client.get_account_info()
+                _reversal_equity = _rev_acct.equity if _rev_acct else 1000.0
+            except Exception:
+                _reversal_equity = 1000.0
             
             if order_type == 'market' or order_type.endswith('_market'):
-                result = await self.order_manager.place_market_order(
+                result = await self._place_market_with_final_risk(
                     symbol=symbol,
                     direction=trade_signal.direction,
-                    volume=position_size,
+                    lots=position_size,
                     stop_loss=stop_loss,
                     take_profit=trade_signal.take_profit,
+                    account_equity=_reversal_equity,
+                    symbol_spec=_reversal_spec,
+                    risk_fraction=_reversal_risk_pct,
+                    comment="ICT_Bot_Reversal",
                 )
                 
-                if result.success:
+                if result and result.success:
+                    fill_ticket = result.ticket or result.order_id
+                    self.reservation_ledger.transfer_to_position(
+                        _reversal_reservation,
+                        fill_ticket,
+                    )
                     logger.info(
                         f"[REVERSAL] {symbol}: Market order PLACED — "
                         f"{trade_signal.direction.upper()} {position_size} lots @ {entry_price:.5f}"
@@ -8158,10 +8914,10 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                     )
                     
                     # Track the new position
-                    if self.position_manager and result.order_id:
+                    if self.position_manager and fill_ticket:
                         from .execution.position_manager import Position as Pos
                         new_pos = Pos(
-                            ticket=result.order_id,
+                            ticket=fill_ticket,
                             symbol=symbol,
                             direction=trade_signal.direction,
                             volume=position_size,
@@ -8170,6 +8926,7 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                             take_profit=trade_signal.take_profit or 0,
                             open_time=datetime.now(timezone.utc),
                             trade_type=getattr(trade_signal, 'trade_type', 'intraday'),
+                            reservation_id=_reversal_reservation.reservation_id,
                         )
                         # Set up multi-TP levels
                         sl_dist = abs(entry_price - stop_loss)
@@ -8231,23 +8988,32 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                 else:
                     logger.warning(
                         f"[REVERSAL] {symbol}: Order placement FAILED — "
-                        f"{getattr(result, 'message', 'unknown error')}"
+                        f"{getattr(result, 'message', 'unknown error') if result else 'final risk blocked'}"
                     )
-                    self.daily_trades = max(0, self.daily_trades - 1)
+                    self.reservation_ledger.release(_reversal_reservation)
             else:
                 # Pending order for reversal (limit entry)
                 suggested_entry = trade_signal.entry_price or current_price
-                result = await self.order_manager.place_pending_order(
+                result = await self._place_pending_with_final_risk(
                     symbol=symbol,
                     direction=trade_signal.direction,
                     order_type=order_type,
                     price=suggested_entry,
-                    volume=position_size,
+                    lots=position_size,
                     stop_loss=stop_loss,
                     take_profit=trade_signal.take_profit,
+                    account_equity=_reversal_equity,
+                    symbol_spec=_reversal_spec,
+                    risk_fraction=_reversal_risk_pct,
+                    comment="ICT_Bot_Reversal",
                 )
                 
-                if result.success:
+                if result and result.success:
+                    pending_ticket = result.ticket or result.order_id
+                    self.reservation_ledger.transfer_to_pending(
+                        _reversal_reservation,
+                        pending_ticket,
+                    )
                     logger.info(
                         f"[REVERSAL] {symbol}: Pending {order_type} PLACED — "
                         f"{trade_signal.direction.upper()} @ {suggested_entry:.5f}"
@@ -8260,27 +9026,34 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                     
                     # Track pending order
                     if hasattr(self, 'pending_order_manager') and self.pending_order_manager:
-                        self.pending_order_manager.track_order(
-                            ticket=result.order_id,
+                        await self.pending_order_manager.add_order(
+                            ticket=pending_ticket,
                             symbol=symbol,
                             direction=trade_signal.direction,
                             order_type=order_type,
+                            volume=position_size,
                             price=suggested_entry,
                             stop_loss=stop_loss,
                             take_profit=trade_signal.take_profit,
-                            volume=position_size,
+                            risk_percent=_reversal_risk_pct,
+                            reservation_id=_reversal_reservation.reservation_id,
                         )
                 else:
                     logger.warning(
                         f"[REVERSAL] {symbol}: Pending order FAILED — "
                         f"{getattr(result, 'message', 'unknown error')}"
                     )
-                    self.daily_trades = max(0, self.daily_trades - 1)
+                    self.reservation_ledger.release(_reversal_reservation)
         
         except Exception as e:
             logger.error(f"[REVERSAL] Error analyzing reversal for {symbol}: {e}")
             import traceback
             traceback.print_exc()
+            if (
+                _reversal_reservation
+                and _reversal_reservation.state == ReservationState.RESERVED
+            ):
+                self.reservation_ledger.release(_reversal_reservation)
     
     def _get_signal_hash(self, symbol: str, direction: str, entry_price: float) -> str:
         """
@@ -8354,6 +9127,15 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
             if self.learning_service:
                 try:
                     updated = await self.learning_service.check_rejected_signal_outcomes(lookback_hours=24)
+                    if updated:
+                        logger.info(f"Updated {updated} rejected signal outcomes")
+                    decision_updates = await self.learning_service.process_decision_outcomes(
+                        mt5_client=self.mt5_client,
+                        lookback_hours=48,
+                        horizon_hours=8,
+                    )
+                    if decision_updates:
+                        logger.info(f"Decision outcome worker updated {decision_updates} rows")
                     if updated > 0:
                         print(f"[LEARNING] Updated {updated} rejected signal outcomes (checking if judge missed winners)", flush=True)
                 except Exception as e:
@@ -8528,6 +9310,13 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                 pass
             logger.info("Position management loop stopped during shutdown")
         
+        if hasattr(self, 'position_manager') and self.position_manager:
+            try:
+                await self.position_manager.flush_persistence()
+                logger.info("Position persistence queue drained")
+            except Exception as e:
+                logger.warning(f"Could not flush position persistence: {e}")
+
         # Save state before shutdown
         logger.info("Saving bot state...")
         if save_full_state(self):

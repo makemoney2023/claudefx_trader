@@ -1,0 +1,307 @@
+"""
+Pure helpers for WIN optimization orchestrator fixes.
+
+Extracted from main.py for unit testing without booting the full bot.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+
+def is_friday_weekend_close_time(now_est: datetime) -> bool:
+    """True when Friday at or after 16:30 US/Eastern."""
+    if now_est.weekday() != 4:
+        return False
+    return now_est.hour > 16 or (now_est.hour == 16 and now_est.minute >= 30)
+
+
+def is_friday_afternoon_entry_block(now_est: datetime) -> bool:
+    """True when Friday noon or later — block new forex entries."""
+    return now_est.weekday() == 4 and now_est.hour >= 12
+
+
+def entry_deviation_pct(entry: float, current_price: float) -> float:
+    if not entry or current_price <= 0:
+        return 0.0
+    return abs(entry - current_price) / current_price
+
+
+def is_intentional_structural_limit(order_type: str, direction: str, entry: float, current_price: float) -> bool:
+    ot = (order_type or "").lower()
+    if ot == "buy_limit" and direction == "long" and entry < current_price:
+        return True
+    if ot == "sell_limit" and direction == "short" and entry > current_price:
+        return True
+    return False
+
+
+def should_reject_entry_deviation(
+    order_type: str,
+    direction: str,
+    entry: float,
+    current_price: float,
+    *,
+    market_max_pct: float = 0.02,
+    limit_max_pct: float = 0.05,
+) -> Tuple[bool, float, str]:
+    deviation = entry_deviation_pct(entry, current_price)
+    if deviation <= 0:
+        return False, deviation, ""
+
+    if is_intentional_structural_limit(order_type, direction, entry, current_price):
+        if deviation <= limit_max_pct:
+            return False, deviation, ""
+        return True, deviation, f"structural limit deviates {deviation:.1%} (max {limit_max_pct:.0%})"
+
+    if deviation > market_max_pct:
+        return True, deviation, f"entry deviates {deviation:.1%} (max {market_max_pct:.0%})"
+    return False, deviation, ""
+
+
+def apply_confidence_caps(base: float, caps: List[float]) -> float:
+    if not caps:
+        return base
+    return min(base, *caps)
+
+
+@dataclass
+class ConfidenceDecision:
+    """Immutable confidence pass: caps apply after boosts and cannot be undone."""
+
+    base: float
+    boosts: List[Tuple[str, float]] = field(default_factory=list)
+    penalties: List[Tuple[str, float]] = field(default_factory=list)
+    caps: List[Tuple[str, float]] = field(default_factory=list)
+    final: float = 0.0
+
+    def compute(self) -> "ConfidenceDecision":
+        value = self.base
+        for name, delta in self.boosts:
+            value += delta
+        for name, delta in self.penalties:
+            value += delta
+        for name, cap in self.caps:
+            value = min(value, cap)
+        self.final = max(0.0, min(1.0, value))
+        return self
+
+
+def build_confidence_decision(
+    base: float,
+    *,
+    boosts: Optional[List[Tuple[str, float]]] = None,
+    penalties: Optional[List[Tuple[str, float]]] = None,
+    caps: Optional[List[Tuple[str, float]]] = None,
+) -> ConfidenceDecision:
+    decision = ConfidenceDecision(
+        base=base,
+        boosts=list(boosts or []),
+        penalties=list(penalties or []),
+        caps=list(caps or []),
+    )
+    return decision.compute()
+
+
+def classify_a_plus(
+    setup_grade: str,
+    confluence_count: int,
+    *,
+    min_confluence: int = 4,
+) -> bool:
+    """Explicit A+ classification from setup grade and confluence — not trade_type alone."""
+    grade = (setup_grade or "").strip().upper().replace(" ", "")
+    if grade in {"A+", "APLUS"}:
+        return True
+    return grade == "A" and confluence_count >= min_confluence
+
+
+def cap_confidence_once(
+    current: float,
+    cap: float,
+    applied_categories: Set[str],
+    category: str,
+) -> float:
+    if category in applied_categories:
+        return current
+    applied_categories.add(category)
+    return min(current, cap)
+
+
+def _fill_distance(direction: str, entry: float, market: float) -> float:
+    if direction == "long":
+        return max(0.0, market - entry)
+    return max(0.0, entry - market)
+
+
+def _rebase_level(level: float, old_entry: float, new_entry: float) -> float:
+    if not level or not old_entry:
+        return level
+    return new_entry + (level - old_entry)
+
+
+def apply_demote_policy(
+    direction: str,
+    current_price: float,
+    original_entry: float,
+    stop_loss: float,
+    take_profit: float,
+    order_type: str,
+    suggested_entry: Optional[float],
+    *,
+    at_zone_pct: float = 0.0005,
+    default_offset_pct: float = 0.001,
+) -> Dict[str, Any]:
+    entry = original_entry or current_price
+    ot = (order_type or "market").lower()
+    zone_dist = entry_deviation_pct(entry, current_price)
+
+    if zone_dist <= at_zone_pct and ot == "market":
+        return {
+            "action": "size_reduce",
+            "demoted_entry": entry,
+            "order_type": "market",
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "size_multiplier": 0.5,
+            "reason": "at_zone_size_reduce",
+        }
+
+    if ot in ("buy_limit", "sell_limit"):
+        candidate = entry
+        if suggested_entry and suggested_entry > 0:
+            if _fill_distance(direction, suggested_entry, current_price) < _fill_distance(
+                direction, entry, current_price
+            ):
+                candidate = suggested_entry
+        return {
+            "action": "keep_limit",
+            "demoted_entry": candidate,
+            "order_type": ot,
+            "stop_loss": _rebase_level(stop_loss, entry, candidate),
+            "take_profit": _rebase_level(take_profit, entry, candidate),
+            "size_multiplier": 0.75,
+            "reason": "keep_existing_limit",
+        }
+
+    if suggested_entry and suggested_entry > 0:
+        demoted_entry = suggested_entry
+        reason = "judge_suggested_entry"
+    else:
+        if direction == "long":
+            demoted_entry = round(current_price * (1 - default_offset_pct), 5)
+        else:
+            demoted_entry = round(current_price * (1 + default_offset_pct), 5)
+        reason = "default_offset_limit"
+
+    if _fill_distance(direction, demoted_entry, current_price) > _fill_distance(
+        direction, entry, current_price
+    ):
+        demoted_entry = entry
+        reason = "kept_closer_entry"
+
+    new_ot = "buy_limit" if direction == "long" else "sell_limit"
+    return {
+        "action": "limit",
+        "demoted_entry": demoted_entry,
+        "order_type": new_ot,
+        "stop_loss": _rebase_level(stop_loss, entry, demoted_entry),
+        "take_profit": _rebase_level(take_profit, entry, demoted_entry),
+        "size_multiplier": 0.75,
+        "reason": reason,
+    }
+
+
+def _market_to_pending(direction: str, entry: float, market: float) -> str:
+    if direction == "long":
+        return "buy_limit" if entry < market else "buy_stop"
+    return "sell_limit" if entry > market else "sell_stop"
+
+
+def resolve_order_type_for_fill(
+    order_type: str,
+    direction: str,
+    entry_price: float,
+    current_price: float,
+    *,
+    at_zone_pct: float = 0.001,
+    pending_threshold_pct: float = 0.001,
+) -> Tuple[str, str]:
+    ot = (order_type or "market").lower()
+    if not entry_price or current_price <= 0:
+        return ot, "unchanged"
+
+    diff_pct = entry_deviation_pct(entry_price, current_price)
+    if ot == "market":
+        if diff_pct <= at_zone_pct:
+            return "market", "at_zone_keep_market"
+        if diff_pct > pending_threshold_pct:
+            return _market_to_pending(direction, entry_price, current_price), "converted_to_pending"
+        return "market", "within_threshold"
+    return ot, "explicit_pending"
+
+
+def resolve_trading_mode_from_state(
+    persisted_mode: Optional[str],
+    configured_mode: Optional[str] = None,
+) -> str:
+    for candidate in (persisted_mode, configured_mode):
+        if candidate:
+            normalized = candidate.strip().lower()
+            if normalized in ("aggressive", "normal", "conservative", "defensive"):
+                return normalized
+    return "normal"
+
+
+def validate_signal_coherence(
+    entry: float,
+    sl: Optional[float],
+    tp: Optional[float],
+    direction: str,
+    *,
+    sl_entry_tolerance: float = 0.0001,
+) -> Tuple[bool, str]:
+    """
+    Reject incoherent Claude signals instead of auto-fixing (REC#9).
+
+    Mechanical broker-distance clamps (e.g. ATR min SL) belong in main.py, not here.
+    """
+    if not entry or entry <= 0:
+        return False, "missing or invalid entry price"
+
+    _dir = (direction or "").lower()
+    if _dir not in ("long", "short"):
+        return False, f"invalid direction: {direction}"
+
+    if sl and abs(sl - entry) < entry * sl_entry_tolerance:
+        return False, f"SL equals entry ({sl}) — zero risk distance"
+
+    if sl and tp:
+        levels_say_long = sl < entry and tp > entry
+        levels_say_short = sl > entry and tp < entry
+
+        if _dir == "short" and levels_say_long:
+            return (
+                False,
+                f"direction SHORT incoherent with levels (SL={sl} < entry={entry} < TP={tp})",
+            )
+        if _dir == "long" and levels_say_short:
+            return (
+                False,
+                f"direction LONG incoherent with levels (TP={tp} < entry={entry} < SL={sl})",
+            )
+
+    if _dir == "long":
+        if sl and sl >= entry:
+            return False, f"SL ({sl}) on wrong side of entry ({entry}) for long"
+        if tp and tp <= entry:
+            return False, f"TP ({tp}) on wrong side of entry ({entry}) for long"
+    else:
+        if sl and sl <= entry:
+            return False, f"SL ({sl}) on wrong side of entry ({entry}) for short"
+        if tp and tp >= entry:
+            return False, f"TP ({tp}) on wrong side of entry ({entry}) for short"
+
+    return True, ""

@@ -8,7 +8,7 @@ Tracks and manages pending orders (limit/stop orders) with:
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Callable
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 
@@ -24,6 +24,31 @@ class PendingOrderStatus(Enum):
     CANCELLED = "cancelled"     # Order was cancelled
     EXPIRED = "expired"         # Order expired without being filled
     UNKNOWN = "unknown"         # Status not yet determined
+
+
+@dataclass
+class ClosedTradeEvent:
+    """Normalized close event for fast pending fill→close between sync cycles."""
+    order_ticket: int
+    position_ticket: Optional[int]
+    symbol: str
+    direction: str
+    volume: float
+    entry_price: float
+    exit_price: float
+    profit_loss: float
+    close_time: datetime
+    close_reason: str
+    closing_deal_ticket: Optional[int] = None
+    reservation_id: Optional[str] = None
+
+
+@dataclass
+class FilledPositionEvent:
+    """Normalized fill event for pending order -> open position identity transfer."""
+    order_ticket: int
+    position_ticket: int
+    reservation_id: Optional[str] = None
 
 
 @dataclass
@@ -43,6 +68,7 @@ class PendingOrder:
     
     # Risk tracking (for accurate daily risk reclaim on cancel)
     risk_percent: Optional[float] = None
+    reservation_id: Optional[str] = None
     
     # Tracking fields
     fill_price: Optional[float] = None
@@ -124,7 +150,54 @@ class PendingOrderManager:
         self._max_filled_map_size = 200
         self.filled_order_map: Dict[int, int] = {}
         
+        # Optional budget reclaim hooks (wired by TradingBot)
+        self._risk_manager = None
+        self._reservation_ledger = None
+        self._get_daily_trades: Optional[Callable[[], int]] = None
+        self._set_daily_trades: Optional[Callable[[int], None]] = None
+        self._decision_recorder: Optional[Callable] = None
+        self._processed_close_deals: set = set()
+        
         logger.info("PendingOrderManager initialized")
+    
+    def set_budget_reclaim(
+        self,
+        risk_manager=None,
+        reservation_ledger=None,
+        get_daily_trades: Optional[Callable[[], int]] = None,
+        set_daily_trades: Optional[Callable[[int], None]] = None,
+    ):
+        """Wire risk manager and daily trade counter for cancel/expire reclaim."""
+        self._risk_manager = risk_manager
+        self._reservation_ledger = reservation_ledger
+        self._get_daily_trades = get_daily_trades
+        self._set_daily_trades = set_daily_trades
+
+    def set_decision_recorder(self, recorder: Optional[Callable]) -> None:
+        """Wire async callback: recorder(outcome_type, order, reason)."""
+        self._decision_recorder = recorder
+
+    def _reclaim_reserved_budget(self, order: PendingOrder, reason: str):
+        """Reclaim reserved risk budget and daily trade slot via reservation ledger."""
+        if self._reservation_ledger and order.reservation_id:
+            reservation = self._reservation_ledger.get_by_id(order.reservation_id)
+            if reservation:
+                self._reservation_ledger.release(reservation)
+                logger.info(
+                    f"Order {order.ticket}: released reservation ({reason})"
+                )
+                return
+
+        if order.reservation_id:
+            logger.warning(
+                f"Order {order.ticket}: reservation {order.reservation_id} not found "
+                f"for reclaim ({reason})"
+            )
+            return
+
+        logger.debug(
+            f"Order {order.ticket}: no bot reservation to reclaim ({reason})"
+        )
     
     def _append_history(self, order: PendingOrder):
         """Append to order_history, trimming oldest entries to stay within bounds."""
@@ -158,7 +231,8 @@ class PendingOrderManager:
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
         expiration_minutes: int = 120,
-        risk_percent: Optional[float] = None
+        risk_percent: Optional[float] = None,
+        reservation_id: Optional[str] = None,
     ) -> PendingOrder:
         """
         Add a pending order to track.
@@ -211,6 +285,7 @@ class PendingOrderManager:
             expiration=expiration,
             status=PendingOrderStatus.ACTIVE,
             risk_percent=risk_percent,
+            reservation_id=reservation_id,
         )
         
         self.pending_orders[ticket] = order
@@ -270,7 +345,7 @@ class PendingOrderManager:
             "orders": cancelled
         }
     
-    async def cancel_order(self, ticket: int, reason: str = "manual") -> bool:
+    async def cancel_order(self, ticket: int, reason: str = "manual", reclaim_budget: bool = True) -> bool:
         """
         Cancel a pending order.
         
@@ -307,9 +382,23 @@ class PendingOrderManager:
             order.status = PendingOrderStatus.CANCELLED if reason != "expired" else PendingOrderStatus.EXPIRED
             order.cancel_reason = reason
             
+            if reclaim_budget:
+                self._reclaim_reserved_budget(order, reason)
+            
             # Move to history
             self._append_history(order)
             del self.pending_orders[ticket]
+
+            if self._decision_recorder:
+                outcome_type = (
+                    "pending_expired" if reason == "expired" else "pending_cancelled"
+                )
+                try:
+                    recorded = self._decision_recorder(outcome_type, order, reason)
+                    if hasattr(recorded, "__await__"):
+                        await recorded
+                except Exception as e:
+                    logger.warning(f"Decision recorder failed for order {ticket}: {e}")
             
             logger.info(f"Order {ticket} cancelled: {reason}")
             return True
@@ -343,6 +432,8 @@ class PendingOrderManager:
             
             filled = []
             filled_closed = []
+            filled_position_events = []
+            closed_trade_events = []
             cancelled = []
             still_active = []
             
@@ -417,6 +508,14 @@ class PendingOrderManager:
                         self.filled_order_map[pos_ticket] = ticket
 
                     filled.append(ticket)
+                    if pos_ticket:
+                        filled_position_events.append(
+                            FilledPositionEvent(
+                                order_ticket=ticket,
+                                position_ticket=pos_ticket,
+                                reservation_id=order.reservation_id,
+                            )
+                        )
                     self._append_history(order)
                     del self.pending_orders[ticket]
                     self._cleanup_filled_order_map()
@@ -454,12 +553,24 @@ class PendingOrderManager:
                         f"{close_price} — P/L: ${pnl:.2f}"
                     )
                     
-                    # Update the DB trade record with real P/L
-                    await self._update_trade_db_for_filled_closed(ticket, order, deal_result)
+                    close_event = self._build_closed_trade_event(
+                        ticket, order, deal_result
+                    )
+                    if close_event:
+                        closing_deal = close_event.closing_deal_ticket
+                        if closing_deal and closing_deal in self._processed_close_deals:
+                            logger.info(
+                                f"Order {ticket}: duplicate close deal {closing_deal} ignored"
+                            )
+                        else:
+                            if closing_deal:
+                                self._processed_close_deals.add(closing_deal)
+                            closed_trade_events.append(close_event)
                 else:
                     # Truly cancelled externally
                     order.status = PendingOrderStatus.CANCELLED
                     order.cancel_reason = "external"
+                    self._reclaim_reserved_budget(order, "external_cancel")
                     
                     cancelled.append(ticket)
                     self._append_history(order)
@@ -478,7 +589,9 @@ class PendingOrderManager:
                 "active": len(still_active),
                 "filled_tickets": filled,
                 "filled_closed_tickets": filled_closed,
-                "cancelled_tickets": cancelled
+                "cancelled_tickets": cancelled,
+                "closed_trade_events": closed_trade_events,
+                "filled_position_events": filled_position_events,
             }
             
         except Exception as e:
@@ -573,67 +686,33 @@ class PendingOrderManager:
             logger.error(f"Error checking deal history for order {ticket}: {e}")
             return None
     
-    async def _update_trade_db_for_filled_closed(
-        self, ticket: int, order: 'PendingOrder', deal_result: Dict[str, Any]
-    ) -> None:
-        """
-        Update the TradeModel in the DB when we detect a filled-then-closed order.
-        
-        This prevents the main.py trade sync from later marking it as
-        cancelled with $0 P/L.
-        """
-        try:
-            from ..api.database import async_session, TradeModel
-            from sqlalchemy import select
-            
-            trade_id = str(ticket)
-            
-            async with async_session() as session:
-                result = await session.execute(
-                    select(TradeModel).where(TradeModel.trade_id == trade_id)
-                )
-                trade = result.scalar_one_or_none()
-                
-                if not trade:
-                    logger.warning(
-                        f"No TradeModel found for ticket {ticket} to update "
-                        f"with filled-then-closed data"
-                    )
-                    return
-                
-                close_price = deal_result.get('close_price', 0)
-                total_pnl = deal_result.get('total_pnl', 0)
-                close_time = deal_result.get('close_time', datetime.now(timezone.utc))
-                fill_price = deal_result.get('fill_price', order.price)
-                
-                trade.entry_price = fill_price
-                trade.exit_price = close_price
-                trade.profit_loss = total_pnl
-                trade.exit_time = close_time if isinstance(close_time, datetime) else datetime.now(timezone.utc)
-                trade.exit_reason = "SL/TP hit (filled-then-closed, detected via deal history)"
-                
-                await session.commit()
-                
-                print(
-                    f"[PENDING-SYNC] Updated DB trade {trade_id} ({order.symbol}): "
-                    f"entry={fill_price}, exit={close_price}, P/L=${total_pnl:.2f}",
-                    flush=True
-                )
-                logger.info(
-                    f"Updated TradeModel {trade_id} with filled-then-closed data: "
-                    f"P/L=${total_pnl:.2f}"
-                )
-                
-        except Exception as e:
-            try:
-                await session.rollback()
-            except Exception:
-                pass
-            logger.error(
-                f"Error updating trade DB for filled-then-closed order {ticket}: {e}"
-            )
-            import traceback
-            traceback.print_exc()
+    def _build_closed_trade_event(
+        self,
+        ticket: int,
+        order: 'PendingOrder',
+        deal_result: Dict[str, Any],
+    ) -> Optional[ClosedTradeEvent]:
+        if not deal_result.get('closed'):
+            return None
+
+        close_time = deal_result.get('close_time', datetime.now(timezone.utc))
+        if not isinstance(close_time, datetime):
+            close_time = datetime.now(timezone.utc)
+
+        return ClosedTradeEvent(
+            order_ticket=ticket,
+            position_ticket=deal_result.get('position_id'),
+            symbol=order.symbol,
+            direction=order.direction,
+            volume=order.volume,
+            entry_price=deal_result.get('fill_price', order.price),
+            exit_price=deal_result.get('close_price', 0),
+            profit_loss=deal_result.get('total_pnl', 0),
+            close_time=close_time,
+            close_reason="sl_tp_fast_close",
+            closing_deal_ticket=deal_result.get('closing_deal_ticket'),
+            reservation_id=order.reservation_id,
+        )
     
     async def import_from_mt5(self) -> Dict[str, Any]:
         """

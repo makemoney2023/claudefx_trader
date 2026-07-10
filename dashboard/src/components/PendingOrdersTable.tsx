@@ -32,8 +32,7 @@ export function PendingOrdersTable({
   const [actionMessage, setActionMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
 
   const fetchOrders = useCallback(async (): Promise<PendingOrder[]> => {
-    const data = await api.getPendingOrders()
-    const ordersArray = Array.isArray(data) ? data : (data?.orders || [])
+    const ordersArray = await api.getPendingOrders()
     return maxOrders ? ordersArray.slice(0, maxOrders) : ordersArray
   }, [maxOrders])
 

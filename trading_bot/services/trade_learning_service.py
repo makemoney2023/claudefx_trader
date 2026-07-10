@@ -16,7 +16,7 @@ Features:
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Any, Optional, TYPE_CHECKING
+from typing import Dict, List, Any, Optional, TYPE_CHECKING, Tuple
 
 from sqlalchemy import select, desc, and_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,6 +28,13 @@ from ..api.database import (
     WeeklyReviewModel,
     AnalysisLogModel,
     TradeModel,
+    SignalDecisionModel,
+)
+from ..services.gate_funnel import (
+    GateFunnel,
+    HYPOTHETICAL_OUTCOME_TYPES,
+    evaluate_hypothetical_outcome,
+    get_gate_funnel,
 )
 from ..utils.logging import get_logger
 
@@ -42,6 +49,55 @@ KNOWLEDGE_RETENTION_DAYS = 90
 # Confidence thresholds
 HIGH_CONFIDENCE_THRESHOLD = 0.7
 MIN_SAMPLE_SIZE_FOR_DOCS = 10
+
+# Learning-loop write gates (REC#10)
+MIN_PATTERN_SAMPLE_PROMOTED = 10
+MIN_PATTERN_SAMPLE_DRAFT = 5
+
+_REQUIRED_INSIGHT_LIST_FIELDS = (
+    "patterns_identified",
+    "recurring_mistakes",
+    "winning_patterns",
+    "recommendations",
+)
+_VALID_GRADES = frozenset({"A", "B", "C", "D", "F", "N/A"})
+
+
+def validate_weekly_insights_schema(insights: Dict[str, Any]) -> Tuple[bool, str]:
+    """Validate LLM weekly insight JSON before persisting to KB or docs."""
+    if not isinstance(insights, dict):
+        return False, "insights must be a dict"
+
+    grade = insights.get("performance_grade")
+    if not grade or not isinstance(grade, str):
+        return False, "missing or invalid performance_grade"
+    if grade.upper() not in _VALID_GRADES and grade not in _VALID_GRADES:
+        return False, f"invalid performance_grade: {grade}"
+
+    summary = insights.get("summary")
+    if not summary or not isinstance(summary, str):
+        return False, "missing or invalid summary"
+
+    for field in _REQUIRED_INSIGHT_LIST_FIELDS:
+        value = insights.get(field)
+        if value is not None and not isinstance(value, list):
+            return False, f"{field} must be a list"
+
+    for dict_field in ("symbol_insights", "session_insights"):
+        value = insights.get(dict_field)
+        if value is not None:
+            if not isinstance(value, dict):
+                return False, f"{dict_field} must be a dict"
+            if not all(isinstance(v, str) for v in value.values()):
+                return False, f"{dict_field} values must be strings"
+
+    return True, ""
+
+
+def knowledge_write_allowed(sample_size: int, *, draft: bool = False) -> bool:
+    """Minimum sample size before writing pattern tags to KB or prompts."""
+    minimum = MIN_PATTERN_SAMPLE_DRAFT if draft else MIN_PATTERN_SAMPLE_PROMOTED
+    return sample_size >= minimum
 
 
 class TradeLearningService:
@@ -59,9 +115,10 @@ class TradeLearningService:
             return 0.0
         return val if abs(val) <= 10 else 0.0
     
-    def __init__(self):
+    def __init__(self, gate_funnel: Optional[GateFunnel] = None):
         """Initialize the trade learning service."""
         self._docs_path = Path(__file__).parent.parent / "docs" / "trading_learnings.md"
+        self._gate_funnel = gate_funnel or get_gate_funnel()
         logger.info("Trade learning service initialized")
     
     # =========================================================================
@@ -351,6 +408,92 @@ class TradeLearningService:
             return []
     
     # =========================================================================
+    # DECISION OUTCOME WORKER
+    # =========================================================================
+
+    async def process_decision_outcomes(
+        self,
+        mt5_client=None,
+        *,
+        lookback_hours: int = 24,
+        horizon_hours: int = 8,
+    ) -> int:
+        """
+        Idempotent worker: evaluate blocked/demoted/unfilled decisions with MT5Client data.
+
+        Returns number of decisions updated.
+        """
+        try:
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+            min_age = datetime.now(timezone.utc) - timedelta(hours=horizon_hours)
+
+            async with self._gate_funnel._session_maker() as db_session:
+                result = await db_session.execute(
+                    select(SignalDecisionModel).where(
+                        and_(
+                            SignalDecisionModel.outcome_type.in_(tuple(HYPOTHETICAL_OUTCOME_TYPES)),
+                            SignalDecisionModel.outcome_worker_status == "pending",
+                            SignalDecisionModel.timestamp >= cutoff,
+                            SignalDecisionModel.timestamp <= min_age,
+                            SignalDecisionModel.entry.isnot(None),
+                            SignalDecisionModel.sl.isnot(None),
+                            SignalDecisionModel.tp.isnot(None),
+                        )
+                    )
+                )
+                decisions = list(result.scalars().all())
+
+            if not decisions:
+                return 0
+
+            updated = 0
+            for decision in decisions:
+                if not mt5_client:
+                    continue
+
+                try:
+                    bars = await mt5_client.get_ohlcv_data(
+                        decision.symbol,
+                        "M5",
+                        count=100,
+                        start_time=decision.timestamp,
+                    )
+                    if not bars:
+                        async with self._gate_funnel._session_maker() as db_session:
+                            row = await db_session.get(SignalDecisionModel, decision.id)
+                            if row and row.outcome_worker_status == "pending":
+                                row.outcome_worker_status = "data_missing"
+                                row.outcome_evaluated_at = datetime.now(timezone.utc)
+                                await db_session.commit()
+                        continue
+
+                    hypo = evaluate_hypothetical_outcome(
+                        decision.direction or "long",
+                        float(decision.entry),
+                        float(decision.sl),
+                        float(decision.tp),
+                        bars,
+                    )
+                    if await self._gate_funnel.update_hypothetical_outcome(
+                        decision.decision_id, hypo
+                    ):
+                        updated += 1
+                except Exception as exc:
+                    logger.debug(f"Outcome worker skipped decision {decision.decision_id}: {exc}")
+
+            if updated > 0:
+                logger.info(f"Decision outcome worker updated {updated} decisions")
+            return updated
+
+        except Exception as e:
+            logger.error(f"Failed to process decision outcomes: {e}")
+            return 0
+
+    async def get_gate_decision_analytics(self, days_back: int = 30) -> Dict[str, Any]:
+        """Read-only aggregate gate expectancy and MFE coverage."""
+        return await self._gate_funnel.get_aggregate_analytics(days_back=days_back)
+
+    # =========================================================================
     # JUDGE ACCURACY ANALYSIS
     # =========================================================================
     
@@ -411,6 +554,55 @@ class TradeLearningService:
                 reject_would_win = len([s for s in rejected_signals if getattr(s, 'outcome_result', None) == 'would_have_won'])
                 reject_would_lose = len([s for s in rejected_signals if getattr(s, 'outcome_result', None) == 'would_have_lost'])
                 reject_unknown = len(rejected_signals) - reject_would_win - reject_would_lose
+
+                # --- Extended false-rejection from signal_decisions ---
+                result = await db_session.execute(
+                    select(SignalDecisionModel).where(
+                        and_(
+                            SignalDecisionModel.timestamp >= cutoff,
+                            SignalDecisionModel.outcome_type.in_(
+                                (
+                                    "judge_reject",
+                                    "judge_demote",
+                                    "judge_failure",
+                                    "mechanical_reject",
+                                    "pending_expired",
+                                    "pending_cancelled",
+                                )
+                            ),
+                        )
+                    )
+                )
+                decision_rows = list(result.scalars().all())
+
+                extended_false_rejection = {}
+                for cat in (
+                    "judge_reject",
+                    "judge_demote",
+                    "judge_failure",
+                    "mechanical_reject",
+                    "pending_expired",
+                    "pending_cancelled",
+                ):
+                    cat_rows = [d for d in decision_rows if d.outcome_type == cat]
+                    would_win = len([d for d in cat_rows if d.hypothetical_result == "would_have_won"])
+                    would_lose = len([d for d in cat_rows if d.hypothetical_result == "would_have_lost"])
+                    extended_false_rejection[cat] = {
+                        "total": len(cat_rows),
+                        "would_have_won": would_win,
+                        "would_have_lost": would_lose,
+                        "false_rejection_rate": (
+                            would_win / max(1, would_win + would_lose)
+                            if (would_win + would_lose) > 0
+                            else None
+                        ),
+                    }
+
+                mfe_eligible = [d for d in decision_rows if d.outcome_type in HYPOTHETICAL_OUTCOME_TYPES]
+                mfe_evaluated = [d for d in mfe_eligible if d.outcome_worker_status == "complete"]
+                mfe_coverage_pct = (
+                    len(mfe_evaluated) / len(mfe_eligible) * 100 if mfe_eligible else 0.0
+                )
                 
                 # --- ALL SIGNALS (total by verdict) ---
                 result = await db_session.execute(
@@ -456,6 +648,8 @@ class TradeLearningService:
                     'reject_would_have_lost': reject_would_lose,
                     'reject_unknown': reject_unknown,
                     'false_rejection_rate': reject_would_win / max(1, reject_would_win + reject_would_lose) if (reject_would_win + reject_would_lose) > 0 else None,
+                    'extended_false_rejection': extended_false_rejection,
+                    'mfe_coverage_pct': round(mfe_coverage_pct, 2),
                     'confluence_stats': confluence_stats,
                 }
                 
@@ -601,9 +795,14 @@ class TradeLearningService:
             # Get winning patterns
             winning_patterns = await self.get_winning_patterns(limit=5)
             
-            # Get relevant knowledge base entries
+            # Get relevant knowledge base entries (promoted only for prompt injection)
             knowledge = await self.get_knowledge_base()
-            symbol_knowledge = [k for k in knowledge if symbol.lower() in k['key'].lower()]
+            symbol_knowledge = [
+                k for k in knowledge
+                if symbol.lower() in k['key'].lower()
+                and k.get('sample_size', 0) >= MIN_PATTERN_SAMPLE_PROMOTED
+                and k.get('confidence', 0) >= HIGH_CONFIDENCE_THRESHOLD
+            ]
             
             # Get judge accuracy stats (30-day rolling)
             judge_stats = await self.get_judge_accuracy_stats(days_back=30)
@@ -822,6 +1021,7 @@ class TradeLearningService:
             # Check rejected signal outcomes before consolidating (non-critical)
             try:
                 await self.check_rejected_signal_outcomes(lookback_hours=168)  # 7 days
+                await self.process_decision_outcomes(lookback_hours=168, horizon_hours=8)
             except Exception as e:
                 logger.debug(f"Rejected signal outcome check skipped: {e}")
             
@@ -930,6 +1130,15 @@ class TradeLearningService:
             
             # Have Claude generate insights (now with judge data)
             insights = await claude_client.generate_weekly_insights(consolidation_data)
+
+            schema_ok, schema_err = validate_weekly_insights_schema(insights)
+            if not schema_ok:
+                logger.warning(
+                    f"Weekly insights failed schema validation — skipping KB/docs writes: {schema_err}"
+                )
+                insights_valid = False
+            else:
+                insights_valid = True
             
             # Calculate statistics
             wins = len([l for l in learnings if l.outcome == 'win'])
@@ -965,11 +1174,12 @@ class TradeLearningService:
             
             logger.info(f"Created weekly review: Grade {review.performance_grade}, {len(learnings)} trades")
             
-            # Update knowledge base from insights
-            await self._update_knowledge_from_insights(insights, learnings)
-            
-            # Update documentation
-            await self.update_learnings_documentation()
+            # Update knowledge base from insights (gated)
+            if insights_valid:
+                await self._update_knowledge_from_insights(insights, learnings)
+                await self.update_learnings_documentation()
+            else:
+                logger.info("Skipped knowledge base and documentation updates (invalid insights)")
             
             # Send notification
             await self.send_weekly_notification(review)
@@ -991,7 +1201,12 @@ class TradeLearningService:
         insights: Dict[str, Any],
         learnings: List[TradeLearningModel]
     ):
-        """Update knowledge base from weekly insights."""
+        """Update knowledge base from weekly insights (sample-size gated)."""
+        schema_ok, schema_err = validate_weekly_insights_schema(insights)
+        if not schema_ok:
+            logger.warning(f"Knowledge base update skipped — invalid insights: {schema_err}")
+            return
+
         try:
             expires_at = datetime.now(timezone.utc) + timedelta(days=KNOWLEDGE_RETENTION_DAYS)
             
@@ -1000,10 +1215,17 @@ class TradeLearningService:
                 symbol_insights = insights.get('symbol_insights', {})
                 for symbol, insight in symbol_insights.items():
                     if isinstance(insight, str) and insight:
-                        key = f"{symbol}_weekly_insight"
-
                         symbol_learnings = [l for l in learnings if l.symbol == symbol]
                         sample_size = len(symbol_learnings)
+                        if not knowledge_write_allowed(sample_size, draft=False):
+                            logger.info(
+                                f"Skipping symbol insight for {symbol}: "
+                                f"sample_size={sample_size} < {MIN_PATTERN_SAMPLE_PROMOTED}"
+                            )
+                            continue
+
+                        key = f"{symbol}_weekly_insight"
+
                         wins = len([l for l in symbol_learnings if l.outcome == 'win'])
                         win_rate = wins / sample_size if sample_size > 0 else 0
                         avg_r = sum(self._sanitize_r(l.r_multiple) for l in symbol_learnings) / sample_size if sample_size > 0 else 0
@@ -1034,32 +1256,39 @@ class TradeLearningService:
                             db_session.add(knowledge)
                         await db_session.flush()
                 
-                # Update recurring mistakes
+                # Update recurring mistakes (draft threshold — week total sample)
                 mistakes = insights.get('recurring_mistakes', [])
-                for i, mistake in enumerate(mistakes[:5]):
-                    if isinstance(mistake, str) and mistake:
-                        key = f"mistake_{i}_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+                week_sample = len(learnings)
+                if not knowledge_write_allowed(week_sample, draft=True):
+                    logger.info(
+                        f"Skipping mistake tags: week sample_size={week_sample} "
+                        f"< {MIN_PATTERN_SAMPLE_DRAFT}"
+                    )
+                else:
+                    for i, mistake in enumerate(mistakes[:5]):
+                        if isinstance(mistake, str) and mistake:
+                            key = f"mistake_{i}_{datetime.now(timezone.utc).strftime('%Y%m%d')}"
 
-                        result = await db_session.execute(
-                            select(KnowledgeBaseModel).where(KnowledgeBaseModel.key == key)
-                        )
-                        existing = result.scalar_one_or_none()
-                        if existing:
-                            existing.insight = mistake
-                            existing.confidence = 0.7
-                            existing.sample_size = len(learnings)
-                            existing.expires_at = expires_at
-                        else:
-                            knowledge = KnowledgeBaseModel(
-                                category="mistake",
-                                key=key,
-                                insight=mistake,
-                                confidence=0.7,
-                                sample_size=len(learnings),
-                                expires_at=expires_at
+                            result = await db_session.execute(
+                                select(KnowledgeBaseModel).where(KnowledgeBaseModel.key == key)
                             )
-                            db_session.add(knowledge)
-                        await db_session.flush()
+                            existing = result.scalar_one_or_none()
+                            if existing:
+                                existing.insight = mistake
+                                existing.confidence = 0.5  # draft-level until promoted
+                                existing.sample_size = week_sample
+                                existing.expires_at = expires_at
+                            else:
+                                knowledge = KnowledgeBaseModel(
+                                    category="mistake",
+                                    key=key,
+                                    insight=mistake,
+                                    confidence=0.5,
+                                    sample_size=week_sample,
+                                    expires_at=expires_at
+                                )
+                                db_session.add(knowledge)
+                            await db_session.flush()
                 
                 await db_session.commit()
                 logger.info("Updated knowledge base from weekly insights")
@@ -1418,7 +1647,12 @@ Total R: {review.total_r:.1f}R
                 avg_r = sum(e['r'] for e in entries) / len(entries) if entries else 0
                 ev = wr / 100 * avg_r - (1 - wr / 100)  # Expected Value
                 
-                tag = "PREFERRED" if wr >= 60 and avg_r > 0 else "AVOID" if wr < 40 else "NEUTRAL"
+                if len(entries) >= MIN_PATTERN_SAMPLE_PROMOTED:
+                    tag = "PREFERRED" if wr >= 60 and avg_r > 0 else "AVOID" if wr < 40 else "NEUTRAL"
+                elif len(entries) >= MIN_PATTERN_SAMPLE_DRAFT:
+                    tag = "DRAFT"
+                else:
+                    continue  # insufficient sample — omit from playbook
                 lines.append((
                     ev,
                     f"[PLAYBOOK] {sym} {direction.upper()} {sess}, {setup}: "

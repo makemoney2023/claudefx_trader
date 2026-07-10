@@ -231,6 +231,11 @@ class PositionStateModel(Base):
     
     # Close reason (for reversal re-entry logic across restarts)
     close_reason: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, default=None)
+
+    # Explicit A+ classification and reservation ownership
+    a_plus: Mapped[bool] = mapped_column(Boolean, default=False)
+    reservation_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, default=None)
+    remaining_volume: Mapped[float] = mapped_column(Float, default=0)
     
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
@@ -354,6 +359,46 @@ class WeeklyReviewModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+class SignalDecisionModel(Base):
+    """Unified gate decision telemetry for every terminal signal outcome."""
+
+    __tablename__ = "signal_decisions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    decision_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    outcome_type: Mapped[str] = mapped_column(String(40), index=True)
+    gate_id: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
+
+    symbol: Mapped[str] = mapped_column(String(20), index=True)
+    direction: Mapped[str] = mapped_column(String(10), default="")
+    entry: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    sl: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    tp: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    session: Mapped[str] = mapped_column(String(20), default="")
+    mode: Mapped[str] = mapped_column(String(20), default="")
+    reason: Mapped[str] = mapped_column(Text, default="")
+    details: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+
+    judge_verdict: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    market_snapshot_ref: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    confidence_components: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+
+    timestamp: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), index=True
+    )
+
+    outcome_horizon_hours: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    mfe_r: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    mae_r: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    hypothetical_result: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    hypothetical_exit: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    hypothetical_r: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    spread_cost_r: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    outcome_worker_status: Mapped[str] = mapped_column(String(20), default="pending")
+    outcome_evaluated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
 class BacktestRunModel(Base):
     """
     Persists backtest runs (ICT, Claude Replay, Walk-Forward Optimizer).
@@ -437,6 +482,10 @@ async def init_db():
     # Migrate: add missing columns to existing tables (SQLite ALTER TABLE)
     async with engine.begin() as conn:
         migrations = [
+            ("position_states", "initial_sl", "FLOAT DEFAULT 0"),
+            ("position_states", "be_triggered", "BOOLEAN DEFAULT 0"),
+            ("position_states", "trailing_active", "BOOLEAN DEFAULT 0"),
+            ("position_states", "partial_closed", "BOOLEAN DEFAULT 0"),
             ("position_states", "tp1", "FLOAT DEFAULT 0"),
             ("position_states", "tp2", "FLOAT DEFAULT 0"),
             ("position_states", "tp3", "FLOAT DEFAULT 0"),
@@ -476,6 +525,42 @@ async def init_db():
             ("trades", "risk_percent", "FLOAT"),
             # P/L source tracking (for sync overwrite logic)
             ("trades", "pnl_source", "VARCHAR(20)"),
+            # Position state durability fields
+            ("position_states", "peak_r_multiple", "FLOAT DEFAULT 0"),
+            ("position_states", "peak_unrealized_pnl", "FLOAT DEFAULT 0"),
+            ("position_states", "near_tp_reached", "BOOLEAN DEFAULT 0"),
+            ("position_states", "a_plus", "BOOLEAN DEFAULT 0"),
+            ("position_states", "reservation_id", "VARCHAR(50)"),
+            ("position_states", "remaining_volume", "FLOAT DEFAULT 0"),
+            ("position_states", "created_at", "DATETIME"),
+            ("position_states", "updated_at", "DATETIME"),
+            # Signal decision telemetry (Wave 3)
+            ("signal_decisions", "decision_id", "VARCHAR(36)"),
+            ("signal_decisions", "outcome_type", "VARCHAR(40)"),
+            ("signal_decisions", "gate_id", "VARCHAR(60)"),
+            ("signal_decisions", "symbol", "VARCHAR(20)"),
+            ("signal_decisions", "direction", "VARCHAR(10)"),
+            ("signal_decisions", "entry", "FLOAT"),
+            ("signal_decisions", "sl", "FLOAT"),
+            ("signal_decisions", "tp", "FLOAT"),
+            ("signal_decisions", "confidence", "FLOAT"),
+            ("signal_decisions", "session", "VARCHAR(20)"),
+            ("signal_decisions", "mode", "VARCHAR(20)"),
+            ("signal_decisions", "reason", "TEXT"),
+            ("signal_decisions", "details", "JSON"),
+            ("signal_decisions", "judge_verdict", "VARCHAR(20)"),
+            ("signal_decisions", "market_snapshot_ref", "VARCHAR(100)"),
+            ("signal_decisions", "confidence_components", "JSON"),
+            ("signal_decisions", "timestamp", "DATETIME"),
+            ("signal_decisions", "outcome_horizon_hours", "INTEGER"),
+            ("signal_decisions", "mfe_r", "FLOAT"),
+            ("signal_decisions", "mae_r", "FLOAT"),
+            ("signal_decisions", "hypothetical_result", "VARCHAR(30)"),
+            ("signal_decisions", "hypothetical_exit", "VARCHAR(20)"),
+            ("signal_decisions", "hypothetical_r", "FLOAT"),
+            ("signal_decisions", "spread_cost_r", "FLOAT"),
+            ("signal_decisions", "outcome_worker_status", "VARCHAR(20)"),
+            ("signal_decisions", "outcome_evaluated_at", "DATETIME"),
         ]
         for table, column, col_type in migrations:
             try:

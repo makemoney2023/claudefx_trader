@@ -21,6 +21,7 @@ import numpy as np
 from ..utils.logging import get_logger
 from ..utils.candle_utils import calculate_atr
 from ..utils.json_helpers import sanitize_for_json
+from .replay_simulation import ReplaySignal, ReplayTrade, simulate_raw_trade as _simulate_trade
 
 logger = get_logger(__name__)
 
@@ -37,35 +38,6 @@ def _detect_session(ts: datetime) -> str:
     if 17 <= h < 22:
         return "new_york_pm"
     return "asian"
-
-
-@dataclass
-class ReplaySignal:
-    """A signal generated during replay."""
-    timestamp: datetime
-    symbol: str
-    direction: str
-    confidence: float
-    entry_price: float
-    stop_loss: float
-    take_profit: float
-    reasoning: str = ""
-    trade_type: str = "intraday"
-    market_structure: str = "unknown"
-
-
-@dataclass
-class ReplayTrade:
-    """A simulated trade from replay."""
-    signal: ReplaySignal
-    outcome: str  # 'win', 'loss', 'timeout'
-    exit_price: float = 0.0
-    exit_time: Optional[datetime] = None
-    pnl_pips: float = 0.0
-    r_multiple: float = 0.0
-    mfe_pips: float = 0.0  # Max Favorable Excursion
-    mae_pips: float = 0.0  # Max Adverse Excursion
-    bars_held: int = 0
 
 
 @dataclass
@@ -89,6 +61,9 @@ class ReplayResult:
     api_calls: int = 0
     estimated_cost: float = 0.0
     duration_seconds: float = 0.0
+    execution_policy_trades: int = 0
+    execution_policy_total_r: float = 0.0
+    strategy_total_r: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -109,6 +84,9 @@ class ReplayResult:
             'api_calls': self.api_calls,
             'estimated_cost': round(self.estimated_cost, 2),
             'duration_seconds': round(self.duration_seconds, 1),
+            'execution_policy_trades': self.execution_policy_trades,
+            'execution_policy_total_r': round(self.execution_policy_total_r, 2),
+            'strategy_total_r': round(self.strategy_total_r, 2),
         }
 
 
@@ -143,96 +121,6 @@ class HistoricalDataLoader:
             return None
 
 
-def _simulate_trade(
-    signal: ReplaySignal,
-    future_data: pd.DataFrame,
-    max_bars: int = 200,
-    pip_size: float = 0.0001,
-) -> ReplayTrade:
-    """
-    Simulate a trade outcome using price data after the signal.
-
-    Checks each bar to see if SL or TP is hit first, tracking MFE/MAE.
-    When both SL and TP are hit on the same bar, uses the bar's open to
-    infer which level was reached first.
-    """
-    if future_data is None or future_data.empty:
-        return ReplayTrade(signal=signal, outcome='timeout')
-
-    entry = signal.entry_price
-    sl = signal.stop_loss
-    tp = signal.take_profit
-    is_long = signal.direction == 'long'
-
-    sl_dist = abs(entry - sl) if sl is not None else 1.0
-    _pip = pip_size if pip_size > 0 else 1.0
-    mfe = 0.0
-    mae = 0.0
-
-    for i, (_, bar) in enumerate(future_data.iterrows()):
-        if i >= max_bars:
-            break
-
-        bar_open = float(bar['open'])
-        high = float(bar['high'])
-        low = float(bar['low'])
-        close = float(bar['close'])
-
-        if is_long:
-            fav = high - entry
-            adv = entry - low
-        else:
-            fav = entry - low
-            adv = high - entry
-
-        mfe = max(mfe, fav / _pip)
-        mae = max(mae, adv / _pip)
-
-        sl_hit = (is_long and low <= sl) or (not is_long and high >= sl)
-        tp_hit = (is_long and high >= tp) or (not is_long and low <= tp)
-
-        if sl_hit and tp_hit:
-            dist_to_sl = abs(bar_open - sl)
-            dist_to_tp = abs(bar_open - tp)
-            if dist_to_sl <= dist_to_tp:
-                sl_hit, tp_hit = True, False
-            else:
-                sl_hit, tp_hit = False, True
-
-        if sl_hit:
-            pnl_raw = (sl - entry) if is_long else (entry - sl)
-            return ReplayTrade(
-                signal=signal, outcome='loss', exit_price=sl,
-                exit_time=bar.name if hasattr(bar, 'name') else None,
-                pnl_pips=pnl_raw / _pip, r_multiple=-1.0,
-                mfe_pips=mfe, mae_pips=mae, bars_held=i + 1,
-            )
-
-        if tp_hit:
-            pnl_raw = (tp - entry) if is_long else (entry - tp)
-            r = pnl_raw / sl_dist if sl_dist > 0 else 0
-            return ReplayTrade(
-                signal=signal, outcome='win', exit_price=tp,
-                exit_time=bar.name if hasattr(bar, 'name') else None,
-                pnl_pips=pnl_raw / _pip, r_multiple=r,
-                mfe_pips=mfe, mae_pips=mae, bars_held=i + 1,
-            )
-
-    last_close = float(future_data.iloc[-1]['close'])
-    pnl_raw = (last_close - entry) if is_long else (entry - last_close)
-    r = pnl_raw / sl_dist if sl_dist > 0 else 0
-    return ReplayTrade(
-        signal=signal,
-        outcome='timeout',
-        exit_price=last_close,
-        pnl_pips=pnl_raw / _pip,
-        r_multiple=r,
-        mfe_pips=mfe,
-        mae_pips=mae,
-        bars_held=len(future_data),
-    )
-
-
 class ClaudeReplayBacktester:
     """
     Replay historical charts through Claude's analysis pipeline.
@@ -250,6 +138,34 @@ class ClaudeReplayBacktester:
         self._data_loader = HistoricalDataLoader(mt5_client)
         self._chart_gen = None
         self._learning_service = trade_learning_service
+        from ..services.trade_judge import JudgeOutcome, JudgeVerdict
+
+        self._default_judge_outcome = JudgeOutcome(
+            verdict=JudgeVerdict.APPROVE,
+            reason="replay baseline",
+        )
+
+    def _evaluate_replay_signal(
+        self,
+        replay_sig: ReplaySignal,
+        future_data: pd.DataFrame,
+        *,
+        current_price: float,
+        pip_size: float = 0.0001,
+        judge_outcome=None,
+    ):
+        """Run one replay signal through raw strategy + execution policy pipelines."""
+        from .execution_policy import run_policy_replay
+
+        strategy_trade = _simulate_trade(replay_sig, future_data, pip_size=pip_size)
+        policy_result = run_policy_replay(
+            replay_sig,
+            future_data,
+            judge_outcome or self._default_judge_outcome,
+            current_price=current_price,
+            pip_size=pip_size,
+        )
+        return strategy_trade, policy_result
 
     async def estimate_cost(
         self, symbol: str, start: datetime, end: datetime, interval_hours: float = 1.0
@@ -810,9 +726,21 @@ class ClaudeReplayBacktester:
                     }
 
                     future = m15_data[m15_data.index > window_end].head(200)
-                    trade = _simulate_trade(replay_sig, future, pip_size=_pip)
+                    trade, policy_result = self._evaluate_replay_signal(
+                        replay_sig,
+                        future,
+                        current_price=sig.entry_price or current_price,
+                        pip_size=_pip,
+                    )
                     result.trades.append(trade)
                     result.total_trades += 1
+                    result.strategy_total_r += trade.r_multiple
+
+                    if policy_result.execution_trade:
+                        result.execution_policy_trades += 1
+                        result.execution_policy_total_r += (
+                            policy_result.execution_trade.r_multiple
+                        )
 
                     if trade.outcome == 'win':
                         result.wins += 1
@@ -923,3 +851,23 @@ class ClaudeReplayBacktester:
         logger.info("=" * 70)
 
         return result
+
+
+def replay_signal_with_policy(
+    signal: ReplaySignal,
+    future_data: pd.DataFrame,
+    judge_outcome,
+    *,
+    current_price: float,
+    pip_size: float = 0.0001,
+):
+    """Run a single signal through the shared execution policy pipeline."""
+    from .execution_policy import run_policy_replay
+
+    return run_policy_replay(
+        signal,
+        future_data,
+        judge_outcome,
+        current_price=current_price,
+        pip_size=pip_size,
+    )

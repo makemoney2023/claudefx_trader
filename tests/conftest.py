@@ -201,7 +201,16 @@ def silver_analyzer():
 def goal_tracker():
     """Create a GoalTracker instance for testing."""
     from trading_bot.services.goal_tracker import GoalTracker
-    return GoalTracker(
-        starting_equity=1000,
-        target_equity=100000
-    )
+    return GoalTracker(starting_equity=1000, target_equity=100000)
+
+
+@pytest.fixture(autouse=True)
+async def _drain_position_manager_persistence():
+    """Prevent aiosqlite background tasks from outliving the test event loop."""
+    yield
+    import gc
+    from trading_bot.execution.position_manager import PositionManager
+
+    for obj in gc.get_objects():
+        if isinstance(obj, PositionManager) and obj._persist_tasks:
+            await obj.flush_persistence()

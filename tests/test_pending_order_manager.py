@@ -507,9 +507,6 @@ class TestSyncWithMT5:
         manager = PendingOrderManager(mt5_client=mock_mt5)
         manager.pending_orders[12345] = self._make_order(12345)
         
-        # Mock the DB update method so it doesn't actually hit DB
-        manager._update_trade_db_for_filled_closed = AsyncMock()
-        
         result = await manager.sync_with_mt5()
         
         assert result['filled_closed'] == 1
@@ -519,13 +516,11 @@ class TestSyncWithMT5:
         assert manager.order_history[0].status == PendingOrderStatus.FILLED
         assert manager.order_history[0].fill_price == 67500.0
         
-        # Verify DB update was called with correct P/L
-        manager._update_trade_db_for_filled_closed.assert_called_once()
-        call_args = manager._update_trade_db_for_filled_closed.call_args
-        deal_result = call_args[0][2]
-        assert deal_result['closed'] == True
-        assert deal_result['close_price'] == 67600.0
-        assert deal_result['total_pnl'] == -10.0 + (-0.5) + (-0.5) + 0.0  # profit + close_comm + open_comm + swap
+        events = result.get('closed_trade_events', [])
+        assert len(events) == 1
+        assert events[0].order_ticket == 12345
+        assert events[0].exit_price == 67600.0
+        assert events[0].profit_loss == -10.0 + (-0.5) + (-0.5) + 0.0
     
     @pytest.mark.asyncio
     async def test_sync_order_truly_cancelled(self):

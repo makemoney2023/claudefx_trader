@@ -9,7 +9,189 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple
 from enum import Enum
 
-from ..config import get_symbol_spec
+from ..config import get_symbol_spec, normalize_lots
+
+# Post-sizing risk verification tolerance (REC#6)
+POST_SIZING_RISK_TOLERANCE = 1.15
+
+# Final broker-bound risk cap tolerance (Wave 2 Task 5)
+FINAL_RISK_TOLERANCE = 1.05
+
+
+def _broker_tick_size(spec) -> float:
+    """Smallest price increment for broker tick math."""
+    if spec.category == "forex":
+        return spec.pip_size / 10.0
+    return spec.pip_size
+
+
+def calculate_broker_loss_at_stop(
+    final_entry: float,
+    final_sl: float,
+    final_lots: float,
+    symbol_spec,
+) -> float:
+    """Maximum dollar loss at stop using broker tick value/size when available."""
+    if final_lots <= 0 or not final_entry or not final_sl:
+        return 0.0
+
+    distance = abs(final_entry - final_sl)
+    if distance <= 0:
+        return 0.0
+
+    if symbol_spec.tick_value > 0:
+        tick_size = _broker_tick_size(symbol_spec)
+        if tick_size > 0:
+            ticks = distance / tick_size
+            return ticks * final_lots * symbol_spec.tick_value
+
+    risk_pips = distance / symbol_spec.pip_size
+    if risk_pips <= 0:
+        return 0.0
+    return final_lots * risk_pips * symbol_spec.pip_value
+
+
+def enforce_final_risk_cap(
+    account_equity: float,
+    risk_fraction: float,
+    final_entry: float,
+    final_sl: float,
+    final_lots: float,
+    symbol_spec,
+    *,
+    symbol: str = "EURUSD",
+    tolerance: float = FINAL_RISK_TOLERANCE,
+) -> Tuple[float, float, Optional[str]]:
+    """
+    Enforce configured account risk dollars immediately before order send.
+
+    Returns (allowed_lots, actual_loss_at_stop, rejection_reason).
+    """
+    if final_lots <= 0 or account_equity <= 0 or risk_fraction <= 0:
+        return 0.0, 0.0, "invalid sizing inputs for final risk cap"
+
+    cap_dollars = account_equity * risk_fraction
+    max_allowed = cap_dollars * tolerance
+    actual_loss = calculate_broker_loss_at_stop(
+        final_entry, final_sl, final_lots, symbol_spec
+    )
+
+    if actual_loss <= max_allowed:
+        return final_lots, actual_loss, None
+
+    loss_per_lot = calculate_broker_loss_at_stop(
+        final_entry, final_sl, 1.0, symbol_spec
+    )
+    if loss_per_lot <= 0:
+        return 0.0, actual_loss, "zero SL distance — cannot enforce final risk cap"
+
+    adjusted = max_allowed / loss_per_lot
+    adjusted = normalize_lots(symbol, adjusted)
+
+    if adjusted < symbol_spec.volume_min:
+        return (
+            0.0,
+            actual_loss,
+            f"actual loss ${actual_loss:.2f} exceeds cap ${max_allowed:.2f} "
+            f"even at min lot {symbol_spec.volume_min}",
+        )
+
+    adjusted_loss = calculate_broker_loss_at_stop(
+        final_entry, final_sl, adjusted, symbol_spec
+    )
+    if adjusted_loss > max_allowed + 0.01:
+        return (
+            0.0,
+            adjusted_loss,
+            f"actual loss ${adjusted_loss:.2f} still exceeds cap ${max_allowed:.2f} "
+            f"after shrinking to {adjusted} lots",
+        )
+
+    return adjusted, adjusted_loss, None
+
+
+def compute_actual_risk_dollars(
+    lots: float,
+    entry_price: float,
+    stop_loss: float,
+    symbol: str,
+) -> float:
+    """Dollar risk at stop loss: lots × pip_value × SL distance in pips."""
+    if lots <= 0 or not entry_price or not stop_loss:
+        return 0.0
+    spec = get_symbol_spec(symbol)
+    risk_pips = abs(entry_price - stop_loss) / spec.pip_size
+    if risk_pips <= 0:
+        return 0.0
+    return lots * risk_pips * spec.pip_value
+
+
+def verify_post_sizing_risk(
+    final_lots: float,
+    target_lots: float,
+    entry_price: float,
+    stop_loss: float,
+    symbol: str,
+    *,
+    tolerance: float = POST_SIZING_RISK_TOLERANCE,
+) -> Tuple[float, float, Optional[str]]:
+    """
+    Verify actual $ risk at SL after all sizing adjustments.
+
+    Compares final lots against the sizer's target lots. If actual risk exceeds
+    target risk × tolerance, shrink lots (or reject if still over at broker min).
+    """
+    if final_lots <= 0 or target_lots <= 0:
+        return 0.0, 0.0, "invalid lot size for risk verification"
+
+    target_risk = compute_actual_risk_dollars(
+        target_lots, entry_price, stop_loss, symbol
+    )
+    if target_risk <= 0:
+        return 0.0, 0.0, "zero SL distance — cannot verify risk"
+
+    max_allowed = target_risk * tolerance
+    actual_risk = compute_actual_risk_dollars(
+        final_lots, entry_price, stop_loss, symbol
+    )
+
+    if actual_risk <= max_allowed:
+        return final_lots, actual_risk, None
+
+    spec = get_symbol_spec(symbol)
+    risk_per_lot = compute_actual_risk_dollars(
+        1.0, entry_price, stop_loss, symbol
+    )
+    if risk_per_lot <= 0:
+        return 0.0, 0.0, "zero SL distance — cannot verify risk"
+
+    adjusted = max_allowed / risk_per_lot
+    adjusted = normalize_lots(symbol, adjusted)
+
+    if adjusted < spec.volume_min:
+        return (
+            0.0,
+            actual_risk,
+            f"actual risk ${actual_risk:.2f} exceeds cap ${max_allowed:.2f} "
+            f"even at min lot {spec.volume_min}",
+        )
+
+    adjusted_risk = compute_actual_risk_dollars(
+        adjusted, entry_price, stop_loss, symbol
+    )
+    if adjusted_risk > max_allowed + 0.01:
+        return (
+            0.0,
+            adjusted_risk,
+            f"actual risk ${adjusted_risk:.2f} still exceeds cap ${max_allowed:.2f} "
+            f"after shrinking to {adjusted} lots",
+        )
+
+    logger.warning(
+        f"Post-sizing risk shrink {symbol}: {final_lots} -> {adjusted} lots "
+        f"(risk ${actual_risk:.2f} -> ${adjusted_risk:.2f}, cap ${max_allowed:.2f})"
+    )
+    return adjusted, adjusted_risk, None
 from ..utils.logging import get_logger
 from ..api.routes.activity import add_activity
 

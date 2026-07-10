@@ -10,6 +10,52 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import json
 
 
+def _make_close_position(**overrides):
+    """Position-like object without MagicMock auto-attributes."""
+    from types import SimpleNamespace
+
+    defaults = {
+        'ticket': 12345,
+        'symbol': 'EURUSD',
+        'direction': 'long',
+        'entry_price': 1.1000,
+        'stop_loss': 1.0980,
+        'take_profit': 1.1060,
+        'current_price': 1.0970,
+        'current_r_multiple': -1.5,
+        'volume': 0.01,
+        'open_time': datetime.now(timezone.utc) - timedelta(hours=2),
+        'closed_profit_loss': None,
+        'closed_exit_price': None,
+        'order_ticket': None,
+        'reservation_id': None,
+        'close_reason': '',
+        'peak_r_multiple': 0.0,
+    }
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
+
+
+def _make_close_bot():
+    """TradingBot with mocks required for _handle_position_close."""
+    from trading_bot.main import TradingBot
+
+    bot = TradingBot()
+    bot.mt5_client = MagicMock()
+    bot.mt5_client.is_simulation = True
+    bot.risk_manager = MagicMock()
+    bot.risk_manager.daily_risk_used = 0.0
+    bot.risk_manager.max_daily_risk = 0.15
+    bot.reservation_ledger = MagicMock()
+    bot.reservation_ledger.get_for_ticket.return_value = None
+    bot.daily_pnl = 0.0
+    bot.win_streak = 0
+    bot.loss_streak = 0
+    bot._symbol_loss_cooldowns = {}
+    bot._last_learnings_update = None
+    return bot
+
+
 class TestLossTradeTriggersReview:
     """Test that losing trades trigger Claude review and storage."""
     
@@ -20,20 +66,14 @@ class TestLossTradeTriggersReview:
         from trading_bot.execution.position_manager import Position
         
         # Create mock position that represents a loss
-        mock_position = MagicMock()
-        mock_position.ticket = 12345
-        mock_position.symbol = "EURUSD"
-        mock_position.direction = "long"
-        mock_position.entry_price = 1.1000
-        mock_position.stop_loss = 1.0980
-        mock_position.take_profit = 1.1060
-        mock_position.current_price = 1.0970  # Below stop loss
-        mock_position.current_r_multiple = -1.5  # Loss
-        mock_position.volume = 0.01
-        mock_position.open_time = datetime.now(timezone.utc) - timedelta(hours=2)
+        mock_position = _make_close_position(
+            ticket=12345,
+            current_price=1.0970,
+            current_r_multiple=-1.5,
+        )
         
         # Create bot instance with mocked services
-        bot = TradingBot()
+        bot = _make_close_bot()
         
         # Mock the Claude client
         bot.claude_client = MagicMock()
@@ -51,6 +91,7 @@ class TestLossTradeTriggersReview:
         # Mock the learning service
         bot.learning_service = MagicMock()
         bot.learning_service.store_trade_review = AsyncMock()
+        bot.learning_service.update_learnings_documentation = AsyncMock()
         
         # Mock session analytics
         bot.session_analytics = MagicMock()
@@ -63,8 +104,11 @@ class TestLossTradeTriggersReview:
         bot.scaling_manager.record_trade = MagicMock()
         
         # Call position close handler with mocked notify
-        with patch('trading_bot.main.notify', AsyncMock()):
-            with patch('trading_bot.api.routes.activity.add_activity', MagicMock()):
+        with patch('trading_bot.main.notify', AsyncMock()), \
+             patch('trading_bot.api.routes.activity.add_activity', MagicMock()), \
+             patch('trading_bot.main.broadcast_trade_update', AsyncMock()), \
+             patch('trading_bot.main.asyncio.create_task', MagicMock()), \
+             patch('trading_bot.main.DB_AVAILABLE', False):
                 # Calculate profit/loss
                 profit_loss = -50.0  # Loss
                 
@@ -87,24 +131,25 @@ class TestWinTradeReviewBehavior:
         """Verify that small wins (<2R) do NOT trigger review."""
         from trading_bot.main import TradingBot
         
-        mock_position = MagicMock()
-        mock_position.ticket = 12346
-        mock_position.symbol = "GBPUSD"
-        mock_position.direction = "short"
-        mock_position.entry_price = 1.2500
-        mock_position.stop_loss = 1.2550
-        mock_position.take_profit = 1.2400
-        mock_position.current_price = 1.2450  # Small win
-        mock_position.current_r_multiple = 1.0  # Only 1R win
-        mock_position.volume = 0.01
-        mock_position.open_time = datetime.now(timezone.utc) - timedelta(hours=1)
+        mock_position = _make_close_position(
+            ticket=12346,
+            symbol='GBPUSD',
+            direction='short',
+            entry_price=1.2500,
+            stop_loss=1.2550,
+            take_profit=1.2400,
+            current_price=1.2450,
+            current_r_multiple=1.0,
+            open_time=datetime.now(timezone.utc) - timedelta(hours=1),
+        )
         
-        bot = TradingBot()
+        bot = _make_close_bot()
         bot.claude_client = MagicMock()
         bot.claude_client.api_key = "test_key"
         bot.claude_client.review_closed_trade = AsyncMock()
         bot.learning_service = MagicMock()
         bot.learning_service.store_trade_review = AsyncMock()
+        bot.learning_service.update_learnings_documentation = AsyncMock()
         
         # Mock other required services
         bot.session_analytics = MagicMock()
@@ -113,8 +158,11 @@ class TestWinTradeReviewBehavior:
         bot.correlation_service = MagicMock()
         bot.scaling_manager = MagicMock()
         
-        with patch('trading_bot.main.notify', AsyncMock()):
-            with patch('trading_bot.api.routes.activity.add_activity', MagicMock()):
+        with patch('trading_bot.main.notify', AsyncMock()), \
+             patch('trading_bot.api.routes.activity.add_activity', MagicMock()), \
+             patch('trading_bot.main.broadcast_trade_update', AsyncMock()), \
+             patch('trading_bot.main.asyncio.create_task', MagicMock()), \
+             patch('trading_bot.main.DB_AVAILABLE', False):
                 await bot._handle_position_close(mock_position)
         
         # Small win should NOT trigger review (not a loss and <2R)
@@ -128,19 +176,14 @@ class TestWinTradeReviewBehavior:
         """Verify that big wins (>=2R) DO trigger review."""
         from trading_bot.main import TradingBot
         
-        mock_position = MagicMock()
-        mock_position.ticket = 12347
-        mock_position.symbol = "EURUSD"
-        mock_position.direction = "long"
-        mock_position.entry_price = 1.1000
-        mock_position.stop_loss = 1.0980
-        mock_position.take_profit = 1.1060
-        mock_position.current_price = 1.1050  # Big win
-        mock_position.current_r_multiple = 2.5  # 2.5R win
-        mock_position.volume = 0.01
-        mock_position.open_time = datetime.now(timezone.utc) - timedelta(hours=3)
+        mock_position = _make_close_position(
+            ticket=12347,
+            current_price=1.1050,
+            current_r_multiple=2.5,
+            open_time=datetime.now(timezone.utc) - timedelta(hours=3),
+        )
         
-        bot = TradingBot()
+        bot = _make_close_bot()
         bot.claude_client = MagicMock()
         bot.claude_client.api_key = "test_key"
         bot.claude_client.review_closed_trade = AsyncMock(return_value={
@@ -154,6 +197,7 @@ class TestWinTradeReviewBehavior:
         })
         bot.learning_service = MagicMock()
         bot.learning_service.store_trade_review = AsyncMock()
+        bot.learning_service.update_learnings_documentation = AsyncMock()
         
         bot.session_analytics = MagicMock()
         bot.session_analytics.get_current_session.return_value = MagicMock(value="london")
@@ -161,8 +205,11 @@ class TestWinTradeReviewBehavior:
         bot.correlation_service = MagicMock()
         bot.scaling_manager = MagicMock()
         
-        with patch('trading_bot.main.notify', AsyncMock()):
-            with patch('trading_bot.api.routes.activity.add_activity', MagicMock()):
+        with patch('trading_bot.main.notify', AsyncMock()), \
+             patch('trading_bot.api.routes.activity.add_activity', MagicMock()), \
+             patch('trading_bot.main.broadcast_trade_update', AsyncMock()), \
+             patch('trading_bot.main.asyncio.create_task', MagicMock()), \
+             patch('trading_bot.main.DB_AVAILABLE', False):
                 await bot._handle_position_close(mock_position)
         
         # Big win (>=2R) SHOULD trigger review
@@ -286,11 +333,16 @@ class TestWeeklyConsolidation:
         service = TradeLearningService()
         
         insights = {
+            'performance_grade': 'B',
+            'summary': 'Strong London performance on EURUSD',
             'symbol_insights': {'EURUSD': 'Strong in London'},
             'recurring_mistakes': ['Entering before FVG fill']
         }
         
-        mock_learnings = [MagicMock(symbol='EURUSD', outcome='loss', r_multiple=-1.0)]
+        mock_learnings = [
+            MagicMock(symbol='EURUSD', outcome='loss', r_multiple=-1.0)
+            for _ in range(5)
+        ]
         
         with patch('trading_bot.services.trade_learning_service.async_session_maker') as mock_session:
             mock_db = AsyncMock()

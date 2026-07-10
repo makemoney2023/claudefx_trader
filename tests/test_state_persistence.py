@@ -2,9 +2,10 @@
 
 import os
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
+from trading_bot.services.pending_order_manager import PendingOrder, PendingOrderStatus
 from trading_bot.utils.state_persistence import StatePersistence, save_full_state, load_full_state
 
 
@@ -184,6 +185,52 @@ class TestSaveFullState:
             
             loaded_cooldowns = sp_module._persistence.load_reversal_cooldowns()
             assert 'BTCUSD' in loaded_cooldowns
+        finally:
+            sp_module._persistence = old
+            if os.path.exists(tf):
+                os.remove(tf)
+
+    def test_save_captures_pending_reservation_ownership(self):
+        bot = MagicMock()
+        bot.win_streak = 0
+        bot.loss_streak = 0
+        bot.daily_trades = 1
+        bot.daily_pnl = 0.0
+        bot.last_reset_date = datetime.now().date()
+        bot._notified_milestones = set()
+        bot.scaling_manager = None
+        bot.goal_tracker = None
+        bot.risk_manager = MagicMock(daily_risk_used=0.012)
+        bot._signal_hash_expiry = {}
+        bot._reversal_cooldowns = {}
+        bot.pending_order_manager = MagicMock()
+        order = PendingOrder(
+            ticket=40401,
+            symbol="EURUSD",
+            order_type="buy_limit",
+            direction="long",
+            volume=0.05,
+            price=1.08,
+            stop_loss=1.075,
+            take_profit=1.09,
+            created_at=datetime.now(timezone.utc),
+            expiration=datetime.now(timezone.utc) + timedelta(hours=1),
+            status=PendingOrderStatus.ACTIVE,
+            risk_percent=0.012,
+            reservation_id="reservation-40401",
+        )
+        bot.pending_order_manager.pending_orders = {order.ticket: order}
+
+        tf = os.path.join(tempfile.gettempdir(), "test_save_pending_ownership.json")
+        import trading_bot.utils.state_persistence as sp_module
+
+        old = sp_module._persistence
+        sp_module._persistence = StatePersistence(tf)
+        try:
+            assert save_full_state(bot) is True
+            metadata = sp_module._persistence.load_pending_order_metadata()
+            assert metadata["40401"]["reservation_id"] == "reservation-40401"
+            assert metadata["40401"]["risk_percent"] == 0.012
         finally:
             sp_module._persistence = old
             if os.path.exists(tf):

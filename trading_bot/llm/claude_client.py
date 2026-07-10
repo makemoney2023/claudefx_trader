@@ -26,6 +26,7 @@ from anthropic import AsyncAnthropic
 
 from ..config import settings
 from ..utils.logging import get_logger
+from ..utils.win_optimization import validate_signal_coherence
 
 logger = get_logger(__name__)
 
@@ -1505,7 +1506,7 @@ reduce your confidence number for it.
         if not isinstance(tool_input, dict):
             logger.warning(f"tool_input is not a dict (got {type(tool_input)}), returning no_trade")
             return {'direction': 'no_trade', 'confidence': 0, 'reasoning': 'Invalid response format'}
-        
+
         # Validate direction
         valid_directions = {'long', 'short', 'no_trade'}
         direction = str(tool_input.get('direction', 'no_trade')).lower()
@@ -1513,7 +1514,7 @@ reduce your confidence number for it.
             logger.warning(f"Invalid direction '{direction}', defaulting to no_trade")
             direction = 'no_trade'
         tool_input['direction'] = direction
-        
+
         # Validate confidence (clamp to 0-1)
         try:
             confidence = float(tool_input.get('confidence', 0))
@@ -1521,14 +1522,13 @@ reduce your confidence number for it.
         except (TypeError, ValueError):
             confidence = 0.0
         tool_input['confidence'] = confidence
-        
+
         # Validate numeric price fields
         for field in ['entry_price', 'stop_loss', 'take_profit', 'risk_reward']:
             val = tool_input.get(field)
             if val is not None:
                 try:
                     val = float(val)
-                    # Price fields must be strictly positive; risk_reward can be 0 (no-trade)
                     if field in ('entry_price', 'stop_loss', 'take_profit') and val <= 0:
                         logger.warning(f"Non-positive {field}: {val}, setting to None")
                         val = None
@@ -1538,9 +1538,29 @@ reduce your confidence number for it.
                 except (TypeError, ValueError):
                     val = None
             tool_input[field] = val
-        
-        # ============================================
-        # SL/TP SWAP DETECTION AND AUTO-CORRECTION
+
+        entry = tool_input.get('entry_price')
+        sl = tool_input.get('stop_loss')
+        tp = tool_input.get('take_profit')
+        if direction in ('long', 'short') and entry and sl and tp:
+            coherent, reason = validate_signal_coherence(entry, sl, tp, direction)
+            if not coherent:
+                logger.warning(f"Signal coherence rejected before auto-repair: {reason}")
+                tool_input['direction'] = 'no_trade'
+                tool_input['confidence'] = 0.0
+                tool_input['reasoning'] = f"Signal rejected: {reason}"
+                return tool_input
+
+        return self._apply_sl_tp_repairs(tool_input)
+
+    def _validate_tool_input(self, tool_input: dict) -> dict:
+        """Alias for readiness tests and external callers."""
+        return self._validate_trade_signal(tool_input)
+
+    def _apply_sl_tp_repairs(self, tool_input: dict) -> dict:
+        direction = tool_input.get('direction', 'no_trade')
+        if direction == 'no_trade':
+            return tool_input
         # Claude sometimes swaps SL and TP values, or returns
         # pip distances instead of absolute price levels.
         # ============================================
@@ -2093,10 +2113,16 @@ Respond with JSON:
         Returns:
             Dict with verdict, reason, suggested_entry, risk_flags
         """
-        default_approve = {"verdict": "APPROVE", "reason": "Judge unavailable", "suggested_entry": None, "risk_flags": []}
-        
+        default_fail = {
+            "verdict": "UNAVAILABLE",
+            "reason": "Judge unavailable",
+            "suggested_entry": None,
+            "risk_flags": ["judge_unavailable"],
+        }
+
         if not self.async_client:
-            return default_approve
+            logger.warning("[JUDGE] Claude client unavailable — fail-closed")
+            return default_fail
         
         direction = signal.get('direction', 'unknown')
         confidence = signal.get('confidence', 0)
@@ -2193,10 +2219,10 @@ Respond ONLY with JSON:
                 result = json.loads(response_text.strip())
             
             # Validate the response structure
-            verdict = result.get('verdict', 'APPROVE').upper()
+            verdict = result.get('verdict', 'UNAVAILABLE').upper()
             if verdict not in ('APPROVE', 'DEMOTE', 'REJECT'):
-                logger.warning(f"[JUDGE] Invalid verdict '{verdict}', defaulting to APPROVE")
-                verdict = 'APPROVE'
+                logger.warning(f"[JUDGE] Invalid verdict '{verdict}', failing closed")
+                return default_fail
             
             result['verdict'] = verdict
             result.setdefault('reason', '')
@@ -2217,11 +2243,11 @@ Respond ONLY with JSON:
             return result
             
         except json.JSONDecodeError as e:
-            logger.warning(f"[JUDGE] Failed to parse response: {e}")
-            return default_approve
+            logger.warning(f"[JUDGE] Failed to parse response: {e} — fail-closed")
+            return default_fail
         except Exception as e:
-            logger.error(f"[JUDGE] Error: {e}")
-            return default_approve
+            logger.error(f"[JUDGE] Error: {e} — fail-closed")
+            return default_fail
     
     async def generate_weekly_review(
         self,

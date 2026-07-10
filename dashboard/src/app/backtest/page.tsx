@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useEffect, useCallback } from 'react'
-import { cn } from '@/lib/utils'
+import { cn, formatOptimizerMetric } from '@/lib/utils'
 import {
   api,
   MT5Symbol,
@@ -752,10 +752,10 @@ export default function BacktestPage() {
                     </div>
                     <div className="flex gap-4">
                       <p className="text-sm">
-                        In-sample Sharpe: {(optResult.result_json as Record<string, unknown>)?.in_sample_sharpe ?? '—'}
+                        In-sample Sharpe: {formatOptimizerMetric((optResult.result_json as Record<string, unknown>)?.in_sample_sharpe)}
                       </p>
                       <p className="text-sm">
-                        Out-of-sample Sharpe: {(optResult.result_json as Record<string, unknown>)?.out_of_sample_sharpe ?? '—'}
+                        Out-of-sample Sharpe: {formatOptimizerMetric((optResult.result_json as Record<string, unknown>)?.out_of_sample_sharpe)}
                       </p>
                     </div>
                     <button

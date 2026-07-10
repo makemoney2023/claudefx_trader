@@ -268,3 +268,18 @@ Pairs that move together:
 5. ☐ Not correlated with open positions
 6. ☐ Trading during kill zone
 7. ☐ Clear mind, no emotions
+
+## Bot enforcement (live system)
+
+These runtime policies complement discretionary rules above:
+
+| Policy | Behavior |
+|--------|----------|
+| `BOT_API_KEY` | Protects mutating API routes and expensive LLM actions; required in production |
+| `STRICT_ICT_SESSIONS` | When enabled, blocks entries outside configured ICT kill zones |
+| Trade Judge `UNAVAILABLE` | Timeout, API error, malformed verdict, or missing client → **no execution**, reservation released |
+| Trade Judge `REJECT` | Hard block; reservation released |
+| Trade Judge `DEMOTE` | Only path allowing reduced/pending execution |
+| A+ exits | TP1 skip applies only to persisted A+ positions at creation |
+| Decision telemetry | Every terminal gate writes `decision_records`; outcome worker fills MFE/MAE for blocked/unfilled rows |
+| Replay | Shares policy modules with live bot; Windows MT5 fills and broker identity must be verified separately on the execution host |

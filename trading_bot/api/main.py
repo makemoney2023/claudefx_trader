@@ -13,7 +13,7 @@ from typing import Optional
 import asyncio
 import os
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -30,7 +30,7 @@ from ..config import settings
 from ..utils.logging import setup_logging, get_logger
 from .routes import trades, analysis, config, performance
 from .websocket import router as ws_router, broadcast_price_update, manager as ws_manager
-from .auth import get_api_key, is_protected_endpoint
+from .auth import get_api_key, is_protected_endpoint, RequireAuth, is_api_key_configured, api_key_fingerprint
 
 logger = get_logger(__name__)
 
@@ -147,12 +147,19 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Telegram command handler failed to start: {e}")
     
-    # Log API key for protected endpoints
-    api_key = get_api_key()
-    logger.info("=" * 50)
-    logger.info(f"🔐 API Key for protected endpoints: {api_key}")
-    logger.info("Use header: X-API-Key: <key>")
-    logger.info("=" * 50)
+    # Log API key status for protected endpoints (never log the raw secret)
+    if is_api_key_configured():
+        logger.info("=" * 50)
+        logger.info("🔐 BOT_API_KEY configured for protected endpoints")
+        logger.info(f"   fingerprint={api_key_fingerprint()}")
+        logger.info("Use header: X-API-Key: <key>")
+        logger.info("=" * 50)
+    else:
+        logger.warning("=" * 50)
+        logger.warning("🔐 BOT_API_KEY not set — ephemeral key generated for this process")
+        logger.warning(f"   fingerprint={api_key_fingerprint()}")
+        logger.warning("Set BOT_API_KEY in the environment for a persistent key")
+        logger.warning("=" * 50)
     
     logger.info("API Server started successfully")
     
@@ -520,6 +527,25 @@ def create_app() -> FastAPI:
         expose_headers=["*"],
         max_age=600,  # Cache preflight for 10 minutes
     )
+
+    @app.middleware("http")
+    async def protect_mutating_endpoints(request: Request, call_next):
+        """Require API key for all mutating requests unless explicitly public."""
+        from .auth import requires_auth, get_api_key
+
+        if requires_auth(request.method, request.url.path):
+            api_key = request.headers.get("X-API-Key") or request.query_params.get("api_key")
+            if not api_key:
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Authentication required"},
+                )
+            if api_key != get_api_key():
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": "Invalid API key"},
+                )
+        return await call_next(request)
     
     # Register routers
     from .routes import activity, backtest, bot_status, news, silver, goal, crypto, scaling, session, precious_metals, learning, orders, intelligence
@@ -751,7 +777,7 @@ def _sync_bot_services_to_api(bot):
 app = create_app()
 
 
-@app.post("/api/admin/reset-daily-risk")
+@app.post("/api/admin/reset-daily-risk", dependencies=[Depends(RequireAuth())])
 async def reset_daily_risk():
     """Reset the daily risk counter so new trades can be placed."""
     if not _bot_instance or not hasattr(_bot_instance, 'risk_manager'):

@@ -905,7 +905,7 @@ class MT5Client:
                 bars = []
                 for bar in result:
                     bars.append({
-                        'time': datetime.fromtimestamp(bar['time']).isoformat(),
+                        'time': datetime.fromtimestamp(bar['time'], tz=timezone.utc).isoformat(),
                         'open': float(bar['open']),
                         'high': float(bar['high']),
                         'low': float(bar['low']),
@@ -973,7 +973,7 @@ class MT5Client:
                 bars = []
                 for bar in result:
                     bars.append({
-                        'time': datetime.fromtimestamp(bar['time']).isoformat(),
+                        'time': datetime.fromtimestamp(bar['time'], tz=timezone.utc).isoformat(),
                         'open': float(bar['open']),
                         'high': float(bar['high']),
                         'low': float(bar['low']),
@@ -1354,8 +1354,8 @@ class MT5Client:
                     }
                 
                 if result.retcode == mt5.TRADE_RETCODE_DONE or (is_pending and result.retcode == mt5.TRADE_RETCODE_PLACED):
-                    # For pending orders, the ticket is result.order (deal may be 0)
-                    ticket = result.deal if not is_pending else (result.order or result.deal)
+                    # Pending: order ticket. Market: position ticket (order), not deal ticket.
+                    ticket = result.order or result.deal
                     # Partial fill detection
                     fill_volume = result.volume if result.volume else volume
                     if abs(fill_volume - volume) > 0.001:
@@ -1770,7 +1770,7 @@ class MT5Client:
                     profit=pos.profit,
                     magic=pos.magic,
                     comment=pos.comment,
-                    time=datetime.fromtimestamp(pos.time)
+                    time=datetime.fromtimestamp(pos.time, tz=timezone.utc)
                 ))
             
             return positions
@@ -1889,7 +1889,7 @@ class MT5Client:
                     'ticket': deal.ticket,
                     'deal': deal.deal if hasattr(deal, 'deal') else deal.ticket,
                     'order': deal.order,
-                    'time': datetime.fromtimestamp(deal.time),
+                    'time': datetime.fromtimestamp(deal.time, tz=timezone.utc),
                     'type': 'buy' if deal.type == 0 else 'sell' if deal.type == 1 else str(deal.type),
                     'entry': deal.entry,  # 0=in, 1=out, 2=inout, 3=state
                     'position_id': deal.position_id,
@@ -1963,8 +1963,8 @@ class MT5Client:
             for o in orders:
                 order_dict = {
                     'ticket': o.ticket,
-                    'time_setup': datetime.fromtimestamp(o.time_setup) if o.time_setup else None,
-                    'time_done': datetime.fromtimestamp(o.time_done) if o.time_done else None,
+                    'time_setup': datetime.fromtimestamp(o.time_setup, tz=timezone.utc) if o.time_setup else None,
+                    'time_done': datetime.fromtimestamp(o.time_done, tz=timezone.utc) if o.time_done else None,
                     'type': int(o.type),
                     'state': int(o.state),
                     'position_id': o.position_id,
@@ -1989,6 +1989,47 @@ class MT5Client:
             traceback.print_exc()
             return []
     
+    @staticmethod
+    def _to_utc_datetime(timestamp: float) -> datetime:
+        """Convert broker epoch seconds to aware UTC datetime."""
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+
+    async def _resolve_position_ticket_from_history(
+        self,
+        symbol: str,
+        order_ticket: int,
+        deal_ticket: Optional[int] = None,
+    ) -> Optional[int]:
+        """Resolve actual position ticket from broker order/deal history."""
+        try:
+            if self._use_simulation:
+                return order_ticket
+
+            history = await self.get_history_orders(
+                start_time=datetime.now(timezone.utc) - timedelta(hours=24),
+                end_time=datetime.now(timezone.utc),
+                ticket=order_ticket,
+            )
+            for order in history:
+                position_id = order.get("position_id")
+                if position_id:
+                    return int(position_id)
+        except Exception as exc:
+            logger.debug(f"Could not resolve position ticket for order {order_ticket}: {exc}")
+        return order_ticket
+
+    async def resolve_fill_position_ticket(
+        self,
+        symbol: str,
+        order_ticket: int,
+        deal_ticket: Optional[int] = None,
+    ) -> int:
+        """Return broker position identity for a market fill (not the order ticket)."""
+        resolved = await self._resolve_position_ticket_from_history(
+            symbol, order_ticket, deal_ticket
+        )
+        return resolved or order_ticket
+
     async def health_check(self) -> Dict[str, Any]:
         """
         Check MT5 connection health.

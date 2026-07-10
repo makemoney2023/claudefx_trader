@@ -31,6 +31,7 @@ out/
 # IDE / OS
 # ===========================
 .DS_Store
+._*
 Thumbs.db
 .vscode/
 .idea/

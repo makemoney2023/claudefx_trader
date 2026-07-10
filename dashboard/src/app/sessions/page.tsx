@@ -1,33 +1,33 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import { api } from '@/lib/api'
+import { api, type SessionStats, type SessionStatsResponse, type CurrentSessionResponse } from '@/lib/api'
 import { Clock, TrendingUp, TrendingDown, Sun, Moon, Sunrise } from 'lucide-react'
-
-interface SessionStats {
-  total_trades: number
-  wins: number
-  losses: number
-  win_rate: number
-  total_pnl: number
-  avg_r: number
-  best_trade_r: number
-  worst_trade_r: number
-}
 
 interface SessionSummary {
   total_trades: number
   total_pnl: number
-  sessions: Record<string, SessionStats>
+  sessions: SessionStatsResponse
   best_session: string | null
   worst_session: string | null
   recommendations: string[]
 }
 
-interface CurrentSessionResponse {
-  session: string
-  is_overlap: boolean
-  time_in_session: number
+function emptySessionStats(session: string): SessionStats {
+  return {
+    session,
+    total_trades: 0,
+    wins: 0,
+    losses: 0,
+    win_rate: 0,
+    total_pnl: 0,
+    total_r: 0,
+    avg_r: 0,
+    best_trade_r: 0,
+    worst_trade_r: 0,
+    expectancy: 0,
+    top_symbols: {},
+  }
 }
 
 export default function SessionsPage() {
@@ -40,7 +40,7 @@ export default function SessionsPage() {
     async function fetchData() {
       try {
         const [currentData] = await Promise.all([
-          api.getCurrentSession().catch(() => ({ session: 'off_hours', is_overlap: false, time_in_session: 0 }))
+          api.getCurrentSession().catch(() => ({ session: 'off_hours', is_overlap: false, is_off_hours: true }))
         ])
         
         // Try to get session stats
@@ -60,10 +60,11 @@ export default function SessionsPage() {
             total_trades: 0,
             total_pnl: 0,
             sessions: {
-              asian: { total_trades: 0, wins: 0, losses: 0, win_rate: 0, total_pnl: 0, avg_r: 0, best_trade_r: 0, worst_trade_r: 0 },
-              london: { total_trades: 0, wins: 0, losses: 0, win_rate: 0, total_pnl: 0, avg_r: 0, best_trade_r: 0, worst_trade_r: 0 },
-              new_york: { total_trades: 0, wins: 0, losses: 0, win_rate: 0, total_pnl: 0, avg_r: 0, best_trade_r: 0, worst_trade_r: 0 },
-              london_ny_overlap: { total_trades: 0, wins: 0, losses: 0, win_rate: 0, total_pnl: 0, avg_r: 0, best_trade_r: 0, worst_trade_r: 0 }
+              asian: emptySessionStats('asian'),
+              london: emptySessionStats('london'),
+              new_york: emptySessionStats('new_york'),
+              london_ny_overlap: emptySessionStats('london_ny_overlap'),
+              off_hours: emptySessionStats('off_hours'),
             },
             best_session: null,
             worst_session: null,
