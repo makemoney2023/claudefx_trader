@@ -336,6 +336,7 @@ class TestReversalDemotePolicy:
         )
         bot._place_market_with_final_risk = AsyncMock()
         bot._record_terminal_decision = AsyncMock(return_value="dec-id")
+        bot._check_drawdown_circuit_breaker = AsyncMock(return_value=False)
         return bot
 
     def _closed_position(self):

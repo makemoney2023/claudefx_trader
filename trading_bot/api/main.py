@@ -30,7 +30,7 @@ from ..config import settings
 from ..utils.logging import setup_logging, get_logger
 from .routes import trades, analysis, config, performance
 from .websocket import router as ws_router, broadcast_price_update, manager as ws_manager
-from .auth import get_api_key, is_protected_endpoint, RequireAuth, is_api_key_configured, api_key_fingerprint
+from .auth import get_api_key, is_protected_endpoint, RequireAuth, is_api_key_configured, api_key_fingerprint, verify_api_key
 
 logger = get_logger(__name__)
 
@@ -62,6 +62,11 @@ async def lifespan(app: FastAPI):
     # Startup
     setup_logging()
     logger.info("Starting ICT Trading Bot API Server")
+
+    from ..config import format_startup_config_banner
+    _config_banner = format_startup_config_banner()
+    if _config_banner:
+        logger.warning(_config_banner)
     
     from .database import init_db
     await init_db()
@@ -455,6 +460,15 @@ async def _run_bot_background():
         logger.error(f"Error in bot background task: {e}")
         import traceback
         traceback.print_exc()
+        try:
+            from ..utils.notifications import notify, NotificationType
+            await notify(
+                NotificationType.ERROR,
+                f"Bot background task crashed: {e}",
+                context="api._run_bot_background",
+            )
+        except Exception as notify_err:
+            logger.error(f"Failed to send bot crash notification: {notify_err}")
     finally:
         print("[BOT] Shutting down...", flush=True)
         if _bot_instance:
@@ -602,7 +616,7 @@ def create_app() -> FastAPI:
     
     # Debug endpoint for MT5 connection
     @app.get("/api/debug/mt5", tags=["Debug"])
-    async def debug_mt5():
+    async def debug_mt5(api_key: str = Depends(verify_api_key)):
         """Debug MT5 connection status."""
         from ..config import settings
         

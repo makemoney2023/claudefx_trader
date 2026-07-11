@@ -23,8 +23,19 @@ from ..utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+def get_database_path() -> Path:
+    """Resolve trading_bot.db relative to project root (Trading/), not CWD."""
+    project_root = Path(__file__).resolve().parent.parent.parent
+    return project_root / "trading_bot.db"
+
+
+def get_database_url() -> str:
+    """Build absolute SQLite URL for async SQLAlchemy engine."""
+    return f"sqlite+aiosqlite:///{get_database_path()}"
+
+
 # Database URL - using SQLite for simplicity, can upgrade to PostgreSQL
-DATABASE_URL = "sqlite+aiosqlite:///./trading_bot.db"
+DATABASE_URL = get_database_url()
 
 
 class Base(DeclarativeBase):
@@ -448,7 +459,7 @@ async_session = async_session_maker  # Another common alias
 
 def backup_database(max_backups: int = 7) -> Optional[Path]:
     """Create a timestamped backup of the trading database. Keeps the last `max_backups`."""
-    db_path = Path("trading_bot.db")
+    db_path = get_database_path()
     if not db_path.exists():
         return None
     backup_dir = Path("backups/db")

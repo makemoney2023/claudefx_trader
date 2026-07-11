@@ -22,6 +22,7 @@ class MockPosition:
     tp: float
     profit: float = 0.0
     time: datetime = None
+    comment: str = "ICT_Bot"
 
 
 @dataclass 

@@ -346,8 +346,15 @@ class TradingSettings(BaseSettings):
     )
     
     auto_start_bot: bool = Field(
-        default=True,
-        description="Auto-start the trading bot when the API server launches. Set False for backtest-only mode."
+        default=False,
+        description="Auto-start the trading bot when the API server launches. Set True to start on API boot."
+    )
+    demo_data_collection_mode: bool = Field(
+        default=False,
+        description=(
+            "Enable AGGRESSIVE scaling mode for demo data collection on live MT5. "
+            "Simulation mode always uses AGGRESSIVE. Leave False for production live accounts."
+        ),
     )
     symbols: List[str] = Field(
         default=["BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD"],

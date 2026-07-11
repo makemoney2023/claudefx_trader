@@ -327,6 +327,7 @@ class TestFastPendingCloseLifecycle:
             sl=1.0800,
             tp=1.0950,
             time=datetime.now(timezone.utc),
+            comment="ICT_Bot",
         )
         mt5 = AsyncMock()
         mt5.is_simulation = True

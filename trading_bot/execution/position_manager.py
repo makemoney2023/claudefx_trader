@@ -491,6 +491,13 @@ class PositionManager:
             for mt5_pos in mt5_positions:
                 ticket = mt5_pos.ticket
                 if ticket not in self.positions:
+                    mt5_comment = getattr(mt5_pos, 'comment', '') or ''
+                    if 'ICT_Bot' not in mt5_comment:
+                        logger.info(
+                            f"Skipping MT5 position {ticket} ({mt5_pos.symbol}) during sync — "
+                            f"not bot-placed (comment='{mt5_comment}')"
+                        )
+                        continue
                     logger.warning(f"Position {ticket} in MT5 but not tracked - adding to tracking")
                     _mt5_time = getattr(mt5_pos, 'time', None)
                     if isinstance(_mt5_time, datetime):

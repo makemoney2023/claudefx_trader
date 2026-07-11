@@ -239,6 +239,20 @@ class MT5Client:
                         # Check if already logged in to any account
                         account_info = await asyncio.to_thread(mt5.account_info)
                         if account_info and account_info.login > 0:
+                            configured_login = int(settings.mt5.login or 0)
+                            if configured_login > 0 and account_info.login != configured_login:
+                                error = await asyncio.to_thread(mt5.last_error)
+                                logger.error(
+                                    f"MT5 terminal logged into account {account_info.login} "
+                                    f"but MT5_LOGIN is configured as {configured_login}. "
+                                    f"Refusing connection to prevent trading on wrong account."
+                                )
+                                if error:
+                                    logger.error(f"MT5 last_error: {error}")
+                                await asyncio.to_thread(mt5.shutdown)
+                                self._connected = False
+                                self._use_simulation = False
+                                return False
                             self._use_simulation = False
                             self.login = account_info.login
                             self.server = account_info.server
@@ -281,6 +295,14 @@ class MT5Client:
         account = await self.get_account_info()
         
         if account:
+            configured_login = int(settings.mt5.login or 0)
+            if configured_login > 0 and account.login != configured_login:
+                logger.error(
+                    f"MT5 account mismatch after connect: terminal={account.login}, "
+                    f"configured={configured_login}. Connection rejected."
+                )
+                self._connected = False
+                return False
             self._connected = True
             logger.info(
                 f"MT5 {'(Simulated)' if self._use_simulation else ''}: "

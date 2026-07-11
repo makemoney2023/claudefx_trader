@@ -359,6 +359,11 @@ class TradingBot:
             import sys as _sys
             print("[INIT] Starting initialization...", flush=True)
             logger.info("Initializing ICT Trading Bot...")
+
+            from .config import format_startup_config_banner
+            _config_banner = format_startup_config_banner()
+            if _config_banner:
+                logger.warning(_config_banner)
             
             # Ensure single instance
             print("[INIT] Acquiring instance lock...", flush=True)
@@ -545,14 +550,16 @@ class TradingBot:
                 max_daily_drawdown=settings.trading.max_daily_drawdown,  # 3% from config
                 max_weekly_drawdown=settings.trading.max_weekly_drawdown,  # 6% from config
             )
-            # Demo account: AGGRESSIVE mode for maximum data collection
-            # AGGRESSIVE LOCK prevents performance rules from downgrading;
-            # only drawdown protections can override
+            # Demo/simulation or explicit demo-data flag: AGGRESSIVE mode for data collection.
+            # Live production accounts stay at NORMAL unless TRADING_DEMO_DATA_COLLECTION=true.
             from .services.scaling_manager import TradingMode
-            self.scaling_manager.current_mode = TradingMode.AGGRESSIVE
-            logger.info("Scaling mode set to AGGRESSIVE (demo data collection)")
-            from .api.routes.activity import add_activity
-            add_activity("mode_change", "Trading mode set to AGGRESSIVE (init)", details={"mode": "AGGRESSIVE", "reason": "demo data collection"})
+            if self._should_use_aggressive_data_collection():
+                self.scaling_manager.current_mode = TradingMode.AGGRESSIVE
+                logger.info("Scaling mode set to AGGRESSIVE (demo data collection)")
+                from .api.routes.activity import add_activity
+                add_activity("mode_change", "Trading mode set to AGGRESSIVE (init)", details={"mode": "AGGRESSIVE", "reason": "demo data collection"})
+            else:
+                logger.info("Scaling mode left at NORMAL (live/production account)")
             
             # Session Analytics - track performance by session
             logger.info("Initializing session analytics...")
@@ -5468,17 +5475,38 @@ class TradingBot:
                             )
                 else:
                     logger.error(f"✗ Trade execution failed for {symbol}: {result.message}")
-                    await self._record_terminal_decision(
-                        "execution_failure",
-                        symbol,
+                    reconciled_ticket = await self._reconcile_fill_after_ambiguous_order(
+                        symbol=symbol,
                         direction=trade_signal.direction,
-                        entry=trade_signal.entry_price or current_price,
-                        sl=trade_signal.stop_loss or 0.0,
-                        tp=trade_signal.take_profit or 0.0,
-                        confidence=trade_signal.confidence,
-                        reason=result.message or "broker rejected order",
+                        lots=position_size.lots,
+                        reservation=_trade_reservation,
+                        stop_loss=_final_sl or 0.0,
+                        take_profit=_final_tp or 0.0,
                     )
-                    self._release_trade_reservation(_trade_reservation)
+                    if reconciled_ticket:
+                        logger.warning(
+                            f"[RECONCILE] {symbol}: execution reported failure but position "
+                            f"{reconciled_ticket} found in MT5 — reservation retained"
+                        )
+                        from .api.routes.activity import add_activity
+                        add_activity(
+                            "reconcile_fill",
+                            f"Recovered ambiguous fill for {symbol} (ticket={reconciled_ticket})",
+                            symbol,
+                            {"ticket": reconciled_ticket, "reason": result.message},
+                        )
+                    else:
+                        await self._record_terminal_decision(
+                            "execution_failure",
+                            symbol,
+                            direction=trade_signal.direction,
+                            entry=trade_signal.entry_price or current_price,
+                            sl=trade_signal.stop_loss or 0.0,
+                            tp=trade_signal.take_profit or 0.0,
+                            confidence=trade_signal.confidence,
+                            reason=result.message or "broker rejected order",
+                        )
+                        self._release_trade_reservation(_trade_reservation)
                     
                     # Log error to activity feed
                     from .api.routes.activity import add_activity
@@ -5886,6 +5914,8 @@ class TradingBot:
             result = await self.order_manager.close_position(pos.ticket)
             
             if result.success:
+                pos.closed_profit_loss = weakest["pnl"]
+                await self._handle_position_close(pos)
                 self.position_manager.remove_position(pos.ticket)
                 
                 # Notify on Telegram
@@ -6397,9 +6427,10 @@ class TradingBot:
             current_value = account.equity
             
             daily_drawdown = 0.0
-            if self._daily_start_balance > 0:
-                daily_drawdown = (self._daily_start_balance - current_value) / self._daily_start_balance
-                daily_drawdown = max(0.0, daily_drawdown)  # Clamp: profit is not drawdown
+            if self.scaling_manager:
+                self.scaling_manager.update_equity(current_value)
+                daily_drawdown = self.scaling_manager.calculate_daily_drawdown(current_value)
+                daily_drawdown = max(0.0, daily_drawdown)
             
             weekly_drawdown = 0.0
             if self.scaling_manager:
@@ -7892,6 +7923,74 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
         return datetime.now(timezone.utc) - self._last_history_sync >= self._history_sync_interval
 
 
+    def _should_use_aggressive_data_collection(self) -> bool:
+        """AGGRESSIVE scaling only for simulation or explicit demo-data flag."""
+        if not self.mt5_client:
+            return False
+        return bool(
+            self.mt5_client.is_simulation
+            or settings.trading.demo_data_collection_mode
+        )
+
+    async def _reconcile_fill_after_ambiguous_order(
+        self,
+        *,
+        symbol: str,
+        direction: str,
+        lots: float,
+        reservation=None,
+        stop_loss: float = 0.0,
+        take_profit: float = 0.0,
+    ) -> Optional[int]:
+        """
+        After a timed-out or ambiguous broker response, check MT5 for a filled position.
+        If found, track it and transfer the reservation instead of releasing the slot.
+        """
+        if not self.mt5_client or not self.position_manager:
+            return None
+
+        try:
+            mt5_positions = await self.mt5_client.get_positions(symbol=symbol)
+        except Exception as exc:
+            logger.warning(f"[RECONCILE] {symbol}: could not query MT5 positions — {exc}")
+            return None
+
+        expected_type = "buy" if direction == "long" else "sell"
+        volume_tolerance = max(0.001, lots * 0.05)
+
+        for mt5_pos in mt5_positions or []:
+            comment = getattr(mt5_pos, "comment", "") or ""
+            if "ICT_Bot" not in comment:
+                continue
+            if mt5_pos.type != expected_type:
+                continue
+            if abs(mt5_pos.volume - lots) > volume_tolerance:
+                continue
+            if mt5_pos.ticket in self.position_manager.positions:
+                continue
+
+            position = Position(
+                ticket=mt5_pos.ticket,
+                symbol=mt5_pos.symbol,
+                direction=direction,
+                volume=mt5_pos.volume,
+                entry_price=mt5_pos.price_open,
+                stop_loss=mt5_pos.sl or stop_loss or mt5_pos.price_open,
+                take_profit=mt5_pos.tp or take_profit or 0.0,
+                open_time=getattr(mt5_pos, "time", None) or datetime.now(timezone.utc),
+                reservation_id=getattr(reservation, "reservation_id", None),
+            )
+            self.position_manager.add_position(position)
+            if reservation and hasattr(self, "reservation_ledger") and self.reservation_ledger:
+                self.reservation_ledger.transfer_to_position(reservation, mt5_pos.ticket)
+            logger.warning(
+                f"[RECONCILE] {symbol}: recovered ambiguous fill as position {mt5_pos.ticket} "
+                f"({direction} {mt5_pos.volume} lots)"
+            )
+            return mt5_pos.ticket
+
+        return None
+
     def _release_trade_reservation(self, reservation) -> None:
         if reservation and hasattr(self, 'reservation_ledger') and self.reservation_ledger:
             if self.reservation_ledger.release(reservation):
@@ -8454,6 +8553,12 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
         _reversal_reservation = None
         
         try:
+            if await self._check_drawdown_circuit_breaker():
+                logger.info(
+                    f"[REVERSAL] {symbol}: Skipping — drawdown kill-switch active"
+                )
+                return
+
             # ---- Safeguard 1: Per-symbol reversal cooldown (1 hour) ----
             if not hasattr(self, '_reversal_cooldowns'):
                 self._reversal_cooldowns = {}

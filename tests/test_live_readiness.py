@@ -77,31 +77,34 @@ class TestPositionOrderTicket:
 class TestDatabaseBackup:
 
     def test_backup_returns_none_when_no_db(self, tmp_path, monkeypatch):
-        monkeypatch.chdir(tmp_path)
-        from trading_bot.api.database import backup_database
-        result = backup_database()
+        import trading_bot.api.database as db_module
+
+        monkeypatch.setattr(db_module, "get_database_path", lambda: tmp_path / "trading_bot.db")
+        result = db_module.backup_database()
         assert result is None
 
     def test_backup_creates_copy(self, tmp_path, monkeypatch):
-        monkeypatch.chdir(tmp_path)
+        import trading_bot.api.database as db_module
+
         db_file = tmp_path / "trading_bot.db"
         db_file.write_text("test data")
-        from trading_bot.api.database import backup_database
-        result = backup_database()
+        monkeypatch.setattr(db_module, "get_database_path", lambda: db_file)
+        result = db_module.backup_database()
         assert result is not None
         assert result.exists()
         assert result.read_text() == "test data"
 
     def test_backup_prunes_old_copies(self, tmp_path, monkeypatch):
-        monkeypatch.chdir(tmp_path)
+        import trading_bot.api.database as db_module
+
         db_file = tmp_path / "trading_bot.db"
         db_file.write_text("data")
         backup_dir = tmp_path / "backups" / "db"
         backup_dir.mkdir(parents=True)
         for i in range(10):
             (backup_dir / f"trading_bot_2026010{i}_000000.db").write_text(f"old_{i}")
-        from trading_bot.api.database import backup_database
-        backup_database(max_backups=3)
+        monkeypatch.setattr(db_module, "get_database_path", lambda: db_file)
+        db_module.backup_database(max_backups=3)
         remaining = list(backup_dir.glob("trading_bot_*.db"))
         assert len(remaining) == 3
 

@@ -699,7 +699,7 @@ export const api = {
   // =========================================================================
 
   getMt5Debug: () =>
-    fetchApi<any>('/api/debug/mt5'),
+    fetchApi<any>('/api/debug/mt5', { requiresAuth: true }),
 
   getLearningRecent: (params?: { limit?: number; offset?: number; symbol?: string }) =>
     fetchApi<TradeLearning[]>('/api/learning/recent', { params }),
