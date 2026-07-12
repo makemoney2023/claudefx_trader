@@ -2,15 +2,27 @@
 Market Hours Utility.
 
 Handles market open/close times, weekends, and holidays.
+Session boundaries follow US/Eastern (NYSE) wall-clock times so DST is handled
+consistently with kill_zones.py and silver_bullet.py.
 """
 
 from datetime import datetime, time, timedelta, timezone
 from typing import Optional, Tuple
 from enum import Enum
 
+import pytz
+
 from .logging import get_logger
 
 logger = get_logger(__name__)
+
+NY_TZ = pytz.timezone("US/Eastern")
+
+# Wall-clock Eastern session boundaries (DST-aware via NY_TZ conversion)
+FOREX_OPEN = time(17, 0)   # Sunday 5 PM ET
+FOREX_CLOSE = time(17, 0)  # Friday 5 PM ET
+DAILY_BREAK_START = time(17, 0)  # Mon-Thu maintenance
+DAILY_BREAK_END = time(18, 0)
 
 
 class MarketType(Enum):
@@ -22,47 +34,11 @@ class MarketType(Enum):
     OIL = "oil"
 
 
-# Market hours in UTC
-MARKET_HOURS = {
-    MarketType.FOREX: {
-        # Forex: Sunday 22:00 UTC to Friday 22:00 UTC
-        "open_day": 6,  # Sunday
-        "open_time": time(22, 0),
-        "close_day": 4,  # Friday
-        "close_time": time(22, 0),
-    },
-    MarketType.CRYPTO: {
-        # Crypto: 24/7
-        "always_open": True
-    },
-    MarketType.METALS: {
-        # Similar to forex but with daily breaks
-        "open_day": 6,  # Sunday
-        "open_time": time(22, 0),
-        "close_day": 4,  # Friday
-        "close_time": time(22, 0),
-        "daily_break_start": time(22, 0),
-        "daily_break_end": time(23, 0),
-    },
-    MarketType.INDICES: {
-        # US indices: Sunday 23:00 UTC to Friday 22:00 UTC, daily break 22:00-23:00
-        "open_day": 6,  # Sunday
-        "open_time": time(23, 0),
-        "close_day": 4,  # Friday
-        "close_time": time(22, 0),
-        "daily_break_start": time(22, 0),
-        "daily_break_end": time(23, 0),
-    },
-    MarketType.OIL: {
-        # Oil: Sunday 23:00 UTC to Friday 22:00 UTC, daily break 22:00-23:00
-        "open_day": 6,  # Sunday
-        "open_time": time(23, 0),
-        "close_day": 4,  # Friday
-        "close_time": time(22, 0),
-        "daily_break_start": time(22, 0),
-        "daily_break_end": time(23, 0),
-    },
-}
+def _to_eastern(current_time: datetime) -> datetime:
+    """Convert any aware/naive UTC time to US/Eastern."""
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    return current_time.astimezone(NY_TZ)
 
 
 def get_market_type(symbol: str) -> MarketType:
@@ -120,37 +96,32 @@ def is_market_open(symbol: str, current_time: Optional[datetime] = None) -> Tupl
         current_time = datetime.now(timezone.utc)
     
     market_type = get_market_type(symbol)
-    hours = MARKET_HOURS[market_type]
     
     # Crypto is always open
-    if hours.get("always_open"):
+    if market_type == MarketType.CRYPTO:
         return True, "Crypto markets are 24/7"
     
-    weekday = current_time.weekday()
-    current_t = current_time.time()
+    et = _to_eastern(current_time)
+    weekday = et.weekday()
+    current_t = et.time()
     
     # Check weekend
     if weekday == 5:  # Saturday
         return False, "Market closed - Saturday"
     
     if weekday == 6:  # Sunday
-        if current_t < hours["open_time"]:
+        if current_t < FOREX_OPEN:
             return False, "Market closed - Sunday before open"
     
     if weekday == 4:  # Friday
-        if current_t >= hours["close_time"]:
+        if current_t >= FOREX_CLOSE:
             return False, "Market closed - Friday after close"
     
-    # Check daily break for metals, indices, and oil (Mon-Thu only, NOT on Sunday open)
+    # Daily break for metals, indices, and oil (Mon-Thu only, NOT on Sunday open)
     if market_type in (MarketType.METALS, MarketType.INDICES, MarketType.OIL):
-        break_start = hours.get("daily_break_start")
-        break_end = hours.get("daily_break_end")
-        if break_start and break_end:
-            # Daily break only applies Mon-Thu (weekday 0-3)
-            # Sunday (6) is market open, not a break
-            # Friday (4) is market close, handled above
-            if weekday <= 3 and break_start <= current_t <= break_end:
-                return False, "Market closed - daily maintenance break"
+        # Daily break only applies Mon-Thu (weekday 0-3)
+        if weekday <= 3 and DAILY_BREAK_START <= current_t <= DAILY_BREAK_END:
+            return False, "Market closed - daily maintenance break"
     
     return True, "Market is open"
 
@@ -164,7 +135,7 @@ def get_next_market_open(symbol: str, current_time: Optional[datetime] = None) -
         current_time: Current time (default: now UTC)
         
     Returns:
-        Datetime of next market open, or None if always open
+        Datetime of next market open (UTC), or None if always open
     """
     if current_time is None:
         current_time = datetime.now(timezone.utc)
@@ -174,34 +145,34 @@ def get_next_market_open(symbol: str, current_time: Optional[datetime] = None) -
     if market_type == MarketType.CRYPTO:
         return None  # Always open
     
-    hours = MARKET_HOURS[market_type]
-    
     is_open, _ = is_market_open(symbol, current_time)
     if is_open:
         return None  # Already open
     
-    weekday = current_time.weekday()
+    et = _to_eastern(current_time)
+    weekday = et.weekday()
     
-    # Calculate days until Sunday 22:00 UTC
+    # Calculate days until Sunday 17:00 ET
     if weekday == 5:  # Saturday
         days_ahead = 1  # Sunday
     elif weekday == 6:  # Sunday
-        if current_time.time() < hours["open_time"]:
+        if et.time() < FOREX_OPEN:
             days_ahead = 0  # Later today
         else:
             days_ahead = 7  # Next Sunday
-    else:  # Friday after close
-        days_ahead = 6 - weekday + 1  # Days to Sunday
+    else:  # Friday after close or other closed state
+        days_ahead = (6 - weekday) % 7
+        if days_ahead == 0:
+            days_ahead = 7
     
-    next_open = current_time + timedelta(days=days_ahead)
-    next_open = next_open.replace(
-        hour=hours["open_time"].hour,
-        minute=hours["open_time"].minute,
+    next_open_et = et + timedelta(days=days_ahead)
+    next_open_et = next_open_et.replace(
+        hour=FOREX_OPEN.hour,
+        minute=FOREX_OPEN.minute,
         second=0,
-        microsecond=0
+        microsecond=0,
     )
-    
-    return next_open
+    return next_open_et.astimezone(timezone.utc)
 
 
 def get_time_until_close(symbol: str, current_time: Optional[datetime] = None) -> Optional[timedelta]:
@@ -223,29 +194,28 @@ def get_time_until_close(symbol: str, current_time: Optional[datetime] = None) -
     if market_type == MarketType.CRYPTO:
         return None  # Always open
     
-    hours = MARKET_HOURS[market_type]
-    
     is_open, _ = is_market_open(symbol, current_time)
     if not is_open:
         return timedelta(0)  # Already closed
     
-    weekday = current_time.weekday()
+    et = _to_eastern(current_time)
+    weekday = et.weekday()
     
-    # Days until Friday
+    # Days until Friday close at 17:00 ET
     if weekday <= 4:
-        days_ahead = 4 - weekday  # Days to Friday
+        days_ahead = 4 - weekday
     else:
-        days_ahead = 4 + (7 - weekday)  # Days to next Friday
+        days_ahead = 4 + (7 - weekday)
     
-    close_time = current_time + timedelta(days=days_ahead)
-    close_time = close_time.replace(
-        hour=hours["close_time"].hour,
-        minute=hours["close_time"].minute,
+    close_et = et + timedelta(days=days_ahead)
+    close_et = close_et.replace(
+        hour=FOREX_CLOSE.hour,
+        minute=FOREX_CLOSE.minute,
         second=0,
-        microsecond=0
+        microsecond=0,
     )
     
-    return close_time - current_time
+    return close_et - et
 
 
 def should_avoid_new_trades(symbol: str, current_time: Optional[datetime] = None) -> Tuple[bool, str]:
@@ -275,9 +245,9 @@ def should_avoid_new_trades(symbol: str, current_time: Optional[datetime] = None
     if time_until_close < timedelta(hours=2):
         return True, f"Market closing in {time_until_close}"
     
-    # Avoid new trades on Friday afternoon
-    weekday = current_time.weekday()
-    if weekday == 4 and current_time.hour >= 18:  # Friday 6pm UTC
-        return True, "Friday evening - avoid new positions"
+    # Avoid new trades on Friday afternoon (after 2 PM ET)
+    et = _to_eastern(current_time)
+    if et.weekday() == 4 and et.hour >= 14:
+        return True, "Friday afternoon - avoid new positions"
     
     return False, "OK to trade"

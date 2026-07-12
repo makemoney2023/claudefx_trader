@@ -195,7 +195,8 @@ class Backtester:
                 current_bar['high'],
                 current_bar['low'],
                 current_bar['close'],
-                timestamp
+                timestamp,
+                bar_open=current_bar['open'],
             )
             
             # Track equity

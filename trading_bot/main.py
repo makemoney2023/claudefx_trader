@@ -47,10 +47,17 @@ from .execution.scaling_position_sizer import (
     ScalingPositionSizer,
     SetupGrade,
     enforce_final_risk_cap,
+    verify_post_sizing_risk,
 )
 from .services.news_service import NewsService
 from .services.correlation_service import CorrelationService
 from .services.trade_judge import JudgeOutcome, JudgeVerdict, run_trade_judge
+from .services.live_trade_gates import (
+    effective_max_daily_trades,
+    compute_booked_risk_percent,
+    news_allows_trading,
+    symbol_edge_allows_trading,
+)
 from .utils.win_optimization import apply_demote_policy, build_confidence_decision, classify_a_plus
 from .services.goal_tracker import GoalTracker
 from .services.scaling_manager import ScalingManager, TradingMode
@@ -1154,10 +1161,17 @@ class TradingBot:
                 _block_reason = "Daily profit target reached"
                 print("[CYCLE] BLOCKED for new trades: Daily profit target reached (positions still being managed)", flush=True)
             
-            # Check if we've hit daily trade limit
-            if not _blocked and self.daily_trades >= settings.trading.max_daily_trades:
+            # Check if we've hit daily trade limit (tier + mode caps, not config default alone)
+            _max_daily = settings.trading.max_daily_trades
+            try:
+                _limit_account = await self.mt5_client.get_account_info()
+                if _limit_account:
+                    _max_daily = self._effective_max_daily_trades(_limit_account.balance)
+            except Exception:
+                pass
+            if not _blocked and self.daily_trades >= _max_daily:
                 _blocked = True
-                _block_reason = f"Daily trade limit reached ({self.daily_trades}/{settings.trading.max_daily_trades})"
+                _block_reason = f"Daily trade limit reached ({self.daily_trades}/{_max_daily})"
                 print(f"[CYCLE] BLOCKED for new trades: {_block_reason} (positions still being managed)", flush=True)
             
             if _blocked:
@@ -1222,6 +1236,20 @@ class TradingBot:
                     if not cycle_symbols:
                         print("[CYCLE] BLOCKED: News blackout and no crypto symbols", flush=True)
                         return
+
+            # Fail-closed when economic calendar feed is stale/unreliable
+            if self.news_service and self.news_service.is_calendar_unreliable():
+                logger.warning(
+                    "News calendar UNKNOWN/stale — blocking all new trades until refreshed (fail-closed)"
+                )
+                from .api.routes.activity import add_activity
+                add_activity(
+                    "news_calendar_stale",
+                    "News calendar stale — fail-closed, no new trades",
+                    details={"fail_closed": True},
+                )
+                print("[CYCLE] BLOCKED: News calendar stale (fail-closed)", flush=True)
+                return
             
             # ============================================
             # STEP 2b: FRIDAY PRE-CLOSE (Weekend Gap Protection)
@@ -1623,6 +1651,32 @@ class TradingBot:
                     bot_state.error(symbol, f"BLOCKED: {symbol} is a dangerous BTC pair")
                     bot_state.symbol_complete(symbol, "blocked_btc_pair")
                 return
+
+            # Edge-health symbol blocking (per-symbol/session win-rate tracking)
+            if self.scaling_manager and self.kill_zone_checker:
+                _edge_session = self.kill_zone_checker.get_current_session()
+                _edge_key = self._session_key_for_edge(
+                    _edge_session.session_name if _edge_session else ""
+                )
+                _edge_ok, _edge_reason, _edge_mult = symbol_edge_allows_trading(
+                    self.scaling_manager, symbol, _edge_key
+                )
+                if not _edge_ok:
+                    logger.warning(f"[EDGE-HEALTH] {symbol}/{_edge_key}: {_edge_reason}")
+                    from .api.routes.activity import add_activity
+                    add_activity(
+                        "edge_health_blocked",
+                        f"{symbol}/{_edge_key}: {_edge_reason}",
+                        symbol=symbol,
+                        details={"session": _edge_key, "reason": _edge_reason},
+                    )
+                    if bot_state:
+                        bot_state.symbol_complete(symbol, "edge_health_blocked")
+                    return
+                if _edge_mult != 1.0:
+                    self._edge_size_multiplier = _edge_mult
+                else:
+                    self._edge_size_multiplier = 1.0
             
             # Gap 55: Block trading in simulation mode unless explicitly allowed
             if self.mt5_client.is_simulation:
@@ -3875,6 +3929,8 @@ class TradingBot:
                     logger.info(f"📊 Correlation adjustment: {symbol} size reduced to {size_multiplier*100:.0f}%")
             else:
                 size_multiplier = 1.0
+            _edge_mult = getattr(self, "_edge_size_multiplier", 1.0)
+            size_multiplier *= _edge_mult
             
             # ============================================
             # PRE-LOCK: Get Claude's position size recommendation OUTSIDE the trade lock
@@ -3921,9 +3977,15 @@ class TradingBot:
             
             # Gap 20: Acquire trade lock to prevent race conditions
             async with self._trade_lock:
-                # Re-check daily trade limit under lock
-                if self.daily_trades >= settings.trading.max_daily_trades:
-                    logger.info(f"Daily trade limit reached ({self.daily_trades}/{settings.trading.max_daily_trades})")
+                account_info = await self.mt5_client.get_account_info()
+                if not account_info:
+                    logger.error("Failed to get account info")
+                    return
+
+                # Re-check daily trade limit under lock (tier + mode caps)
+                _max_daily = self._effective_max_daily_trades(account_info.balance)
+                if self.daily_trades >= _max_daily:
+                    logger.info(f"Daily trade limit reached ({self.daily_trades}/{_max_daily})")
                     return
                 
                 # Reserve this trade slot immediately to prevent over-execution
@@ -3933,15 +3995,9 @@ class TradingBot:
                     risk_percent=0.0,
                 )
                 _trade_reservation = await _trade_reservation_context.__aenter__()
-                logger.info(f"Trade slot reserved ({self.daily_trades}/{settings.trading.max_daily_trades})")
+                logger.info(f"Trade slot reserved ({self.daily_trades}/{_max_daily})")
                 
-                # Get account info for position sizing (fresh, under lock)
-                account_info = await self.mt5_client.get_account_info()
-                if not account_info:
-                    logger.error("Failed to get account info")
-                    self._release_trade_reservation(_trade_reservation)
-                    return
-                
+                _conf_used_for_sizing = trade_signal.confidence
                 # Calculate position size with scaling
                 size_result = self.position_sizer.calculate_position_size(
                     equity=account_info.balance,
@@ -4031,7 +4087,9 @@ class TradingBot:
                     direction=_val_dir,
                     symbol=symbol,
                     account_balance=account_info.balance,
-                    actual_risk_pct=size_result.risk_percent,  # Use actual scaled risk, not default
+                    actual_risk_pct=compute_booked_risk_percent(
+                        final_lots, _val_entry, _val_sl, symbol, account_info.balance
+                    ) or size_result.risk_percent,
                     trade_type=getattr(trade_signal, 'trade_type', 'intraday')
                 )
                 
@@ -4280,6 +4338,56 @@ class TradingBot:
                             trade_signal.confidence = min(0.95, trade_signal.confidence + 0.1)
                             logger.info(f"🔄 Breaker Block entry - A+ setup! Confidence: {trade_signal.confidence:.0%}")
                             break
+
+                # Re-size with post-modifier confidence so judge and sizing agree
+                if abs(trade_signal.confidence - _conf_used_for_sizing) > 0.001:
+                    if trade_signal.confidence >= 0.85:
+                        setup_grade = SetupGrade.A_PLUS
+                    elif trade_signal.confidence >= 0.75:
+                        setup_grade = SetupGrade.A
+                    elif trade_signal.confidence >= 0.65:
+                        setup_grade = SetupGrade.B
+                    else:
+                        setup_grade = SetupGrade.C
+                    size_result = self.position_sizer.calculate_position_size(
+                        equity=account_info.balance,
+                        entry_price=trade_signal.entry_price or current_price,
+                        stop_loss=trade_signal.stop_loss,
+                        symbol=symbol,
+                        confidence=trade_signal.confidence,
+                        setup_grade=setup_grade,
+                        win_streak=self.win_streak,
+                        loss_streak=self.loss_streak,
+                        current_exposure_lots=self._get_current_exposure_lots(),
+                        correlation_multiplier=size_multiplier,
+                        claude_recommendation=claude_size_rec,
+                        confluence_count=confluence_count or 0,
+                    )
+                    final_lots = size_result.lots
+                    if is_crypto and self.crypto_analyzer:
+                        crypto_adj = self.crypto_analyzer.get_position_size_adjustment(symbol, final_lots)
+                        from .config import normalize_lots as _norm_crypto
+                        final_lots = _norm_crypto(symbol, crypto_adj)
+                    if self.scaling_manager:
+                        mode_config = self.scaling_manager.get_mode_config()
+                        risk_mult = getattr(mode_config, 'risk_multiplier', 1.0)
+                        if risk_mult != 1.0:
+                            from .config import normalize_lots as _norm_scale
+                            final_lots = _norm_scale(symbol, final_lots * risk_mult)
+                    if self.news_service:
+                        try:
+                            _news_mult, _ = self.news_service.should_reduce_size(symbol)
+                            if _news_mult < 1.0:
+                                from .config import normalize_lots as _norm_news2
+                                final_lots = _norm_news2(symbol, final_lots * _news_mult)
+                        except Exception:
+                            pass
+                    position_size.lots = final_lots
+                    logger.info(
+                        f"[CONF-RESIZE] {symbol}: lots re-sized after confidence "
+                        f"{_conf_used_for_sizing:.0%} -> {trade_signal.confidence:.0%} "
+                        f"({final_lots} lots)"
+                    )
                 
                 # FINAL SAFETY CHECK before execution
                 # Block if position size is 0 (blocked pair) or symbol is dangerous
@@ -5030,6 +5138,31 @@ class TradingBot:
                 from .config import get_symbol_spec as _gss_final
                 _final_spec = _gss_final(symbol)
                 _final_entry = trade_signal.entry_price or current_price
+
+                _verified_lots, _, _verify_reason = verify_post_sizing_risk(
+                    final_lots=position_size.lots,
+                    target_lots=size_result.lots,
+                    entry_price=_final_entry,
+                    stop_loss=_final_sl,
+                    symbol=symbol,
+                )
+                if _verify_reason:
+                    logger.warning(f"[POST-SIZING] {symbol}: blocked — {_verify_reason}")
+                    await self._reject_and_record(
+                        _trade_reservation,
+                        "mechanical_reject",
+                        symbol,
+                        gate_id="post_sizing_risk",
+                        direction=trade_signal.direction,
+                        entry=_final_entry,
+                        sl=_final_sl or 0.0,
+                        tp=_final_tp or 0.0,
+                        confidence=trade_signal.confidence,
+                        reason=_verify_reason,
+                    )
+                    return
+                position_size.lots = _verified_lots
+
                 _final_lots, _, _final_risk_reason = self._enforce_final_risk_before_order(
                     symbol=symbol,
                     entry=_final_entry,
@@ -5242,11 +5375,19 @@ class TradingBot:
                     )
                 
                 if result.success:
-                    _risk_pct = (
-                        size_result.risk_percent
-                        if hasattr(size_result, 'risk_percent')
-                        else self.risk_manager.risk_per_trade
+                    _risk_pct = compute_booked_risk_percent(
+                        position_size.lots,
+                        _final_entry,
+                        _final_sl,
+                        symbol,
+                        account_info.balance,
                     )
+                    if _risk_pct <= 0:
+                        _risk_pct = (
+                            size_result.risk_percent
+                            if hasattr(size_result, 'risk_percent')
+                            else self.risk_manager.risk_per_trade
+                        )
                     if _trade_reservation:
                         _trade_reservation.risk_percent = _risk_pct
                         self.reservation_ledger.commit_risk(_trade_reservation)
@@ -6317,6 +6458,29 @@ class TradingBot:
             learning_context,
             timeout=8.0,
         )
+
+    def _effective_max_daily_trades(self, equity: float) -> int:
+        """Min of tier, scaling-mode, and config daily trade caps."""
+        return effective_max_daily_trades(
+            equity,
+            self.position_sizer,
+            self.scaling_manager,
+            settings.trading.max_daily_trades,
+        )
+
+    @staticmethod
+    def _session_key_for_edge(session_name: str) -> str:
+        """Map kill-zone session label to scaling_manager session key."""
+        name = (session_name or "").lower()
+        if "london close" in name:
+            return "london_close"
+        if "london" in name:
+            return "london"
+        if "new york" in name or name.startswith("ny"):
+            return "new_york"
+        if "asian" in name:
+            return "asian"
+        return "unknown"
 
     def _apply_judge_outcome(self, outcome: JudgeOutcome, reservation=None) -> bool:
         """Release reservation and block when judge is unavailable/reject."""

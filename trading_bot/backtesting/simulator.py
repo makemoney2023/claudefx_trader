@@ -198,7 +198,8 @@ class OrderSimulator:
         high: float,
         low: float,
         close: float,
-        timestamp: datetime
+        timestamp: datetime,
+        bar_open: Optional[float] = None,
     ) -> List[SimulatedPosition]:
         """
         Update positions with new price data and check for SL/TP hits.
@@ -223,25 +224,23 @@ class OrderSimulator:
             
             exit_price = None
             exit_reason = ""
-            
-            if position.direction == "long":
-                # Check stop loss
-                if low <= position.stop_loss:
-                    exit_price = position.stop_loss
-                    exit_reason = "stop_loss"
-                # Check take profit
-                elif high >= position.take_profit:
-                    exit_price = position.take_profit
-                    exit_reason = "take_profit"
-            else:  # short
-                # Check stop loss
-                if high >= position.stop_loss:
-                    exit_price = position.stop_loss
-                    exit_reason = "stop_loss"
-                # Check take profit
-                elif low <= position.take_profit:
-                    exit_price = position.take_profit
-                    exit_reason = "take_profit"
+
+            from ..services.gate_funnel import resolve_same_bar_tp_sl
+
+            sl_hit, tp_hit = resolve_same_bar_tp_sl(
+                position.direction,
+                float(bar_open if bar_open is not None else close),
+                high,
+                low,
+                position.stop_loss,
+                position.take_profit,
+            )
+            if sl_hit:
+                exit_price = position.stop_loss
+                exit_reason = "stop_loss"
+            elif tp_hit:
+                exit_price = position.take_profit
+                exit_reason = "take_profit"
             
             if exit_price:
                 position = self._close_position(

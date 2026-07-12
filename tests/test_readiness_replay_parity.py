@@ -230,7 +230,7 @@ class TestBacktesterExecutionPolicyMetrics:
     def test_evaluate_replay_signal_populates_policy_metrics(self):
         from trading_bot.backtesting.replay import ClaudeReplayBacktester
 
-        bt = ClaudeReplayBacktester()
+        bt = ClaudeReplayBacktester(auto_approve_judge=True)
         replay_sig = _signal()
         future = FIXTURE_APPROVE_WIN
 
@@ -249,7 +249,7 @@ class TestBacktesterExecutionPolicyMetrics:
     def test_backtester_result_tracks_separate_policy_totals(self):
         from trading_bot.backtesting.replay import ClaudeReplayBacktester, ReplayResult
 
-        bt = ClaudeReplayBacktester()
+        bt = ClaudeReplayBacktester(auto_approve_judge=True)
         result = ReplayResult(
             symbol="EURUSD",
             start_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
@@ -277,3 +277,20 @@ class TestBacktesterExecutionPolicyMetrics:
         assert result.execution_policy_trades == 1
         assert result.execution_policy_total_r != result.strategy_total_r or result.total_trades == 1
         assert result.strategy_total_r == pytest.approx(strategy_trade.r_multiple)
+
+    def test_default_replay_judge_rejects_without_opt_in(self):
+        from trading_bot.backtesting.replay import ClaudeReplayBacktester
+
+        bt = ClaudeReplayBacktester()
+        replay_sig = _signal()
+        future = FIXTURE_APPROVE_WIN
+
+        _, policy_result = bt._evaluate_replay_signal(
+            replay_sig,
+            future,
+            current_price=1.0850,
+            pip_size=0.0001,
+        )
+
+        assert policy_result.execution_blocked is True
+        assert policy_result.execution_trade is None

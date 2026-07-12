@@ -133,17 +133,24 @@ class ClaudeReplayBacktester:
     # Approximate cost per API call (Opus 4.5 with images)
     COST_PER_CALL = 0.08
 
-    def __init__(self, claude_client=None, mt5_client=None, trade_learning_service=None):
+    def __init__(self, claude_client=None, mt5_client=None, trade_learning_service=None, *, auto_approve_judge: bool = False):
         self._claude = claude_client
         self._data_loader = HistoricalDataLoader(mt5_client)
         self._chart_gen = None
         self._learning_service = trade_learning_service
+        self._auto_approve_judge = auto_approve_judge
         from ..services.trade_judge import JudgeOutcome, JudgeVerdict
 
-        self._default_judge_outcome = JudgeOutcome(
-            verdict=JudgeVerdict.APPROVE,
-            reason="replay baseline",
-        )
+        if auto_approve_judge:
+            self._default_judge_outcome = JudgeOutcome(
+                verdict=JudgeVerdict.APPROVE,
+                reason="replay baseline auto-approve (explicit opt-in)",
+            )
+        else:
+            self._default_judge_outcome = JudgeOutcome(
+                verdict=JudgeVerdict.REJECT,
+                reason="replay requires judge invocation (no auto-approve)",
+            )
 
     def _evaluate_replay_signal(
         self,
