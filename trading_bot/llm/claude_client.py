@@ -1192,6 +1192,28 @@ Unicorn/Breaker setups, buy_stop/sell_stop breakouts):
 """
             
             # =============================================
+            # MECHANICAL ICT BASELINE (rule-based advisory)
+            # =============================================
+            
+            if market_data.get('mechanical_ict_setup'):
+                mech = market_data['mechanical_ict_setup']
+                mech_zone = mech.get('entry_zone') or {}
+                prompt += f"""
+## Mechanical ICT Baseline (rule-based scan — advisory only)
+A deterministic ICT ruleset (H4 trend + liquidity sweep + FVG/OB entry zone) independently found this setup:
+- Direction: {str(mech.get('direction', 'N/A')).upper()}
+- Confidence: {mech.get('confidence', 0):.0%} | R:R: {mech.get('risk_reward', 0):.2f}
+- Entry zone: {mech_zone.get('low', 'N/A')} - {mech_zone.get('high', 'N/A')} (optimal: {mech_zone.get('optimal', 'N/A')})
+- SL: {mech.get('stop_loss', 'N/A')} | TP1: {mech.get('take_profit_1', 'N/A')}
+- Basis: {mech.get('entry_reason', 'N/A')} | HTF structure: {mech.get('market_structure', 'N/A')}
+
+Treat this as one additional confluence input, NOT an instruction:
+- If your read AGREES with the mechanical baseline, that is meaningful confluence.
+- If you DISAGREE, explicitly state in your reasoning why the mechanical read is wrong
+  (e.g. stale zone, sweep not confirmed, structure shifted since).
+"""
+            
+            # =============================================
             # 100-PIP EXPANSION CONTEXT
             # =============================================
             

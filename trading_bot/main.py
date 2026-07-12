@@ -443,12 +443,16 @@ class TradingBot:
             ob_detector = OrderBlockDetector()
             liquidity_mapper = LiquidityMapper()
             
-            # Initialize strategy
+            # Initialize strategy (advisory baseline — see _mechanical_setup_advisory).
+            # Pass a session-configured checker so its session gate matches the bot's.
             self.strategy = ICTStrategy(
                 structure_analyzer=market_structure,
                 fvg_detector=fvg_detector,
                 ob_detector=ob_detector,
-                liquidity_mapper=liquidity_mapper
+                liquidity_mapper=liquidity_mapper,
+                kill_zone_checker=KillZoneChecker(
+                    allowed_sessions=settings.trading.allowed_sessions
+                )
             )
             
             # Initialize execution components
@@ -1552,6 +1556,31 @@ class TradingBot:
                     },
                 )
 
+    def _mechanical_setup_advisory(self, symbol: str, htf_df, ltf_df):
+        """
+        Run the rule-based ICTStrategy as an advisory cross-check.
+
+        This NEVER drives execution. The setup (if any) is added to Claude's
+        context as a mechanical baseline, and mechanical-vs-Claude agreement
+        is logged so the LLM's value-add over pure rules can be measured.
+        """
+        if not self.strategy or htf_df is None or ltf_df is None:
+            return None
+        try:
+            # ICTStrategy's SL buffer logic reads df.attrs['symbol']
+            ltf_df.attrs['symbol'] = symbol
+            setup = self.strategy.analyze(
+                htf_data=htf_df,
+                ltf_data=ltf_df,
+                symbol=symbol,
+                htf_name='H4',
+                ltf_name=settings.timeframes.execution_tf,
+            )
+            return setup.to_dict() if setup else None
+        except Exception as e:
+            logger.debug(f"[MECH] ICTStrategy advisory failed for {symbol}: {e}")
+            return None
+
     async def _analyze_and_trade(self, symbol: str, is_crypto: bool = False):
         """
         Analyze a symbol and execute trade if valid setup found.
@@ -2084,7 +2113,7 @@ class TradingBot:
             _mtf_dfs = {}  # {timeframe: DataFrame}
             additional_charts = []
             try:
-                for _ctf, _ctf_candles in [('D1', 60), ('H1', 100), ('M5', 100), ('M1', 100)]:
+                for _ctf, _ctf_candles in [('D1', 60), ('H4', 100), ('H1', 100), ('M5', 100), ('M1', 100)]:
                     _ctf_df = await self.data_fetcher.get_ohlcv(
                         symbol=symbol, timeframe=_ctf, count=_ctf_candles
                     )
@@ -2158,13 +2187,14 @@ class TradingBot:
                 except Exception as _be_err:
                     logger.debug(f"[BAR_EXTREME] Error for {symbol}: {_be_err}")
 
-                # Generate composite chart (D1, H1, M15, M5) as primary image
+                # Generate composite chart (D1, H4, H1, M15, M5) as primary image
                 _composite_base64 = None
                 try:
                     from .utils.chart_screenshot import create_composite_chart
                     _composite_panels = []
                     for _panel_tf, _panel_df in [
                         ('D1', _mtf_dfs.get('D1')),
+                        ('H4', _mtf_dfs.get('H4')),
                         ('H1', _mtf_dfs.get('H1')),
                         ('M15', df),
                         ('M5', _mtf_dfs.get('M5'))
@@ -2206,13 +2236,24 @@ class TradingBot:
                 if _composite_base64:
                     additional_charts.insert(0, {
                         'base64': _composite_base64,
-                        'timeframe': 'COMPOSITE (D1/H1/M15/M5)'
+                        'timeframe': 'COMPOSITE (D1/H4/H1/M15/M5)'
                     })
                 
                 if additional_charts:
                     logger.info(f"Sending {len(additional_charts)} charts for {symbol} (composite + LTF)")
             except Exception as e:
                 logger.warning(f"Failed to generate multi-TF charts for {symbol}: {e}")
+            
+            # Mechanical ICT advisory: rule-based baseline for Claude (never executes)
+            _mech_setup = self._mechanical_setup_advisory(symbol, _mtf_dfs.get('H4'), df)
+            if _mech_setup:
+                analysis_results["mechanical_setup"] = _mech_setup
+                logger.info(
+                    f"[MECH] {symbol}: Rule-based ICT setup found — "
+                    f"{_mech_setup.get('direction', '?').upper()} "
+                    f"(conf {_mech_setup.get('confidence', 0):.0%}, "
+                    f"R:R {_mech_setup.get('risk_reward', 0):.2f})"
+                )
             
             # Build strategy context
             strategy_context = self.context_builder.get_ict_context()
@@ -2359,6 +2400,10 @@ class TradingBot:
             # =============================================
             # NEW: ADD 100-PIP EXPANSION CONTEXT FOR CLAUDE
             # =============================================
+            
+            # Mechanical ICT baseline (rule-based ICTStrategy advisory)
+            if 'mechanical_setup' in analysis_results:
+                market_data["mechanical_ict_setup"] = analysis_results["mechanical_setup"]
             
             # AMD Cycle context
             if 'amd_cycle' in analysis_results:
@@ -2589,7 +2634,7 @@ class TradingBot:
                     if gold_price > 0 and silver_price > 0:
                         geopolitical = 'normal'
                         if self.news_service:
-                            geo_level = self.news_service.geopolitical_risk_level([])
+                            geo_level = self.news_service.get_geopolitical_risk_level()
                             geopolitical = geo_level if geo_level else 'normal'
                         
                         market_data["precious_metals_context"] = self.precious_metals_analyzer.get_context_for_claude(
@@ -2787,6 +2832,27 @@ class TradingBot:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "reasoning": trade_signal.reasoning or "",
             }
+            
+            # Mechanical-vs-Claude agreement telemetry (measures LLM value-add
+            # over the pure rule-based baseline)
+            _mech_baseline = analysis_results.get("mechanical_setup")
+            if _mech_baseline:
+                _mech_dir = _mech_baseline.get("direction", "?")
+                if trade_signal.direction in ("long", "short"):
+                    _mech_agree = "AGREE" if _mech_dir == trade_signal.direction else "DISAGREE"
+                else:
+                    _mech_agree = "CLAUDE_PASSED"
+                print(
+                    f"[MECH-VS-CLAUDE] {symbol}: mechanical={_mech_dir.upper()} "
+                    f"({_mech_baseline.get('confidence', 0):.0%}) vs "
+                    f"claude={trade_signal.direction.upper()} "
+                    f"({trade_signal.confidence:.0%}) -> {_mech_agree}",
+                    flush=True,
+                )
+                logger.info(
+                    f"[MECH-VS-CLAUDE] {symbol}: {_mech_agree} "
+                    f"(mech={_mech_dir}, claude={trade_signal.direction})"
+                )
             
             # Log Claude's response
             if bot_state:
@@ -8539,6 +8605,43 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
         except Exception as e:
             logger.error(f"Error handling position close: {e}")
     
+    async def _reversal_position_size(
+        self, symbol: str, entry_price: float, stop_loss: float
+    ) -> float:
+        """
+        Risk-based position sizing for reversal re-entries.
+
+        Uses RiskManager fixed-percentage sizing plus the scaling manager's
+        mode risk multiplier. Falls back to the minimum lot on any error.
+        """
+        position_size = 0.01  # Default minimum
+        if not self.risk_manager:
+            return position_size
+        try:
+            account_info = await self.mt5_client.get_account_info()
+            equity = account_info.equity if account_info else 1000.0
+
+            sizing = self.risk_manager.calculate_position_size(
+                account_balance=equity,
+                entry_price=entry_price,
+                stop_loss=stop_loss,
+                symbol=symbol,
+            )
+            if sizing and sizing.lots > 0:
+                position_size = sizing.lots
+
+            # Apply scaling manager risk multiplier for reversals too
+            if self.scaling_manager:
+                _mode_cfg = self.scaling_manager.get_mode_config()
+                _rmult = getattr(_mode_cfg, 'risk_multiplier', 1.0)
+                if _rmult != 1.0:
+                    from .config import normalize_lots as _nl
+                    position_size = _nl(symbol, position_size * _rmult)
+        except Exception as e:
+            logger.warning(f"[REVERSAL] Position sizing error: {e}")
+            position_size = 0.01
+        return position_size
+
     async def _analyze_reversal_entry(self, closed_position):
         """
         Analyze whether a reversal re-entry trade is warranted after profit protection
@@ -8931,31 +9034,9 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                 logger.warning(f"[REVERSAL] {symbol}: No stop loss provided, aborting")
                 return
             
-            position_size = 0.01  # Default minimum
-            if self.risk_manager:
-                try:
-                    account_info = await self.mt5_client.get_account_info()
-                    equity = account_info.equity if account_info else 1000.0
-                    sl_distance = abs(entry_price - stop_loss)
-                    
-                    sizing = self.risk_manager.calculate_position_size(
-                        symbol=symbol,
-                        entry_price=entry_price,
-                        stop_loss=stop_loss,
-                        account_equity=equity,
-                    )
-                    if sizing and sizing.get('position_size', 0) > 0:
-                        position_size = sizing['position_size']
-                    
-                    # Apply scaling manager risk multiplier for reversals too
-                    if self.scaling_manager:
-                        _mode_cfg = self.scaling_manager.get_mode_config()
-                        _rmult = getattr(_mode_cfg, 'risk_multiplier', 1.0)
-                        if _rmult != 1.0:
-                            from .config import normalize_lots as _nl
-                            position_size = _nl(symbol, position_size * _rmult)
-                except Exception as e:
-                    logger.warning(f"[REVERSAL] Position sizing error: {e}")
+            position_size = await self._reversal_position_size(
+                symbol, entry_price, stop_loss
+            )
 
             if _reversal_size_multiplier != 1.0:
                 from .config import normalize_lots as _nl_rev_demote

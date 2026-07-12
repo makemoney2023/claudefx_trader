@@ -462,7 +462,9 @@ def backup_database(max_backups: int = 7) -> Optional[Path]:
     db_path = get_database_path()
     if not db_path.exists():
         return None
-    backup_dir = Path("backups/db")
+    # Anchor backups next to the database file, not the process CWD,
+    # so pruning always operates on the directory backups are written to.
+    backup_dir = db_path.parent / "backups" / "db"
     backup_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     backup_path = backup_dir / f"trading_bot_{timestamp}.db"

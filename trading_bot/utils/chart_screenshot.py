@@ -375,11 +375,12 @@ class ChartScreenshot:
         bar_extreme_zones: Optional[List[Dict]] = None,
     ) -> bytes:
         """
-        Generate a 2x2 multi-timeframe composite chart as a single image.
+        Generate a multi-timeframe composite chart as a single image.
 
         Args:
             charts: List of dicts with keys 'timeframe', 'df', and optional 'overlays'.
-                    Expected order: [D1, H1, M15, M5]. Up to 4 panels.
+                    Expected order: HTF first (e.g. [D1, H4, H1, M15, M5]).
+                    Up to 6 panels (2x2 grid for <=4, 3x2 grid for 5-6).
             symbol: Trading symbol
             trade_markers: Trade history markers for M15 panel
             volume_profile: Volume profile data for M15 panel
@@ -392,14 +393,23 @@ class ChartScreenshot:
         """
         import matplotlib.gridspec as gridspec
 
-        n = min(len(charts), 4)
+        n = min(len(charts), 6)
         if n == 0:
             raise ValueError("At least one chart dict is required")
 
-        fig = plt.figure(figsize=(20, 14), dpi=150)
-        gs = gridspec.GridSpec(2, 2, hspace=0.30, wspace=0.20)
+        if n <= 4:
+            grid_rows, grid_cols = 2, 2
+            fig_height = 14
+        else:
+            grid_rows, grid_cols = 3, 2
+            fig_height = 21
 
-        panel_positions = [(0, 0), (0, 1), (1, 0), (1, 1)]
+        fig = plt.figure(figsize=(20, fig_height), dpi=150)
+        gs = gridspec.GridSpec(grid_rows, grid_cols, hspace=0.30, wspace=0.20)
+
+        panel_positions = [
+            (r, c) for r in range(grid_rows) for c in range(grid_cols)
+        ]
 
         for idx in range(n):
             row, col = panel_positions[idx]

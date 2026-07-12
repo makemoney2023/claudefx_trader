@@ -10,10 +10,25 @@ from datetime import datetime, time
 from dataclasses import dataclass
 import pandas as pd
 import numpy as np
+import pytz
 
 from ..utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# Silver Bullet windows are defined in New York time (ICT convention).
+NY_TZ = pytz.timezone("America/New_York")
+
+
+def _to_eastern_naive(dt: datetime) -> datetime:
+    """Convert a datetime to naive US/Eastern wall-clock time.
+
+    tz-aware inputs are converted; naive inputs are assumed to already be
+    Eastern (test/backtest convention).
+    """
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(NY_TZ).replace(tzinfo=None)
+    return dt
 
 
 @dataclass
@@ -120,9 +135,13 @@ class SilverBulletDetector:
             if 'time' in df.columns:
                 current_time = pd.to_datetime(df['time'].iloc[-1])
             else:
-                current_time = datetime.now()
+                current_time = datetime.now(NY_TZ)
         
-        current_time_only = current_time.time() if isinstance(current_time, datetime) else current_time
+        if isinstance(current_time, datetime):
+            current_time = _to_eastern_naive(current_time)
+            current_time_only = current_time.time()
+        else:
+            current_time_only = current_time
         
         for window_name, (start, end) in self.SILVER_BULLET_WINDOWS.items():
             if start <= current_time_only <= end:
@@ -296,7 +315,8 @@ class SilverBulletDetector:
             Dict with 'active', 'window', 'time_remaining'
         """
         if current_time is None:
-            current_time = datetime.now()
+            current_time = datetime.now(NY_TZ)
+        current_time = _to_eastern_naive(current_time)
         
         current_time_only = current_time.time()
         

@@ -147,6 +147,11 @@ class FVGDetector:
         Returns:
             FVGAnalysis object with all detected FVGs
         """
+        # Drop the still-forming candle: an FVG whose third candle is
+        # incomplete can vanish before the bar closes (repainting zone).
+        from . import exclude_forming_candle
+        df = exclude_forming_candle(df)
+        
         logger.debug(f"Detecting FVGs in {len(df)} candles")
         
         bullish_fvgs = []

@@ -6,7 +6,7 @@ converting it to pandas DataFrames for analysis.
 """
 
 from typing import Optional, Dict, List, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import pandas as pd
 import numpy as np
 
@@ -298,10 +298,15 @@ class DataFetcher:
         
         minutes = tf_minutes.get(timeframe.upper(), 60)
         
-        # Check if last bar is within current candle period
+        # Check if last bar is within current candle period.
+        # MT5 bar times are tz-aware UTC; compare in UTC and treat naive
+        # timestamps as UTC so aware/naive subtraction can never raise.
         last_bar_time = df.index[-1]
         if isinstance(last_bar_time, pd.Timestamp):
-            age = datetime.now() - last_bar_time.to_pydatetime()
+            last_dt = last_bar_time.to_pydatetime()
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+            age = datetime.now(timezone.utc) - last_dt
             return age < timedelta(minutes=minutes)
         
         return False

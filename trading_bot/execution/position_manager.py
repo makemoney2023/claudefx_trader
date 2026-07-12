@@ -1203,6 +1203,11 @@ class PositionManager:
                 position.trailing_active = old_trailing_active
                 position.status = old_status
                 await self._persist_and_wait(position)
+                logger.warning(
+                    f"Trailing stop modify FAILED for {position.ticket} — "
+                    f"SL reverted to {old_sl}, will retry next cycle"
+                )
+                return None
         
         return {
             "action": "trailing_stop",
