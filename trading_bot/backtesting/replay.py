@@ -548,161 +548,50 @@ class ClaudeReplayBacktester:
                 _zone_gate_decision = "no_gate"
                 if sig.direction != 'no_trade' and sig.entry_price and sig.stop_loss and sig.take_profit:
                     from ..config import settings as _bt_settings
+                    from ..services.entry_gates import (
+                        ZoneGateSettings,
+                        evaluate_replay_pre_execution_gates,
+                    )
 
                     _sl_dist_bt = abs(sig.entry_price - sig.stop_loss)
                     _tp_dist_bt = abs(sig.take_profit - sig.entry_price)
                     _rr_bt = _tp_dist_bt / _sl_dist_bt if _sl_dist_bt > 0 else 0
                     _d1_bias_bt = (analysis_data.get('d1_bias') or '').lower()
-                    _gate_mode = _bt_settings.trading.zone_gate_mode
-                    _gate_blocked = False
-
-                    # --- Zone-aware gate (replaces legacy D1 direction gate) ---
-                    _use_zone_gate = (
-                        _pd_d1_result is not None
-                        and _gate_mode in ('active', 'shadow')
-                        and symbol not in _bt_settings.trading.zone_gate_disabled_symbols
+                    _zone_settings = ZoneGateSettings(
+                        gate_mode=_bt_settings.trading.zone_gate_mode,
+                        misaligned_min_confidence=_bt_settings.trading.zone_misaligned_min_confidence,
+                        misaligned_min_rr=_bt_settings.trading.zone_misaligned_min_rr,
+                        equilibrium_min_confidence=_bt_settings.trading.zone_equilibrium_min_confidence,
+                        disabled_symbols=tuple(_bt_settings.trading.zone_gate_disabled_symbols),
                     )
+                    from ..config import get_symbol_spec
+                    _sym_spec = get_symbol_spec(symbol)
+                    _is_index = _sym_spec.category == 'index' if _sym_spec else False
+                    _weak_hrs = tuple(_bt_settings.trading.weak_hours_by_symbol.get(symbol, []))
 
-                    if _use_zone_gate:
-                        _zone_str = _pd_d1_result.current_zone.value
-                        _retrace = _pd_d1_result.retracement_percent
-
-                        _in_correct_zone = (
-                            (sig.direction == 'short' and _retrace >= 0.5)
-                            or (sig.direction == 'long' and _retrace <= 0.5)
-                        )
-                        from ..config import get_symbol_spec
-                        _sym_spec = get_symbol_spec(symbol)
-                        _is_index = _sym_spec.category == 'index' if _sym_spec else False
-
-                        _counter_trend = (
-                            (_d1_bias_bt == 'bullish' and sig.direction == 'short')
-                            or (_d1_bias_bt == 'bearish' and sig.direction == 'long')
-                        )
-                        _index_counter = False
-                        if _is_index and _in_correct_zone:
-                            _index_counter = (
-                                (sig.direction == 'short' and _d1_bias_bt != 'bearish')
-                                or (sig.direction == 'long' and _d1_bias_bt != 'bullish')
-                            )
-
-                        if _in_correct_zone and (_counter_trend or _index_counter) and _is_index:
-                            _zone_aligned = False
-                            _zone_misaligned = True
-                            logger.info(
-                                f"[REPLAY] ZONE-GATE index counter-trend: "
-                                f"d1={_d1_bias_bt!r} dir={sig.direction} retrace={_retrace:.0%}"
-                            )
-                        elif _in_correct_zone and _counter_trend:
-                            _zone_aligned = False
-                            _zone_misaligned = False
-                        else:
-                            _zone_aligned = _in_correct_zone
-                            _zone_misaligned = (
-                                (sig.direction == 'long' and _retrace >= 0.618)
-                                or (sig.direction == 'short' and _retrace <= 0.382)
-                            )
-
-                        if _zone_misaligned:
-                            _zm_conf = _bt_settings.trading.zone_misaligned_min_confidence
-                            _zm_rr = _bt_settings.trading.zone_misaligned_min_rr
-                            if sig.confidence < _zm_conf or _rr_bt < _zm_rr:
-                                _gate_blocked = True
-                                _zone_gate_decision = "blocked_misaligned"
-                                _block_msg = (
-                                    f"ZONE-GATE blocked {sig.direction.upper()} from {_zone_str} "
-                                    f"(retrace={_retrace:.0%}, conf={sig.confidence:.0%}, RR={_rr_bt:.1f}, "
-                                    f"need {_zm_conf:.0%}/{_zm_rr:.0f}:1)"
-                                )
-                            else:
-                                _zone_gate_decision = "allowed_misaligned_high_conf"
-                        elif not _zone_aligned:
-                            _eq_conf = _bt_settings.trading.zone_equilibrium_min_confidence
-                            if sig.confidence < _eq_conf:
-                                _gate_blocked = True
-                                _zone_gate_decision = "blocked_equilibrium"
-                                _block_msg = (
-                                    f"ZONE-GATE blocked {sig.direction.upper()} from {_zone_str} "
-                                    f"(equilibrium, conf={sig.confidence:.0%}, need {_eq_conf:.0%})"
-                                )
-                            else:
-                                _zone_gate_decision = "allowed_equilibrium"
-                        else:
-                            _zone_gate_decision = "allowed_zone_aligned"
-
-                        if _gate_blocked and _gate_mode == 'shadow':
-                            logger.info(
-                                f"[REPLAY] {current.strftime('%m/%d %H:%M')} "
-                                f"ZONE-GATE-SHADOW: would block — {_block_msg}"
-                            )
-                            _gate_blocked = False
-                            _zone_gate_decision = f"shadow_{_zone_gate_decision}"
-
-                        if _gate_blocked:
-                            logger.info(f"[REPLAY] {current.strftime('%m/%d %H:%M')} {_block_msg}")
-                            if progress_callback:
-                                try:
-                                    await progress_callback(
-                                        pct,
-                                        f"Zone-blocked {sig.direction} from {_zone_str} @ {current.strftime('%m/%d %H:%M')}"
-                                    )
-                                except Exception as e:
-                                    logger.debug(f"[REPLAY] Progress callback error: {e}")
-                            signals_processed += 1
-                            current += timedelta(hours=interval_hours)
-                            step_idx += 1
-                            continue
-
-                        if _zone_gate_decision.startswith("allowed"):
-                            logger.info(
-                                f"[REPLAY] {current.strftime('%m/%d %H:%M')} "
-                                f"ZONE-GATE: {_zone_gate_decision} {sig.direction.upper()} "
-                                f"from {_zone_str} (retrace={_retrace:.0%})"
-                            )
-
-                    elif _gate_mode != 'active' or not _use_zone_gate:
-                        # Legacy D1 direction gate fallback
-                        _is_counter_bt = (
-                            _d1_bias_bt in ('bullish', 'bearish')
-                            and (
-                                (_d1_bias_bt == 'bullish' and sig.direction == 'short')
-                                or (_d1_bias_bt == 'bearish' and sig.direction == 'long')
-                            )
-                        )
-                        if _is_counter_bt and (sig.confidence < 0.70 or _rr_bt < 3.0):
-                            logger.info(
-                                f"[REPLAY] {current.strftime('%m/%d %H:%M')} "
-                                f"DIRECTION-GATE blocked {sig.direction.upper()} "
-                                f"(D1={_d1_bias_bt}, conf={sig.confidence:.0%}, RR={_rr_bt:.1f})"
-                            )
-                            _zone_gate_decision = "legacy_blocked"
-                            if progress_callback:
-                                try:
-                                    await progress_callback(
-                                        pct,
-                                        f"Blocked counter-trend {sig.direction} @ {current.strftime('%m/%d %H:%M')}"
-                                    )
-                                except Exception as e:
-                                    logger.debug(f"[REPLAY] Progress callback error: {e}")
-                            signals_processed += 1
-                            current += timedelta(hours=interval_hours)
-                            step_idx += 1
-                            continue
-                        _zone_gate_decision = "legacy_allowed"
-
-                    # --- Time-of-day gate: skip weak hours unless elevated confidence ---
-                    _weak_hrs = _bt_settings.trading.weak_hours_by_symbol.get(symbol, [])
-                    if current.hour in _weak_hrs and sig.confidence < 0.68:
+                    _rg = evaluate_replay_pre_execution_gates(
+                        direction=sig.direction,
+                        confidence=sig.confidence,
+                        rr=_rr_bt,
+                        d1_bias=_d1_bias_bt,
+                        pd_result=_pd_d1_result,
+                        symbol=symbol,
+                        is_index=_is_index,
+                        utc_hour=current.hour,
+                        weak_hours=_weak_hrs,
+                        zone_settings=_zone_settings,
+                    )
+                    _zone_gate_decision = _rg.zone_decision
+                    if _rg.blocked:
                         logger.info(
                             f"[REPLAY] {current.strftime('%m/%d %H:%M')} "
-                            f"TOD-GATE blocked {sig.direction.upper()} "
-                            f"(weak hour {current.hour:02d}:00, conf={sig.confidence:.0%})"
+                            f"GATE blocked {sig.direction.upper()}: {_rg.reason}"
                         )
                         if progress_callback:
                             try:
                                 await progress_callback(
                                     pct,
-                                    f"Blocked weak hour {sig.direction} @ {current.strftime('%m/%d %H:%M')}"
+                                    f"Gate blocked {sig.direction} @ {current.strftime('%m/%d %H:%M')}"
                                 )
                             except Exception as e:
                                 logger.debug(f"[REPLAY] Progress callback error: {e}")

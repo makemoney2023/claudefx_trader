@@ -63,8 +63,11 @@ class OptimizationResult:
     holdout_chronological: bool = True
     multiple_testing_note: str = (
         "Walk-forward reduces overfitting but does not eliminate multiple-testing risk "
-        "across parameter grid searches."
+        "across parameter grid searches. Treat outputs as suggestive, not load-bearing."
     )
+    recommend_apply: bool = False
+    guardrail_warnings: List[str] = field(default_factory=list)
+    grid_combinations: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -83,7 +86,47 @@ class OptimizationResult:
             'bot_owned_trade_count': self.bot_owned_trade_count,
             'holdout_chronological': self.holdout_chronological,
             'multiple_testing_note': self.multiple_testing_note,
+            'recommend_apply': self.recommend_apply,
+            'guardrail_warnings': self.guardrail_warnings,
+            'grid_combinations': self.grid_combinations,
         }
+
+
+MIN_OOS_TRADES_FOR_APPLY = 15
+MIN_PARAMETER_STABILITY = 0.60
+MIN_OOS_SHARPE = 0.0
+
+
+def evaluate_optimizer_guardrails(
+    *,
+    out_of_sample_trades: int,
+    out_of_sample_sharpe: float,
+    parameter_stability: float,
+    fold_flags: List[str],
+    grid_combinations: int,
+) -> tuple[bool, List[str]]:
+    """Return (recommend_apply, warnings). Conservative by default."""
+    warnings: List[str] = []
+    if out_of_sample_trades < MIN_OOS_TRADES_FOR_APPLY:
+        warnings.append(
+            f"OOS trade count {out_of_sample_trades} < {MIN_OOS_TRADES_FOR_APPLY}"
+        )
+    if out_of_sample_sharpe < MIN_OOS_SHARPE:
+        warnings.append(f"OOS Sharpe {out_of_sample_sharpe:.3f} < {MIN_OOS_SHARPE}")
+    if parameter_stability < MIN_PARAMETER_STABILITY:
+        warnings.append(
+            f"Parameter stability {parameter_stability:.2f} < {MIN_PARAMETER_STABILITY}"
+        )
+    for flag in fold_flags:
+        if flag:
+            warnings.append(f"Fold flag: {flag}")
+    if grid_combinations > 200:
+        warnings.append(
+            f"Grid searched {grid_combinations} combos — multiple-testing risk elevated (advisory)"
+        )
+    critical = [w for w in warnings if "advisory" not in w]
+    recommend = len(critical) == 0
+    return recommend, warnings
 
 
 def _simulate_gate_logic(
@@ -309,6 +352,15 @@ class WalkForwardOptimizer:
         is_wins = sum(1 for t in full_is if t.get('r_multiple', 0) > 0)
         oos_wins = sum(1 for t in full_oos if t.get('r_multiple', 0) > 0)
 
+        fold_flags = [r.get('flag') or '' for r in all_results]
+        recommend, warnings = evaluate_optimizer_guardrails(
+            out_of_sample_trades=len(full_oos),
+            out_of_sample_sharpe=_compute_sharpe(full_oos),
+            parameter_stability=stability,
+            fold_flags=fold_flags,
+            grid_combinations=len(combos),
+        )
+
         result = OptimizationResult(
             best_params=best_overall_params,
             in_sample_sharpe=_compute_sharpe(full_is),
@@ -325,6 +377,9 @@ class WalkForwardOptimizer:
             execution_out_of_sample_sharpe=_compute_sharpe(full_oos),
             bot_owned_trade_count=len(trades),
             holdout_chronological=True,
+            recommend_apply=recommend,
+            guardrail_warnings=warnings,
+            grid_combinations=len(combos),
         )
 
         logger.info(

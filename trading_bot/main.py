@@ -58,6 +58,19 @@ from .services.live_trade_gates import (
     news_allows_trading,
     symbol_edge_allows_trading,
 )
+from .services.entry_gates import (
+    ZoneGateSettings,
+    evaluate_zone_gate,
+    evaluate_legacy_d1_gate,
+    evaluate_tod_gate,
+    evaluate_volatile_regime_gate,
+    should_use_zone_gate,
+)
+from .services.confidence_modifiers import (
+    SecondaryModifierContext,
+    apply_secondary_modifiers,
+    confidence_decision_to_dict,
+)
 from .utils.win_optimization import apply_demote_policy, build_confidence_decision, classify_a_plus
 from .services.goal_tracker import GoalTracker
 from .services.scaling_manager import ScalingManager, TradingMode
@@ -1465,6 +1478,8 @@ class TradingBot:
         market_snapshot_ref: Optional[str] = None,
         confidence_components: Optional[dict] = None,
     ) -> Optional[str]:
+        if confidence_components is None:
+            confidence_components = getattr(self, "_last_confidence_components", None)
         funnel = getattr(self, "gate_funnel", None) or get_gate_funnel()
         return await funnel.record_decision(
             outcome_type,
@@ -3268,13 +3283,15 @@ class TradingBot:
                     )
                     trade_signal.confidence = 0.70
                 # Enforce 2.0:1 R:R minimum
-                if actual_rr < 2.0:
+                if actual_rr < settings.trading.gate_counter_trend_rr_floor:
                     logger.warning(
                         f"[BLOCKED] {symbol}: Counter-D1-trend scalp R:R {actual_rr:.2f}:1 "
-                        f"below 2.0:1 minimum. D1={_d1_bias}, dir={_dir}. Rejected."
+                        f"below {settings.trading.gate_counter_trend_rr_floor:.1f}:1 minimum. "
+                        f"D1={_d1_bias}, dir={_dir}. Rejected."
                     )
                     print(
-                        f"[BLOCKED] {symbol}: Counter-trend scalp needs 2.0:1 R:R, "
+                        f"[BLOCKED] {symbol}: Counter-trend scalp needs "
+                        f"{settings.trading.gate_counter_trend_rr_floor:.1f}:1 R:R, "
                         f"got {actual_rr:.2f}:1. Skipping.",
                         flush=True
                     )
@@ -3290,154 +3307,90 @@ class TradingBot:
             _regime_type = _regime_data.get('regime', '').lower() if isinstance(_regime_data, dict) else ''
 
             _zone_gate_mode = settings.trading.zone_gate_mode
-            _use_zone_gate_live = (
-                pd_analysis is not None
-                and _zone_gate_mode in ('active', 'shadow')
-                and symbol not in settings.trading.zone_gate_disabled_symbols
-                and not _is_counter_trend_scalp
+            _zone_settings = ZoneGateSettings(
+                gate_mode=_zone_gate_mode,
+                misaligned_min_confidence=settings.trading.zone_misaligned_min_confidence,
+                misaligned_min_rr=settings.trading.zone_misaligned_min_rr,
+                equilibrium_min_confidence=settings.trading.zone_equilibrium_min_confidence,
+                disabled_symbols=tuple(settings.trading.zone_gate_disabled_symbols),
+            )
+            _use_zone_gate_live = should_use_zone_gate(
+                pd_analysis is not None,
+                _zone_gate_mode,
+                symbol,
+                _zone_settings.disabled_symbols,
+                is_counter_trend_scalp=_is_counter_trend_scalp,
             )
 
             if _use_zone_gate_live:
-                _zone_str = pd_analysis.current_zone.value
-                _retrace = pd_analysis.retracement_percent
-
-                _in_correct_zone = (
-                    (_dir == 'short' and _retrace >= 0.5)
-                    or (_dir == 'long' and _retrace <= 0.5)
-                )
                 from .config import get_symbol_spec
                 _sym_spec = get_symbol_spec(symbol)
                 _is_index = _sym_spec.category == 'index' if _sym_spec else False
-
-                _counter_trend = (
-                    (_d1_bias == 'bullish' and _dir == 'short')
-                    or (_d1_bias == 'bearish' and _dir == 'long')
+                _zg = evaluate_zone_gate(
+                    direction=_dir,
+                    confidence=trade_signal.confidence,
+                    actual_rr=actual_rr,
+                    retrace=pd_analysis.retracement_percent,
+                    zone_str=pd_analysis.current_zone.value,
+                    d1_bias=_d1_bias,
+                    is_index=_is_index,
+                    settings=_zone_settings,
+                    symbol=symbol,
+                    is_counter_trend_scalp=_is_counter_trend_scalp,
                 )
-                _index_counter = False
-                if _is_index and _in_correct_zone:
-                    _index_counter = (
-                        (_dir == 'short' and _d1_bias != 'bearish')
-                        or (_dir == 'long' and _d1_bias != 'bullish')
-                    )
-
-                if _in_correct_zone and (_counter_trend or _index_counter) and _is_index:
-                    _zone_aligned = False
-                    _zone_misaligned = True
-                    logger.info(
-                        f"ZONE-GATE index counter-trend: "
-                        f"d1={_d1_bias!r} dir={_dir} retrace={_retrace:.0%}"
-                    )
-                elif _in_correct_zone and _counter_trend:
-                    _zone_aligned = False
-                    _zone_misaligned = False
-                else:
-                    _zone_aligned = _in_correct_zone
-                    _zone_misaligned = (
-                        (_dir == 'long' and _retrace >= 0.618)
-                        or (_dir == 'short' and _retrace <= 0.382)
-                    )
-
-                _zone_blocked = False
-                if _zone_misaligned:
-                    _zm_conf = settings.trading.zone_misaligned_min_confidence
-                    _zm_rr = settings.trading.zone_misaligned_min_rr
-                    if trade_signal.confidence < _zm_conf or actual_rr < _zm_rr:
-                        _zone_blocked = True
-                        _block_reason = (
-                            f"[ZONE-GATE] {symbol}: {_dir.upper()} from {_zone_str} "
-                            f"(retrace={_retrace:.0%}). conf={trade_signal.confidence:.0%} "
-                            f"(need {_zm_conf:.0%}), RR={actual_rr:.1f} (need {_zm_rr:.0f}:1). Rejected."
-                        )
-                elif not _zone_aligned:
-                    _eq_conf = settings.trading.zone_equilibrium_min_confidence
-                    if trade_signal.confidence < _eq_conf:
-                        _zone_blocked = True
-                        _block_reason = (
-                            f"[ZONE-GATE] {symbol}: {_dir.upper()} from {_zone_str} "
-                            f"(equilibrium). conf={trade_signal.confidence:.0%} "
-                            f"(need {_eq_conf:.0%}). Rejected."
-                        )
-
-                if _zone_blocked and _zone_gate_mode == 'shadow':
-                    logger.info(f"[ZONE-GATE-SHADOW] Would block: {_block_reason}")
-                    _zone_blocked = False
-
-                if _zone_blocked:
-                    logger.warning(_block_reason)
-                    print(_block_reason, flush=True)
+                if _zg.shadow_only:
+                    logger.info(f"[ZONE-GATE-SHADOW] Would block: {_zg.reason}")
+                if _zg.blocked:
+                    logger.warning(_zg.reason)
+                    print(_zg.reason, flush=True)
                     return
-                elif _zone_aligned:
+                if _zg.decision == "allowed_zone_aligned":
                     logger.info(
-                        f"[ZONE-GATE] {symbol}: {_dir.upper()} zone-aligned in {_zone_str} "
-                        f"(retrace={_retrace:.0%}) — allowed"
+                        f"[ZONE-GATE] {symbol}: {_dir.upper()} zone-aligned in "
+                        f"{pd_analysis.current_zone.value} "
+                        f"(retrace={pd_analysis.retracement_percent:.0%}) — allowed"
                     )
 
             elif not _is_counter_trend_scalp:
-                # Legacy D1 direction gate fallback
-                _is_counter_d1 = (
-                    _d1_bias in ('bullish', 'bearish')
-                    and (
-                        (_d1_bias == 'bullish' and _dir == 'short')
-                        or (_d1_bias == 'bearish' and _dir == 'long')
-                    )
+                _legacy_blocked, _legacy_reason = evaluate_legacy_d1_gate(
+                    direction=_dir,
+                    confidence=trade_signal.confidence,
+                    actual_rr=actual_rr,
+                    d1_bias=_d1_bias,
                 )
-                if _is_counter_d1:
-                    _ct_min_conf = 0.70
-                    _ct_min_rr = 3.0
-                    if trade_signal.confidence < _ct_min_conf or actual_rr < _ct_min_rr:
-                        logger.warning(
-                            f"[DIRECTION-GATE] {symbol}: {_dir.upper()} opposes D1 bias "
-                            f"({_d1_bias}). Confidence {trade_signal.confidence:.0%} "
-                            f"(need {_ct_min_conf:.0%}), R:R {actual_rr:.2f} "
-                            f"(need {_ct_min_rr:.1f}). Rejected."
-                        )
-                        print(
-                            f"[DIRECTION-GATE] {symbol}: {_dir.upper()} vs D1 {_d1_bias}. "
-                            f"Need {_ct_min_conf:.0%} conf + {_ct_min_rr:.0f}:1 RR for counter-trend. "
-                            f"Got {trade_signal.confidence:.0%} / {actual_rr:.1f}:1. Skipping.",
-                            flush=True
-                        )
-                        return
-                    else:
-                        logger.info(
-                            f"[DIRECTION-GATE] {symbol}: Counter-D1 {_dir.upper()} ALLOWED "
-                            f"— high conf ({trade_signal.confidence:.0%}) + strong R:R ({actual_rr:.1f}:1)"
-                        )
-
-            if _regime_type == 'volatile_ranging':
-                _vr_min_conf = 0.70
-                if trade_signal.confidence < _vr_min_conf:
-                    logger.warning(
-                        f"[REGIME-GATE] {symbol}: Volatile ranging regime — "
-                        f"confidence {trade_signal.confidence:.0%} below {_vr_min_conf:.0%} minimum. Rejected."
-                    )
-                    print(
-                        f"[REGIME-GATE] {symbol}: VOLATILE RANGING detected. "
-                        f"Need {_vr_min_conf:.0%} confidence, got {trade_signal.confidence:.0%}. Skipping.",
-                        flush=True
-                    )
+                if _legacy_blocked:
+                    logger.warning(f"[DIRECTION-GATE] {symbol}: {_legacy_reason}")
+                    print(f"[BLOCKED] {symbol}: {_legacy_reason}", flush=True)
                     return
+                elif _d1_bias in ('bullish', 'bearish') and (
+                    (_d1_bias == 'bullish' and _dir == 'short')
+                    or (_d1_bias == 'bearish' and _dir == 'long')
+                ):
+                    logger.info(
+                        f"[DIRECTION-GATE] {symbol}: Counter-D1 {_dir.upper()} ALLOWED "
+                        f"— high conf ({trade_signal.confidence:.0%}) + strong R:R ({actual_rr:.1f}:1)"
+                    )
 
-            # ============================================
-            # TIME-OF-DAY PERFORMANCE GATE
-            # Skip historically weak hours unless confidence
-            # is elevated. Based on backtest analysis.
-            # ============================================
+            _vr_blocked, _vr_reason = evaluate_volatile_regime_gate(
+                regime_type=_regime_type,
+                confidence=trade_signal.confidence,
+            )
+            if _vr_blocked:
+                logger.warning(f"[REGIME-GATE] {symbol}: {_vr_reason}")
+                print(f"[BLOCKED] {symbol}: {_vr_reason}", flush=True)
+                return
+
             _current_utc_hour = datetime.now(timezone.utc).hour
-            _weak_hours = settings.trading.weak_hours_by_symbol.get(symbol, [])
-            if _current_utc_hour in _weak_hours:
-                _tod_min_conf = 0.68
-                if trade_signal.confidence < _tod_min_conf:
-                    logger.warning(
-                        f"[TOD-GATE] {symbol}: Hour {_current_utc_hour:02d}:00 UTC is a weak hour. "
-                        f"Confidence {trade_signal.confidence:.0%} below {_tod_min_conf:.0%}. Rejected."
-                    )
-                    print(
-                        f"[TOD-GATE] {symbol}: Weak hour ({_current_utc_hour:02d}:00 UTC). "
-                        f"Need {_tod_min_conf:.0%} confidence, got {trade_signal.confidence:.0%}. Skipping.",
-                        flush=True
-                    )
-                    return
+            _weak_hours = tuple(settings.trading.weak_hours_by_symbol.get(symbol, []))
+            _tod_blocked, _tod_reason = evaluate_tod_gate(
+                utc_hour=_current_utc_hour,
+                weak_hours=_weak_hours,
+                confidence=trade_signal.confidence,
+            )
+            if _tod_blocked:
+                logger.warning(f"[TOD-GATE] {symbol}: {_tod_reason}")
+                print(f"[BLOCKED] {symbol}: {_tod_reason}", flush=True)
+                return
 
             # ============================================
             # M15 EXECUTION TIMEFRAME STRUCTURE GATE
@@ -3608,7 +3561,7 @@ class TradingBot:
                 pass  # Off-hours block already capped confidence — don't double-penalize
             elif not _is_kill:
                 if 'asian' in _session_name:
-                    _session_penalty = 0.10
+                    _session_penalty = settings.trading.gate_session_penalty_asian
                 else:
                     _session_penalty = 0.15
             elif 'london close' in _session_name or 'london_close' in _session_name:
@@ -3811,9 +3764,12 @@ class TradingBot:
                     return
             
             # Validate confidence (fallback if no scaling manager)
-            min_confidence = 0.60
+            min_confidence = settings.trading.gate_min_confidence
             if self.scaling_manager:
-                min_confidence = self.scaling_manager.get_mode_config().confidence_threshold
+                min_confidence = max(
+                    min_confidence,
+                    self.scaling_manager.get_mode_config().confidence_threshold,
+                )
                 
             if trade_signal.confidence < min_confidence:
                 logger.info(f"Trade signal rejected for {symbol}: Low confidence ({trade_signal.confidence:.2f} < {min_confidence})")
@@ -4154,141 +4110,38 @@ class TradingBot:
                     else:
                         logger.info(f"✅ DXY confirms {trade_signal.direction.upper()} bias for {symbol}")
                 
-                # Record original confidence before secondary modifiers
                 _conf_before_modifiers = trade_signal.confidence
-                
-                # GATE 2b: RETAIL CONTRARIAN Check (NEW)
-                # If retail is extreme, boost confidence when trading against them
-                if retail_contrarian:
-                    if trade_signal.direction == retail_contrarian:
-                        # Trading WITH contrarian signal (against retail) = BOOST
-                        trade_signal.confidence = min(0.95, trade_signal.confidence + 0.05)
-                        logger.info(f"🔄✅ RETAIL CONTRARIAN BOOST: Trading against crowd (+5% confidence)")
-                    else:
-                        # Trading WITH retail = REDUCE confidence
-                        trade_signal.confidence = max(0.5, trade_signal.confidence - 0.1)
-                        logger.warning(
-                            f"🔄⚠️ TRADING WITH RETAIL: {symbol} {trade_signal.direction.upper()} "
-                            f"aligns with retail - reduced confidence (-10%)"
-                        )
-                
-                # GATE 2c: VIX Risk Sentiment Check (NEW)
-                if vix_risk_mode:
-                    if vix_risk_mode == 'risk_off':
-                        # Risk-off: Favor JPY, CHF, Gold
-                        if symbol in ['USDJPY', 'USDCHF'] and trade_signal.direction == 'long':
-                            logger.warning(f"⚠️ RISK-OFF: Long {symbol} less favorable - consider SHORT")
-                            trade_signal.confidence = max(0.5, trade_signal.confidence - 0.05)
-                        elif symbol == 'XAUUSD' and trade_signal.direction == 'long':
-                            trade_signal.confidence = min(0.95, trade_signal.confidence + 0.05)
-                            logger.info(f"✅ RISK-OFF: Long Gold favored (+5% confidence)")
-                    elif vix_risk_mode == 'risk_on':
-                        # Risk-on: Favor AUD, NZD
-                        if symbol in ['AUDUSD', 'NZDUSD'] and trade_signal.direction == 'long':
-                            trade_signal.confidence = min(0.95, trade_signal.confidence + 0.03)
-                            logger.info(f"✅ RISK-ON: Long {symbol} favored (+3% confidence)")
-                
-                # GATE 2d: SOCIAL SENTIMENT Contrarian (NEW)
-                social_sentiment = analysis_results.get("social_sentiment", {})
-                if social_sentiment.get('contrarian_signal'):
-                    social_contrarian = social_sentiment.get('contrarian_signal')
-                    if trade_signal.direction == social_contrarian and social_sentiment.get('volume') == 'high':
-                        # High volume contrarian = strong signal
-                        trade_signal.confidence = min(0.95, trade_signal.confidence + 0.03)
-                        logger.info(f"🐦✅ SOCIAL CONTRARIAN: High volume {social_contrarian.upper()} signal (+3%)")
-                
-                # GATE 2e: OPTIONS FLOW Confluence (NEW)
-                options_flow = analysis_results.get("options_flow", {})
-                if options_flow.get('flow') != 'neutral':
-                    flow_direction = options_flow.get('flow')
-                    if (trade_signal.direction == 'long' and flow_direction == 'bullish') or \
-                       (trade_signal.direction == 'short' and flow_direction == 'bearish'):
-                        trade_signal.confidence = min(0.95, trade_signal.confidence + 0.02)
-                        logger.info(f"📊✅ OPTIONS FLOW confirms {trade_signal.direction.upper()} (+2%)")
-                    
-                    # Check if near magnet level (potential reversal zone)
-                    magnet_levels = options_flow.get('magnet_levels', [])
-                    if magnet_levels:
-                        for magnet in magnet_levels:
-                            if abs(current_price - magnet) / current_price < 0.001:  # Within 10 pips
-                                logger.warning(f"⚠️ NEAR OPTIONS MAGNET LEVEL: {magnet} - Watch for reversal")
-                
-                # GATE 2f: INTERMARKET Risk Environment (NEW)
-                intermarket = analysis_results.get("intermarket", {})
-                if intermarket.get('risk_environment'):
-                    risk_env = intermarket.get('risk_environment')
-                    
-                    # Strong risk-on = boost AUD/NZD longs, Strong risk-off = boost JPY/CHF/Gold longs
-                    if 'strong_risk_on' in risk_env:
-                        if symbol in ['AUDUSD', 'NZDUSD'] and trade_signal.direction == 'long':
-                            trade_signal.confidence = min(0.95, trade_signal.confidence + 0.05)
-                            logger.info(f"🌐✅ STRONG RISK-ON: {symbol} LONG boosted (+5%)")
-                        elif symbol in ['USDJPY', 'USDCHF'] and trade_signal.direction == 'short':
-                            trade_signal.confidence = max(0.5, trade_signal.confidence - 0.05)
-                            logger.warning(f"🌐⚠️ STRONG RISK-ON: {symbol} SHORT penalized (-5%)")
-                    elif 'strong_risk_off' in risk_env:
-                        if symbol == 'XAUUSD' and trade_signal.direction == 'long':
-                            trade_signal.confidence = min(0.95, trade_signal.confidence + 0.05)
-                            logger.info(f"🌐✅ STRONG RISK-OFF: Gold LONG boosted (+5%)")
-                        elif symbol in ['USDJPY', 'USDCHF'] and trade_signal.direction == 'short':
-                            trade_signal.confidence = min(0.95, trade_signal.confidence + 0.03)
-                            logger.info(f"🌐✅ STRONG RISK-OFF: {symbol} SHORT boosted (safe-haven flows)")
-                
-                # GATE 2g: SEASONAL Pattern Boost (NEW)
-                seasonal = analysis_results.get("seasonal_pattern", {})
-                if seasonal.get('current_month_bias') != 'unknown':
-                    seasonal_bias = seasonal.get('current_month_bias')
-                    accuracy = seasonal.get('historical_accuracy', 0)
-                    
-                    if accuracy >= 65:  # Only trust high-accuracy patterns
-                        if (trade_signal.direction == 'long' and seasonal_bias == 'bullish') or \
-                           (trade_signal.direction == 'short' and seasonal_bias == 'bearish'):
-                            boost = 0.03 if accuracy >= 75 else 0.02
-                            trade_signal.confidence = min(0.95, trade_signal.confidence + boost)
-                            logger.info(
-                                f"📅✅ SEASONAL: {seasonal.get('current_month')} favors "
-                                f"{seasonal_bias.upper()} ({accuracy}% accuracy, +{int(boost*100)}%)"
-                            )
-                
-                # GATE 2h: BOND YIELD Spread for EUR/USD (NEW)
-                yields = analysis_results.get("bond_yields", {})
-                if yields.get('eurusd_bias') and 'EUR' in symbol:
-                    yield_bias = yields.get('eurusd_bias')
-                    spread = yields.get('spread', 0)
-                    
-                    if abs(spread) > 1.5:  # Significant spread
-                        if (trade_signal.direction == 'long' and yield_bias == 'bullish') or \
-                           (trade_signal.direction == 'short' and yield_bias == 'bearish'):
-                            trade_signal.confidence = min(0.95, trade_signal.confidence + 0.02)
-                            logger.info(f"📈✅ YIELD SPREAD ({spread:.2f}%) confirms {trade_signal.direction.upper()} (+2%)")
-                        else:
-                            trade_signal.confidence = max(0.5, trade_signal.confidence - 0.03)
-                            logger.warning(f"📈⚠️ YIELD SPREAD ({spread:.2f}%) conflicts - reduced confidence (-3%)")
-                
-                # GATE 2i: BTC DOMINANCE for Crypto (NEW)
-                btc_dom = analysis_results.get("btc_dominance", {})
-                if btc_dom and symbol in ['BTCUSD', 'ETHUSD', 'XRPUSD', 'SOLUSD', 'ADAUSD']:
-                    if symbol == 'BTCUSD':
-                        # BTC dominance rising = BTC bullish
-                        if btc_dom.get('trend') == 'rising' and trade_signal.direction == 'long':
-                            trade_signal.confidence = min(0.95, trade_signal.confidence + 0.03)
-                            logger.info(f"₿✅ BTC DOMINANCE rising: BTCUSD LONG boosted (+3%)")
-                    else:
-                        # Altcoins: opposite relationship
-                        alt_sentiment = btc_dom.get('altcoin_sentiment', 'neutral')
-                        if (trade_signal.direction == 'long' and alt_sentiment == 'bullish') or \
-                           (trade_signal.direction == 'short' and alt_sentiment == 'bearish'):
-                            trade_signal.confidence = min(0.95, trade_signal.confidence + 0.03)
-                            logger.info(f"₿✅ ALTCOIN sentiment {alt_sentiment}: {symbol} {trade_signal.direction.upper()} boosted (+3%)")
-                
-                # Cap total positive confidence boost from secondary modifiers at +10%
-                _conf_boost = trade_signal.confidence - _conf_before_modifiers
-                if _conf_boost > 0.10:
-                    trade_signal.confidence = _conf_before_modifiers + 0.10
-                    logger.info(
-                        f"[CONF-CAP] {symbol}: Secondary modifiers boosted +{_conf_boost*100:.0f}%, "
-                        f"capped to +10% (final: {trade_signal.confidence:.0%})"
-                    )
+                _at_breaker = False
+                if breaker_blocks:
+                    _entry_chk = trade_signal.entry_price or current_price
+                    for bb in breaker_blocks:
+                        if bb.bottom <= _entry_chk <= bb.top:
+                            _at_breaker = True
+                            break
+                _conf_decision = apply_secondary_modifiers(
+                    _conf_before_modifiers,
+                    SecondaryModifierContext(
+                        direction=trade_signal.direction,
+                        symbol=symbol,
+                        retail_contrarian=retail_contrarian,
+                        vix_risk_mode=vix_risk_mode,
+                        social_sentiment=analysis_results.get("social_sentiment"),
+                        options_flow=analysis_results.get("options_flow"),
+                        intermarket=analysis_results.get("intermarket"),
+                        seasonal=analysis_results.get("seasonal_pattern"),
+                        bond_yields=analysis_results.get("bond_yields"),
+                        btc_dominance=analysis_results.get("btc_dominance"),
+                        silver_bullet_ready=bool(silver_bullet_ready),
+                        at_breaker_block=_at_breaker,
+                        current_price=current_price,
+                    ),
+                )
+                trade_signal.confidence = _conf_decision.final
+                self._last_confidence_components = confidence_decision_to_dict(_conf_decision)
+                logger.info(
+                    f"[CONF-PIPE] {symbol}: base={_conf_decision.base:.0%} -> "
+                    f"final={_conf_decision.final:.0%}"
+                )
                 
                 # GATE 3: Displacement Check for Market Orders
                 # Only allow immediate market execution if displacement is confirmed
@@ -4322,24 +4175,7 @@ class TradingBot:
                         else:
                             logger.info("✅ Displacement confirmed - proceeding with market order")
                 
-                # GATE 4: Silver Bullet Boost
-                # If in SB window with displacement, boost confidence
-                if silver_bullet_ready:
-                    if trade_signal.confidence < 0.9:
-                        trade_signal.confidence = min(0.95, trade_signal.confidence + 0.1)
-                        logger.info(f"🔫⚡ Silver Bullet confidence boost: {trade_signal.confidence:.0%}")
-                
-                # GATE 5: Breaker Block A+ Setup
-                # If entering at breaker block, boost confidence
-                if breaker_blocks:
-                    for bb in breaker_blocks:
-                        entry_price = trade_signal.entry_price or current_price
-                        if bb.bottom <= entry_price <= bb.top:
-                            trade_signal.confidence = min(0.95, trade_signal.confidence + 0.1)
-                            logger.info(f"🔄 Breaker Block entry - A+ setup! Confidence: {trade_signal.confidence:.0%}")
-                            break
-
-                # Re-size with post-modifier confidence so judge and sizing agree
+                # GATE 3: Displacement Check for Market Orders
                 if abs(trade_signal.confidence - _conf_used_for_sizing) > 0.001:
                     if trade_signal.confidence >= 0.85:
                         setup_grade = SetupGrade.A_PLUS
@@ -4716,20 +4552,26 @@ class TradingBot:
 
                 # Handle DEMOTE verdict — convert to pending limit order
                 elif judge_outcome.allows_demote_execution():
-                    suggested = judge_outcome.suggested_entry
-                    
-                    # Calculate demoted entry price
-                    if suggested is not None and suggested > 0:
-                        demoted_entry = suggested
-                    else:
-                        # Default: 0.1% improvement from current price (tight enough to fill)
-                        if trade_signal.direction == 'long':
-                            demoted_entry = round(current_price * 0.999, 5)  # Buy slightly cheaper
-                        else:
-                            demoted_entry = round(current_price * 1.001, 5)  # Sell slightly higher
-                    
-                    # ---- Guard: R:R must still be >= 1.0 after demotion ----
-                    # No hardcoded TP floors. Just check Claude's TP vs demoted entry.
+                    demote = apply_demote_policy(
+                        trade_signal.direction,
+                        current_price,
+                        trade_signal.entry_price or current_price,
+                        trade_signal.stop_loss,
+                        trade_signal.take_profit,
+                        getattr(trade_signal, "order_type", "market") or "market",
+                        judge_outcome.suggested_entry,
+                    )
+                    demoted_entry = demote["demoted_entry"]
+                    trade_signal.order_type = demote["order_type"]
+                    trade_signal.stop_loss = demote["stop_loss"]
+                    trade_signal.take_profit = demote["take_profit"]
+                    trade_signal.entry_price = demoted_entry
+                    if demote.get("size_multiplier", 1.0) not in (None, 1.0):
+                        from .config import normalize_lots as _nd_demote
+                        position_size.lots = _nd_demote(
+                            symbol, position_size.lots * demote["size_multiplier"]
+                        )
+
                     _sl_for_check = trade_signal.stop_loss or 0
                     _demote_sl_dist = abs(demoted_entry - _sl_for_check) if _sl_for_check else 0
                     _demote_tp_dist = abs((trade_signal.take_profit or 0) - demoted_entry)
@@ -4762,23 +4604,7 @@ class TradingBot:
                         )
                         return
                     
-                    # Override to pending limit order
-                    if trade_signal.direction == 'long':
-                        trade_signal.order_type = 'buy_limit'
-                    else:
-                        trade_signal.order_type = 'sell_limit'
-                    # Rebase SL/TP as offsets from the demoted entry
-                    _orig_entry = trade_signal.entry_price or current_price
-                    if trade_signal.stop_loss and _orig_entry and _orig_entry > 0:
-                        _sl_offset = trade_signal.stop_loss - _orig_entry
-                        trade_signal.stop_loss = demoted_entry + _sl_offset
-                    if trade_signal.take_profit and _orig_entry and _orig_entry > 0:
-                        _tp_offset = trade_signal.take_profit - _orig_entry
-                        trade_signal.take_profit = demoted_entry + _tp_offset
-                    
-                    trade_signal.entry_price = demoted_entry
-                    
-                    # ---- Guard: SL must remain on the correct side of the demoted entry ----
+                    reason = judge_outcome.reason or demote.get("reason", "Judge demoted")
                     _sl_check = trade_signal.stop_loss or 0
                     if _sl_check > 0:
                         _sl_wrong_side = False
@@ -6460,12 +6286,14 @@ class TradingBot:
         )
 
     def _effective_max_daily_trades(self, equity: float) -> int:
-        """Min of tier, scaling-mode, and config daily trade caps."""
+        """Min of tier, scaling-mode, config, and optional optimizer gate override."""
+        gate_override = getattr(settings.trading, "gate_max_daily_trades", None)
         return effective_max_daily_trades(
             equity,
             self.position_sizer,
             self.scaling_manager,
             settings.trading.max_daily_trades,
+            gate_override=gate_override,
         )
 
     @staticmethod

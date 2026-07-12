@@ -430,6 +430,14 @@ class TradingSettings(BaseSettings):
         default=2.5,
         description="Minimum R:R for counter-trend scalps"
     )
+    gate_max_daily_trades: Optional[int] = Field(
+        default=None,
+        description="Optional optimizer override for max daily trades (None = use tier/mode caps only)"
+    )
+    optimizer_results_suggestive_only: bool = Field(
+        default=True,
+        description="When True, walk-forward optimizer output is advisory and never auto-applied"
+    )
     weak_hours_by_symbol: Dict[str, List[int]] = Field(
         default={
             "BTCUSD": [12, 13],

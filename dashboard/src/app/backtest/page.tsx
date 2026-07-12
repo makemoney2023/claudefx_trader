@@ -294,10 +294,15 @@ export default function BacktestPage() {
     const res = optResult?.result_json as Record<string, unknown> | undefined
     const best = res?.best_params as Record<string, unknown> | undefined
     if (!best) return
+    if (res?.recommend_apply === false) return
     try {
       const payload: Record<string, number> = {}
       if (best.min_confidence != null) payload.gate_min_confidence = best.min_confidence as number
-      if (best.min_rr != null) payload.gate_counter_trend_rr_floor = best.min_rr as number
+      if (best.min_rr != null) payload.min_risk_reward = best.min_rr as number
+      if (best.counter_trend_rr_floor != null) {
+        payload.gate_counter_trend_rr_floor = best.counter_trend_rr_floor as number
+      }
+      if (best.max_daily_trades != null) payload.gate_max_daily_trades = best.max_daily_trades as number
       if (best.cooldown_minutes != null) payload.gate_cooldown_minutes = best.cooldown_minutes as number
       await api.updateTradingConfig(payload as Parameters<typeof api.updateTradingConfig>[0])
     } catch (e) {
@@ -758,9 +763,24 @@ export default function BacktestPage() {
                         Out-of-sample Sharpe: {formatOptimizerMetric((optResult.result_json as Record<string, unknown>)?.out_of_sample_sharpe)}
                       </p>
                     </div>
+                    {(optResult.result_json as Record<string, unknown>)?.guardrail_warnings &&
+                      Array.isArray((optResult.result_json as Record<string, unknown>).guardrail_warnings) &&
+                      ((optResult.result_json as Record<string, unknown>).guardrail_warnings as string[]).length > 0 && (
+                      <div className="text-sm text-amber-400 space-y-1">
+                        {((optResult.result_json as Record<string, unknown>).guardrail_warnings as string[]).map((w) => (
+                          <p key={w}>{w}</p>
+                        ))}
+                      </div>
+                    )}
                     <button
                       onClick={applyOptimizerParams}
-                      className="btn btn-primary flex items-center gap-2"
+                      disabled={(optResult.result_json as Record<string, unknown>)?.recommend_apply === false}
+                      className="btn btn-primary flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                      title={
+                        (optResult.result_json as Record<string, unknown>)?.recommend_apply === false
+                          ? 'Guardrails failed — review warnings before applying'
+                          : undefined
+                      }
                     >
                       Apply to Config
                     </button>

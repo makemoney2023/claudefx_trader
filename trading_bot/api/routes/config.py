@@ -61,6 +61,7 @@ class UpdateTradingConfigRequest(BaseModel):
     gate_session_penalty_asian: Optional[float] = Field(None, ge=0.0, le=0.5)
     gate_cooldown_minutes: Optional[int] = Field(None, ge=0, le=120)
     gate_counter_trend_rr_floor: Optional[float] = Field(None, ge=1.0, le=10.0)
+    gate_max_daily_trades: Optional[int] = Field(None, ge=1, le=50)
 
 
 class UpdateTimeframeConfigRequest(BaseModel):
@@ -213,6 +214,10 @@ async def update_trading_config(request: UpdateTradingConfigRequest, persist: bo
     if request.gate_counter_trend_rr_floor is not None:
         settings.trading.gate_counter_trend_rr_floor = request.gate_counter_trend_rr_floor
         updates_to_persist['gate_counter_trend_rr_floor'] = request.gate_counter_trend_rr_floor
+
+    if request.gate_max_daily_trades is not None:
+        settings.trading.gate_max_daily_trades = request.gate_max_daily_trades
+        updates_to_persist['gate_max_daily_trades'] = request.gate_max_daily_trades
 
     # Gap 5: Persist changes to .env.local
     if persist and updates_to_persist:

@@ -93,121 +93,48 @@ def simulate_trade_with_exit_policy(
     *,
     pip_size: float = 0.0001,
     a_plus: bool = False,
-    partial_close_r: float = 1.0,
-    giveback_min_peak_r: float = 1.5,
-    trailing_start_r: float = 2.0,
     max_bars: int = 200,
 ) -> ReplayTrade:
-    """Simulate partial exits, trailing, and giveback protection."""
+    """Simulate partial exits, trailing, and giveback using shared exit_policy."""
+    from ..execution.exit_policy import simulate_exit_policy_bars
+    from ..config import get_symbol_spec
+
     if future_data is None or future_data.empty:
         return ReplayTrade(signal=signal, outcome="timeout")
 
-    entry = signal.entry_price
-    sl = signal.stop_loss
-    tp = signal.take_profit
-    is_long = signal.direction == "long"
-    sl_dist = abs(entry - sl) if sl else 1.0
-    _pip = pip_size if pip_size > 0 else 1.0
+    spec = get_symbol_spec(signal.symbol)
+    is_crypto = spec.category == "crypto" if spec else False
 
-    mfe = 0.0
-    mae = 0.0
-    peak_r = 0.0
-    remaining_fraction = 1.0
-    realized_r = 0.0
-    current_sl = sl
-    trailing_active = False
-    tp1_hit = False
+    bars = [
+        {
+            "open": float(row["open"]),
+            "high": float(row["high"]),
+            "low": float(row["low"]),
+            "close": float(row["close"]),
+        }
+        for _, row in future_data.iterrows()
+    ]
 
-    tp1 = entry + sl_dist if is_long else entry - sl_dist
+    outcome, total_r, bars_held, mfe, mae = simulate_exit_policy_bars(
+        direction=signal.direction,
+        entry=signal.entry_price,
+        sl=signal.stop_loss,
+        tp=signal.take_profit,
+        bars=bars,
+        is_crypto=is_crypto,
+        a_plus=a_plus,
+        max_bars=max_bars,
+    )
 
-    for i, (_, bar) in enumerate(future_data.iterrows()):
-        if i >= max_bars:
-            break
-
-        high = float(bar["high"])
-        low = float(bar["low"])
-        bar_open = float(bar["open"])
-
-        if is_long:
-            fav = (high - entry) / sl_dist
-            adv = (entry - low) / sl_dist
-            current_r = (float(bar["close"]) - entry) / sl_dist
-        else:
-            fav = (entry - low) / sl_dist
-            adv = (high - entry) / sl_dist
-            current_r = (entry - float(bar["close"])) / sl_dist
-
-        mfe = max(mfe, fav)
-        mae = max(mae, adv)
-        peak_r = max(peak_r, fav)
-
-        sl_hit, tp_hit = resolve_same_bar_tp_sl(
-            signal.direction, bar_open, high, low, current_sl, tp
-        )
-
-        if tp_hit:
-            tp_r = abs(tp - entry) / sl_dist if sl_dist > 0 else 1.0
-            total_r = realized_r + remaining_fraction * tp_r
-            return ReplayTrade(
-                signal=signal,
-                outcome="win",
-                exit_price=tp,
-                r_multiple=total_r,
-                mfe_pips=mfe,
-                mae_pips=mae,
-                bars_held=i + 1,
-            )
-
-        if sl_hit:
-            total_r = realized_r + remaining_fraction * (-1.0)
-            return ReplayTrade(
-                signal=signal,
-                outcome="loss",
-                exit_price=current_sl,
-                r_multiple=total_r,
-                mfe_pips=mfe,
-                mae_pips=mae,
-                bars_held=i + 1,
-            )
-
-        if not a_plus and not tp1_hit and fav >= partial_close_r:
-            tp1_hit = True
-            realized_r += 0.5 * partial_close_r
-            remaining_fraction = 0.5
-            current_sl = entry
-
-        if peak_r >= trailing_start_r:
-            trailing_active = True
-            trail_r = peak_r - 0.5
-            if is_long:
-                current_sl = max(current_sl, entry + trail_r * sl_dist)
-            else:
-                current_sl = min(current_sl, entry - trail_r * sl_dist)
-
-        if peak_r >= giveback_min_peak_r and current_r <= peak_r * 0.5:
-            total_r = realized_r + remaining_fraction * current_r
-            return ReplayTrade(
-                signal=signal,
-                outcome="win" if total_r > 0 else "loss",
-                exit_price=float(bar["close"]),
-                r_multiple=total_r,
-                mfe_pips=mfe,
-                mae_pips=mae,
-                bars_held=i + 1,
-            )
-
-    last_close = float(future_data.iloc[-1]["close"])
-    pnl_raw = (last_close - entry) if is_long else (entry - last_close)
-    r = pnl_raw / sl_dist if sl_dist > 0 else 0
-    total_r = realized_r + remaining_fraction * r
+    exit_price = float(future_data.iloc[min(bars_held - 1, len(future_data) - 1)]["close"]) if bars_held else signal.entry_price
     return ReplayTrade(
         signal=signal,
-        outcome="timeout",
-        exit_price=last_close,
+        outcome=outcome,
+        exit_price=exit_price,
         r_multiple=total_r,
         mfe_pips=mfe,
         mae_pips=mae,
-        bars_held=len(future_data),
+        bars_held=bars_held,
     )
 
 
@@ -342,7 +269,9 @@ def run_policy_replay(
         a_plus=a_plus,
     )
     execution_trade.r_multiple = apply_symbol_execution_costs(
-        signal.symbol, execution_trade.r_multiple
+        signal.symbol,
+        execution_trade.r_multiple,
+        bars_held=execution_trade.bars_held,
     )
     path.append(f"exit:{execution_trade.outcome}")
 

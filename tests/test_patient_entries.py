@@ -293,17 +293,16 @@ class TestPatienceInPrompts:
 
 
 class TestFallbackMinConfidence:
-    """Tests the fallback min_confidence value in main.py."""
+    """Tests the min confidence gate in main.py."""
 
     def test_fallback_confidence_is_060(self):
-        """The fallback min_confidence should be 0.60 to allow more signals through."""
-        # We test by checking the source code directly
+        """Min confidence should come from gate_min_confidence (default 0.60)."""
         import inspect
         from trading_bot.main import TradingBot
 
         source = inspect.getsource(TradingBot)
-        # The fallback should be 0.60 (lowered from 0.75 to capture scalp opportunities)
-        assert "min_confidence = 0.60" in source or "min_confidence = 0.6" in source
+        assert "gate_min_confidence" in source
+        assert "min_confidence = settings.trading.gate_min_confidence" in source
 
 
 class TestDirectionalBiasFix:

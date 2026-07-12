@@ -19,6 +19,7 @@ def effective_max_daily_trades(
     position_sizer: Optional[ScalingPositionSizer],
     scaling_manager=None,
     config_cap: Optional[int] = None,
+    gate_override: Optional[int] = None,
 ) -> int:
     """
     Effective daily trade cap: min(tier limit, scaling-mode limit, config cap).
@@ -34,6 +35,8 @@ def effective_max_daily_trades(
         mode_limit = scaling_manager.get_mode_config().max_daily_trades
 
     cap = min(tier_limit, mode_limit)
+    if gate_override is not None:
+        cap = min(cap, gate_override)
     if config_cap is not None:
         cap = min(cap, config_cap)
     return max(1, cap)
