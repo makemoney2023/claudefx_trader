@@ -50,8 +50,18 @@ logs/
 # Runtime data
 # ===========================
 data/bot.lock
+data/bot_state.json
 trading_bot.db
+trading_bot.db-*
+trading_bot.db.*
+trading_bot_*backup*.db
 trades/journal.json
+backups/db/
+dashboard/backups/
+
+# Local scratch / commit helpers
+commit_msg*.txt
+main_diff.txt
 
 # ===========================
 # Test / Cache
