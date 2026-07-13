@@ -40,6 +40,30 @@ logger = get_logger(__name__)
 if TYPE_CHECKING:
     from ..main import TradingBot
 
+_PLAYBOOK_STATS_TTL_SECONDS = 3600
+
+
+async def _get_playbook_stats(bot: "TradingBot") -> list:
+    """Structured setup stats for the playbook gate, cached for 1 hour."""
+    try:
+        if not getattr(bot, "learning_service", None):
+            return []
+        now = datetime.now(timezone.utc)
+        cached_at = getattr(bot, "_playbook_stats_time", None)
+        if (
+            cached_at is not None
+            and isinstance(cached_at, datetime)
+            and (now - cached_at).total_seconds() < _PLAYBOOK_STATS_TTL_SECONDS
+        ):
+            return getattr(bot, "_playbook_stats_cache", []) or []
+        stats = await bot.learning_service.get_setup_stats()
+        bot._playbook_stats_cache = stats if isinstance(stats, list) else []
+        bot._playbook_stats_time = now
+        return bot._playbook_stats_cache
+    except Exception as exc:
+        logger.debug(f"Playbook stats unavailable: {exc}")
+        return []
+
 
 async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool = False) -> None:
     """Run full analyze-and-trade pipeline for one symbol."""
@@ -558,6 +582,47 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
             datetime.now(timezone.utc),
         )
 
+        # Stash regime for close/fill telemetry (used by TradeFillHandler)
+        try:
+            _regime_info = market_data.get("regime") or {}
+            if not hasattr(bot, "_last_regime_by_symbol"):
+                bot._last_regime_by_symbol = {}
+            bot._last_regime_by_symbol[symbol] = (
+                _regime_info.get("regime") if isinstance(_regime_info, dict) else None
+            )
+        except Exception:
+            pass
+
+        # ============================================
+        # PLAYBOOK HARD GATE (proven negative expectancy combos)
+        # ============================================
+        from .edge_policies import evaluate_playbook_gate
+
+        _playbook_stats = await _get_playbook_stats(bot)
+        _pb_result = evaluate_playbook_gate(
+            _playbook_stats,
+            symbol,
+            trade_signal.direction,
+            _session_name,
+            trade_type=getattr(trade_signal, "trade_type", None),
+        )
+        if _pb_result.blocked:
+            logger.warning(f"[PLAYBOOK-GATE] {symbol}: {_pb_result.reason}")
+            print(f"[BLOCKED] {symbol}: {_pb_result.reason}", flush=True)
+            await bot._record_terminal_decision(
+                "mechanical_reject",
+                symbol,
+                gate_id="playbook_block",
+                direction=trade_signal.direction,
+                entry=trade_signal.entry_price or current_price,
+                sl=trade_signal.stop_loss or 0.0,
+                tp=trade_signal.take_profit or 0.0,
+                confidence=trade_signal.confidence,
+                reason=_pb_result.reason,
+                details={"playbook_stats": _pb_result.stats},
+            )
+            return
+
         # Gap 21: Track signal hashes for dedup, but DON'T hard-block.
         # Multiple trades per symbol are allowed if the analysis supports it.
         # The pending order replacement logic downstream already handles
@@ -582,6 +647,26 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
             size_multiplier = 1.0
         _edge_mult = getattr(bot, "_edge_size_multiplier", 1.0)
         size_multiplier *= _edge_mult
+
+        # ============================================
+        # ENSEMBLE SIZING: mechanical baseline vs Claude agreement
+        # ============================================
+        from .edge_policies import mech_agreement_size_multiplier
+
+        _agree = mech_agreement_size_multiplier(
+            analysis_results.get("mechanical_setup"), trade_signal.direction
+        )
+        if _agree.multiplier != 1.0:
+            size_multiplier *= _agree.multiplier
+            logger.info(
+                f"[ENSEMBLE] {symbol}: mech/Claude {_agree.label} — "
+                f"size x{_agree.multiplier:.2f}"
+            )
+            print(
+                f"[ENSEMBLE] {symbol}: Mechanical baseline {_agree.label.upper()} "
+                f"with Claude — size multiplier {_agree.multiplier:.2f}",
+                flush=True,
+            )
         
         # ============================================
         # PRE-LOCK: Get Claude's position size recommendation OUTSIDE the trade lock

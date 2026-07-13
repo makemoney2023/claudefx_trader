@@ -186,6 +186,9 @@ class PositionManager:
         # While set and in the future, giveback protection uses tighter
         # thresholds (volatility spike response)
         self.volatility_tighten_until: Optional[datetime] = None
+        # Per-symbol exit trigger overrides from MFE/MAE excursion tuning:
+        # {symbol: {"tp1_r": float, "tp2_r": float}}
+        self.symbol_exit_overrides: Dict[str, Dict[str, float]] = {}
         
         logger.info("Position manager initialized")
     
@@ -242,6 +245,28 @@ class PositionManager:
     def _skip_tp1_partial(self, position: Position) -> bool:
         """Skip early TP1 partial only for explicit A+ classification."""
         return bool(getattr(position, "a_plus", False))
+
+    def set_exit_overrides(self, symbol: str, tp1_r: float, tp2_r: float) -> None:
+        """Set MFE-tuned TP1/TP2 R triggers for a symbol."""
+        self.symbol_exit_overrides[symbol] = {"tp1_r": tp1_r, "tp2_r": tp2_r}
+        logger.info(
+            f"[EXIT-TUNE] {symbol}: TP1 trigger {tp1_r}R, TP2 trigger {tp2_r}R "
+            f"(from excursion data)"
+        )
+
+    def _tp1_trigger_r(self, position: Position) -> float:
+        """TP1 / break-even trigger R for this position's symbol."""
+        override = self.symbol_exit_overrides.get(position.symbol)
+        if override:
+            return override["tp1_r"]
+        return self.break_even_trigger_r
+
+    def _tp2_trigger_r(self, position: Position) -> float:
+        """TP2 / trailing-start trigger R for this position's symbol."""
+        override = self.symbol_exit_overrides.get(position.symbol)
+        if override:
+            return override["tp2_r"]
+        return self.trailing_start_r
     
     def remove_position(self, ticket: int):
         """Remove a position from tracking."""
@@ -625,21 +650,24 @@ class PositionManager:
         if protection_action:
             return protection_action
         
+        _tp1_r = self._tp1_trigger_r(position)
+        _tp2_r = self._tp2_trigger_r(position)
+        
         # Stage 0.5: If TP1 fired (partial close done) but break-even modification failed,
         # retry the break-even move. Without this, tp1_hit=True prevents re-entering Stage 1.
-        if position.tp1_hit and not position.be_triggered and r_multiple >= self.break_even_trigger_r:
+        if position.tp1_hit and not position.be_triggered and r_multiple >= _tp1_r:
             logger.info(f"Retrying break-even modification for {position.ticket} (TP1 already done)")
             return await self._move_to_break_even(position)
         
         # Stage 1: TP1 - Partial close (if possible) + move to break-even
-        if not position.tp1_hit and r_multiple >= self.break_even_trigger_r:
+        if not position.tp1_hit and r_multiple >= _tp1_r:
             tp1_reached = False
             if position.tp1 > 0:
                 if position.direction == 'long' and position.current_price >= position.tp1:
                     tp1_reached = True
                 elif position.direction == 'short' and position.current_price <= position.tp1:
                     tp1_reached = True
-            if r_multiple >= self.break_even_trigger_r:
+            if r_multiple >= _tp1_r:
                 tp1_reached = True
             
             if tp1_reached:
@@ -676,7 +704,7 @@ class PositionManager:
                     tp2_reached = True
                 elif position.direction == 'short' and position.current_price <= position.tp2:
                     tp2_reached = True
-            if r_multiple >= self.trailing_start_r:
+            if r_multiple >= _tp2_r:
                 tp2_reached = True
             
             if tp2_reached:
@@ -694,7 +722,7 @@ class PositionManager:
                     return await self._update_trailing_stop(position)
         
         # Stage 3: Trailing stop on runner (applies to all position sizes)
-        if position.tp2_hit and r_multiple >= self.trailing_start_r:
+        if position.tp2_hit and r_multiple >= _tp2_r:
             return await self._update_trailing_stop(position)
         
         return None

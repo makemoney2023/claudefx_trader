@@ -34,6 +34,8 @@ class ExcursionResult:
     p90_mae: float
     optimal_sl: float  # 90th percentile MAE of winners
     optimal_tp: float  # Median MFE of winners
+    median_winner_mfe_r: float = 0.0  # Median winner MFE in R multiples
+    winner_sample: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -48,6 +50,8 @@ class ExcursionResult:
             'p90_mae': round(self.p90_mae, 5),
             'optimal_sl': round(self.optimal_sl, 5),
             'optimal_tp': round(self.optimal_tp, 5),
+            'median_winner_mfe_r': round(self.median_winner_mfe_r, 2),
+            'winner_sample': self.winner_sample,
         }
 
 
@@ -109,6 +113,7 @@ class ExcursionAnalyzer:
             maes = []
             winner_mfes = []
             winner_maes = []
+            winner_mfe_rs = []
 
             for t in trades:
                 entry = float(t.entry_price)
@@ -139,6 +144,7 @@ class ExcursionAnalyzer:
                 if is_winner:
                     winner_mfes.append(mfe_abs)
                     winner_maes.append(mae_abs)
+                    winner_mfe_rs.append(mfe_abs / sl_dist)
 
             if not mfes:
                 return None
@@ -165,6 +171,10 @@ class ExcursionAnalyzer:
                 p90_mae=float(np.percentile(maes_arr, 90)),
                 optimal_sl=optimal_sl,
                 optimal_tp=optimal_tp,
+                median_winner_mfe_r=(
+                    float(np.median(winner_mfe_rs)) if winner_mfe_rs else 0.0
+                ),
+                winner_sample=len(winner_mfe_rs),
             )
 
             logger.info(

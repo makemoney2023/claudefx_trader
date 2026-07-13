@@ -334,6 +334,8 @@ class GateFunnel:
                     "unknown": len([r for r in cat_rows if r.hypothetical_result not in ("would_have_won", "would_have_lost")]),
                 }
 
+            from .edge_policies import build_gate_tuning_recommendations
+
             return {
                 "period_days": days_back,
                 "total_decisions": len(rows),
@@ -344,6 +346,9 @@ class GateFunnel:
                     "coverage_pct": round(coverage_pct, 2),
                 },
                 "false_rejection": false_rejection,
+                "tuning_recommendations": build_gate_tuning_recommendations(
+                    gate_expectancy
+                ),
             }
         except Exception as exc:
             logger.error(f"Failed to compute gate analytics: {exc}")

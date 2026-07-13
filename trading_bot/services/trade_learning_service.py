@@ -1674,6 +1674,65 @@ Total R: {review.total_r:.1f}R
             logger.warning(f"Failed to build setup playbook: {e}")
             return ""
     
+    async def get_setup_stats(
+        self,
+        lookback_days: int = 180,
+        min_sample: int = 1,
+    ) -> List[Dict[str, Any]]:
+        """
+        Structured setup performance rows for programmatic gating.
+
+        Returns [{symbol, direction, session, setup, sample, win_rate, avg_r}].
+        Same grouping as build_setup_playbook but machine-readable.
+        """
+        try:
+            cutoff = datetime.now() - timedelta(days=lookback_days)
+
+            async with async_session_maker() as session:
+                q = select(TradeModel).where(
+                    and_(
+                        TradeModel.timestamp >= cutoff.isoformat(),
+                        TradeModel.exit_price.isnot(None),
+                    )
+                )
+                result = await session.execute(q)
+                trades = result.scalars().all()
+
+            if not trades:
+                return []
+
+            groups: Dict[str, List] = {}
+            for t in trades:
+                key = (
+                    f"{t.symbol or 'unknown'}|{t.direction or 'unknown'}|"
+                    f"{t.session or 'unknown'}|{t.trade_type or 'unknown'}"
+                )
+                groups.setdefault(key, []).append({
+                    'won': (t.profit_loss or 0) > 0,
+                    'r': self._sanitize_r(t.r_multiple or 0),
+                })
+
+            rows = []
+            for key, entries in groups.items():
+                if len(entries) < min_sample:
+                    continue
+                sym, direction, sess, setup = key.split('|')
+                wins = sum(1 for e in entries if e['won'])
+                rows.append({
+                    'symbol': sym,
+                    'direction': direction,
+                    'session': sess,
+                    'setup': setup,
+                    'sample': len(entries),
+                    'win_rate': wins / len(entries),
+                    'avg_r': sum(e['r'] for e in entries) / len(entries),
+                })
+            return rows
+
+        except Exception as e:
+            logger.warning(f"Failed to build setup stats: {e}")
+            return []
+
     async def get_reactive_levels(
         self,
         symbol: str,

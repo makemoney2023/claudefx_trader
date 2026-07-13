@@ -319,6 +319,9 @@ class TradingBot:
         self._volatility_pause_until: Optional[datetime] = None
         self._volatility_spike_expiry: Dict[str, datetime] = {}
         
+        # Edge policy state: regime tags for fill telemetry, playbook cache
+        self._last_regime_by_symbol: Dict[str, Optional[str]] = {}
+        
         # SAFE Crypto symbols (24/7 trading) - ONLY USD pairs!
         # WARNING: BTC pairs (ETHBTC, DASHBTC, etc.) are EXCLUDED because 
         # their contract value is in BTC, not USD, causing incorrect position sizing
@@ -489,6 +492,12 @@ class TradingBot:
                 print("[INIT] Position sync timed out (15s), continuing...", flush=True)
             except Exception as e:
                 print(f"[INIT] Position sync failed: {e}, continuing...", flush=True)
+            
+            # MFE-tuned per-symbol exit triggers (fail-open without data)
+            try:
+                await asyncio.wait_for(self._refresh_exit_overrides(), timeout=15)
+            except Exception as e:
+                logger.debug(f"Exit override refresh skipped: {e}")
             
             # Initialize kill zone checker with allowed sessions
             self.kill_zone_checker = KillZoneChecker(
@@ -4382,6 +4391,37 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
 
             await self._handle_position_close(position)
 
+    async def _refresh_exit_overrides(self):
+        """
+        Tune per-symbol TP1/TP2 exit triggers from measured winner MFE.
+
+        Fail-open: symbols without >= 10 winners keep the default ladder.
+        """
+        if not self.position_manager:
+            return
+        from .analysis.excursion_analysis import ExcursionAnalyzer
+        from .services.edge_policies import exit_trigger_overrides_from_excursion
+
+        analyzer = ExcursionAnalyzer()
+        tuned = 0
+        for symbol in settings.trading.symbols:
+            try:
+                result = await analyzer.compute(symbol, direction="all", lookback_days=90)
+                if not result:
+                    continue
+                overrides = exit_trigger_overrides_from_excursion(
+                    result.median_winner_mfe_r, result.winner_sample
+                )
+                if overrides:
+                    self.position_manager.set_exit_overrides(
+                        symbol, overrides["tp1_r"], overrides["tp2_r"]
+                    )
+                    tuned += 1
+            except Exception as exc:
+                logger.debug(f"Exit tuning skipped for {symbol}: {exc}")
+        if tuned:
+            logger.info(f"[EXIT-TUNE] Applied MFE-tuned exit triggers for {tuned} symbol(s)")
+
     async def _handle_position_close(self, position):
         """
         Gap 6: Handle position close - auto-log to journal.
@@ -5582,6 +5622,12 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
             if hasattr(self, 'risk_manager') and self.risk_manager:
                 self.risk_manager.reset_daily_risk()
                 logger.info("Risk manager daily risk reset")
+            
+            # Refresh MFE-tuned exit triggers with latest trade data
+            try:
+                await self._refresh_exit_overrides()
+            except Exception as e:
+                logger.debug(f"Exit override refresh skipped: {e}")
             
             # Check for weekly reset (Monday) - weekly consolidation happens on Sunday
             if today.weekday() == 0:  # Monday

@@ -142,8 +142,16 @@ class TradeFillHandler:
                         sl=trade_signal.stop_loss or 0.0,
                         tp=trade_signal.take_profit or 0.0,
                         confidence=trade_signal.confidence,
+                        session=(
+                            bot.kill_zone_checker.get_current_session().session_name
+                            if bot.kill_zone_checker else ""
+                        ),
                         reason=f"Pending {order_type} placed",
-                        details={"ticket": result.ticket, "order_type": order_type},
+                        details={
+                            "ticket": result.ticket,
+                            "order_type": order_type,
+                            "regime": getattr(bot, "_last_regime_by_symbol", {}).get(symbol),
+                        },
                     )
                     
                     # Add to activity feed as pending order (not "trade opened")
@@ -273,6 +281,18 @@ class TradeFillHandler:
                     
                     bot.position_manager.add_position(position)
                     print(f"[TRADE] {symbol}: Market order filled (ticket={result.ticket}, fill={result.fill_price})", flush=True)
+                    
+                    # Execution cost + regime telemetry for edge analysis
+                    from ..services.edge_policies import compute_slippage
+                    _requested = trade_signal.entry_price or current_price
+                    _slippage = compute_slippage(
+                        trade_signal.direction, _requested, result.fill_price
+                    )
+                    _session = (
+                        bot.kill_zone_checker.get_current_session().session_name
+                        if bot.kill_zone_checker else ""
+                    )
+                    _regime = getattr(bot, "_last_regime_by_symbol", {}).get(symbol)
                     await bot._record_terminal_decision(
                         "market_filled",
                         symbol,
@@ -281,8 +301,15 @@ class TradeFillHandler:
                         sl=tracked_sl or 0.0,
                         tp=tracked_tp or 0.0,
                         confidence=trade_signal.confidence,
+                        session=_session,
                         reason="Market order filled",
-                        details={"ticket": result.ticket},
+                        details={
+                            "ticket": result.ticket,
+                            "requested_entry": _requested,
+                            "fill_price": result.fill_price,
+                            "slippage": round(_slippage, 6),
+                            "regime": _regime,
+                        },
                     )
                     
                     # Track in correlation service
