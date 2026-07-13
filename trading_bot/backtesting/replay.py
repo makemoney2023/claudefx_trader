@@ -548,10 +548,9 @@ class ClaudeReplayBacktester:
                 _zone_gate_decision = "no_gate"
                 if sig.direction != 'no_trade' and sig.entry_price and sig.stop_loss and sig.take_profit:
                     from ..config import settings as _bt_settings
-                    from ..services.entry_gates import (
-                        ZoneGateSettings,
-                        evaluate_replay_pre_execution_gates,
-                    )
+                    from ..services.entry_gates import ZoneGateSettings, should_use_zone_gate
+                    from ..services.gate_pipeline import evaluate_pre_execution_gates
+                    from ..services.trade_context import TradeContext
 
                     _sl_dist_bt = abs(sig.entry_price - sig.stop_loss)
                     _tp_dist_bt = abs(sig.take_profit - sig.entry_price)
@@ -568,20 +567,41 @@ class ClaudeReplayBacktester:
                     _sym_spec = get_symbol_spec(symbol)
                     _is_index = _sym_spec.category == 'index' if _sym_spec else False
                     _weak_hrs = tuple(_bt_settings.trading.weak_hours_by_symbol.get(symbol, []))
-
-                    _rg = evaluate_replay_pre_execution_gates(
-                        direction=sig.direction,
-                        confidence=sig.confidence,
-                        rr=_rr_bt,
-                        d1_bias=_d1_bias_bt,
-                        pd_result=_pd_d1_result,
+                    _use_zone = should_use_zone_gate(
+                        _pd_d1_result is not None,
+                        _zone_settings.gate_mode,
+                        symbol,
+                        _zone_settings.disabled_symbols,
+                    )
+                    _replay_market = {
+                        'd1_bias': _d1_bias_bt,
+                        'h4_bias': (analysis_data.get('h4_bias') or '').lower(),
+                        'm15_bias': (analysis_data.get('m15_bias') or '').lower(),
+                        'regime': analysis_data.get('regime', {}),
+                    }
+                    _replay_ctx = TradeContext.from_signal(
                         symbol=symbol,
-                        is_index=_is_index,
+                        trade_signal=sig,
+                        market_data=_replay_market,
+                        analysis_results=analysis_data or {},
+                        current_price=sig.entry_price or current_price,
+                        pd_analysis=_pd_d1_result,
                         utc_hour=current.hour,
                         weak_hours=_weak_hrs,
-                        zone_settings=_zone_settings,
+                        is_index=_is_index,
+                        actual_rr=_rr_bt,
                     )
-                    _zone_gate_decision = _rg.zone_decision
+                    _rg = evaluate_pre_execution_gates(
+                        _replay_ctx,
+                        zone_settings=_zone_settings,
+                        use_zone_gate=_use_zone,
+                        is_kill_zone=True,
+                        gate_min_confidence=_bt_settings.trading.gate_min_confidence,
+                    )
+                    sig.confidence = _replay_ctx.confidence
+                    _zone_gate_decision = (
+                        _rg.gate_id if _rg.blocked else "allowed"
+                    )
                     if _rg.blocked:
                         logger.info(
                             f"[REPLAY] {current.strftime('%m/%d %H:%M')} "

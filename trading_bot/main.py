@@ -60,11 +60,12 @@ from .services.live_trade_gates import (
 )
 from .services.entry_gates import (
     ZoneGateSettings,
-    evaluate_zone_gate,
-    evaluate_legacy_d1_gate,
-    evaluate_tod_gate,
-    evaluate_volatile_regime_gate,
     should_use_zone_gate,
+)
+from .services.gate_pipeline import (
+    count_confluence,
+    evaluate_entry_gates,
+    evaluate_trade_permission_gates,
 )
 from .services.confidence_modifiers import (
     SecondaryModifierContext,
@@ -1634,6 +1635,9 @@ class TradingBot:
         """
         _trade_reservation = None
         _trade_reservation_context = None
+        if not hasattr(self, "_trade_pipeline"):
+            from .services.trade_pipeline import TradePipeline
+            self._trade_pipeline = TradePipeline(self)
         try:
             logger.info(f"Analyzing {symbol}...")
             
@@ -1727,44 +1731,25 @@ class TradingBot:
             if bot_state:
                 bot_state.running_technical_analysis(symbol)
             
-            # Core ICT analysis (use symbol-specific pip_value)
-            from .config import get_symbol_spec as _get_spec
-            _core_pip = _get_spec(symbol).pip_size
-            market_structure_analyzer = MarketStructureAnalyzer()
-            fvg_detector = FVGDetector(pip_value=_core_pip)
-            ob_detector = OrderBlockDetector()
-            liquidity_mapper = LiquidityMapper(pip_value=_core_pip)
-            volume_analyzer = VolumeAnalyzer()
+            # Core ICT analysis via shared orchestrator
+            if not hasattr(self, "_analysis_orchestrator"):
+                from .services.analysis_orchestrator import AnalysisOrchestrator
+                self._analysis_orchestrator = AnalysisOrchestrator()
+            analysis_results = self._analysis_orchestrator.run_core_analysis(symbol, df)
             
-            analysis_results = {
-                "market_structure": market_structure_analyzer.analyze(df),
-                "fvg": fvg_detector.detect(df),
-                "order_blocks": ob_detector.detect(df),
-                "liquidity": liquidity_mapper.analyze(df)
-            }
-            
-            # Volume analysis
+            # Volume bot_state telemetry
             try:
-                volume_analysis = volume_analyzer.analyze(df)
-                analysis_results["volume"] = volume_analysis.to_dict()
-                logger.info(
-                    f"Volume: {volume_analysis.relative_volume:.1f}x avg, "
-                    f"Trend: {volume_analysis.volume_trend}, "
-                    f"Spikes: {len(volume_analysis.spike_bars)}, "
-                    f"Low: {'YES' if volume_analysis.relative_volume < 0.5 else 'NO'}"
-                )
-                if bot_state:
+                volume_analysis = analysis_results.get("volume", {})
+                _rel = volume_analysis.get("relative_volume", 1.0) if isinstance(volume_analysis, dict) else 1.0
+                _trend = volume_analysis.get("volume_trend", "") if isinstance(volume_analysis, dict) else ""
+                _spikes = len(volume_analysis.get("spike_bars", [])) if isinstance(volume_analysis, dict) else 0
+                logger.info(f"Volume: {_rel:.1f}x avg, Trend: {_trend}, Spikes: {_spikes}")
+                if bot_state and isinstance(volume_analysis, dict):
                     bot_state.volume_analysis_complete(
-                        symbol,
-                        volume_analysis.relative_volume,
-                        volume_analysis.volume_trend,
-                        len(volume_analysis.spike_bars),
-                        volume_analysis.relative_volume < 0.5
+                        symbol, _rel, _trend, _spikes, _rel < 0.5
                     )
             except Exception as e:
-                logger.warning(f"Volume analysis error: {e}")
-                volume_analysis = None
-                analysis_results["volume"] = {}
+                logger.warning(f"Volume telemetry error: {e}")
             
             # =============================================
             # NEW: 100-PIP EXPANSION ANALYSIS
@@ -2983,172 +2968,27 @@ class TradingBot:
                 return
             
             # ============================================
-            # SIGNAL PRICE SANITY CHECKS (A5)
-            # Validate Claude's prices before any execution
+            # SIGNAL PRICE SANITY CHECKS (A5) — shared normalizer
             # ============================================
-            _entry = trade_signal.entry_price or current_price
-            _sl = trade_signal.stop_loss
-            _tp = trade_signal.take_profit
-            _dir = trade_signal.direction
-            
-            # Check 1 & 2: SL/TP must be on the correct side of entry
-            # Instead of immediately rejecting, try to auto-correct swapped SL/TP first
-            
-            # Step 0: Handle SL == Entry (zero risk distance).
-            # Claude sometimes outputs SL at the same price as entry.
-            # Derive a sensible SL using the key support/resistance level or a default offset.
-            if _sl and _entry and abs(_sl - _entry) < _entry * 0.0001:  # Within 0.01%
-                _key_levels = getattr(claude_result, 'key_levels', {}) or {}
-                _key_s1 = _key_levels.get('support_1')
-                _key_r1 = _key_levels.get('resistance_1')
-                
-                if _dir == 'long':
-                    # Use S1 if available and below entry, otherwise use 1% below entry
-                    if _key_s1 and _key_s1 < _entry:
-                        _sl = _key_s1
-                    else:
-                        _sl = _entry * 0.99  # 1% below
-                elif _dir == 'short':
-                    if _key_r1 and _key_r1 > _entry:
-                        _sl = _key_r1
-                    else:
-                        _sl = _entry * 1.01  # 1% above
-                
-                trade_signal.stop_loss = _sl
-                logger.warning(
-                    f"SL=ENTRY AUTO-FIX for {symbol} ({_dir}): "
-                    f"SL was at entry {_entry}, corrected to {_sl}"
-                )
-                print(f"[A5-FIX] {symbol}: SL was at entry, corrected to {_sl}", flush=True)
-            
-            # ── DIRECTION COHERENCE CHECK (A5 safety net) ──────────
-            # If SL/TP orientation clearly indicates the opposite direction,
-            # flip the direction label instead of swapping levels.
-            _direction_flipped = False
-            if _sl and _tp and _entry:
-                _levels_say_long = (_sl < _entry and _tp > _entry)
-                _levels_say_short = (_sl > _entry and _tp < _entry)
-                
-                if _dir == 'short' and _levels_say_long:
-                    logger.warning(
-                        f"[A5-FLIP] {symbol}: Levels say LONG (SL={_sl} < Entry={_entry} < TP={_tp}) "
-                        f"but direction was SHORT. Flipping to LONG."
-                    )
-                    print(f"[A5-FLIP] {symbol}: Direction flipped SHORT→LONG (levels indicate LONG)", flush=True)
-                    _dir = 'long'
-                    trade_signal.direction = 'long'
-                    _direction_flipped = True
-                elif _dir == 'long' and _levels_say_short:
-                    logger.warning(
-                        f"[A5-FLIP] {symbol}: Levels say SHORT (TP={_tp} < Entry={_entry} < SL={_sl}) "
-                        f"but direction was LONG. Flipping to SHORT."
-                    )
-                    print(f"[A5-FLIP] {symbol}: Direction flipped LONG→SHORT (levels indicate SHORT)", flush=True)
-                    _dir = 'short'
-                    trade_signal.direction = 'short'
-                    _direction_flipped = True
-            
-            sl_wrong = False
-            tp_wrong = False
-            
-            if _dir == 'long' and _sl and _sl >= _entry:
-                sl_wrong = True
-            if _dir == 'short' and _sl and _sl <= _entry:
-                sl_wrong = True
-            if _dir == 'long' and _tp and _tp <= _entry:
-                tp_wrong = True
-            if _dir == 'short' and _tp and _tp >= _entry:
-                tp_wrong = True
-            
-            # If both are on the wrong side, swap them
-            if sl_wrong and tp_wrong and _sl and _tp:
-                logger.warning(
-                    f"SL/TP SWAP AUTO-FIX for {symbol} ({_dir}): "
-                    f"SL={_sl} and TP={_tp} both on wrong side of entry={_entry}. Swapping."
-                )
-                _sl, _tp = _tp, _sl
-                trade_signal.stop_loss = _sl
-                trade_signal.take_profit = _tp
-                sl_wrong = False
-                tp_wrong = False
-            elif (sl_wrong or tp_wrong) and _sl and _tp:
-                # One is wrong — try swapping
-                logger.warning(
-                    f"SL/TP SWAP AUTO-FIX for {symbol} ({_dir}): "
-                    f"SL={_sl} or TP={_tp} on wrong side of entry={_entry}. Swapping."
-                )
-                _sl, _tp = _tp, _sl
-                trade_signal.stop_loss = _sl
-                trade_signal.take_profit = _tp
-                # Re-check after swap (post-swap validation)
-                sl_wrong = False
-                tp_wrong = False
-                if _dir == 'long' and _sl >= _entry:
-                    sl_wrong = True
-                if _dir == 'short' and _sl <= _entry:
-                    sl_wrong = True
-                if _dir == 'long' and _tp <= _entry:
-                    tp_wrong = True
-                if _dir == 'short' and _tp >= _entry:
-                    tp_wrong = True
-            
-            # After swap, SL may still equal entry — apply the SL=entry fix again
-            if _sl and _entry and abs(_sl - _entry) < _entry * 0.0001:
-                _key_levels2 = getattr(claude_result, 'key_levels', {}) or {}
-                _key_s1_2 = _key_levels2.get('support_1')
-                _key_r1_2 = _key_levels2.get('resistance_1')
-                
-                if _dir == 'long':
-                    if _key_s1_2 and _key_s1_2 < _entry:
-                        _sl = _key_s1_2
-                    else:
-                        _sl = _entry * 0.99
-                elif _dir == 'short':
-                    if _key_r1_2 and _key_r1_2 > _entry:
-                        _sl = _key_r1_2
-                    else:
-                        _sl = _entry * 1.01
-                trade_signal.stop_loss = _sl
-                sl_wrong = False
-                logger.warning(f"SL=ENTRY POST-SWAP FIX for {symbol}: corrected SL to {_sl}")
-                print(f"[A5-FIX] {symbol}: Post-swap SL=entry fix, SL now {_sl}", flush=True)
-            
-            # After auto-fix attempt, reject if still wrong
-            if sl_wrong:
-                logger.warning(f"SIGNAL REJECTED for {symbol}: SL ({_sl}) on wrong side of entry ({_entry}) for {_dir}")
+            from .services.signal_normalizer import normalize_signal_prices
+            _norm = normalize_signal_prices(
+                trade_signal, claude_result, current_price, symbol
+            )
+            if _norm.rejected:
+                logger.warning(f"SIGNAL REJECTED for {symbol}: {_norm.reject_reason}")
                 if bot_state:
-                    bot_state.trade_decision(symbol, "rejected", f"Invalid SL placement for {_dir}")
+                    bot_state.trade_decision(symbol, "rejected", _norm.reject_reason)
                     bot_state.symbol_complete(symbol, "invalid_signal")
                 return
-            if tp_wrong:
-                logger.warning(f"SIGNAL REJECTED for {symbol}: TP ({_tp}) on wrong side of entry ({_entry}) for {_dir}")
-                if bot_state:
-                    bot_state.trade_decision(symbol, "rejected", f"Invalid TP placement for {_dir}")
-                    bot_state.symbol_complete(symbol, "invalid_signal")
-                return
-            
-            # Check 3: Entry price must be within 2% of current market price
-            if _entry and current_price > 0:
-                deviation = abs(_entry - current_price) / current_price
-                if deviation > 0.02:
-                    logger.warning(
-                        f"SIGNAL REJECTED for {symbol}: Entry ({_entry}) deviates {deviation:.1%} "
-                        f"from current price ({current_price}) - max 2% allowed"
-                    )
-                    if bot_state:
-                        bot_state.trade_decision(symbol, "rejected", f"Entry price too far from market ({deviation:.1%})")
-                        bot_state.symbol_complete(symbol, "invalid_signal")
-                    return
-            
-            # Check 4: SL and TP must exist
-            if not _sl or not _tp:
-                logger.warning(f"SIGNAL REJECTED for {symbol}: Missing SL ({_sl}) or TP ({_tp})")
-                if bot_state:
-                    bot_state.trade_decision(symbol, "rejected", "Missing SL or TP")
-                    bot_state.symbol_complete(symbol, "invalid_signal")
-                return
-            
+            _entry = _norm.entry
+            _sl = _norm.sl
+            _tp = _norm.tp
+            _dir = _norm.direction
+            _direction_flipped = _norm.direction_flipped
+            for _audit in _norm.audit_log:
+                logger.info(f"[A5] {symbol}: {_audit}")
             logger.info(f"Signal price checks passed for {symbol}: Entry={_entry}, SL={_sl}, TP={_tp}")
+
             
             # ============================================
             # ATR-BASED MINIMUM SL DISTANCE (v3)
@@ -3298,386 +3138,44 @@ class TradingBot:
                     return
             
             # ============================================
-            # ZONE-AWARE DIRECTION GATE (ALL TRADE TYPES)
-            # ICT principle: sell from premium, buy from discount.
-            # Uses PremiumDiscountAnalyzer when available,
-            # falls back to legacy D1 bias gate otherwise.
+            # PIPELINE ENTRY GATES (shared with replay)
             # ============================================
-            _regime_data = market_data.get('regime', {}) if market_data else {}
-            _regime_type = _regime_data.get('regime', '').lower() if isinstance(_regime_data, dict) else ''
-
-            _zone_gate_mode = settings.trading.zone_gate_mode
-            _zone_settings = ZoneGateSettings(
-                gate_mode=_zone_gate_mode,
-                misaligned_min_confidence=settings.trading.zone_misaligned_min_confidence,
-                misaligned_min_rr=settings.trading.zone_misaligned_min_rr,
-                equilibrium_min_confidence=settings.trading.zone_equilibrium_min_confidence,
-                disabled_symbols=tuple(settings.trading.zone_gate_disabled_symbols),
-            )
-            _use_zone_gate_live = should_use_zone_gate(
-                pd_analysis is not None,
-                _zone_gate_mode,
-                symbol,
-                _zone_settings.disabled_symbols,
+            _pipeline_ctx, _zone_settings, _use_zone_gate_live = self._build_pipeline_context(
+                symbol=symbol,
+                trade_signal=trade_signal,
+                market_data=market_data,
+                analysis_results=analysis_results,
+                pd_analysis=pd_analysis,
+                current_price=current_price,
+                actual_rr=actual_rr,
+                is_crypto=is_crypto,
                 is_counter_trend_scalp=_is_counter_trend_scalp,
             )
-
-            if _use_zone_gate_live:
-                from .config import get_symbol_spec
-                _sym_spec = get_symbol_spec(symbol)
-                _is_index = _sym_spec.category == 'index' if _sym_spec else False
-                _zg = evaluate_zone_gate(
-                    direction=_dir,
-                    confidence=trade_signal.confidence,
-                    actual_rr=actual_rr,
-                    retrace=pd_analysis.retracement_percent,
-                    zone_str=pd_analysis.current_zone.value,
-                    d1_bias=_d1_bias,
-                    is_index=_is_index,
-                    settings=_zone_settings,
-                    symbol=symbol,
-                    is_counter_trend_scalp=_is_counter_trend_scalp,
-                )
-                if _zg.shadow_only:
-                    logger.info(f"[ZONE-GATE-SHADOW] Would block: {_zg.reason}")
-                if _zg.blocked:
-                    logger.warning(_zg.reason)
-                    print(_zg.reason, flush=True)
-                    return
-                if _zg.decision == "allowed_zone_aligned":
-                    logger.info(
-                        f"[ZONE-GATE] {symbol}: {_dir.upper()} zone-aligned in "
-                        f"{pd_analysis.current_zone.value} "
-                        f"(retrace={pd_analysis.retracement_percent:.0%}) — allowed"
-                    )
-
-            elif not _is_counter_trend_scalp:
-                _legacy_blocked, _legacy_reason = evaluate_legacy_d1_gate(
-                    direction=_dir,
-                    confidence=trade_signal.confidence,
-                    actual_rr=actual_rr,
-                    d1_bias=_d1_bias,
-                )
-                if _legacy_blocked:
-                    logger.warning(f"[DIRECTION-GATE] {symbol}: {_legacy_reason}")
-                    print(f"[BLOCKED] {symbol}: {_legacy_reason}", flush=True)
-                    return
-                elif _d1_bias in ('bullish', 'bearish') and (
-                    (_d1_bias == 'bullish' and _dir == 'short')
-                    or (_d1_bias == 'bearish' and _dir == 'long')
-                ):
-                    logger.info(
-                        f"[DIRECTION-GATE] {symbol}: Counter-D1 {_dir.upper()} ALLOWED "
-                        f"— high conf ({trade_signal.confidence:.0%}) + strong R:R ({actual_rr:.1f}:1)"
-                    )
-
-            _vr_blocked, _vr_reason = evaluate_volatile_regime_gate(
-                regime_type=_regime_type,
-                confidence=trade_signal.confidence,
+            _session_name, _is_kill = self._session_for_gates()
+            _entry_gate = evaluate_entry_gates(
+                _pipeline_ctx,
+                zone_settings=_zone_settings,
+                use_zone_gate=_use_zone_gate_live,
+                session_name=_session_name,
+                is_kill_zone=_is_kill,
+                asian_penalty=settings.trading.gate_session_penalty_asian,
             )
-            if _vr_blocked:
-                logger.warning(f"[REGIME-GATE] {symbol}: {_vr_reason}")
-                print(f"[BLOCKED] {symbol}: {_vr_reason}", flush=True)
+            if _entry_gate.blocked:
+                await self._handle_pipeline_gate_block(symbol, _entry_gate)
                 return
-
-            _current_utc_hour = datetime.now(timezone.utc).hour
-            _weak_hours = tuple(settings.trading.weak_hours_by_symbol.get(symbol, []))
-            _tod_blocked, _tod_reason = evaluate_tod_gate(
-                utc_hour=_current_utc_hour,
-                weak_hours=_weak_hours,
-                confidence=trade_signal.confidence,
+            trade_signal.confidence = _pipeline_ctx.confidence
+            confluence_count, confluence_factors = count_confluence(_pipeline_ctx)
+            logger.info(
+                f"Confluence factors for {symbol}: {confluence_count} "
+                f"({', '.join(confluence_factors) if confluence_factors else 'none'})"
             )
-            if _tod_blocked:
-                logger.warning(f"[TOD-GATE] {symbol}: {_tod_reason}")
-                print(f"[BLOCKED] {symbol}: {_tod_reason}", flush=True)
-                return
-
-            # ============================================
-            # M15 EXECUTION TIMEFRAME STRUCTURE GATE
-            # M15 is the execution TF — trading against it means
-            # fighting the current price action.
-            # ============================================
-            _m15_bias = (market_data.get('m15_bias') or '').lower() if market_data else ''
-            _amd_phase_raw = getattr(trade_signal, 'amd_phase', '') or ''
-            _amd_phase_lc = _amd_phase_raw.lower()
-            _m15_opposes = (
-                (_m15_bias == 'bearish' and _dir == 'long')
-                or (_m15_bias == 'bullish' and _dir == 'short')
+            print(
+                f"[CONFLUENCE] {symbol}: {confluence_count} factors "
+                f"({', '.join(confluence_factors) if confluence_factors else 'none'}), "
+                f"confidence={trade_signal.confidence:.0%}",
+                flush=True,
             )
-            if _m15_opposes and _amd_phase_lc != 'manipulation':
-                _d1_supports = (
-                    (_d1_bias == 'bullish' and _dir == 'long')
-                    or (_d1_bias == 'bearish' and _dir == 'short')
-                )
-                _h4_supports = (
-                    (_h4_bias == 'bullish' and _dir == 'long')
-                    or (_h4_bias == 'bearish' and _dir == 'short')
-                )
-                _is_pending_limit = trade_signal.order_type in ('buy_limit', 'sell_limit')
-                _is_pullback = _d1_supports and _h4_supports and _is_pending_limit
 
-                if _is_pullback:
-                    trade_signal.confidence = min(trade_signal.confidence, 0.55)
-                    logger.info(
-                        f"[ANTICIPATORY] {symbol}: M15 opposes {_dir.upper()} but D1+H4 "
-                        f"support — allowing pending limit (pullback entry). "
-                        f"Confidence capped at {trade_signal.confidence:.0%}"
-                    )
-                    print(
-                        f"[ANTICIPATORY] {symbol}: Pullback detected, pending {trade_signal.order_type} "
-                        f"allowed at key level. Confidence {trade_signal.confidence:.0%}",
-                        flush=True
-                    )
-                else:
-                    logger.warning(
-                        f"[BLOCKED] {symbol}: {_dir.upper()} contradicts M15 bias "
-                        f"({_m15_bias}). Execution TF must confirm direction. Rejected."
-                    )
-                    print(
-                        f"[BLOCKED] {symbol}: {_dir.upper()} vs M15 {_m15_bias} structure. "
-                        f"Execution timeframe opposes trade. Skipping.",
-                        flush=True
-                    )
-                    return
-
-            # ============================================
-            # HTF (D1 + H4) ALIGNMENT GATE
-            # Both D1 and H4 opposing = hard block.
-            # One opposing = confidence cap.
-            # ============================================
-            _h4_bias = (market_data.get('h4_bias') or '').lower() if market_data else ''
-            _d1_opposes = (
-                (_d1_bias == 'bearish' and _dir == 'long')
-                or (_d1_bias == 'bullish' and _dir == 'short')
-            )
-            _h4_opposes = (
-                (_h4_bias == 'bearish' and _dir == 'long')
-                or (_h4_bias == 'bullish' and _dir == 'short')
-            )
-            _trade_type_lc = (trade_signal.trade_type or '').lower()
-            _is_scalp = 'scalp' in _trade_type_lc
-            if _d1_opposes and _h4_opposes:
-                if _is_scalp and not _m15_opposes and actual_rr >= 2.0 and trade_signal.confidence >= 0.70:
-                    trade_signal.confidence = min(trade_signal.confidence, 0.55)
-                    logger.info(
-                        f"[COUNTER-SCALP] {symbol}: HTFs oppose but M15 confirms {_dir.upper()} — "
-                        f"allowing scalp with capped confidence {trade_signal.confidence:.0%}"
-                    )
-                else:
-                    logger.warning(
-                        f"[BLOCKED] {symbol}: {_dir.upper()} opposes BOTH D1 ({_d1_bias}) "
-                        f"and H4 ({_h4_bias}). HTF alignment required. Rejected."
-                    )
-                    print(
-                        f"[BLOCKED] {symbol}: {_dir.upper()} vs D1={_d1_bias} & H4={_h4_bias}. "
-                        f"Both HTFs oppose — skipping.",
-                        flush=True
-                    )
-                    return
-            elif _d1_opposes or _h4_opposes:
-                _opposing_tf = 'D1' if _d1_opposes else 'H4'
-                if trade_signal.confidence > 0.60:
-                    logger.info(
-                        f"[HTF-CAP] {symbol}: {_opposing_tf} opposes {_dir.upper()} "
-                        f"({_d1_bias}/{_h4_bias}). Confidence {trade_signal.confidence:.0%} -> 60%"
-                    )
-                    trade_signal.confidence = 0.60
-
-            # ============================================
-            # AMD DISTRIBUTION PHASE GATE
-            # Distribution = move is done. Require strong R:R
-            # and cap confidence for marginal entries.
-            # ============================================
-            _bot_amd_phase = ''
-            if analysis_results.get("amd_cycle"):
-                _bot_amd_phase = (analysis_results["amd_cycle"].get("phase") or '').lower()
-            _effective_amd = _bot_amd_phase or _amd_phase_lc
-            if _effective_amd == 'distribution':
-                if trade_signal.confidence > 0.55:
-                    logger.info(
-                        f"[DISTRIB-CAP] {symbol}: Distribution phase — confidence "
-                        f"{trade_signal.confidence:.0%} -> capped at 55%"
-                    )
-                    trade_signal.confidence = 0.55
-                if actual_rr < 2.5:
-                    logger.warning(
-                        f"[BLOCKED] {symbol}: Distribution phase + R:R {actual_rr:.2f}:1 "
-                        f"below 2.5:1 minimum. Move is done. Rejected."
-                    )
-                    print(
-                        f"[BLOCKED] {symbol}: Distribution phase, R:R only "
-                        f"{actual_rr:.2f}:1 (need 2.5). Skipping.",
-                        flush=True
-                    )
-                    return
-
-            # ============================================
-            # OFF-HOURS SOFT BLOCK
-            # Outside kill zones: cap confidence, raise R:R bar
-            # ============================================
-            if self._off_hours_mode:
-                if trade_signal.confidence > 0.50:
-                    logger.info(
-                        f"[OFF-HOURS] {symbol}: Confidence {trade_signal.confidence:.0%} -> 50% (outside kill zone)"
-                    )
-                    trade_signal.confidence = 0.50
-                if actual_rr < 3.0:
-                    logger.warning(
-                        f"[BLOCKED] {symbol}: Off-hours R:R {actual_rr:.2f}:1 < 3.0 minimum. Skipping."
-                    )
-                    print(
-                        f"[BLOCKED] {symbol}: Off-hours, need 3.0 R:R, got {actual_rr:.2f}. Skipping.",
-                        flush=True
-                    )
-                    return
-
-            # ============================================
-            # POST-COOLDOWN CONFIDENCE GATE
-            # First trade after a loss cooldown needs 75%+
-            # ============================================
-            if hasattr(self, '_post_cooldown_symbols') and symbol in self._post_cooldown_symbols:
-                if trade_signal.confidence < 0.75:
-                    logger.warning(
-                        f"[POST-COOLDOWN] {symbol}: First signal after loss cooldown "
-                        f"needs 75%+ confidence, got {trade_signal.confidence:.0%}. Rejected."
-                    )
-                    print(
-                        f"[POST-COOLDOWN] {symbol}: Need 75% confidence after loss, "
-                        f"got {trade_signal.confidence:.0%}. Skipping.",
-                        flush=True
-                    )
-                    return
-                self._post_cooldown_symbols.discard(symbol)
-
-            # ============================================
-            # SESSION-AWARE CONFIDENCE ADJUSTMENT
-            # Kill zones = baseline, off-session = penalty
-            # ============================================
-            _session = self.kill_zone_checker.get_current_session() if self.kill_zone_checker else None
-            _session_name = (_session.session_name if _session else '').lower()
-            _is_kill = _session.is_kill_zone if _session else False
-            _session_penalty = 0.0
-            if self._off_hours_mode:
-                pass  # Off-hours block already capped confidence — don't double-penalize
-            elif not _is_kill:
-                if 'asian' in _session_name:
-                    _session_penalty = settings.trading.gate_session_penalty_asian
-                else:
-                    _session_penalty = 0.15
-            elif 'london close' in _session_name or 'london_close' in _session_name:
-                _session_penalty = 0.05
-            if _session_penalty > 0 and trade_signal.confidence > 0:
-                _old_conf = trade_signal.confidence
-                trade_signal.confidence = max(0.40, trade_signal.confidence - _session_penalty)
-                if trade_signal.confidence != _old_conf:
-                    logger.info(
-                        f"[SESSION-CONF] {symbol}: {_session_name} penalty -{_session_penalty:.0%}: "
-                        f"confidence {_old_conf:.0%} -> {trade_signal.confidence:.0%}"
-                    )
-
-            # ============================================
-            # TRADE QUALITY FILTER (E3)
-            # Count ICT confluence factors for quality grading
-            # ============================================
-            confluence_count = 0
-            confluence_factors = []
-            
-            # Check FVG confluence
-            if analysis_results.get("fvg"):
-                fvg_data = analysis_results["fvg"]
-                if _dir == 'long' and hasattr(fvg_data, 'bullish_fvgs') and fvg_data.bullish_fvgs:
-                    confluence_count += 1
-                    confluence_factors.append("Bullish FVG")
-                elif _dir == 'short' and hasattr(fvg_data, 'bearish_fvgs') and fvg_data.bearish_fvgs:
-                    confluence_count += 1
-                    confluence_factors.append("Bearish FVG")
-            
-            # Check Order Block confluence
-            if analysis_results.get("order_blocks"):
-                ob_data = analysis_results["order_blocks"]
-                if _dir == 'long' and hasattr(ob_data, 'bullish_obs') and ob_data.bullish_obs:
-                    confluence_count += 1
-                    confluence_factors.append("Bullish OB")
-                elif _dir == 'short' and hasattr(ob_data, 'bearish_obs') and ob_data.bearish_obs:
-                    confluence_count += 1
-                    confluence_factors.append("Bearish OB")
-            
-            # Check liquidity sweep confluence
-            if analysis_results.get("liquidity"):
-                liq_data = analysis_results["liquidity"]
-                if _dir == 'long' and hasattr(liq_data, 'nearest_ssl') and liq_data.nearest_ssl:
-                    confluence_count += 1
-                    confluence_factors.append("SSL Liquidity")
-                elif _dir == 'short' and hasattr(liq_data, 'nearest_bsl') and liq_data.nearest_bsl:
-                    confluence_count += 1
-                    confluence_factors.append("BSL Liquidity")
-            
-            # Check AMD cycle confluence
-            if analysis_results.get("amd_cycle"):
-                amd = analysis_results["amd_cycle"]
-                if amd.get("phase") == "distribution" and amd.get("expected_direction") == _dir:
-                    confluence_count += 1
-                    confluence_factors.append("AMD Distribution")
-            
-            # Check displacement confluence
-            if analysis_results.get("displacement"):
-                disp = analysis_results["displacement"]
-                if disp.get("distribution_confirmed"):
-                    confluence_count += 1
-                    confluence_factors.append("Displacement")
-            
-            # Check premium/discount zone confluence
-            if analysis_results.get("premium_discount"):
-                pd = analysis_results["premium_discount"]
-                if pd.get("in_ote"):
-                    confluence_count += 1
-                    confluence_factors.append("OTE Zone")
-            
-            logger.info(f"Confluence factors for {symbol}: {confluence_count} ({', '.join(confluence_factors) if confluence_factors else 'none'})")
-            print(f"[CONFLUENCE] {symbol}: {confluence_count} factors ({', '.join(confluence_factors) if confluence_factors else 'none'}), confidence={trade_signal.confidence:.0%}", flush=True)
-            
-            # Volume enforcement -- block dead-market entries
-            _rel_vol = 1.0
-            try:
-                _vol_data = analysis_results.get("volume", {})
-                if isinstance(_vol_data, dict):
-                    _rel_vol = _vol_data.get("relative_volume", 1.0) or 1.0
-                elif hasattr(_vol_data, 'relative_volume'):
-                    _rel_vol = getattr(_vol_data, 'relative_volume', 1.0) or 1.0
-            except Exception as e:
-                logger.debug(f"Could not compute relative volume: {e}")
-                pass
-            
-            if _rel_vol < 0.3:
-                print(f"[VOLUME-BLOCK] {symbol}: Relative volume {_rel_vol:.2f}x < 0.3 — dead market, skipping", flush=True)
-                logger.warning(f"Trade blocked for {symbol}: relative volume {_rel_vol:.2f}x (dead market)")
-                return
-            elif _rel_vol < 0.5:
-                _old_conf = trade_signal.confidence
-                trade_signal.confidence = min(trade_signal.confidence, 0.70)
-                if _old_conf != trade_signal.confidence:
-                    print(f"[VOLUME-CAP] {symbol}: Relative volume {_rel_vol:.2f}x — confidence capped {_old_conf:.0%} -> {trade_signal.confidence:.0%}", flush=True)
-            
-            # Require minimum confluence factors for trades
-            # In AGGRESSIVE mode (data collection), lower the bar to 1 factor at 65%+ confidence
-            min_confluence = 1 if (self.scaling_manager and self.scaling_manager.current_mode.value == 'aggressive') else 2
-            confidence_override = 0.65 if (self.scaling_manager and self.scaling_manager.current_mode.value == 'aggressive') else 0.75
-            
-            if confluence_count < min_confluence:
-                # Allow Claude high-confidence signals through even with low confluence
-                if trade_signal.confidence < confidence_override:
-                    print(f"[FILTERED] {symbol}: Only {confluence_count} confluence factors (min {min_confluence}), confidence {trade_signal.confidence:.0%} < {confidence_override:.0%}", flush=True)
-                    logger.info(
-                        f"Trade signal filtered for {symbol}: Only {confluence_count} confluence "
-                        f"factors (min {min_confluence} required). Confidence {trade_signal.confidence:.0%} too low to override."
-                    )
-                    if bot_state:
-                        bot_state.trade_decision(symbol, "filtered", f"Low confluence ({confluence_count} factors)")
-                        bot_state.symbol_complete(symbol, "low_confluence")
-                    return
-                else:
-                    logger.info(f"Low confluence ({confluence_count}) but high confidence ({trade_signal.confidence:.0%}) - allowing through")
-            
             # ============================================
             # SCALING MANAGER: Check if trade is allowed
             # ============================================
@@ -3737,47 +3235,39 @@ class TradingBot:
                         from .api.routes.activity import add_activity
                         add_activity("mode_change", f"Trading mode changed to {self.scaling_manager.current_mode.value}", details={"mode": self.scaling_manager.current_mode.value, "previous": _prev_mode.value, "symbol": symbol, "equity": current_equity})
                 
-                # Determine setup grade from confidence
-                if trade_signal.confidence >= 0.85:
-                    setup_grade_str = "A+"
-                elif trade_signal.confidence >= 0.75:
-                    setup_grade_str = "A"
-                elif trade_signal.confidence >= 0.65:
-                    setup_grade_str = "B"
-                else:
-                    setup_grade_str = "C"
-                
-                # Check if trade should be taken based on mode
-                should_trade, rejection_reason = self.scaling_manager.should_take_trade(
-                    setup_grade=setup_grade_str,
-                    confidence=trade_signal.confidence,
-                    daily_trades=self.daily_trades
-                )
-                
-                print(f"[SCALING] {symbol}: should_trade={should_trade}, grade={setup_grade_str}, reason={rejection_reason}", flush=True)
-                
-                if not should_trade:
-                    print(f"[BLOCKED] {symbol}: Scaling manager rejected - {rejection_reason}", flush=True)
-                    logger.info(f"Trade signal rejected by scaling manager for {symbol}: {rejection_reason}")
-                    if bot_state:
-                        bot_state.trade_decision(symbol, "rejected", rejection_reason)
-                    return
-            
-            # Validate confidence (fallback if no scaling manager)
-            min_confidence = settings.trading.gate_min_confidence
-            if self.scaling_manager:
-                min_confidence = max(
-                    min_confidence,
-                    self.scaling_manager.get_mode_config().confidence_threshold,
-                )
-                
-            if trade_signal.confidence < min_confidence:
-                logger.info(f"Trade signal rejected for {symbol}: Low confidence ({trade_signal.confidence:.2f} < {min_confidence})")
-                if bot_state:
-                    bot_state.trade_decision(symbol, "rejected", f"Low confidence ({trade_signal.confidence:.2f})")
-                    bot_state.symbol_complete(symbol, "low_confidence")
+            # ============================================
+            # PIPELINE PERMISSION GATES (scaling + correlation)
+            # ============================================
+            _pipeline_ctx.scaling_aggressive = (
+                self.scaling_manager is not None
+                and self.scaling_manager.current_mode.value == "aggressive"
+            )
+            _pipeline_ctx.confidence = trade_signal.confidence
+
+            def _correlation_check():
+                if self.correlation_service:
+                    return self.correlation_service.should_block_trade(
+                        symbol, direction=trade_signal.direction
+                    )
+                return False, ""
+
+            _perm_gate = evaluate_trade_permission_gates(
+                _pipeline_ctx,
+                scaling_manager=self.scaling_manager,
+                daily_trades=self.daily_trades,
+                gate_min_confidence=settings.trading.gate_min_confidence,
+                correlation_check=_correlation_check if self.correlation_service else None,
+            )
+            if _perm_gate.blocked:
+                await self._handle_pipeline_gate_block(symbol, _perm_gate)
                 return
-            
+            trade_signal.confidence = _pipeline_ctx.confidence
+            if (
+                hasattr(self, "_post_cooldown_symbols")
+                and symbol in self._post_cooldown_symbols
+            ):
+                self._post_cooldown_symbols.discard(symbol)
+
             # R:R was already validated in the A6 block above (rejected if below 1.0,
             # borderline passed to Trade Judge). Claude's TP/SL are never modified.
             # We do NOT reject based on Claude's self-reported risk_reward field here.
@@ -3866,20 +3356,9 @@ class TradingBot:
                 print(f"[DEDUP] {symbol}: Repeat {trade_signal.direction} signal @ {trade_signal.entry_price or current_price:.2f} — allowing (may update pending order)", flush=True)
             
             # ============================================
-            # CHECK CORRELATION BEFORE TRADING
+            # CORRELATION SIZE ADJUSTMENT
             # ============================================
             if self.correlation_service:
-                should_block, block_reason = self.correlation_service.should_block_trade(
-                    symbol, direction=trade_signal.direction
-                )
-                if should_block:
-                    print(f"[BLOCKED] {symbol}: Correlation block - {block_reason}", flush=True)
-                    logger.warning(f"⚠️ CORRELATION BLOCK: {symbol} - {block_reason}")
-                    if bot_state:
-                        bot_state.trade_decision(symbol, "blocked", f"Correlation: {block_reason}")
-                    return
-                
-                # Get position size multiplier
                 size_multiplier = self.correlation_service.get_position_size_multiplier(symbol)
                 if size_multiplier < 1.0:
                     logger.info(f"📊 Correlation adjustment: {symbol} size reduced to {size_multiplier*100:.0f}%")
@@ -4746,196 +4225,40 @@ class TradingBot:
                     )
                 
                 # =============================================
-                # POSITION CONFLICT GUARD: Block duplicate or
-                # conflicting positions on the same symbol.
+                # EXECUTION PREP (position conflicts + order normalization)
                 # =============================================
-                if self.position_manager:
-                    existing_positions = self.position_manager.get_positions_by_symbol(symbol)
-                    if existing_positions:
-                        # Block opposite-direction conflict
-                        opposite_dir = 'short' if trade_signal.direction == 'long' else 'long'
-                        conflicting = [
-                            p for p in existing_positions
-                            if p.direction == opposite_dir
-                        ]
-                        if conflicting:
-                            print(
-                                f"[BLOCKED] {symbol}: Cannot place {trade_signal.direction.upper()} order — "
-                                f"already have {opposite_dir.upper()} position open "
-                                f"(ticket={conflicting[0].ticket}). "
-                                f"Close existing position first or wait for reversal re-entry logic.",
-                                flush=True
-                            )
-                            logger.warning(
-                                f"Blocked {trade_signal.direction} {symbol}: opposite-direction "
-                                f"position exists (ticket={conflicting[0].ticket})"
-                            )
-                            await self._reject_and_record(
-                                _trade_reservation,
-                                "mechanical_reject",
-                                symbol,
-                                gate_id="position_conflict",
-                                direction=trade_signal.direction,
-                                entry=trade_signal.entry_price or current_price,
-                                sl=trade_signal.stop_loss or 0.0,
-                                tp=trade_signal.take_profit or 0.0,
-                                confidence=trade_signal.confidence,
-                                reason=f"Opposite {opposite_dir} position open",
-                            )
-                            return
-                        
-                        # Block same-direction stacking
-                        same_dir = [
-                            p for p in existing_positions
-                            if p.direction == trade_signal.direction
-                        ]
-                        if same_dir:
-                            print(
-                                f"[BLOCKED] {symbol}: Already have {trade_signal.direction.upper()} "
-                                f"position open (ticket={same_dir[0].ticket}). "
-                                f"No same-direction stacking allowed.",
-                                flush=True
-                            )
-                            logger.warning(
-                                f"Blocked {trade_signal.direction} {symbol}: same-direction "
-                                f"position already open (ticket={same_dir[0].ticket})"
-                            )
-                            await self._reject_and_record(
-                                _trade_reservation,
-                                "mechanical_reject",
-                                symbol,
-                                gate_id="position_stacking",
-                                direction=trade_signal.direction,
-                                entry=trade_signal.entry_price or current_price,
-                                sl=trade_signal.stop_loss or 0.0,
-                                tp=trade_signal.take_profit or 0.0,
-                                confidence=trade_signal.confidence,
-                                reason="Same-direction position already open",
-                            )
-                            return
-                
-                # =============================================
-                # PENDING ORDER VS MARKET ORDER DECISION
-                # =============================================
-                order_type = trade_signal.order_type if hasattr(trade_signal, 'order_type') else 'market'
-                entry_price = trade_signal.entry_price or current_price
-                
-                # Smart conversion: if Claude set a specific entry_price that differs from
-                # current_price by more than 0.1%, force a pending order (limit/stop)
-                if order_type == 'market' and trade_signal.entry_price and current_price > 0:
-                    price_diff_pct = abs(trade_signal.entry_price - current_price) / current_price
-                    if price_diff_pct > 0.001:  # >0.1% away from market = use pending
-                        if trade_signal.direction == 'long':
-                            if trade_signal.entry_price < current_price:
-                                order_type = 'buy_limit'
-                            else:
-                                order_type = 'buy_stop'
-                        else:
-                            if trade_signal.entry_price > current_price:
-                                order_type = 'sell_limit'
-                            else:
-                                order_type = 'sell_stop'
-                        trade_signal.order_type = order_type
-                        logger.info(
-                            f"🔄 Auto-converted to {order_type}: entry {trade_signal.entry_price:.5f} "
-                            f"differs from market {current_price:.5f} by {price_diff_pct:.2%}"
-                        )
-                
-                # Fix mislabeled limit/stop orders: buy_limit must be BELOW price,
-                # sell_limit must be ABOVE price. If inverted, swap to stop.
-                if order_type in ('buy_limit', 'sell_limit', 'buy_stop', 'sell_stop') and entry_price and current_price > 0:
-                    if order_type == 'buy_limit' and entry_price > current_price * 1.001:
-                        order_type = 'buy_stop'
-                        trade_signal.order_type = order_type
-                        print(f"[ORDER-FIX] {symbol}: buy_limit above market -> buy_stop (entry={entry_price:.5f} > market={current_price:.5f})", flush=True)
-                    elif order_type == 'sell_limit' and entry_price < current_price * 0.999:
-                        order_type = 'sell_stop'
-                        trade_signal.order_type = order_type
-                        print(f"[ORDER-FIX] {symbol}: sell_limit below market -> sell_stop (entry={entry_price:.5f} < market={current_price:.5f})", flush=True)
-                    elif order_type == 'buy_stop' and entry_price < current_price * 0.999:
-                        order_type = 'buy_limit'
-                        trade_signal.order_type = order_type
-                        print(f"[ORDER-FIX] {symbol}: buy_stop below market -> buy_limit (entry={entry_price:.5f} < market={current_price:.5f})", flush=True)
-                    elif order_type == 'sell_stop' and entry_price > current_price * 1.001:
-                        order_type = 'sell_limit'
-                        trade_signal.order_type = order_type
-                        print(f"[ORDER-FIX] {symbol}: sell_stop above market -> sell_limit (entry={entry_price:.5f} > market={current_price:.5f})", flush=True)
-                
-                # ICT Zone Validation: block limit orders that contradict the price zone
-                # Premium = sell only, Discount = buy only (stop orders exempt - breakouts)
-                if order_type in ('buy_limit', 'sell_limit'):
-                    _zone_str = None
-                    _retrace_pct = None
-                    try:
-                        _pd_data = analysis_results.get("premium_discount", {})
-                        if isinstance(_pd_data, dict):
-                            _zone_str = _pd_data.get("current_zone")
-                            _retrace_pct = _pd_data.get("retracement_percent")
-                        elif hasattr(_pd_data, 'current_zone'):
-                            _zone_str = _pd_data.current_zone.value if hasattr(_pd_data.current_zone, 'value') else str(_pd_data.current_zone)
-                            _retrace_pct = getattr(_pd_data, 'retracement_percent', None)
-                    except Exception as e:
-                        logger.debug(f"Could not compute premium/discount zone: {e}")
-                        pass
+                if not hasattr(self, "_execution_coordinator"):
+                    from .execution.trade_execution import ExecutionCoordinator
+                    self._execution_coordinator = ExecutionCoordinator()
+                _existing_positions = (
+                    self.position_manager.get_positions_by_symbol(symbol)
+                    if self.position_manager
+                    else []
+                )
+                _exec_prep = self._execution_coordinator.prepare_order(
+                    trade_signal=trade_signal,
+                    current_price=current_price,
+                    existing_positions=_existing_positions,
+                    analysis_results=analysis_results,
+                )
+                if _exec_prep.blocked:
+                    print(f"[BLOCKED] {symbol}: {_exec_prep.reason}", flush=True)
+                    await self._reject_and_record(
+                        _trade_reservation,
+                        "mechanical_reject",
+                        symbol,
+                        gate_id=_exec_prep.gate_id,
+                        direction=trade_signal.direction,
+                        entry=trade_signal.entry_price or current_price,
+                        sl=trade_signal.stop_loss or 0.0,
+                        tp=trade_signal.take_profit or 0.0,
+                        confidence=trade_signal.confidence,
+                        reason=_exec_prep.reason,
+                    )
+                    return
+                order_type = _exec_prep.order_type
+                entry_price = _exec_prep.entry_price
 
-                    if _zone_str and _retrace_pct is not None:
-                        if order_type == 'buy_limit' and _retrace_pct > 0.70:
-                            print(
-                                f"[ZONE-BLOCK] {symbol}: buy_limit in PREMIUM zone ({_retrace_pct:.0%}) — "
-                                f"ICT rule: do NOT buy in premium. Blocking trade.",
-                                flush=True
-                            )
-                            logger.warning(f"Zone block: buy_limit in premium ({_retrace_pct:.0%}) for {symbol}")
-                            await self._reject_and_record(
-                                _trade_reservation,
-                                "mechanical_reject",
-                                symbol,
-                                gate_id="zone_block",
-                                direction=trade_signal.direction,
-                                entry=entry_price,
-                                sl=_final_sl or 0.0,
-                                tp=_final_tp or 0.0,
-                                confidence=trade_signal.confidence,
-                                reason=f"buy_limit in premium zone ({_retrace_pct:.0%})",
-                            )
-                            return
-                        elif order_type == 'sell_limit' and _retrace_pct < 0.30:
-                            print(
-                                f"[ZONE-BLOCK] {symbol}: sell_limit in DISCOUNT zone ({_retrace_pct:.0%}) — "
-                                f"ICT rule: do NOT sell in discount. Blocking trade.",
-                                flush=True
-                            )
-                            logger.warning(f"Zone block: sell_limit in discount ({_retrace_pct:.0%}) for {symbol}")
-                            await self._reject_and_record(
-                                _trade_reservation,
-                                "mechanical_reject",
-                                symbol,
-                                gate_id="zone_block",
-                                direction=trade_signal.direction,
-                                entry=entry_price,
-                                sl=_final_sl or 0.0,
-                                tp=_final_tp or 0.0,
-                                confidence=trade_signal.confidence,
-                                reason=f"sell_limit in discount zone ({_retrace_pct:.0%})",
-                            )
-                            return
-                        elif order_type == 'buy_limit' and _retrace_pct > 0.55:
-                            _old_conf = trade_signal.confidence
-                            trade_signal.confidence = min(trade_signal.confidence, 0.60)
-                            print(
-                                f"[ZONE-WARN] {symbol}: buy_limit in upper zone ({_retrace_pct:.0%}) — "
-                                f"confidence capped {_old_conf:.0%} -> {trade_signal.confidence:.0%}",
-                                flush=True
-                            )
-                        elif order_type == 'sell_limit' and _retrace_pct < 0.45:
-                            _old_conf = trade_signal.confidence
-                            trade_signal.confidence = min(trade_signal.confidence, 0.60)
-                            print(
-                                f"[ZONE-WARN] {symbol}: sell_limit in lower zone ({_retrace_pct:.0%}) — "
-                                f"confidence capped {_old_conf:.0%} -> {trade_signal.confidence:.0%}",
-                                flush=True
-                            )
-                
                 # Respect Claude's explicit pending order choice — do NOT override to market
                 # even during distribution phase. Claude knows the entry model.
                 
@@ -5576,27 +4899,21 @@ class TradingBot:
             if df is None or df.empty:
                 return
             
-            # Run technical analysis (symbol-specific pip_value)
-            from .config import get_symbol_spec as _get_spec2
-            _ao_pip = _get_spec2(symbol).pip_size
-            analysis_results = {
-                "market_structure": MarketStructureAnalyzer().analyze(df),
-                "fvg": FVGDetector(pip_value=_ao_pip).detect(df),
-                "order_blocks": OrderBlockDetector().detect(df),
-                "liquidity": LiquidityMapper(pip_value=_ao_pip).analyze(df)
-            }
+            if not hasattr(self, "_analysis_orchestrator"):
+                from .services.analysis_orchestrator import AnalysisOrchestrator
+                self._analysis_orchestrator = AnalysisOrchestrator()
+            analysis_results = self._analysis_orchestrator.run_core_analysis(symbol, df)
             
-            # Volume analysis (simulation mode)
+            # Volume telemetry (simulation mode)
             try:
-                volume_analysis = VolumeAnalyzer().analyze(df)
-                analysis_results["volume"] = volume_analysis.to_dict()
-                if bot_state:
+                volume_analysis = analysis_results.get("volume", {})
+                if bot_state and isinstance(volume_analysis, dict):
                     bot_state.volume_analysis_complete(
                         symbol,
-                        volume_analysis.relative_volume,
-                        volume_analysis.volume_trend,
-                        len(volume_analysis.spike_bars),
-                        volume_analysis.relative_volume < 0.5
+                        volume_analysis.get("relative_volume", 1.0),
+                        volume_analysis.get("volume_trend", ""),
+                        len(volume_analysis.get("spike_bars", [])),
+                        volume_analysis.get("relative_volume", 1.0) < 0.5,
                     )
             except Exception as e:
                 logger.warning(f"Volume analysis error (simulation): {e}")
@@ -6284,6 +5601,83 @@ class TradingBot:
             learning_context,
             timeout=8.0,
         )
+
+    def _build_pipeline_context(
+        self,
+        *,
+        symbol: str,
+        trade_signal,
+        market_data: dict,
+        analysis_results: dict,
+        pd_analysis,
+        current_price: float,
+        actual_rr: float,
+        is_crypto: bool,
+        is_counter_trend_scalp: bool,
+    ):
+        from datetime import datetime, timezone
+        from .config import get_symbol_spec
+        from .services.trade_context import TradeContext
+
+        _sym_spec = get_symbol_spec(symbol)
+        _is_index = _sym_spec.category == "index" if _sym_spec else False
+        _weak_hours = tuple(settings.trading.weak_hours_by_symbol.get(symbol, []))
+        ctx = TradeContext.from_signal(
+            symbol=symbol,
+            trade_signal=trade_signal,
+            market_data=market_data,
+            analysis_results=analysis_results,
+            current_price=current_price,
+            is_crypto=is_crypto,
+            pd_analysis=pd_analysis,
+            off_hours_mode=bool(getattr(self, "_off_hours_mode", False)),
+            post_cooldown=(
+                hasattr(self, "_post_cooldown_symbols")
+                and symbol in self._post_cooldown_symbols
+            ),
+            utc_hour=datetime.now(timezone.utc).hour,
+            weak_hours=_weak_hours,
+            is_index=_is_index,
+            is_counter_trend_scalp=is_counter_trend_scalp,
+            actual_rr=actual_rr,
+        )
+        ctx.scaling_aggressive = (
+            self.scaling_manager is not None
+            and self.scaling_manager.current_mode.value == "aggressive"
+        )
+        _zone_settings = ZoneGateSettings(
+            gate_mode=settings.trading.zone_gate_mode,
+            misaligned_min_confidence=settings.trading.zone_misaligned_min_confidence,
+            misaligned_min_rr=settings.trading.zone_misaligned_min_rr,
+            equilibrium_min_confidence=settings.trading.zone_equilibrium_min_confidence,
+            disabled_symbols=tuple(settings.trading.zone_gate_disabled_symbols),
+        )
+        _use_zone = should_use_zone_gate(
+            pd_analysis is not None,
+            _zone_settings.gate_mode,
+            symbol,
+            _zone_settings.disabled_symbols,
+            is_counter_trend_scalp=is_counter_trend_scalp,
+        )
+        return ctx, _zone_settings, _use_zone
+
+    def _session_for_gates(self):
+        _session = (
+            self.kill_zone_checker.get_current_session()
+            if self.kill_zone_checker
+            else None
+        )
+        _name = (_session.session_name if _session else "").lower()
+        _is_kill = _session.is_kill_zone if _session else False
+        return _name, _is_kill
+
+    async def _handle_pipeline_gate_block(self, symbol: str, outcome) -> None:
+        logger.warning(f"[GATE] {symbol}: {outcome.reason}")
+        print(f"[BLOCKED] {symbol}: {outcome.reason}", flush=True)
+        if bot_state:
+            bot_state.trade_decision(symbol, "blocked", outcome.reason)
+            if outcome.gate_id in ("low_confluence", "min_confidence", "scaling_manager"):
+                bot_state.symbol_complete(symbol, outcome.gate_id)
 
     def _effective_max_daily_trades(self, equity: float) -> int:
         """Min of tier, scaling-mode, config, and optional optimizer gate override."""

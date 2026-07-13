@@ -296,13 +296,15 @@ class TestFallbackMinConfidence:
     """Tests the min confidence gate in main.py."""
 
     def test_fallback_confidence_is_060(self):
-        """Min confidence should come from gate_min_confidence (default 0.60)."""
+        """Min confidence gate uses gate_min_confidence via pipeline."""
         import inspect
         from trading_bot.main import TradingBot
+        from trading_bot.services import gate_pipeline
 
-        source = inspect.getsource(TradingBot)
-        assert "gate_min_confidence" in source
-        assert "min_confidence = settings.trading.gate_min_confidence" in source
+        bot_source = inspect.getsource(TradingBot)
+        pipeline_source = inspect.getsource(gate_pipeline)
+        assert "gate_min_confidence" in bot_source
+        assert "gate_min_confidence" in pipeline_source
 
 
 class TestDirectionalBiasFix:
