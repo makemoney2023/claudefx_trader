@@ -26,6 +26,7 @@ def analyze_and_trade_source() -> str:
         services / "expanded_analysis.py",
         services / "claude_analysis_stage.py",
         services / "analysis_orchestrator.py",
+        services / "post_claude_gates.py",
         execution / "trade_execution.py",
         execution / "trade_fill_handler.py",
     ]

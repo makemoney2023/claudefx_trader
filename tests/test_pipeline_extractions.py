@@ -29,6 +29,13 @@ class TestFinalExtractions:
         assert "_release_trade_reservation" in src
         assert "_releasetrade_reservation" not in src
 
+    def test_runner_uses_trade_pipeline_components(self):
+        src = analyze_and_trade_source()
+        assert "run_post_claude_gates" in src
+        assert "pipeline.analysis" in src
+        assert "pipeline.claude()" in src
+        assert "TradePipeline(bot)" not in src
+
     def test_simple_position_size_uses_self_lots(self):
         src = analyze_and_trade_source()
         assert "self.lots = lots" in src

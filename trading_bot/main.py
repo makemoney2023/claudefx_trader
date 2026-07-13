@@ -2429,16 +2429,41 @@ class TradingBot:
     async def _handle_pipeline_gate_block(
         self, symbol: str, outcome, *, ctx=None
     ) -> None:
+        from .services.post_claude_gates import build_reject_details
+
         logger.warning(f"[GATE] {symbol}: {outcome.reason}")
         print(f"[BLOCKED] {symbol}: {outcome.reason}", flush=True)
         gate_path = list(getattr(outcome, "gate_path", None) or [])
         if ctx is not None and getattr(ctx, "gate_path", None):
             gate_path = list(ctx.gate_path)
-        details = {"gate_path": gate_path} if gate_path else None
+        direction = getattr(ctx, "direction", "") if ctx else ""
+        entry = 0.0
+        sl = 0.0
+        tp = 0.0
+        confidence = getattr(ctx, "confidence", 0.0) if ctx else 0.0
+        if ctx is not None and getattr(ctx, "trade_signal", None):
+            sig = ctx.trade_signal
+            entry = getattr(sig, "entry_price", None) or getattr(ctx, "current_price", 0.0) or 0.0
+            sl = getattr(sig, "stop_loss", None) or 0.0
+            tp = getattr(sig, "take_profit", None) or 0.0
+            confidence = getattr(sig, "confidence", confidence) or confidence
+        details = build_reject_details(
+            gate_path=gate_path,
+            direction=direction,
+            entry=entry,
+            sl=sl,
+            tp=tp,
+            confidence=confidence,
+        )
         await self._record_terminal_decision(
             "mechanical_reject",
             symbol,
             gate_id=getattr(outcome, "gate_id", None) or "",
+            direction=direction,
+            entry=entry,
+            sl=sl,
+            tp=tp,
+            confidence=confidence,
             reason=outcome.reason,
             details=details,
         )

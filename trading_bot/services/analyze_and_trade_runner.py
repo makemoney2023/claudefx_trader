@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional
-
-import numpy as np
 
 from ..config import settings
 from ..utils.logging import get_logger
-from ..utils.notifications import notify, NotificationType
 from ..utils.win_optimization import apply_demote_policy, build_confidence_decision, classify_a_plus
 from ..execution.scaling_position_sizer import SetupGrade
 from ..services.live_trade_gates import (
@@ -23,13 +20,8 @@ from ..services.confidence_modifiers import (
     apply_secondary_modifiers,
     confidence_decision_to_dict,
 )
-from ..services.gate_pipeline import (
-    count_confluence,
-    evaluate_entry_gates,
-    evaluate_trade_permission_gates,
-)
+from ..services.gate_pipeline import count_confluence
 from ..services.signal_normalizer import normalize_signal_prices
-from ..api.websocket import broadcast_trade_update, broadcast_analysis_update
 
 try:
     from ..api.routes.bot_status import get_bot_state
@@ -45,20 +37,9 @@ if TYPE_CHECKING:
 
 async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool = False) -> None:
     """Run full analyze-and-trade pipeline for one symbol."""
-    from ..main import save_signal_to_db, save_trade_to_db
-
-    """
-    Analyze a symbol and execute trade if valid setup found.
-    
-    Args:
-        symbol: Trading symbol to analyze
-        is_crypto: Whether this is a crypto symbol (24/7 trading)
-    """
+    pipeline = bot._trade_pipeline
     _trade_reservation = None
     _trade_reservation_context = None
-    if not hasattr(bot, "_trade_pipeline"):
-        from .trade_pipeline import TradePipeline
-        bot._trade_pipeline = TradePipeline(bot)
     try:
         logger.info(f"Analyzing {symbol}...")
         
@@ -153,10 +134,7 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
             bot_state.running_technical_analysis(symbol)
         
         # Core ICT analysis via shared orchestrator
-        if not hasattr(bot, "_analysis_orchestrator"):
-            from .analysis_orchestrator import AnalysisOrchestrator
-            bot._analysis_orchestrator = AnalysisOrchestrator()
-        analysis_results = bot._analysis_orchestrator.run_core_analysis(symbol, df)
+        analysis_results = pipeline.analysis.run_core_analysis(symbol, df)
         
         # Volume bot_state telemetry
         try:
@@ -207,7 +185,7 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
             logger.warning(f"Failed to generate chart for {symbol}")
             return
         
-        _chart_pkg = await bot._analysis_orchestrator.build_chart_package(
+        _chart_pkg = await pipeline.analysis.build_chart_package(
             bot,
             symbol=symbol,
             df=df,
@@ -230,10 +208,7 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                 f"R:R {_mech_setup.get('risk_reward', 0):.2f})"
             )
         
-        if not hasattr(bot, "_claude_stage"):
-            from .claude_analysis_stage import ClaudeAnalysisStage
-            bot._claude_stage = ClaudeAnalysisStage(bot.claude_client)
-        _claude_out = await bot._claude_stage.run_stage(
+        _claude_out = await pipeline.claude().run_stage(
             bot,
             symbol=symbol,
             df=df,
@@ -282,181 +257,98 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
             logger.info(f"[A5] {symbol}: {_audit}")
         logger.info(f"Signal price checks passed for {symbol}: Entry={_entry}, SL={_sl}, TP={_tp}")
 
-        
         # ============================================
-        # ATR-BASED MINIMUM SL DISTANCE (v3)
-        # Ensure SL is at least 1.5x ATR(14) from entry
-        # to avoid stop-outs from normal price noise.
+        # SHARED POST-CLAUDE GATES (live/replay parity)
         # ============================================
-        try:
-            from ..utils.candle_utils import calculate_atr as _calc_atr
-            _atr_series = _calc_atr(df, period=14)
-            _atr_val = float(_atr_series.iloc[-1]) if not _atr_series.empty and not np.isnan(_atr_series.iloc[-1]) else None
-            if _atr_val and _atr_val > 0 and _sl and _entry:
-                _min_sl_dist = _atr_val * 1.5
-                _current_sl_dist = abs(_entry - _sl)
-                if _current_sl_dist < _min_sl_dist:
-                    _old_sl = _sl
-                    if _dir == 'long':
-                        _sl = _entry - _min_sl_dist
-                    else:
-                        _sl = _entry + _min_sl_dist
-                    trade_signal.stop_loss = _sl
-                    _new_tp_dist = abs(_tp - _entry) if _tp else 0
-                    _new_rr = _new_tp_dist / _min_sl_dist if _min_sl_dist > 0 else 0
-                    logger.info(
-                        f"[ATR-SL-ADJUST] {symbol}: SL widened from {_old_sl:.5f} to {_sl:.5f} "
-                        f"(ATR={_atr_val:.5f}, min_dist={_min_sl_dist:.5f}, new R:R={_new_rr:.2f})"
-                    )
-                    print(
-                        f"[ATR-SL-ADJUST] {symbol}: SL {_old_sl:.5f} -> {_sl:.5f} "
-                        f"(1.5x ATR={_min_sl_dist:.5f}), R:R now {_new_rr:.2f}:1",
-                        flush=True
-                    )
-                    if _new_rr < 1.5:
-                        logger.warning(
-                            f"[ATR-SL-BLOCK] {symbol}: After ATR SL widen, R:R={_new_rr:.2f} < 1.5. "
-                            f"SL too wide for TP target. Blocking trade."
-                        )
-                        print(
-                            f"[ATR-SL-BLOCK] {symbol}: R:R {_new_rr:.2f}:1 after ATR widen — trade blocked.",
-                            flush=True
-                        )
-                        return
-        except Exception as _atr_err:
-            logger.debug(f"[ATR-SL] Could not apply ATR SL check for {symbol}: {_atr_err}")
-        
-        # ============================================
-        # R:R ENFORCEMENT (A6)
-        # Ensure TP distance >= min_rr * SL distance
-        # If Claude gives bad R:R, auto-correct the TP
-        # ============================================
-        # Adjust min R:R based on trade type AND asset category
-        # Crypto assets need higher R:R because even minimum lot sizes carry
-        # significant dollar risk — a 1.5:1 R:R on ETH/BTC is not worth it.
-        _trade_type = getattr(trade_signal, 'trade_type', 'intraday') or 'intraday'
-        from ..config import get_symbol_spec as _get_spec_rr
-        _spec_rr = _get_spec_rr(symbol)
-        
-        if _spec_rr.category == 'crypto':
-            _rr_by_type = {'scalp': 2.0, 'intraday': 2.5, 'swing': 3.5}
-        else:
-            _rr_by_type = {'scalp': 1.5, 'intraday': 2.0, 'swing': 3.0}
-        
-        min_rr = _rr_by_type.get(_trade_type, settings.trading.min_risk_reward)
-        logger.info(f"R:R threshold for {symbol} ({_trade_type}, {_spec_rr.category}): {min_rr:.1f}:1")
-        sl_distance = abs(_entry - _sl)
-        tp_distance = abs(_tp - _entry)
-        
-        if sl_distance > 0:
-            actual_rr = tp_distance / sl_distance
-        else:
-            actual_rr = 0.0
-        
-        if actual_rr < min_rr and sl_distance > 0:
-            # R:R is below minimum. Two tiers:
-            # 1) If R:R >= hard floor, let Trade Judge decide.
-            # 2) If R:R < hard floor, hard-reject.
-            # In AGGRESSIVE mode (demo data collection), lower floor to 1.0
-            # to collect more trade outcomes for learning.
-            _is_aggressive = (bot.scaling_manager and 
-                              bot.scaling_manager.current_mode.value == 'aggressive')
-            _hard_floor_rr = 1.0 if _is_aggressive else 1.5
-            
-            if actual_rr < _hard_floor_rr:
-                # Reward < risk — hard reject regardless of setup quality
-                logger.warning(
-                    f"[BLOCKED] {symbol}: R:R {actual_rr:.2f}:1 below hard floor {_hard_floor_rr:.1f}:1 "
-                    f"(risk ${sl_distance:.2f} > reward ${tp_distance:.2f}). Rejected."
-                )
-                print(
-                    f"[BLOCKED] {symbol}: R:R {actual_rr:.2f}:1 — risking ${sl_distance:.2f} "
-                    f"for only ${tp_distance:.2f} reward. Not worth it.",
-                    flush=True
-                )
-                return
-            else:
-                # R:R is between 1.0 and min_rr — borderline.
-                # Let the Trade Judge decide with full context.
-                logger.info(
-                    f"[R:R WARNING] {symbol}: R:R {actual_rr:.2f}:1 below target {min_rr:.1f}:1 "
-                    f"but above 1.0 floor. Passing to Trade Judge for evaluation."
-                )
-                print(
-                    f"[R:R WARNING] {symbol}: R:R {actual_rr:.2f}:1 (target {min_rr:.1f}:1) — "
-                    f"borderline, letting Trade Judge decide.",
-                    flush=True
-                )
-        else:
-            logger.info(f"R:R OK for {symbol}: {actual_rr:.2f} (min {min_rr:.1f})")
-        
-        # Claude's TP is trusted — based on structure, liquidity, IPDA levels.
-        # No hardcoded TP floors or ceilings. R:R enforcement above handles rejection.
-        
-        # ============================================
-        # COUNTER-TREND SCALP CAP
-        # If scalp direction opposes the D1 bias, enforce stricter limits
-        # ============================================
-        _trade_type = getattr(trade_signal, 'trade_type', 'intraday') or 'intraday'
-        _d1_bias = market_data.get('d1_bias', '').lower() if market_data else ''
-        _is_counter_trend_scalp = (
-            _trade_type == 'scalp'
-            and _d1_bias in ('bullish', 'bearish')
-            and (
-                (_d1_bias == 'bullish' and _dir == 'short')
-                or (_d1_bias == 'bearish' and _dir == 'long')
-            )
+        from .post_claude_gates import (
+            PostClaudeGateInput,
+            build_reject_details,
+            run_post_claude_gates,
         )
-        if _is_counter_trend_scalp:
-            # Cap confidence at 70%
-            if trade_signal.confidence > 0.70:
-                logger.info(
-                    f"[COUNTER-SCALP] {symbol}: Counter-D1-trend scalp confidence "
-                    f"{trade_signal.confidence:.0%} -> capped at 70%"
-                )
-                trade_signal.confidence = 0.70
-            # Enforce 2.0:1 R:R minimum
-            if actual_rr < settings.trading.gate_counter_trend_rr_floor:
-                logger.warning(
-                    f"[BLOCKED] {symbol}: Counter-D1-trend scalp R:R {actual_rr:.2f}:1 "
-                    f"below {settings.trading.gate_counter_trend_rr_floor:.1f}:1 minimum. "
-                    f"D1={_d1_bias}, dir={_dir}. Rejected."
-                )
-                print(
-                    f"[BLOCKED] {symbol}: Counter-trend scalp needs "
-                    f"{settings.trading.gate_counter_trend_rr_floor:.1f}:1 R:R, "
-                    f"got {actual_rr:.2f}:1. Skipping.",
-                    flush=True
-                )
-                return
-        
-        # ============================================
-        # PIPELINE ENTRY GATES (shared with replay)
-        # ============================================
-        _pipeline_ctx, _zone_settings, _use_zone_gate_live = bot._build_pipeline_context(
+
+        _is_aggressive = (
+            bot.scaling_manager is not None
+            and bot.scaling_manager.current_mode.value == "aggressive"
+        )
+        _session_name, _is_kill = bot._session_for_gates()
+        _pc_inp = PostClaudeGateInput(
             symbol=symbol,
             trade_signal=trade_signal,
+            norm=_norm,
             market_data=market_data,
             analysis_results=analysis_results,
             pd_analysis=pd_analysis,
             current_price=current_price,
-            actual_rr=actual_rr,
             is_crypto=is_crypto,
-            is_counter_trend_scalp=_is_counter_trend_scalp,
-        )
-        _session_name, _is_kill = bot._session_for_gates()
-        _entry_gate = evaluate_entry_gates(
-            _pipeline_ctx,
-            zone_settings=_zone_settings,
-            use_zone_gate=_use_zone_gate_live,
+            is_aggressive=_is_aggressive,
+            df=df,
             session_name=_session_name,
             is_kill_zone=_is_kill,
-            asian_penalty=settings.trading.gate_session_penalty_asian,
+            build_pipeline_context=bot._build_pipeline_context,
+            last_signal_direction=bot._last_signal_direction,
+            direction_flipped=_direction_flipped,
         )
-        if _entry_gate.blocked:
-            await bot._handle_pipeline_gate_block(symbol, _entry_gate, ctx=_pipeline_ctx)
+
+        _price_gate = run_post_claude_gates(_pc_inp, stop_after="price")
+        if _price_gate.blocked:
+            logger.warning(f"[BLOCKED] {symbol}: {_price_gate.reason}")
+            print(f"[BLOCKED] {symbol}: {_price_gate.reason}", flush=True)
+            await bot._record_terminal_decision(
+                "mechanical_reject",
+                symbol,
+                gate_id=_price_gate.gate_id,
+                direction=_price_gate.direction,
+                entry=_price_gate.entry,
+                sl=_price_gate.sl,
+                tp=_price_gate.tp,
+                confidence=_price_gate.confidence,
+                reason=_price_gate.reason,
+                details=build_reject_details(
+                    gate_path=_price_gate.gate_path,
+                    direction=_price_gate.direction,
+                    entry=_price_gate.entry,
+                    sl=_price_gate.sl,
+                    tp=_price_gate.tp,
+                    confidence=_price_gate.confidence,
+                ),
+            )
             return
-        trade_signal.confidence = _pipeline_ctx.confidence
+
+        _entry = _price_gate.entry
+        _sl = _price_gate.sl
+        _tp = _price_gate.tp
+        _dir = _price_gate.direction
+        actual_rr = _price_gate.actual_rr
+        min_rr = _price_gate.min_rr
+        _is_counter_trend_scalp = _price_gate.is_counter_trend_scalp
+
+        if actual_rr < min_rr:
+            logger.info(
+                f"[R:R WARNING] {symbol}: R:R {actual_rr:.2f}:1 below target {min_rr:.1f}:1 "
+                f"but above hard floor — Trade Judge will decide."
+            )
+            print(
+                f"[R:R WARNING] {symbol}: R:R {actual_rr:.2f}:1 (target {min_rr:.1f}:1) — "
+                f"borderline, letting Trade Judge decide.",
+                flush=True,
+            )
+        else:
+            logger.info(f"R:R OK for {symbol}: {actual_rr:.2f} (min {min_rr:.1f})")
+
+        _entry_gate_result = run_post_claude_gates(
+            _pc_inp,
+            start_at="entry",
+            stop_after="entry",
+            gate_path=_price_gate.gate_path,
+            carry=_price_gate,
+        )
+        if _entry_gate_result.blocked:
+            await bot._handle_pipeline_gate_block(
+                symbol, _entry_gate_result, ctx=_entry_gate_result.pipeline_ctx
+            )
+            return
+        _pipeline_ctx = _entry_gate_result.pipeline_ctx
+        trade_signal.confidence = _entry_gate_result.confidence
         confluence_count, confluence_factors = count_confluence(_pipeline_ctx)
         logger.info(
             f"Confluence factors for {symbol}: {confluence_count} "
@@ -529,13 +421,14 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                     add_activity("mode_change", f"Trading mode changed to {bot.scaling_manager.current_mode.value}", details={"mode": bot.scaling_manager.current_mode.value, "previous": _prev_mode.value, "symbol": symbol, "equity": current_equity})
             
         # ============================================
-        # PIPELINE PERMISSION GATES (scaling + correlation)
+        # PIPELINE PERMISSION + FLIP GATES (shared with replay)
         # ============================================
-        _pipeline_ctx.scaling_aggressive = (
+        _pc_inp.scaling_aggressive = (
             bot.scaling_manager is not None
             and bot.scaling_manager.current_mode.value == "aggressive"
         )
-        _pipeline_ctx.confidence = trade_signal.confidence
+        _pc_inp.scaling_manager = bot.scaling_manager
+        _pc_inp.daily_trades = bot.daily_trades
 
         def _correlation_check():
             if bot.correlation_service:
@@ -544,84 +437,81 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                 )
             return False, ""
 
-        _perm_gate = evaluate_trade_permission_gates(
-            _pipeline_ctx,
-            scaling_manager=bot.scaling_manager,
-            daily_trades=bot.daily_trades,
-            gate_min_confidence=settings.trading.gate_min_confidence,
-            correlation_check=_correlation_check if bot.correlation_service else None,
+        _pc_inp.correlation_check = (
+            _correlation_check if bot.correlation_service else None
         )
-        if _perm_gate.blocked:
-            await bot._handle_pipeline_gate_block(symbol, _perm_gate, ctx=_pipeline_ctx)
+
+        _perm_flip = run_post_claude_gates(
+            _pc_inp,
+            start_at="permission",
+            stop_after="complete",
+            ctx=_pipeline_ctx,
+            gate_path=_entry_gate_result.gate_path,
+            carry=_entry_gate_result,
+        )
+        if _perm_flip.blocked:
+            if _perm_flip.gate_id == "direction_flip":
+                logger.warning(f"[FLIP-GUARD] {symbol}: {_perm_flip.reason}")
+                from ..api.routes.activity import add_activity
+
+                last_dir = bot._last_signal_direction.get(
+                    symbol, ("", datetime.now(timezone.utc))
+                )[0]
+                add_activity(
+                    "direction_flip_blocked",
+                    f"Blocked {symbol} flip: {last_dir.upper()} -> {trade_signal.direction.upper()}",
+                    symbol,
+                    {
+                        "previous_direction": last_dir,
+                        "new_direction": trade_signal.direction,
+                        "confidence": trade_signal.confidence,
+                        "required_confidence": 0.80,
+                    },
+                )
+                print(
+                    f"[BLOCKED] ║  Direction flip {symbol}: {_perm_flip.reason}",
+                    flush=True,
+                )
+                if bot_state:
+                    bot_state.trade_decision(
+                        symbol,
+                        "rejected",
+                        f"Direction flip blocked ({last_dir} -> {trade_signal.direction})",
+                    )
+                await bot._record_terminal_decision(
+                    "mechanical_reject",
+                    symbol,
+                    gate_id=_perm_flip.gate_id,
+                    direction=trade_signal.direction,
+                    entry=trade_signal.entry_price or current_price,
+                    sl=trade_signal.stop_loss or 0.0,
+                    tp=trade_signal.take_profit or 0.0,
+                    confidence=trade_signal.confidence,
+                    reason=_perm_flip.reason,
+                    details=build_reject_details(
+                        gate_path=_perm_flip.gate_path,
+                        direction=trade_signal.direction,
+                        entry=trade_signal.entry_price or current_price,
+                        sl=trade_signal.stop_loss or 0.0,
+                        tp=trade_signal.take_profit or 0.0,
+                        confidence=trade_signal.confidence,
+                    ),
+                )
+                return
+            await bot._handle_pipeline_gate_block(
+                symbol, _perm_flip, ctx=_perm_flip.pipeline_ctx
+            )
             return
-        trade_signal.confidence = _pipeline_ctx.confidence
+        trade_signal.confidence = _perm_flip.confidence
         if (
             hasattr(bot, "_post_cooldown_symbols")
             and symbol in bot._post_cooldown_symbols
         ):
             bot._post_cooldown_symbols.discard(symbol)
 
-        # R:R was already validated in the A6 block above (rejected if below 1.0,
-        # borderline passed to Trade Judge). Claude's TP/SL are never modified.
-        # We do NOT reject based on Claude's self-reported risk_reward field here.
-        # The final validate_trade() call will do the definitive R:R check.
-        
-        # =============================================
-        # DIRECTION-FLIP COOLDOWN (shared flip guard)
-        # =============================================
-        from .scaling_gates import evaluate_flip_guard
-
-        _flip_outcome = evaluate_flip_guard(
-            symbol=symbol,
-            direction=trade_signal.direction,
-            confidence=trade_signal.confidence,
-            last_signal_direction=bot._last_signal_direction,
-            direction_flipped=_direction_flipped,
-            reversal_reentry=getattr(trade_signal, "reversal_reentry", False),
-        )
-        _pipeline_ctx.gate_path.extend(_flip_outcome.gate_path)
-        if _flip_outcome.blocked:
-            logger.warning(f"[FLIP-GUARD] {symbol}: {_flip_outcome.reason}")
-            from ..api.routes.activity import add_activity
-
-            last_dir = bot._last_signal_direction.get(symbol, ("", datetime.now(timezone.utc)))[0]
-            add_activity(
-                "direction_flip_blocked",
-                f"Blocked {symbol} flip: {last_dir.upper()} -> {trade_signal.direction.upper()}",
-                symbol,
-                {
-                    "previous_direction": last_dir,
-                    "new_direction": trade_signal.direction,
-                    "confidence": trade_signal.confidence,
-                    "required_confidence": 0.80,
-                },
-            )
-            print(
-                f"[BLOCKED] ║  Direction flip {symbol}: {_flip_outcome.reason}",
-                flush=True,
-            )
-            if bot_state:
-                bot_state.trade_decision(
-                    symbol,
-                    "rejected",
-                    f"Direction flip blocked ({last_dir} -> {trade_signal.direction})",
-                )
-            await bot._record_terminal_decision(
-                "mechanical_reject",
-                symbol,
-                gate_id=_flip_outcome.gate_id,
-                direction=trade_signal.direction,
-                entry=trade_signal.entry_price or current_price,
-                sl=trade_signal.stop_loss or 0.0,
-                tp=trade_signal.take_profit or 0.0,
-                confidence=trade_signal.confidence,
-                reason=_flip_outcome.reason,
-                details={"gate_path": list(_pipeline_ctx.gate_path)},
-            )
-            return
-        if _flip_outcome.gate_path and _flip_outcome.gate_path[0].startswith("flip_guard_bypass"):
-            logger.info(f"[FLIP-GUARD] {symbol}: Bypassing cooldown ({_flip_outcome.gate_path[0]})")
-        elif _flip_outcome.gate_path == ["flip_guard_high_confidence"]:
+        if any(p.startswith("flip_guard_bypass") for p in _perm_flip.gate_path):
+            logger.info(f"[FLIP-GUARD] {symbol}: Bypassing cooldown")
+        elif "flip_guard_high_confidence" in _perm_flip.gate_path:
             logger.info(
                 f"[FLIP-GUARD] {symbol}: Allowing high-confidence flip "
                 f"({trade_signal.confidence:.0%} >= 80%)"
@@ -832,6 +722,14 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                     tp=_val_tp or 0.0,
                     confidence=trade_signal.confidence,
                     reason="; ".join(validation.errors),
+                    details=build_reject_details(
+                        gate_path=["risk_validation"],
+                        direction=trade_signal.direction,
+                        entry=_val_entry,
+                        sl=_val_sl or 0.0,
+                        tp=_val_tp or 0.0,
+                        confidence=trade_signal.confidence,
+                    ),
                 )
                 return
             
@@ -1204,6 +1102,14 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                         tp=_final_tp,
                         confidence=trade_signal.confidence,
                         reason=f"Final R:R {_final_rr:.2f}:1 below 1.0",
+                        details=build_reject_details(
+                            gate_path=["final_rr_check"],
+                            direction=_final_dir,
+                            entry=_final_entry,
+                            sl=_final_sl,
+                            tp=_final_tp,
+                            confidence=trade_signal.confidence,
+                        ),
                     )
                     return
                 elif _final_rr < min_rr and _final_sl_dist > 0:
@@ -1282,6 +1188,8 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                     f"| flags: [{flags_str}]",
                     flush=True
                 )
+
+                from ..main import save_signal_to_db
 
                 await save_signal_to_db(
                     symbol=symbol,
@@ -1370,6 +1278,14 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                         confidence=trade_signal.confidence,
                         reason=f"DEMOTE R:R {_demote_rr:.2f}:1 below 1.0",
                         judge_verdict="DEMOTE",
+                        details=build_reject_details(
+                            gate_path=["judge_demote", "demote_rr_check"],
+                            direction=trade_signal.direction,
+                            entry=demoted_entry,
+                            sl=_sl_for_check,
+                            tp=trade_signal.take_profit or 0.0,
+                            confidence=trade_signal.confidence,
+                        ),
                     )
                     return
                 
@@ -1405,6 +1321,14 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                             confidence=trade_signal.confidence,
                             reason="DEMOTE SL on wrong side of entry",
                             judge_verdict="DEMOTE",
+                            details=build_reject_details(
+                                gate_path=["judge_demote", "demote_sl_check"],
+                                direction=trade_signal.direction,
+                                entry=demoted_entry,
+                                sl=_sl_check,
+                                tp=trade_signal.take_profit or 0.0,
+                                confidence=trade_signal.confidence,
+                            ),
                         )
                         return
                 
@@ -1544,6 +1468,14 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                     tp=trade_signal.take_profit or 0.0,
                     confidence=trade_signal.confidence,
                     reason=_exec_prep.reason,
+                    details=build_reject_details(
+                        gate_path=[_exec_prep.gate_id or "execution_prep"],
+                        direction=trade_signal.direction,
+                        entry=trade_signal.entry_price or current_price,
+                        sl=trade_signal.stop_loss or 0.0,
+                        tp=trade_signal.take_profit or 0.0,
+                        confidence=trade_signal.confidence,
+                    ),
                 )
                 return
             order_type = _exec_prep.order_type
@@ -1578,6 +1510,14 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                     tp=_exec_result.final_tp,
                     confidence=trade_signal.confidence,
                     reason=_exec_result.reason,
+                    details=build_reject_details(
+                        gate_path=[_exec_result.gate_id or "execution"],
+                        direction=trade_signal.direction,
+                        entry=_exec_result.final_entry,
+                        sl=_exec_result.final_sl,
+                        tp=_exec_result.final_tp,
+                        confidence=trade_signal.confidence,
+                    ),
                 )
                 return
             if _exec_result.dry_run:

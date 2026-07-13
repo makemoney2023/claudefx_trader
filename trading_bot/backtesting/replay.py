@@ -267,6 +267,7 @@ class ClaudeReplayBacktester:
         )
         step_idx = 0
         _last_signal_for_symbol: Dict[str, Dict[str, Any]] = {}
+        self._replay_last_signal_direction: Dict[str, Any] = {}
 
         while current <= end_date and signals_processed < max_signals:
             if current.weekday() >= 5 or (current.weekday() == 4 and current.hour >= 19):
@@ -566,13 +567,13 @@ class ClaudeReplayBacktester:
                 if sig.direction != 'no_trade' and sig.entry_price and sig.stop_loss and sig.take_profit:
                     from ..config import settings as _bt_settings
                     from ..services.entry_gates import ZoneGateSettings, should_use_zone_gate
-                    from ..services.gate_pipeline import evaluate_pre_execution_gates
-                    from ..services.trade_context import TradeContext
+                    from ..services.post_claude_gates import (
+                        PostClaudeGateInput,
+                        SecondaryModifierInput,
+                        run_post_claude_gates,
+                    )
+                    from ..analysis.kill_zones import KillZoneChecker
 
-                    _sl_dist_bt = abs(sig.entry_price - sig.stop_loss)
-                    _tp_dist_bt = abs(sig.take_profit - sig.entry_price)
-                    _rr_bt = _tp_dist_bt / _sl_dist_bt if _sl_dist_bt > 0 else 0
-                    _d1_bias_bt = (analysis_data.get('d1_bias') or '').lower()
                     _zone_settings = ZoneGateSettings(
                         gate_mode=_bt_settings.trading.zone_gate_mode,
                         misaligned_min_confidence=_bt_settings.trading.zone_misaligned_min_confidence,
@@ -580,49 +581,46 @@ class ClaudeReplayBacktester:
                         equilibrium_min_confidence=_bt_settings.trading.zone_equilibrium_min_confidence,
                         disabled_symbols=tuple(_bt_settings.trading.zone_gate_disabled_symbols),
                     )
-                    from ..config import get_symbol_spec
-                    _sym_spec = get_symbol_spec(symbol)
-                    _is_index = _sym_spec.category == 'index' if _sym_spec else False
-                    _weak_hrs = tuple(_bt_settings.trading.weak_hours_by_symbol.get(symbol, []))
                     _use_zone = should_use_zone_gate(
                         _pd_d1_result is not None,
                         _zone_settings.gate_mode,
                         symbol,
                         _zone_settings.disabled_symbols,
                     )
-                    _replay_market = {
-                        'd1_bias': _d1_bias_bt,
-                        'h4_bias': (analysis_data.get('h4_bias') or '').lower(),
-                        'm15_bias': (analysis_data.get('m15_bias') or '').lower(),
-                        'regime': analysis_data.get('regime', {}),
-                    }
-                    _replay_ctx = TradeContext.from_signal(
+                    _replay_last_dir: Dict[str, Dict[str, Any]] = getattr(
+                        self, "_replay_last_signal_direction", {}
+                    )
+                    _pc_inp = PostClaudeGateInput(
                         symbol=symbol,
                         trade_signal=sig,
-                        market_data=_replay_market,
+                        norm=_norm,
+                        market_data=market_data,
                         analysis_results=analysis_data or {},
-                        current_price=sig.entry_price or current_price,
                         pd_analysis=_pd_d1_result,
-                        utc_hour=current.hour,
-                        weak_hours=_weak_hrs,
-                        is_index=_is_index,
-                        actual_rr=_rr_bt,
-                    )
-                    _rg = evaluate_pre_execution_gates(
-                        _replay_ctx,
+                        current_price=current_price,
+                        df=m15_window,
+                        snapshot_time=current,
                         zone_settings=_zone_settings,
                         use_zone_gate=_use_zone,
-                        is_kill_zone=True,
-                        gate_min_confidence=_bt_settings.trading.gate_min_confidence,
+                        last_signal_direction=_replay_last_dir,
+                        direction_flipped=_norm.direction_flipped,
+                        apply_secondary_modifiers=True,
+                        modifier_input=SecondaryModifierInput(),
                     )
-                    sig.confidence = _replay_ctx.confidence
+                    _kz = KillZoneChecker()
+                    _gate_result = run_post_claude_gates(
+                        _pc_inp,
+                        kill_zone_checker=_kz,
+                        stop_after="complete",
+                    )
+                    sig.confidence = _gate_result.confidence
                     _zone_gate_decision = (
-                        _rg.gate_id if _rg.blocked else "allowed"
+                        _gate_result.gate_id if _gate_result.blocked else "allowed"
                     )
-                    if _rg.blocked:
+                    if _gate_result.blocked:
                         logger.info(
                             f"[REPLAY] {current.strftime('%m/%d %H:%M')} "
-                            f"GATE blocked {sig.direction.upper()}: {_rg.reason}"
+                            f"GATE blocked {sig.direction.upper()}: {_gate_result.reason}"
                         )
                         if progress_callback:
                             try:
@@ -657,6 +655,10 @@ class ClaudeReplayBacktester:
                         'entry_price': sig.entry_price,
                         'timestamp': current.isoformat(),
                     }
+                    self._replay_last_signal_direction[symbol] = (
+                        sig.direction,
+                        current,
+                    )
 
                     future = m15_data[m15_data.index > window_end].head(200)
                     trade, policy_result = self._evaluate_replay_signal(

@@ -23,11 +23,14 @@ class TradePipeline:
     def __init__(self, bot: "TradingBot"):
         self.bot = bot
         self.analysis = AnalysisOrchestrator()
+        bot._analysis_orchestrator = self.analysis
         self.claude_stage: Optional[ClaudeAnalysisStage] = None
+        bot._trade_pipeline = self
 
     def claude(self) -> ClaudeAnalysisStage:
         if self.claude_stage is None:
             self.claude_stage = ClaudeAnalysisStage(self.bot.claude_client)
+            self.bot._claude_stage = self.claude_stage
         return self.claude_stage
 
     def normalize_signal(self, trade_signal, claude_result, current_price, symbol):
