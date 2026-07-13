@@ -1,13 +1,14 @@
 @echo off
-REM ICT Trading Bot - Start Script
-REM This script starts both the backend API and the dashboard
+REM ICT Trading Bot - Development Start Script
+REM Starts backend (with hot-reload) and dashboard (dev server)
+
+cd /d "%~dp0"
 
 echo ========================================
-echo   ICT Trading Bot - Starting...
+echo   ICT Trading Bot - Starting (Dev)
 echo ========================================
 echo.
 
-REM Check if virtual environment exists
 if not exist venv (
     echo ERROR: Virtual environment not found!
     echo Please run setup_windows.bat first.
@@ -15,7 +16,6 @@ if not exist venv (
     exit /b 1
 )
 
-REM Check if .env.local exists
 if not exist .env.local (
     echo ERROR: .env.local not found!
     echo Please create .env.local with your credentials.
@@ -24,7 +24,6 @@ if not exist .env.local (
     exit /b 1
 )
 
-REM Check if MT5 is running
 echo Checking if MetaTrader 5 is running...
 tasklist /FI "IMAGENAME eq terminal64.exe" 2>NUL | find /I /N "terminal64.exe">NUL
 if errorlevel 1 (
@@ -37,19 +36,11 @@ if errorlevel 1 (
 )
 
 echo.
-echo Starting Backend API server...
-echo (This window will run the FastAPI backend)
-echo.
 echo Starting Dashboard in a new window...
-echo.
+start "ICT Dashboard" cmd /k pushd "%~dp0dashboard" ^&^& npm run dev
 
-REM Start dashboard in new window
-start "ICT Dashboard" cmd /k "cd dashboard && npm run dev"
-
-REM Small delay to let dashboard start
 timeout /t 2 /nobreak >nul
 
-REM Activate venv and start backend (this window)
 call venv\Scripts\activate.bat
 
 echo.
@@ -60,6 +51,7 @@ echo.
 echo API will be available at: http://localhost:8000
 echo Dashboard will be at:     http://localhost:3000
 echo.
+echo For production/VPS use: start_bot_production.bat
 echo Press Ctrl+C to stop the server
 echo.
 

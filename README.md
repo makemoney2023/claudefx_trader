@@ -97,6 +97,8 @@ trading_bot/
 
 ### Windows Setup (Recommended for Live Trading)
 
+> **Deploying on a Windows VPS?** See the dedicated guide: [docs/WINDOWS_VPS_SETUP.md](docs/WINDOWS_VPS_SETUP.md)
+
 **Prerequisites:**
 - Python 3.10+ ([Download](https://www.python.org/downloads/))
 - Node.js 18+ ([Download](https://nodejs.org/))
@@ -183,27 +185,46 @@ ALLOWED_SESSIONS=london,new_york
 
 ### Starting the Bot (Windows)
 
-**Quick Start:**
+**Development (local testing):**
 ```batch
-# Start both backend and dashboard
 start_bot.bat
+```
 
-# Stop all services
+**Production (VPS / 24-7):**
+```batch
+start_bot_production.bat
+```
+
+**Individual components:**
+```batch
+start_api.bat
+start_dashboard.bat
 stop_bot.bat
 ```
+
+> See [docs/WINDOWS_VPS_SETUP.md](docs/WINDOWS_VPS_SETUP.md) for full VPS deployment instructions.
 
 **Test MT5 Connection First:**
 ```batch
 python test_mt5_connection.py
 ```
 
+**Test Telegram Notifications:**
+```batch
+python test_telegram_connection.py
+```
+
+> See [docs/WINDOWS_VPS_SETUP.md#telegram-notifications](docs/WINDOWS_VPS_SETUP.md#telegram-notifications) for full Telegram setup.
+
 **Manual Start:**
 ```batch
 # Terminal 1: Start API backend
-venv\Scripts\activate
-python -m uvicorn trading_bot.api.main:app --reload
+start_api.bat
 
-# Terminal 2: Start dashboard
+# Terminal 2: Start dashboard (production)
+start_dashboard.bat
+
+# Or for development:
 cd dashboard
 npm run dev
 ```
@@ -330,6 +351,8 @@ Uses Claude Opus 4.5 vision API to analyze chart screenshots and generate trade 
 ### Windows MT5 verification
 
 Live execution requires Windows with MetaTrader 5 installed. Run `python test_mt5_connection.py` on the Windows host before paper promotion. macOS/Linux development uses simulation mode only.
+
+Optional Telegram alerts: run `python test_telegram_connection.py` after setting `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env.local`.
 
 ## Backtesting and Validation
 
