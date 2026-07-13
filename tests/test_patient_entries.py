@@ -298,12 +298,12 @@ class TestFallbackMinConfidence:
     def test_fallback_confidence_is_060(self):
         """Min confidence gate uses gate_min_confidence via pipeline."""
         import inspect
-        from trading_bot.main import TradingBot
         from trading_bot.services import gate_pipeline
+        from tests.pipeline_source import analyze_and_trade_source
 
-        bot_source = inspect.getsource(TradingBot)
+        runner_source = analyze_and_trade_source()
         pipeline_source = inspect.getsource(gate_pipeline)
-        assert "gate_min_confidence" in bot_source
+        assert "gate_min_confidence" in runner_source
         assert "gate_min_confidence" in pipeline_source
 
 

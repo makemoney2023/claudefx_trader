@@ -40,3 +40,9 @@ class TradePipeline:
 
     def run_permission_gates(self, ctx, **kwargs):
         return evaluate_trade_permission_gates(ctx, **kwargs)
+
+    async def run(self, symbol: str, is_crypto: bool = False) -> None:
+        """Execute the full analyze-and-trade pipeline for one symbol."""
+        from .analyze_and_trade_runner import run_analyze_and_trade
+
+        await run_analyze_and_trade(self.bot, symbol, is_crypto=is_crypto)

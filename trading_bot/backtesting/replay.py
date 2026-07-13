@@ -545,6 +545,14 @@ class ClaudeReplayBacktester:
                 )
 
                 sig = claude_result.signal
+                from ..services.signal_normalizer import normalize_signal_prices
+
+                normalize_signal_prices(
+                    sig,
+                    claude_result,
+                    current_price,
+                    symbol,
+                )
                 _zone_gate_decision = "no_gate"
                 if sig.direction != 'no_trade' and sig.entry_price and sig.stop_loss and sig.take_profit:
                     from ..config import settings as _bt_settings

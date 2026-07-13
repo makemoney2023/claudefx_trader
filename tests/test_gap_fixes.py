@@ -524,11 +524,10 @@ class TestConfigCandleCounts:
         assert settings.confirmation_tf_candles == 150
     
     def test_execution_tf_candles_used_in_main(self):
-        """main.py should reference settings.timeframes.execution_tf_candles."""
-        import inspect
-        from trading_bot.main import TradingBot
-        
-        source = inspect.getsource(TradingBot._analyze_and_trade)
+        """Pipeline should reference settings.timeframes.execution_tf_candles."""
+        from tests.pipeline_source import analyze_and_trade_source
+
+        source = analyze_and_trade_source()
         assert 'execution_tf_candles' in source
 
 
@@ -1333,16 +1332,15 @@ class TestCycleMemory:
                 "Should not include last signal section when no data"
     
     def test_signal_memory_stored_in_analyze_and_trade(self):
-        """_analyze_and_trade should store signals in _last_signal_per_symbol."""
-        import inspect
-        from trading_bot.main import TradingBot
-        
-        source = inspect.getsource(TradingBot._analyze_and_trade)
+        """Pipeline should store signals in _last_signal_per_symbol."""
+        from tests.pipeline_source import analyze_and_trade_source
+
+        source = analyze_and_trade_source()
         assert '_last_signal_per_symbol' in source, \
-            "_analyze_and_trade should update _last_signal_per_symbol"
+            "Pipeline should update _last_signal_per_symbol"
         assert "market_data[\"last_signal\"]" in source or \
                "market_data['last_signal']" in source, \
-            "_analyze_and_trade should inject last_signal into market_data"
+            "Pipeline should inject last_signal into market_data"
 
 
 # ============================================================
@@ -1353,16 +1351,18 @@ class TestDirectionFlipCooldown:
     """Test the direction-flip cooldown guard logic."""
     
     def test_flip_guard_exists_in_code(self):
-        """The flip guard logic should exist in _analyze_and_trade."""
+        """The flip guard logic should exist in the shared pipeline modules."""
         import inspect
-        from trading_bot.main import TradingBot
-        
-        source = inspect.getsource(TradingBot._analyze_and_trade)
-        assert 'FLIP-GUARD' in source, "Should have FLIP-GUARD logic"
+
+        from tests.pipeline_source import analyze_and_trade_source
+        from trading_bot.services import scaling_gates
+
+        source = analyze_and_trade_source() + inspect.getsource(scaling_gates)
+        assert 'FLIP-GUARD' in source or 'evaluate_flip_guard' in source
         assert '_last_signal_direction' in source, "Should track last signal direction"
-        assert 'flip_cooldown_minutes' in source, "Should have cooldown window"
-        assert 'flip_min_confidence' in source, "Should have higher confidence for flips"
-    
+        assert 'flip_cooldown_minutes' in source or 'cooldown_minutes' in source
+        assert 'flip_min_confidence' in source or 'min_confidence' in source
+
     def test_same_direction_always_passes(self):
         """Same direction signal should never be blocked by the flip guard."""
         from datetime import datetime, timedelta

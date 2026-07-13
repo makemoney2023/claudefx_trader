@@ -271,7 +271,9 @@ class TestFinalRiskOrchestratorPaths:
         assert "order_manager.place_market_order" not in upgrade_block
 
     def test_regular_market_reenforces_after_tick_refine(self):
-        source = inspect.getsource(TradingBot._analyze_and_trade)
+        from tests.pipeline_source import analyze_and_trade_source
+
+        source = analyze_and_trade_source()
         tick_idx = source.index("[TICK-REFINE]")
         market_block = source[tick_idx : source.index("elif order_type in ['buy_limit'", tick_idx)]
         assert "_place_market_with_final_risk(" in market_block

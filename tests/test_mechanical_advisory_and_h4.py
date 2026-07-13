@@ -86,8 +86,8 @@ class TestMechanicalSetupAdvisory:
 
 class TestPipelineWiring:
     def _main_source(self):
-        import trading_bot.main as main_module
-        return Path(main_module.__file__).read_text()
+        from tests.pipeline_source import pipeline_source
+        return pipeline_source()
 
     def _claude_source(self):
         import trading_bot.llm.claude_client as cc

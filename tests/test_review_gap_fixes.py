@@ -199,10 +199,10 @@ class TestGeopoliticalRiskWiring:
         assert svc.get_geopolitical_risk_level() == "low"
 
     def test_main_does_not_call_nonexistent_method(self):
-        """main.py must use get_geopolitical_risk_level(), not geopolitical_risk_level([])."""
-        from pathlib import Path
-        import trading_bot.main as main_module
-        source = Path(main_module.__file__).read_text()
+        """Pipeline must use get_geopolitical_risk_level(), not geopolitical_risk_level([])."""
+        from tests.pipeline_source import pipeline_source
+
+        source = pipeline_source()
         assert "geopolitical_risk_level([])" not in source
         assert "get_geopolitical_risk_level()" in source
 

@@ -408,14 +408,18 @@ class TestFlipCooldownBypass:
     """Reversal re-entries should bypass the direction flip cooldown."""
 
     def test_flip_guard_code_has_reversal_bypass(self):
-        """The flip guard in main.py should check reversal_reentry."""
+        """The flip guard should check reversal_reentry."""
         import inspect
-        from trading_bot.main import TradingBot
-        source = inspect.getsource(TradingBot._analyze_and_trade)
+
+        from tests.pipeline_source import analyze_and_trade_source
+        from trading_bot.services.scaling_gates import evaluate_flip_guard
+
+        source = analyze_and_trade_source() + inspect.getsource(evaluate_flip_guard)
         assert 'reversal_reentry' in source, \
             "Flip guard should check reversal_reentry flag"
-        assert 'Bypassing cooldown for reversal re-entry' in source, \
-            "Should log bypass for reversal re-entries"
+        assert 'flip_guard_bypass_reversal' in source or \
+               'Bypassing cooldown for reversal re-entry' in source, \
+            "Should bypass for reversal re-entries"
 
 
 # ================================================================

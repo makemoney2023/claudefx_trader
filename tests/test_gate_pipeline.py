@@ -69,3 +69,40 @@ class TestGatePipeline:
         ctx = _ctx(post_cooldown=True, confidence=0.70)
         outcome = evaluate_structure_and_quality_gates(ctx)
         assert outcome.blocked is True
+
+
+class TestFlipGuard:
+    def test_blocks_low_confidence_flip(self):
+        from datetime import datetime, timedelta, timezone
+
+        from trading_bot.services.scaling_gates import evaluate_flip_guard
+
+        last = {
+            "EURUSD": (
+                "long",
+                datetime.now(timezone.utc) - timedelta(minutes=5),
+            )
+        }
+        outcome = evaluate_flip_guard(
+            symbol="EURUSD",
+            direction="short",
+            confidence=0.75,
+            last_signal_direction=last,
+        )
+        assert outcome.blocked is True
+        assert outcome.gate_id == "direction_flip"
+
+    def test_allows_reversal_reentry_bypass(self):
+        from datetime import datetime, timezone
+
+        from trading_bot.services.scaling_gates import evaluate_flip_guard
+
+        outcome = evaluate_flip_guard(
+            symbol="EURUSD",
+            direction="short",
+            confidence=0.70,
+            last_signal_direction={"EURUSD": ("long", datetime.now(timezone.utc))},
+            reversal_reentry=True,
+        )
+        assert outcome.blocked is False
+        assert outcome.gate_path == ["flip_guard_bypass_reversal"]
