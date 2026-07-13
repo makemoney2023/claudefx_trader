@@ -10,7 +10,7 @@ An advanced algorithmic trading system that combines Claude AI's analytical capa
 
 The ICT Trading Bot is a sophisticated automated trading system designed to capture 100+ pip expansion moves by identifying and trading with institutional order flow. It leverages:
 
-- **Claude AI (Opus 4.5)** for intelligent chart analysis and decision-making
+- **Claude AI (Opus 4.8)** for intelligent chart analysis and decision-making
 - **ICT Methodology** including AMD cycles, liquidity sweeps, and Smart Money concepts
 - **Real-Time Intelligence** via Firecrawl integration for sentiment, positioning, and macro data
 - **MetaTrader 5** for reliable trade execution across forex, crypto, and precious metals
@@ -33,6 +33,11 @@ The ICT Trading Bot is a sophisticated automated trading system designed to capt
 - **Contextual Learning**: Learns from past trades to improve future recommendations
 - **Confidence Scoring**: Every trade signal includes a confidence level based on multiple factors
 - **Natural Language Reasoning**: Detailed explanations for every trade decision
+- **Claude Opus 4.8 everywhere**: chart analysis, trade judge, position/pending re-evals, trade reviews, weekly insights, and sizing all run on Opus 4.8 with adaptive thinking (high effort for analysis/judge, medium for lighter tasks)
+- **Guaranteed-valid outputs**: the analysis tool uses strict tool use and the trade judge uses structured outputs (JSON schema), so signals and verdicts are always schema-valid
+- **Prompt caching**: the static ICT ruleset (`ANALYSIS_RULES`), the trade-judge rubric (`JUDGE_RUBRIC`), the re-eval rules, and strategy docs all live in cached system blocks, cutting repeat token cost per scan cycle
+- **Cost telemetry**: every API call logs a `[USAGE]` line and writes a row to the `api_usage` table (tokens, cache hits, estimated USD cost per task type)
+- **Prompt telemetry**: `scripts/prompt_baseline_report.py` compares signal distributions before/after the prompt-v2 cutover (2026-07-13) to measure behavioural drift
 
 ### 📊 ICT Strategy Implementation
 
@@ -150,7 +155,7 @@ Powered by Firecrawl API integration:
 | Layer | Technology |
 |-------|------------|
 | **Trading Engine** | Python 3.12+, AsyncIO |
-| **AI Integration** | Anthropic Claude API (Opus 4.5) |
+| **AI Integration** | Anthropic Claude API (Opus 4.8 for ALL tasks — analysis, judge, re-evals, reviews, sizing) |
 | **Market Data** | MetaTrader 5 MCP Server |
 | **Intelligence** | Firecrawl API |
 | **Backend API** | FastAPI, SQLAlchemy |

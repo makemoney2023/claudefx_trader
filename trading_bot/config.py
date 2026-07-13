@@ -330,9 +330,9 @@ class ClaudeSettings(BaseSettings):
     )
     
     api_key: str = Field(default="", description="Anthropic API key")
-    model: str = Field(default="claude-sonnet-4-5-20250929", description="Claude model for light tasks (re-evals, reviews). Heavy tasks use claude-opus-4-6.")
-    max_tokens: int = Field(default=4096, description="Maximum tokens in response")
-    temperature: float = Field(default=0.3, description="Temperature for response generation")
+    model: str = Field(default="claude-sonnet-4-5-20250929", description="Legacy/default model setting. All runtime calls (heavy AND light tasks) now use claude-opus-4-8, set in ClaudeClient.__init__.")
+    max_tokens: int = Field(default=4096, description="Legacy default. Each Opus 4.8 call sets its own budget (thinking + response).")
+    temperature: float = Field(default=0.3, description="Legacy sampling temperature. NOT sent to any Opus 4.8 call, which rejects non-default sampling params.")
 
 
 class TradingSettings(BaseSettings):

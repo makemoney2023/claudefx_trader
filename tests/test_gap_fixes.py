@@ -913,6 +913,8 @@ class TestTradeJudgeMechanical:
             client.model = "test"
             client.model_heavy = "test"
             client.model_light = "test"
+            client.effort_heavy = "high"
+            client.effort_light = "medium"
             client.max_tokens = 4096
             client.temperature = 0.3
             client.max_retries = 3
@@ -1048,6 +1050,261 @@ class TestTradeJudgeMechanical:
         
         assert result['verdict'] == 'UNAVAILABLE', "API error should fail closed"
 
+    @pytest.mark.asyncio
+    async def test_judge_uses_opus_48_request_shape(self):
+        """Heavy judge call must be Opus 4.8 compatible: no temperature, adaptive
+        thinking, explicit effort. Also verifies a leading thinking block is skipped."""
+        client = self._get_claude_client()
+
+        thinking_block = MagicMock(type='thinking', thinking='deliberating...')
+        text_block = MagicMock(
+            type='text',
+            text='```json\n{"verdict": "APPROVE", "reason": "ok", "suggested_entry": null, "risk_flags": []}\n```',
+        )
+        mock_response = MagicMock()
+        mock_response.content = [thinking_block, text_block]
+        client.async_client = AsyncMock()
+        client.async_client.messages.create = AsyncMock(return_value=mock_response)
+
+        signal = {'symbol': 'EURUSD', 'direction': 'long', 'confidence': 0.85,
+                  'entry_price': 1.0850, 'stop_loss': 1.0800, 'take_profit': 1.0950,
+                  'order_type': 'market', 'reasoning': 'Test'}
+        risk_metrics = {'account_balance': 209.0, 'daily_pnl': 0.0, 'drawdown_pct': 0.0,
+                        'risk_reward': 2.0, 'position_size_pct': 0.02, 'trades_today': 0,
+                        'max_daily_trades': 5, 'session': 'london'}
+
+        result = await client.judge_trade(signal, risk_metrics, "")
+
+        # Parsed the text block, skipping the thinking block.
+        assert result['verdict'] == 'APPROVE'
+
+        kwargs = client.async_client.messages.create.call_args.kwargs
+        assert 'temperature' not in kwargs, "Opus 4.8 rejects temperature"
+        assert kwargs.get('thinking') == {'type': 'adaptive'}
+        assert kwargs.get('output_config', {}).get('effort') == 'high'
+        # Structured output: the judge constrains its verdict to a JSON schema.
+        fmt = kwargs.get('output_config', {}).get('format', {})
+        assert fmt.get('type') == 'json_schema', "Judge should request json_schema output"
+        assert fmt.get('schema', {}).get('properties', {}).get('verdict'), \
+            "Judge schema should define the verdict field"
+        # Static rubric must ride in a prompt-cached system block.
+        from trading_bot.llm.claude_client import JUDGE_RUBRIC
+        system = kwargs.get('system') or []
+        assert any(
+            blk.get('text') == JUDGE_RUBRIC and blk.get('cache_control')
+            for blk in system
+        ), "Judge should send JUDGE_RUBRIC as a cached system block"
+
+    @pytest.mark.asyncio
+    async def test_judge_falls_back_when_structured_output_rejected(self):
+        """If the API rejects output_config.format, judge retries without it and still parses."""
+        import anthropic
+        client = self._get_claude_client()
+
+        text_block = MagicMock(
+            type='text',
+            text='```json\n{"verdict": "APPROVE", "reason": "ok", "suggested_entry": null, "risk_flags": []}\n```',
+        )
+        ok_response = MagicMock()
+        ok_response.content = [text_block]
+
+        bad_request = anthropic.BadRequestError(
+            message="format incompatible",
+            response=MagicMock(status_code=400),
+            body=None,
+        )
+
+        client.async_client = AsyncMock()
+        # First call (with format) raises; second call (without format) succeeds.
+        client.async_client.messages.create = AsyncMock(side_effect=[bad_request, ok_response])
+
+        signal = {'symbol': 'EURUSD', 'direction': 'long', 'confidence': 0.85,
+                  'entry_price': 1.0850, 'stop_loss': 1.0800, 'take_profit': 1.0950,
+                  'order_type': 'market', 'reasoning': 'Test'}
+        risk_metrics = {'account_balance': 209.0, 'daily_pnl': 0.0, 'drawdown_pct': 0.0,
+                        'risk_reward': 2.0, 'position_size_pct': 0.02, 'trades_today': 0,
+                        'max_daily_trades': 5, 'session': 'london'}
+
+        result = await client.judge_trade(signal, risk_metrics, "")
+
+        assert result['verdict'] == 'APPROVE'
+        assert client.async_client.messages.create.call_count == 2
+        # The retry must NOT include the format constraint.
+        retry_kwargs = client.async_client.messages.create.call_args_list[1].kwargs
+        assert 'format' not in retry_kwargs.get('output_config', {})
+
+
+# ============================================================
+# 21c. Opus 4.8 Everywhere — Strict Tool + Light-Task Shape
+# ============================================================
+
+class TestOpus48Everywhere:
+    """All Claude calls (light tasks included) run on Opus 4.8 with valid params."""
+
+    def _get_claude_client(self):
+        from trading_bot.llm.claude_client import ClaudeClient
+        with patch.object(ClaudeClient, '__init__', lambda self, **kw: None):
+            client = ClaudeClient.__new__(ClaudeClient)
+            client.api_key = "test"
+            client.model = "test"
+            client.model_heavy = "claude-opus-4-8"
+            client.model_light = "claude-opus-4-8"
+            client.effort_heavy = "high"
+            client.effort_light = "medium"
+            client.max_tokens = 16000
+            client.temperature = 0.3
+            client.max_retries = 3
+            client._cache = MagicMock()
+            client._request_timestamps = []
+            client._rate_limit_window = 60
+            client._rate_limit_max = 50
+            client._rate_lock = asyncio.Lock()
+            client.sync_client = None
+            client.async_client = None
+            return client
+
+    def test_model_light_is_opus_48(self):
+        """__init__ source must point model_light at Opus 4.8 (no more Sonnet split)."""
+        import inspect
+        from trading_bot.llm.claude_client import ClaudeClient
+
+        source = inspect.getsource(ClaudeClient.__init__)
+        assert 'self.model_light = "claude-opus-4-8"' in source
+        assert 'self.effort_light' in source
+
+    def test_trade_signal_tool_is_strict(self):
+        """The analysis tool must use strict tool use with a strict-compatible schema."""
+        from trading_bot.llm.claude_client import TRADE_SIGNAL_TOOL
+
+        assert TRADE_SIGNAL_TOOL.get('strict') is True
+        schema = TRADE_SIGNAL_TOOL['input_schema']
+        assert schema.get('additionalProperties') is False
+        # Nested objects need additionalProperties: false too.
+        assert schema['properties']['key_levels'].get('additionalProperties') is False
+        # Numeric range constraints are unsupported by the strict grammar pipeline.
+        import json as _json
+        flat = _json.dumps(schema)
+        assert '"minimum"' not in flat and '"maximum"' not in flat, \
+            "strict tool schemas must not contain numeric range constraints"
+
+    def test_no_light_call_sends_temperature(self):
+        """All light-task methods must route through the shared Opus 4.8 JSON helper."""
+        import inspect
+        from trading_bot.llm.claude_client import ClaudeClient
+
+        # The helper is the single source of truth for the light-task request shape.
+        helper_source = inspect.getsource(ClaudeClient._light_json_call)
+        assert 'temperature=' not in helper_source, "_light_json_call must not send temperature"
+        assert 'thinking={"type": "adaptive"}' in helper_source, "_light_json_call missing adaptive thinking"
+        assert 'self._extract_text(message)' in helper_source, "_light_json_call not thinking-block safe"
+        assert 'self._record_usage(task, message)' in helper_source, "_light_json_call missing usage telemetry"
+
+        for method_name in ('recommend_position_size', 'review_closed_trade',
+                            'generate_weekly_review', 'generate_weekly_insights',
+                            'assess_scaling_decision'):
+            source = inspect.getsource(getattr(ClaudeClient, method_name))
+            assert 'temperature=' not in source, f"{method_name} still sends temperature"
+            assert '_light_json_call' in source, f"{method_name} bypasses the shared light-task helper"
+
+    @pytest.mark.asyncio
+    async def test_light_task_request_shape(self):
+        """A representative light task must use Opus 4.8 params and skip thinking blocks."""
+        client = self._get_claude_client()
+
+        thinking_block = MagicMock(type='thinking', thinking='pondering...')
+        text_block = MagicMock(
+            type='text',
+            text='```json\n{"outcome": "win", "grade": "A", "analysis": "solid", '
+                 '"what_went_right": [], "what_went_wrong": [], "learnings": [], '
+                 '"would_take_again": true, "improvement_suggestions": []}\n```',
+        )
+        mock_response = MagicMock()
+        mock_response.content = [thinking_block, text_block]
+        client.async_client = AsyncMock()
+        client.async_client.messages.create = AsyncMock(return_value=mock_response)
+
+        result = await client.review_closed_trade({'symbol': 'EURUSD', 'direction': 'long'})
+
+        assert result['grade'] == 'A', "Should parse text block, skipping the thinking block"
+        kwargs = client.async_client.messages.create.call_args.kwargs
+        assert kwargs.get('model') == 'claude-opus-4-8'
+        assert 'temperature' not in kwargs
+        assert kwargs.get('thinking') == {'type': 'adaptive'}
+        assert kwargs.get('output_config', {}).get('effort') == 'medium'
+
+    def test_main_reevals_use_extract_text_and_opus_params(self):
+        """Position and pending re-evals must be thinking-block safe, temperature-free,
+        send their static rules as cached system blocks, and record usage."""
+        import inspect
+        from trading_bot.main import TradingBot
+
+        expected_rules = {
+            '_claude_reevaluate_positions': 'POSITION_REEVAL_RULES',
+            '_claude_reevaluate_pending_orders': 'PENDING_REEVAL_RULES',
+        }
+        for method_name, rules_const in expected_rules.items():
+            source = inspect.getsource(getattr(TradingBot, method_name))
+            assert '_extract_text' in source, f"{method_name} reads content[0] directly"
+            assert 'temperature=' not in source, f"{method_name} sends temperature"
+            assert '"adaptive"' in source, f"{method_name} missing adaptive thinking"
+            assert rules_const in source, f"{method_name} missing cached {rules_const} system block"
+            assert 'cache_control' in source, f"{method_name} system block not cache-controlled"
+            assert '_record_usage' in source, f"{method_name} missing usage telemetry"
+
+    def test_reeval_rules_contain_output_contracts(self):
+        """The cached re-eval rules must keep the strict first-word output contracts."""
+        from trading_bot.main import PENDING_REEVAL_RULES, POSITION_REEVAL_RULES
+
+        assert 'OUTPUT CONTRACT' in POSITION_REEVAL_RULES
+        assert 'HOLD, CLOSE, or TIGHTEN' in POSITION_REEVAL_RULES
+        assert 'OUTPUT CONTRACT' in PENDING_REEVAL_RULES
+        assert 'KEEP or CANCEL' in PENDING_REEVAL_RULES
+
+    def test_api_usage_model_schema(self):
+        """The api_usage telemetry table must exist with token + cost columns."""
+        from trading_bot.api.database import ApiUsageModel
+
+        assert ApiUsageModel.__tablename__ == 'api_usage'
+        cols = {c.name for c in ApiUsageModel.__table__.columns}
+        assert {'task', 'model', 'input_tokens', 'output_tokens',
+                'cache_read_tokens', 'cache_creation_tokens',
+                'estimated_cost_usd', 'timestamp'} <= cols
+
+    def test_record_usage_skips_mocked_usage(self):
+        """_record_usage must silently ignore mock/malformed usage (never raises)."""
+        client = self._get_claude_client()
+        # MagicMock usage attributes are not ints -> should be skipped quietly.
+        client._record_usage('judge', MagicMock())
+        # Missing usage entirely -> also skipped.
+        client._record_usage('judge', None)
+
+    @pytest.mark.asyncio
+    async def test_record_usage_logs_real_usage(self):
+        """_record_usage should accept integer token counts and schedule persistence."""
+        from types import SimpleNamespace
+        client = self._get_claude_client()
+
+        message = SimpleNamespace(
+            model='claude-opus-4-8',
+            usage=SimpleNamespace(
+                input_tokens=1000,
+                output_tokens=500,
+                cache_read_input_tokens=6000,
+                cache_creation_input_tokens=0,
+            ),
+        )
+        # Must not raise; DB write is fire-and-forget and swallows its own errors.
+        client._record_usage('analysis', message)
+        await asyncio.sleep(0)  # let the persistence task start (and fail silently if no DB)
+
+    def test_opus_pricing_constants(self):
+        """Cache read must be cheaper than input; cache write more expensive (1.25x)."""
+        from trading_bot.llm.claude_client import OPUS_48_PRICING
+
+        assert OPUS_48_PRICING['cache_read'] < OPUS_48_PRICING['input']
+        assert OPUS_48_PRICING['cache_write'] > OPUS_48_PRICING['input']
+        assert OPUS_48_PRICING['output'] > OPUS_48_PRICING['input']
+
 
 # ============================================================
 # 22. Trade Judge Tests — Performance Guardrails
@@ -1089,14 +1346,18 @@ class TestTradeJudgePerformance:
         )
     
     def test_judge_evaluates_on_merit(self):
-        """The judge prompt should evaluate trades on their own merit, not force-approve at any confidence."""
+        """The judge rubric should evaluate trades on their own merit, not force-approve at any confidence.
+
+        The static rubric lives in the prompt-cached JUDGE_RUBRIC system block, so
+        assertions inspect the method source combined with that constant.
+        """
         import inspect
-        from trading_bot.llm.claude_client import ClaudeClient
+        from trading_bot.llm import claude_client
         
-        source = inspect.getsource(ClaudeClient.judge_trade)
+        source = inspect.getsource(claude_client.ClaudeClient.judge_trade) + "\n" + claude_client.JUDGE_RUBRIC
         assert 'on its own merit' in source or 'merit' in source, \
-            "Judge prompt should evaluate trades on merit"
-        assert 'confidence alone does not guarantee' in source or 'strong consideration' in source, \
+            "Judge rubric should evaluate trades on merit"
+        assert 'Confidence alone neither approves nor rejects' in source or 'confidence alone' in source.lower(), \
             "Judge should consider confidence but not force-approve based on it alone"
     
     def test_judge_prompt_includes_learning_context(self):
@@ -1120,14 +1381,18 @@ class TestTradeJudgePerformance:
             assert metric in source, f"Judge prompt missing risk metric: {metric}"
     
     def test_judge_latency_budget(self):
-        """Shared judge adapter should use asyncio.wait_for with timeout <= 8 seconds."""
+        """Shared judge adapter should use asyncio.wait_for with an Opus 4.8-sized timeout.
+
+        The old Sonnet-era 8s budget would fail-close (block) every trade now that the
+        judge runs on Opus 4.8 with high-effort adaptive thinking (~10-20s typical).
+        """
         import inspect
         from trading_bot.services.trade_judge import run_trade_judge
 
         source = inspect.getsource(run_trade_judge)
         assert 'wait_for' in source, "run_trade_judge should use asyncio.wait_for"
-        assert 'timeout' in source and '8' in source, \
-            "run_trade_judge timeout should be 8 seconds"
+        assert 'timeout: float = 45.0' in source, \
+            "run_trade_judge default timeout should be 45s for Opus 4.8 + thinking"
     
     def test_judge_demote_default_price_improvement(self):
         """Default demote should use 0.2% price improvement from current."""
@@ -1198,46 +1463,50 @@ class TestTradeJudgePerformance:
 class TestReactiveTradingPrompt:
     """Verify the analysis prompt enforces reactive trading, not prediction."""
     
-    def test_prompt_contains_reactive_mandate(self):
-        """Prompt should contain the REACT, DO NOT PREDICT mandate."""
+    @staticmethod
+    def _analysis_rules_source():
+        """Combined source: dynamic prompt builder + the static (cached) ANALYSIS_RULES.
+
+        The static methodology now lives in the prompt-cached ANALYSIS_RULES system
+        block rather than being rebuilt into every user prompt, so prompt-content
+        assertions must inspect both locations.
+        """
         import inspect
-        from trading_bot.llm.claude_client import ClaudeClient
-        
-        source = inspect.getsource(ClaudeClient._build_analysis_prompt)
-        assert 'REACT' in source, "Prompt should contain REACT mandate"
-        assert 'REACTIVE' in source, "Prompt should use the word REACTIVE"
-        assert 'ALREADY' in source, "Prompt should require ALREADY confirmed setups"
+        from trading_bot.llm import claude_client
+        return (
+            inspect.getsource(claude_client.ClaudeClient._build_analysis_prompt)
+            + "\n"
+            + claude_client.ANALYSIS_RULES
+        )
+    
+    def test_prompt_contains_reactive_mandate(self):
+        """Prompt/ruleset should contain the REACT, DO NOT PREDICT mandate."""
+        source = self._analysis_rules_source()
+        assert 'REACT' in source, "Ruleset should contain REACT mandate"
+        assert 'REACTIVE' in source, "Ruleset should use the word REACTIVE"
+        assert 'ALREADY' in source, "Ruleset should require ALREADY confirmed setups"
     
     def test_prompt_does_not_encourage_direction_flipping(self):
         """Prompt should NOT contain the old 'EVALUATE BOTH DIRECTIONS EVERY CYCLE'."""
-        import inspect
-        from trading_bot.llm.claude_client import ClaudeClient
-        
-        source = inspect.getsource(ClaudeClient._build_analysis_prompt)
+        source = self._analysis_rules_source()
         assert 'EVALUATE BOTH DIRECTIONS EVERY CYCLE' not in source, \
             "Old direction-flipping instruction should be removed"
         assert 'actively look for the opposite setup' not in source, \
             "Old direction-seeking instruction should be removed"
     
     def test_prompt_includes_confirmation_checklist(self):
-        """Prompt should require citing specific confirmations before any signal."""
-        import inspect
-        from trading_bot.llm.claude_client import ClaudeClient
-        
-        source = inspect.getsource(ClaudeClient._build_analysis_prompt)
+        """Prompt/ruleset should require citing specific confirmations before any signal."""
+        source = self._analysis_rules_source()
         # Should mention key confirmations
-        assert 'displacement' in source.lower(), "Prompt should mention displacement as confirmation"
-        assert 'BOS' in source or 'Break of Structure' in source, "Prompt should mention BOS"
-        assert 'CHoCH' in source or 'Change of Character' in source, "Prompt should mention CHoCH"
-        assert 'liquidity sweep' in source.lower(), "Prompt should mention liquidity sweep"
-        assert 'FVG' in source or 'Fair Value Gap' in source, "Prompt should mention FVG/OB"
+        assert 'displacement' in source.lower(), "Ruleset should mention displacement as confirmation"
+        assert 'BOS' in source or 'Break of Structure' in source, "Ruleset should mention BOS"
+        assert 'CHoCH' in source or 'Change of Character' in source, "Ruleset should mention CHoCH"
+        assert 'liquidity sweep' in source.lower(), "Ruleset should mention liquidity sweep"
+        assert 'FVG' in source or 'Fair Value Gap' in source, "Ruleset should mention FVG/OB"
     
     def test_prompt_has_variable_confidence_scale(self):
-        """Prompt should define a confidence scale (not flat 75%)."""
-        import inspect
-        from trading_bot.llm.claude_client import ClaudeClient
-        
-        source = inspect.getsource(ClaudeClient._build_analysis_prompt)
+        """Prompt/ruleset should define a confidence scale (not flat 75%)."""
+        source = self._analysis_rules_source()
         # Should have a multi-tier confidence scale
         assert '0.60' in source or '60' in source, "Should have 0.60 tier in confidence scale"
         assert '0.70' in source or '70' in source, "Should have 0.70 tier in confidence scale"
@@ -1247,15 +1516,12 @@ class TestReactiveTradingPrompt:
             "Should warn against parking at 0.75"
     
     def test_prompt_warns_against_flipping_without_cause(self):
-        """Prompt should tell Claude not to flip direction without confirmed change."""
-        import inspect
-        from trading_bot.llm.claude_client import ClaudeClient
-        
-        source = inspect.getsource(ClaudeClient._build_analysis_prompt)
+        """Prompt/ruleset should tell Claude not to flip direction without confirmed change."""
+        source = self._analysis_rules_source()
         assert 'flip direction without cause' in source.lower() or \
                'do not flip' in source.lower() or \
                'flip direction' in source.lower(), \
-            "Prompt should warn against direction flips without cause"
+            "Ruleset should warn against direction flips without cause"
 
 
 # ============================================================

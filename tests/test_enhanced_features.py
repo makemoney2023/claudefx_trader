@@ -607,23 +607,32 @@ class TestSwingInReeval:
     """Tests for swing validation context in Claude position re-evaluation."""
 
     def test_reeval_prompt_includes_swing_context(self):
-        """The position re-evaluation prompt should include swing validation guidance."""
-        # We can't easily call _claude_reevaluate_positions directly, 
-        # but we can verify the prompt template includes swing content
-        # by reading the source code
-        import inspect
-        from trading_bot.main import TradingBot
+        """The position re-evaluation ruleset should include swing validation guidance.
 
-        source = inspect.getsource(TradingBot._claude_reevaluate_positions)
+        The static evaluation rules now live in the prompt-cached
+        POSITION_REEVAL_RULES system block, so assertions inspect the method
+        source combined with that constant.
+        """
+        import inspect
+        from trading_bot import main as bot_main
+
+        source = (
+            inspect.getsource(bot_main.TradingBot._claude_reevaluate_positions)
+            + "\n" + bot_main.POSITION_REEVAL_RULES
+        )
         assert "Swing Exhaustion Check" in source or "swing" in source.lower(), (
-            "_claude_reevaluate_positions should include swing validation context"
+            "Position re-eval ruleset should include swing validation context"
         )
         assert "4-6 swing" in source.lower() or "4+ swings" in source.lower(), (
-            "_claude_reevaluate_positions should reference 4-6 swing rule"
+            "Position re-eval ruleset should reference 4-6 swing rule"
         )
         assert "21 EMA" in source, (
-            "_claude_reevaluate_positions should reference 21 EMA trailing"
+            "Position re-eval ruleset should reference 21 EMA trailing"
         )
+        # The method must actually send the cached rules as a system block.
+        method_source = inspect.getsource(bot_main.TradingBot._claude_reevaluate_positions)
+        assert "POSITION_REEVAL_RULES" in method_source
+        assert "cache_control" in method_source
 
 
 # ===================================================================

@@ -220,13 +220,73 @@ async def save_signal_to_db(
         logger.warning(f"Failed to open database session for signal save: {e}")
 
 
+# =============================================================================
+# STATIC RE-EVALUATION RULES
+# -----------------------------------------------------------------------------
+# These never change between calls, so they go in prompt-cached system blocks
+# instead of being rebuilt into every re-eval user prompt (the re-eval loops run
+# every ~60-120s on Opus 4.8, so caching pays for itself within one cycle).
+# =============================================================================
+
+POSITION_REEVAL_RULES = """You re-evaluate an open trading position described in the user message.
+
+## Context -- BE PATIENT
+Good entries need time to develop. Closing too early is worse than holding through
+normal consolidation. Only recommend CLOSE if the original trade thesis is CLEARLY
+invalidated (structure break against the position, key level lost, or R-multiple
+below -0.5R). A trade that is flat or slightly positive is NOT a reason to close --
+it means the market hasn't moved yet, not that the thesis is wrong. Let the trade breathe.
+
+## Swing Exhaustion Check
+Consider the 4-6 swing rule when evaluating the position:
+- If the trade entered after 4+ swings into the POI with a sweep, the thesis is strong -- lean HOLD.
+- If price is now making new swings AGAINST the position (4+ against), the thesis may be invalidating -- lean CLOSE.
+- If price is consolidating/rounding near the entry, momentum may be shifting -- lean TIGHTEN.
+- Use the 21 EMA as a trailing reference: if price has closed beyond the 21 EMA against the trade direction, consider TIGHTEN or CLOSE.
+
+## Decision
+Based on current market conditions, choose one:
+1. HOLD - Keep position. This is the DEFAULT choice. Flat, slightly positive, or
+   consolidating trades that haven't invalidated their thesis should be HELD.
+   Let the trade develop.
+2. CLOSE - ONLY if the trade thesis is CLEARLY invalidated: structure break against
+   the position, key level lost, or R-multiple below -0.5R. A flat or barely
+   profitable trade is NOT a reason to close. Stagnation is NOT invalidation.
+3. TIGHTEN - Move stop loss closer to lock profits. Use when the trade is in
+   profit and you want to protect gains while giving it room to run.
+
+Default to HOLD unless there is strong evidence the thesis is broken.
+
+## OUTPUT CONTRACT (strict)
+The FIRST WORD of your reply MUST be exactly one of: HOLD, CLOSE, or TIGHTEN
+(uppercase, nothing before it — no preamble, no markdown, no "My recommendation is").
+After that first word, add a brief 1-2 sentence reasoning on the same or next line.
+Example: "HOLD — thesis intact, price consolidating above the OB, still +0.4R."
+"""
+
+PENDING_REEVAL_RULES = """You re-evaluate a pending (unfilled) order described in the user message.
+
+## Decision
+The order has been waiting without filling. Choose one:
+- KEEP: The setup is still valid, price may still reach the entry level.
+- CANCEL: Market has moved away, structure has changed, or the opportunity has passed.
+
+Consider: Is price moving TOWARD or AWAY from the entry? Has the entry zone been invalidated?
+
+## OUTPUT CONTRACT (strict)
+The FIRST WORD of your reply MUST be exactly KEEP or CANCEL (uppercase, nothing before it —
+no preamble, no markdown). After that first word, add a brief 1-2 sentence reasoning.
+Example: "KEEP — price still coiling below the FVG, entry zone intact."
+"""
+
+
 class TradingBot:
     """
     Main trading bot class that orchestrates all components.
     
     Implements the ICT/Market Maker/FVG trading strategy using:
     - MT5 Client for market data and trade execution
-    - Claude Opus 4.5 for intelligent chart analysis
+    - Claude Opus 4.8 for intelligent chart analysis
     - Comprehensive strategy documentation for LLM context
     """
     
@@ -1386,14 +1446,16 @@ class TradingBot:
                         self._last_analysis_time[sym] = now
                         
                         print(f"[CYCLE] Analyzing {sym} (crypto={is_crypto})...", flush=True)
-                        # Per-symbol timeout: 120s max per analysis to prevent one slow symbol
-                        # from blocking the entire batch
+                        # Per-symbol timeout to prevent one slow symbol from blocking the
+                        # batch. Covers the full pipeline: Opus 4.8 high-effort analysis
+                        # (can exceed 100s with thinking + images) + judge + execution,
+                        # so the old Sonnet-era 120s budget was too tight.
                         await asyncio.wait_for(
                             self._analyze_and_trade(sym, is_crypto=is_crypto),
-                            timeout=120.0
+                            timeout=300.0
                         )
                     except asyncio.TimeoutError:
-                        logger.error(f"Analysis of {sym} TIMED OUT after 120s - skipping")
+                        logger.error(f"Analysis of {sym} TIMED OUT after 300s - skipping")
                     except Exception as e:
                         logger.error(f"Error analyzing {sym}: {e}")
                 
@@ -2417,7 +2479,7 @@ class TradingBot:
             signal_dict,
             risk_metrics,
             learning_context,
-            timeout=8.0,
+            timeout=45.0,  # Opus 4.8 + high-effort thinking; 8s would fail-close every trade
         )
         logger.info(
             f"[JUDGE] {symbol} {trade_signal.direction}: {outcome.verdict.value} "
@@ -2450,7 +2512,7 @@ class TradingBot:
             signal_dict,
             risk_metrics,
             learning_context,
-            timeout=8.0,
+            timeout=45.0,  # Opus 4.8 + high-effort thinking; 8s would fail-close every trade
         )
 
     def _build_pipeline_context(
@@ -3069,7 +3131,9 @@ class TradingBot:
                         logger.debug(f"Could not get spread for re-eval: {e}")
                         pass
                     
-                    # Build context for Claude
+                    # Build context for Claude. The evaluation rules (BE PATIENT, swing
+                    # exhaustion check, decision options, OUTPUT CONTRACT) live in the
+                    # prompt-cached POSITION_REEVAL_RULES system block.
                     position_context = f"""
 ## Open Position to Evaluate
 
@@ -3085,34 +3149,8 @@ class TradingBot:
 - Stagnant: {"YES - barely moved" if is_stagnant else "No"}
 {_reeval_extra}
 
-## Context -- BE PATIENT
-Good entries need time to develop. Closing too early is worse than holding through
-normal consolidation. Only recommend CLOSE if the original trade thesis is CLEARLY
-invalidated (structure break against the position, key level lost, or R-multiple
-below -0.5R). A trade that is flat or slightly positive is NOT a reason to close --
-it means the market hasn't moved yet, not that the thesis is wrong. Let the trade breathe.
-
-## Swing Exhaustion Check
-Consider the 4-6 swing rule when evaluating this position:
-- If the trade entered after 4+ swings into the POI with a sweep, the thesis is strong -- lean HOLD.
-- If price is now making new swings AGAINST our position (4+ against), the thesis may be invalidating -- lean CLOSE.
-- If price is consolidating/rounding near our entry, momentum may be shifting -- lean TIGHTEN.
-- Use the 21 EMA as a trailing reference: if price has closed beyond the 21 EMA against our direction, consider TIGHTEN or CLOSE.
-
-## Question
-Based on current market conditions, should we:
-1. HOLD - Keep position. This is the DEFAULT choice. Flat, slightly positive, or
-   consolidating trades that haven't invalidated their thesis should be HELD.
-   Let the trade develop.
-2. CLOSE - ONLY if the trade thesis is CLEARLY invalidated: structure break against
-   the position, key level lost, or R-multiple below -0.5R. A flat or barely
-   profitable trade is NOT a reason to close. Stagnation is NOT invalidation.
-3. TIGHTEN - Move stop loss closer to lock profits. Use when the trade is in
-   profit and you want to protect gains while giving it room to run.
-
-Default to HOLD unless there is strong evidence the thesis is broken.
-Respond with one of: HOLD, CLOSE, or TIGHTEN
-Include brief reasoning.
+Apply the evaluation rules from the system message and reply per the OUTPUT CONTRACT
+(first word exactly HOLD, CLOSE, or TIGHTEN).
 """
                     
                     # Generate chart image for visual context
@@ -3138,18 +3176,27 @@ Include brief reasoning.
                         "text": position_context
                     })
                     
-                    # Get Claude's recommendation (with timeout and validation)
+                    # Get Claude's recommendation (with timeout and validation).
+                    # Opus 4.8: no temperature; adaptive thinking + light effort. Budget
+                    # covers thinking + reply; timeout raised for the bigger model.
                     try:
                         response = await asyncio.wait_for(
                             self.claude_client.async_client.messages.create(
                                 model=self.claude_client.model_light,
-                                max_tokens=300,
+                                max_tokens=2000,
+                                thinking={"type": "adaptive"},
+                                output_config={"effort": self.claude_client.effort_light},
+                                system=[{
+                                    "type": "text",
+                                    "text": POSITION_REEVAL_RULES,
+                                    "cache_control": {"type": "ephemeral"},
+                                }],
                                 messages=[{
                                     "role": "user",
                                     "content": chart_content
                                 }]
                             ),
-                            timeout=30  # 30s timeout per position
+                            timeout=60  # timeout per position (Opus 4.8 + thinking)
                         )
                     except asyncio.TimeoutError:
                         logger.warning(f"Claude reevaluation timed out for {position.symbol}")
@@ -3163,7 +3210,10 @@ Include brief reasoning.
                         logger.warning(f"Empty Claude response for {position.symbol} reevaluation")
                         continue
                     
-                    raw_reeval = response.content[0].text.strip()
+                    self.claude_client._record_usage("position_reeval", response)
+                    
+                    # Skip any leading thinking block; take the text content.
+                    raw_reeval = self.claude_client._extract_text(response).strip()
                     recommendation = raw_reeval.upper().replace("*", "").replace("#", "").strip()
                     
                     logger.info(f"Claude recommendation for {position.symbol}: {recommendation[:100]}")
@@ -3619,6 +3669,8 @@ Include brief reasoning.
                     else:
                         distance_pct = 0
                     
+                    # Decision rules + OUTPUT CONTRACT live in the prompt-cached
+                    # PENDING_REEVAL_RULES system block; only order facts go here.
                     prompt = f"""## Pending Order Re-evaluation
 
 - Symbol: {symbol}
@@ -3631,15 +3683,8 @@ Include brief reasoning.
 - Age: {age_minutes:.0f} minutes (placed at {order.created_at.strftime('%H:%M')})
 - Latest Signal: {latest_signal.get('direction', 'unknown').upper() if latest_signal else 'N/A'} @ {latest_signal.get('confidence', 0):.0%} confidence
 
-## Question
-This pending order has been waiting {age_minutes:.0f} minutes without filling.
-Should we KEEP it or CANCEL it?
-
-- KEEP: The setup is still valid, price may still reach the entry level.
-- CANCEL: Market has moved away, structure has changed, or the opportunity has passed.
-
-Consider: Is price moving TOWARD or AWAY from the entry? Has the entry zone been invalidated?
-Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
+Apply the evaluation rules from the system message and reply per the OUTPUT CONTRACT
+(first word exactly KEEP or CANCEL).
 """
                     # Generate chart for visual context
                     pending_chart_content = []
@@ -3667,13 +3712,21 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                     pending_chart_content.append({"type": "text", "text": prompt})
                     
                     try:
+                        # Opus 4.8: no temperature; adaptive thinking + light effort.
                         response = await asyncio.wait_for(
                             self.claude_client.async_client.messages.create(
                                 model=self.claude_client.model_light,
-                                max_tokens=200,
+                                max_tokens=1500,
+                                thinking={"type": "adaptive"},
+                                output_config={"effort": self.claude_client.effort_light},
+                                system=[{
+                                    "type": "text",
+                                    "text": PENDING_REEVAL_RULES,
+                                    "cache_control": {"type": "ephemeral"},
+                                }],
                                 messages=[{"role": "user", "content": pending_chart_content}]
                             ),
-                            timeout=20
+                            timeout=45  # Opus 4.8 + thinking needs more headroom than Sonnet
                         )
                     except asyncio.TimeoutError:
                         logger.warning(f"Pending order re-eval timed out for {symbol}")
@@ -3688,7 +3741,10 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                         kept_count += 1
                         continue
                     
-                    raw_recommendation = response.content[0].text.strip()
+                    self.claude_client._record_usage("pending_reeval", response)
+                    
+                    # Skip any leading thinking block; take the text content.
+                    raw_recommendation = self.claude_client._extract_text(response).strip()
                     # Strip markdown formatting (bold, etc.) before parsing
                     recommendation = raw_recommendation.upper().replace("*", "").replace("#", "").strip()
                     decision = "CANCEL" if "CANCEL" in recommendation else "KEEP"

@@ -701,13 +701,13 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                             base_lots=tier.base_lots,
                             max_lots=tier.max_lots
                         ),
-                        timeout=15.0  # Don't wait more than 15s for size rec
+                        timeout=40.0  # Opus 4.8 + thinking needs more headroom than the old Sonnet 15s
                     )
                     if rec.get('recommended_lots'):
                         claude_size_rec = rec['recommended_lots']
                         logger.info(f"Claude size recommendation: {claude_size_rec} lots ({rec.get('reasoning', '')})")
             except asyncio.TimeoutError:
-                logger.warning("Claude position size recommendation timed out (15s)")
+                logger.warning("Claude position size recommendation timed out (40s)")
             except Exception as e:
                 logger.warning(f"Could not get Claude size recommendation: {e}")
         

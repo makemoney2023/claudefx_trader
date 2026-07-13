@@ -1,6 +1,6 @@
 # ICT Trading Bot
 
-An AI-powered forex trading bot combining ICT (Inner Circle Trading), Market Maker, and Fair Value Gap strategies with MetaTrader 5 via MCP, using Claude Opus 4.5 for intelligent chart analysis and trade execution.
+An AI-powered forex trading bot combining ICT (Inner Circle Trading), Market Maker, and Fair Value Gap strategies with MetaTrader 5 via MCP, using Claude Opus 4.8 for intelligent chart analysis and trade execution.
 
 ## Features
 
@@ -11,7 +11,7 @@ An AI-powered forex trading bot combining ICT (Inner Circle Trading), Market Mak
   - Liquidity Pool Mapping
   - Kill Zone/Session Timing
 
-- **AI-Powered Analysis**: Claude Opus 4.5 vision capabilities for chart analysis
+- **AI-Powered Analysis**: Claude Opus 4.8 vision capabilities for chart analysis
 - **MT5 Integration**: MetaTrader 5 connectivity through MCP server
 - **Risk Management**: Professional position sizing and trade validation
 - **Multi-Timeframe Analysis**: HTF bias with LTF entry refinement
@@ -335,7 +335,7 @@ Locates institutional entry zones - the last opposing candle before a significan
 Maps buy-side and sell-side liquidity pools, including equal highs/lows.
 
 ### Claude Integration
-Uses Claude Opus 4.5 vision API to analyze chart screenshots and generate trade signals.
+Uses Claude Opus 4.8 vision API (adaptive thinking, effort=high) to analyze chart screenshots and generate trade signals.
 
 ## Risk Management
 

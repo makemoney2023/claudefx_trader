@@ -248,6 +248,7 @@ class TestPatienceInPrompts:
         client.sync_client = None
         client.cache = {}
 
+        from trading_bot.llm import claude_client
         prompt = client._build_analysis_prompt(
             symbol="XAUUSD",
             timeframe="M15",
@@ -260,11 +261,12 @@ class TestPatienceInPrompts:
             },
             analysis_data=None
         )
+        combined = prompt + "\n" + claude_client.ANALYSIS_RULES
 
         # Check patience language
-        assert "PATIENCE IS PROFIT" in prompt or "patience" in prompt.lower()
-        assert "STRONGLY PREFER pending orders" in prompt or "pending order" in prompt.lower()
-        assert "no_trade" in prompt.lower()
+        assert "PATIENCE IS PROFIT" in combined or "patience" in combined.lower()
+        assert "STRONGLY PREFER pending orders" in combined or "pending order" in combined.lower()
+        assert "no_trade" in combined.lower()
 
     def test_important_rules_mention_quality_over_quantity(self):
         """Important Rules section should mention quality over quantity."""
@@ -275,6 +277,7 @@ class TestPatienceInPrompts:
         client.sync_client = None
         client.cache = {}
 
+        from trading_bot.llm import claude_client
         prompt = client._build_analysis_prompt(
             symbol="XAUUSD",
             timeframe="M15",
@@ -287,9 +290,10 @@ class TestPatienceInPrompts:
             },
             analysis_data=None
         )
+        combined = prompt + "\n" + claude_client.ANALYSIS_RULES
 
-        assert "Quality over quantity" in prompt or "quality over quantity" in prompt.lower()
-        assert "Do NOT force a trade" in prompt or "do not force" in prompt.lower()
+        assert "Quality over quantity" in combined or "quality over quantity" in combined.lower()
+        assert "Do NOT force a trade" in combined or "do not force" in combined.lower()
 
 
 class TestFallbackMinConfidence:
@@ -414,16 +418,18 @@ class TestDirectionalBiasFix:
     # ----- Anti-Bias Instruction -----
 
     def test_reactive_mandate_in_important_rules(self):
-        """Important Rules should contain reactive trading mandate."""
-        prompt = self._build_prompt_with_bearish_htf()
-        assert "REACT" in prompt, "Prompt should have reactive mandate"
-        assert "ALREADY" in prompt, "Prompt should require ALREADY confirmed setups"
+        """Ruleset should contain reactive trading mandate (now in cached ANALYSIS_RULES)."""
+        from trading_bot.llm import claude_client
+        combined = self._build_prompt_with_bearish_htf() + "\n" + claude_client.ANALYSIS_RULES
+        assert "REACT" in combined, "Ruleset should have reactive mandate"
+        assert "ALREADY" in combined, "Ruleset should require ALREADY confirmed setups"
 
     def test_anti_flip_instruction_in_rules(self):
-        """Rules should warn against flipping direction without confirmed change."""
-        prompt = self._build_prompt_with_bearish_htf()
-        assert "flip direction" in prompt.lower(), \
-            "Prompt should warn against direction flips without cause"
+        """Ruleset should warn against flipping direction without confirmed change."""
+        from trading_bot.llm import claude_client
+        combined = self._build_prompt_with_bearish_htf() + "\n" + claude_client.ANALYSIS_RULES
+        assert "flip direction" in combined.lower(), \
+            "Ruleset should warn against direction flips without cause"
 
     # ----- Premium/Discount Soft Guidance -----
 

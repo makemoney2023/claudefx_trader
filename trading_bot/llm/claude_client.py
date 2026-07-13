@@ -1,12 +1,14 @@
 """
-Claude Opus 4.5 Client for Chart Analysis.
+Claude Opus 4.8 Client for Chart Analysis.
 
 Integrates with Anthropic's Claude API to analyze forex charts
 using vision capabilities and ICT strategy context.
 
 Features:
 - Async/await support for concurrent analysis
-- Tool use for reliable structured JSON output
+- Adaptive thinking with explicit effort for the heavy analysis/judge calls
+- Tool use for reliable structured JSON output (tool_choice=auto so it is
+  compatible with adaptive thinking)
 - Caching layer to avoid duplicate API calls
 - Rate limit awareness with backoff
 """
@@ -35,6 +37,10 @@ logger = get_logger(__name__)
 TRADE_SIGNAL_TOOL = {
     "name": "submit_trade_analysis",
     "description": "Submit the trade analysis and recommendation based on ICT methodology.",
+    # strict: the API guarantees tool inputs match this schema exactly (valid enums,
+    # required fields present, no extra keys). Requires additionalProperties=false and
+    # no numeric range constraints (those live in descriptions instead).
+    "strict": True,
     "input_schema": {
         "type": "object",
         "properties": {
@@ -45,9 +51,7 @@ TRADE_SIGNAL_TOOL = {
             },
             "confidence": {
                 "type": "number",
-                "minimum": 0,
-                "maximum": 1,
-                "description": "Confidence level from 0.0 to 1.0"
+                "description": "Confidence level from 0.0 to 1.0 (values outside this range are invalid)"
             },
             "entry_price": {
                 "type": ["number", "null"],
@@ -67,7 +71,7 @@ TRADE_SIGNAL_TOOL = {
             },
             "reasoning": {
                 "type": "string",
-                "description": "Detailed explanation of the analysis"
+                "description": "4-8 sentences naming the SPECIFIC confirmations you observed on the charts (e.g. 'M15 swept the 1.0845 low, displaced up, and left an FVG at 1.0862'). State the setup, the entry level and why, and the SL/TP basis. Do NOT restate the rules from the prompt or list generic ICT definitions — only what THIS chart shows."
             },
             "market_structure": {
                 "type": "string",
@@ -82,7 +86,7 @@ TRADE_SIGNAL_TOOL = {
             "order_type": {
                 "type": "string",
                 "enum": ["market", "buy_limit", "sell_limit", "buy_stop", "sell_stop"],
-                "description": "Use 'market' when displacement is confirmed and momentum is strong — do NOT miss moves waiting for pullbacks. Use 'buy_limit' to buy at a LOWER price (OB/FVG retracement fill), 'sell_limit' to sell at a HIGHER price (OB/FVG retracement fill). CRITICAL ZONE RULES: buy_limit ONLY in DISCOUNT zone (below 50% equilibrium) — NEVER place buy_limit in premium, price is expensive. sell_limit ONLY in PREMIUM zone (above 50% equilibrium) — NEVER place sell_limit in discount, price is cheap. This is the core ICT principle: buy discount, sell premium. For BREAKOUT entries where price is consolidating below/above a key level and you expect a break, use 'buy_stop' (buy ABOVE current price) or 'sell_stop' (sell BELOW current price). Match order type to setup: limit for retracements in correct zone, stop for breakouts, market for active displacement."
+                "description": "Choose per the ORDER TYPE SELECTION section of the prompt: 'buy_limit'/'sell_limit' to enter INTO a level (retracement fill, correct zone only), 'buy_stop'/'sell_stop' to enter THROUGH a level (breakout), 'market' only when displacement is already confirmed and price is at your level now. Zone rule (buy discount / sell premium) is mandatory — see system message."
             },
             "amd_phase": {
                 "type": "string",
@@ -116,6 +120,7 @@ TRADE_SIGNAL_TOOL = {
                     "daily_high": {"type": ["number", "null"]},
                     "daily_low": {"type": ["number", "null"]}
                 },
+                "additionalProperties": False,
                 "description": "Key price levels"
             },
             "warnings": {
@@ -124,7 +129,8 @@ TRADE_SIGNAL_TOOL = {
                 "description": "Risk factors or concerns"
             }
         },
-        "required": ["direction", "confidence", "reasoning", "market_structure", "trade_type"]
+        "required": ["direction", "confidence", "reasoning", "market_structure", "trade_type"],
+        "additionalProperties": False
     }
 }
 
@@ -307,9 +313,301 @@ class AnalysisCache:
         return len(self._cache)
 
 
+# =============================================================================
+# STATIC ICT ANALYSIS RULESET
+# -----------------------------------------------------------------------------
+# These rules never change between calls, so they live in the (prompt-cached)
+# system message instead of being rebuilt into every user prompt. Keeping them
+# here as a single constant is both the cache anchor and the single source of
+# truth for the methodology. Dynamic, per-symbol context is assembled separately
+# in ClaudeClient._build_analysis_prompt().
+# =============================================================================
+ANALYSIS_RULES = """## Analysis Required
+
+Analyze the chart image(s) and provide:
+
+1. **Market Structure Analysis**
+   - Current trend direction
+   - Recent BOS (Break of Structure) or CHoCH (Change of Character)
+   - Key swing highs and lows
+
+2. **Key ICT Levels**
+   - Fair Value Gaps (FVGs) - unfilled imbalances
+   - Order Blocks - institutional entry zones
+   - Liquidity pools - buy-side and sell-side
+
+3. **Trade Recommendation**
+   Use the submit_trade_analysis tool to provide your structured recommendation.
+
+## EXAMPLE OF A GOOD SIGNAL (format + reasoning quality reference)
+This is a generic example to show the expected shape — adapt every value to the actual chart,
+never copy these numbers. A clean long: price is ~1.0850, D1/H4 bullish, M15 swept the 1.0838
+session low and reclaimed it, an M5 displacement candle closed leaving an FVG at 1.0846-1.0849.
+- direction: "long", trade_type: "intraday", confidence: 0.82
+- order_type: "buy_limit", entry_price: 1.0847 (into the FVG, discount zone)
+- stop_loss: 1.0833 (below the swept low + buffer — BELOW entry)
+- take_profit: 1.0889 (prior day high / BSL — ABOVE entry), risk_reward: 3.0
+- reasoning: names the sweep, the displacement, the FVG entry, and the SL/TP basis in 4-6 sentences.
+All three prices are absolute levels in the same magnitude as current price; SL and TP are on the
+correct sides of entry; R:R clears the 2:1 intraday minimum.
+
+## ⚠️ CRITICAL WARNINGS - DANGEROUS PAIRS
+
+**NEVER TRADE these pairs - ALWAYS return "no_trade" for:**
+- Any pair ending in "BTC" (e.g., DASHBTC, ETHBTC, LTCBTC)
+- Any pair ending in "BIT" (e.g., XRPBIT, EOSBIT, IOTABIT)
+
+**Why:** These pairs are quoted in Bitcoin, not USD. Our position sizing assumes USD quote currency.
+Trading these causes CATASTROPHIC losses due to incorrect position sizing.
+If the current symbol ends in BTC or BIT, you MUST return direction="no_trade" with reasoning explaining it's a dangerous BTC-quoted pair.
+
+## CORE MANDATE -- CONFIRMED SETUPS FIRST, ANTICIPATORY SECOND:
+You operate in TWO modes:
+
+MODE 1 (PRIMARY) -- REACTIVE: Signal a trade when price has ALREADY confirmed a setup.
+Before recommending a MARKET order, cite at least TWO confirmations that have ALREADY
+OCCURRED on the chart (not "developing" or "likely"):
+1. A displacement candle has CLOSED (strong impulsive move with body > 70% of range)
+2. A Break of Structure (BOS) or Change of Character (CHoCH) has PRINTED on M1/M5
+3. A liquidity sweep has COMPLETED (wick swept a high/low and price reclaimed)
+4. Price is AT or INSIDE a valid FVG/OB entry zone RIGHT NOW (not approaching it)
+If you cannot cite two of these for a MARKET order, do NOT use a market order.
+
+MODE 2 (SECONDARY) -- ANTICIPATORY: When D1+H4 agree on direction but M15 is pulling
+back (opposing), you MAY place a PENDING LIMIT ORDER (buy_limit/sell_limit) at a key
+level (OB, FVG, liquidity sweep zone) in the HTF direction. Requirements:
+- Order type MUST be buy_limit or sell_limit (never market)
+- Entry must be at a specific structural level (name it in reasoning)
+- Confidence capped at 55-60%
+- This is NOT predicting -- it is positioning at a key level where price is likely
+  to react IF it arrives there
+
+NEVER use a MARKET order based on prediction. Anticipation is only valid via pending
+limit orders at defined structural levels.
+
+## Important Rules -- PATIENCE IS THE EDGE:
+- **Do NOT force a trade.** If the setup is not textbook (swing validation, confluence, clear levels), return no_trade. It is ALWAYS better to miss a move than to enter poorly and draw down.
+- **Quality over quantity.** One perfect entry with circular price action confirmation is worth more than five mediocre entries. Wait for the setup to come to you.
+- **Confidence must reflect CONFIRMED evidence, not conviction in a direction.** Use this scale:
+  - 0.60-0.69: One confirmation present, setup developing but incomplete
+  - 0.70-0.79: Two confirmations present, valid but not ideal
+  - 0.80-0.89: Three+ confirmations, strong confluence, kill zone timing
+  - 0.90-1.00: Full confluence: swing validation + displacement + sweep + FVG/OB + volume
+  Do NOT park at exactly 0.75 every time. Your confidence MUST vary based on the actual evidence.
+  This scale applies to EVERY signal — scalps, intraday, and swings, market and pending orders alike.
+
+## CONFIDENCE ADJUSTMENT RULES (SINGLE SOURCE OF TRUTH for numeric confidence):
+These are the ONLY numeric confidence adjustments you may apply. Every OTHER section
+describes either (a) confluence factors that feed your BASE confidence scale above, or
+(b) items to put in the `warnings` field. No other section may add or subtract a
+specific percentage.
+
+Your stated confidence is your SETUP QUALITY assessment. Start from the confidence
+scale above (based on how many confirmations are present), then apply AT MOST -20%
+total from these SETUP-QUALITY factors only:
+- D1/H4/H1 misaligned: -10%
+- Against TV consensus: -5%
+- Total reduction from the above MUST NOT exceed -20%.
+
+Do NOT adjust confidence for SESSION TIMING or VOLUME. The system applies its own
+session and volume adjustments after you respond, so adjusting here would double-count.
+If you see low volume or off-session timing, put it in the `warnings` field and leave
+your confidence number unchanged. (Volume can still drive a no_trade decision per the
+Volume Confirmation Rules below — that is a setup validity call, not a confidence tweak.)
+
+- **MINIMUM 1.5:1 R:R on ALL trades (every trade_type, including scalps)** — see the R:R GUIDANCE in the trade-type section for the per-type targets.
+- Session timing is handled by the system — focus on setup quality.
+- Identify specific price levels for entry, SL, and TP using M1/M5 precision
+- **CRITICAL: SL must NEVER equal entry price.** For LONG trades, SL must be placed BELOW entry (beyond the nearest swing low or OB). For SHORT trades, SL must be placed ABOVE entry (beyond the nearest swing high or OB). A zero-distance SL is invalid and will be rejected.
+- If genuinely no setup exists (ranging, no structure, no POI nearby), recommend "no_trade" with your reasoning
+- RESPECT news blackouts - recommend no_trade, or add the blackout to the `warnings` field (do not apply an ad-hoc confidence reduction — see CONFIDENCE ADJUSTMENT RULES)
+- Consider recent performance and current streak when setting confidence
+- **ONLY trade USD-quoted pairs** (ending in USD, USDT, or standard forex like EURUSD)
+- **Do NOT flip direction without cause.** If market structure has not changed since the last analysis, do not switch from long to short or vice versa. Unchanged chart = unchanged signal or no_trade.
+
+## Volume Confirmation Rules (Institutional Validation — single volume ladder):
+Volume affects SETUP VALIDITY and CONFLUENCE, never a numeric confidence tweak (see
+CONFIDENCE ADJUSTMENT RULES). Apply this one ladder:
+- EXTREMELY LOW VOLUME (<0.3x avg): return no_trade — no institutional commitment.
+- LOW / BELOW-AVERAGE VOLUME (0.3x-0.7x avg): the setup can still be valid, but add a
+  warning noting the thin participation.
+- NORMAL VOLUME (0.7x-2.0x avg): no volume concern.
+- HIGH VOLUME (>2.0x avg) WITH displacement: strong institutional commitment — counts as an
+  extra confirmation feeding your base confidence scale.
+- Liquidity sweep + volume spike (>2x avg) = confirmed stop hunt, a strong reversal confluence.
+- Volume climax (>3x avg) + reversal candle: possible exhaustion — note in warnings.
+
+**Precious Metals Notes (XAUUSD/XAGUSD):**
+- Gold/Silver have wider typical stops than forex (30-50 pips for gold)
+- Consider the gold/silver ratio when analyzing either metal
+- Both metals are safe havens - strong during geopolitical uncertainty
+- Silver is more volatile (~2x gold moves) - adjust position size accordingly
+- Watch USD correlation (typically inverse)
+"""
+
+
+# Approximate Claude Opus 4.8 pricing in USD per million tokens, used only for the
+# estimated_cost_usd column in usage telemetry (cache write = 1.25x input for the
+# 5-minute ephemeral tier; cache read = 0.1x input). Update if Anthropic reprices.
+OPUS_48_PRICING = {
+    "input": 5.00,
+    "output": 25.00,
+    "cache_read": 0.50,
+    "cache_write": 6.25,
+}
+
+
+# JSON schema for the trade judge's structured output (Opus 4.8 structured outputs).
+# Passed via output_config.format so the verdict is guaranteed-parseable JSON rather
+# than relying on regex extraction. Structured outputs require additionalProperties=false
+# and disallow unsupported constraints (min/maxLength, numeric bounds, etc.).
+JUDGE_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["APPROVE", "DEMOTE", "REJECT"]},
+        "reason": {"type": "string"},
+        "suggested_entry": {"type": ["number", "null"]},
+        "risk_flags": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["verdict", "reason", "suggested_entry", "risk_flags"],
+    "additionalProperties": False,
+}
+
+
+# Static trade-judge rubric. Lives in a prompt-cached system block so the judge —
+# which runs on EVERY signal at high effort — only bills these tokens once per
+# cache window. Per-trade facts (proposed trade, risk metrics, learnings) stay in
+# the user message built by judge_trade().
+JUDGE_RUBRIC = """You are a TRADE JUDGE — a risk-focused second opinion before a trade is executed with real money.
+
+A trade analyst proposes a trade in the user message. Your job is to check it against learned patterns and risk math. You are NOT re-analyzing the market — the analysis is already done. You are validating whether this trade should proceed NOW at market price, or whether it should be DEMOTED to a pending limit order at a better entry price. Judge every trade on its own merit.
+
+## R:R TARGETS (per trade type)
+- SCALP: target 1.5:1 | INTRADAY: target 2:1 | SWING: target 3:1
+- ABSOLUTE FLOOR for ALL trade types: 1.5:1
+- SCALP trades have tighter SL/TP and shorter hold times — this is NORMAL, do not penalize.
+- SWING trades should have wider SL/TP and require full HTF alignment.
+- Only a R:R below the 1.5:1 floor is a rejectable defect; between 1.5:1 and the trade-type
+  target is a warning, not a reject.
+
+## Step 1 — Find every concern (coverage, do NOT filter here)
+List EVERY concern you find in `risk_flags`, including low-confidence or minor ones. Do not
+suppress a flag because it feels minor — the verdict logic in Step 2 decides what actually blocks
+the trade. Prefix each flag with a severity: "critical:", "warning:", or "note:". Check at minimum:
+- Does the trade match any KNOWN LOSING PATTERN from the past learnings in the user message?
+- Is the SL on the correct side of entry? Is the TP on the correct side of entry?
+- Is the R:R at or above the 1.5:1 ABSOLUTE FLOOR? Is it at or above the trade-type target from
+  the R:R TARGETS table? (Below 1.5:1 is a "critical:" flag; between 1.5:1 and the target is a
+  "warning:" flag.)
+- Is the risk per trade appropriate for an account of this size?
+- Is the current session appropriate for this symbol and setup?
+
+## Step 2 — Decide the verdict from concrete criteria only
+Base the verdict ONLY on the enumerated criteria below, not on overall "feel". A pile of
+"warning:"/"note:" flags does NOT justify a REJECT on its own.
+
+REJECT only if AT LEAST ONE of these is true:
+(a) SL or TP is on the WRONG side of entry (long: SL must be < entry < TP; short: TP < entry < SL).
+(b) The daily trade limit is already reached (Trades Today at or above the max shown in Risk Metrics).
+(c) The trade matches a NAMED losing pattern from the learning context.
+(d) R:R is below the 1.5:1 ABSOLUTE FLOOR (after any SL adjustment). A trade that is above
+    1.5:1 but below its trade-type target does NOT reject on this criterion — record it as a
+    "warning:" flag and let (a)-(c) decide.
+
+DEMOTE (convert to a tighter pending limit order) only if entry price has a CONCRETE, specific
+problem — e.g. entry is chasing into premium/discount against the zone rule, or sits past the
+ideal OB/FVG level — and none of the REJECT criteria fire.
+- For LONG: suggested_entry must be BELOW current entry (buy cheaper).
+- For SHORT: suggested_entry must be ABOVE current entry (sell higher).
+- Default improvement 0.1%-0.3% from the proposed entry. NEVER suggest a WORSE entry than proposed.
+
+APPROVE in all other cases. Confidence alone neither approves nor rejects.
+
+## Hard exceptions
+- NEVER REJECT or DEMOTE solely on position size % when the position is AT BROKER MINIMUM LOT SIZE.
+  The trader cannot go smaller; judge purely on technical merit. Record it as a "note:" flag only.
+
+Keep `reason` to ONE sentence.
+
+Your entire response must be a single JSON object (no surrounding prose or markdown) with
+exactly this shape:
+- "verdict": "APPROVE" or "DEMOTE" or "REJECT"
+- "reason": one sentence explanation
+- "suggested_entry": float price, or null if APPROVE
+- "risk_flags": array of strings, each prefixed "critical:", "warning:", or "note:"
+"""
+
+
+# JSON schemas for light-task structured outputs (Opus 4.8 output_config.format).
+# Guarantees parseable JSON instead of regex extraction with silent degraded
+# fallbacks. NOTE: generate_weekly_insights is intentionally NOT schema-constrained
+# because its symbol_insights/session_insights are free-form dicts, which the strict
+# grammar (additionalProperties must be false) cannot express.
+POSITION_SIZE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "recommended_lots": {"type": "number"},
+        "reasoning": {"type": "string"},
+        "risk_assessment": {"type": "string", "enum": ["low", "medium", "high"]},
+        "size_adjustment": {"type": "string"},
+    },
+    "required": ["recommended_lots", "reasoning", "risk_assessment"],
+    "additionalProperties": False,
+}
+
+TRADE_REVIEW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "outcome": {"type": "string", "enum": ["win", "loss", "breakeven"]},
+        "grade": {"type": "string", "enum": ["A", "B", "C", "D", "F"]},
+        "analysis": {"type": "string"},
+        "what_went_right": {"type": "array", "items": {"type": "string"}},
+        "what_went_wrong": {"type": "array", "items": {"type": "string"}},
+        "learnings": {"type": "array", "items": {"type": "string"}},
+        "would_take_again": {"type": "boolean"},
+        "improvement_suggestions": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["outcome", "grade", "analysis", "what_went_right", "what_went_wrong",
+                 "learnings", "would_take_again", "improvement_suggestions"],
+    "additionalProperties": False,
+}
+
+WEEKLY_REVIEW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "performance_grade": {"type": "string", "enum": ["A", "B", "C", "D", "F"]},
+        "summary": {"type": "string"},
+        "patterns_identified": {"type": "array", "items": {"type": "string"}},
+        "strengths": {"type": "array", "items": {"type": "string"}},
+        "weaknesses": {"type": "array", "items": {"type": "string"}},
+        "recommendations": {"type": "array", "items": {"type": "string"}},
+        "focus_for_next_week": {"type": "string"},
+        "risk_adjustment": {"type": "string", "enum": ["increase", "maintain", "decrease"]},
+    },
+    "required": ["performance_grade", "summary", "patterns_identified", "strengths",
+                 "weaknesses", "recommendations", "focus_for_next_week", "risk_adjustment"],
+    "additionalProperties": False,
+}
+
+SCALING_DECISION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "recommended_mode": {"type": "string", "enum": ["aggressive", "normal", "conservative", "defensive"]},
+        "reasoning": {"type": "string"},
+        "risk_multiplier": {"type": "number"},
+        "setup_filter": {"type": "string", "enum": ["all", "A_and_B", "A_only"]},
+        "confidence_threshold": {"type": "number"},
+        "warnings": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["recommended_mode", "reasoning", "risk_multiplier", "setup_filter",
+                 "confidence_threshold", "warnings"],
+    "additionalProperties": False,
+}
+
+
 class ClaudeClient:
     """
-    Async client for Claude Opus 4.5 chart analysis.
+    Async client for Claude Opus 4.8 chart analysis.
     
     Uses Anthropic's API with vision capabilities to analyze
     forex chart screenshots and generate trade signals based
@@ -326,7 +624,7 @@ class ClaudeClient:
         self,
         api_key: Optional[str] = None,
         model: Optional[str] = None,
-        max_tokens: int = 4096,
+        max_tokens: int = 16000,
         temperature: float = 0.3,
         max_retries: int = 3,
         cache_ttl: int = 300,
@@ -338,18 +636,26 @@ class ClaudeClient:
         Args:
             api_key: Anthropic API key (uses settings if not provided)
             model: Model to use (uses settings if not provided)
-            max_tokens: Maximum tokens in response
-            temperature: Response temperature (lower = more focused)
+            max_tokens: Maximum output tokens for heavy analysis calls. On Opus 4.8
+                this caps thinking + response combined, so it is set generously.
+            temperature: Retained for backwards compatibility only. NOT sent to
+                Opus 4.8 (non-default sampling params return a 400 error); behavior
+                is steered via prompting and the effort parameter instead.
             max_retries: Maximum retry attempts for API calls
             cache_ttl: Cache time-to-live in seconds
             cache_size: Maximum cache entries
         """
         self.api_key = api_key or settings.claude.api_key
+        # Legacy attribute: no runtime call uses self.model anymore (kept only so
+        # external readers of client.model don't break). All calls use model_heavy/
+        # model_light below, both pinned to Opus 4.8.
         self.model = model or settings.claude.model
-        self.model_heavy = "claude-opus-4-6"  # Best model for chart analysis + trade judge
-        self.model_light = self.model  # Sonnet for lighter tasks (re-evals, reviews)
+        self.model_heavy = "claude-opus-4-8"  # Best model for chart analysis + trade judge
+        self.model_light = "claude-opus-4-8"  # Opus 4.8 everywhere — light tasks too (re-evals, reviews)
+        self.effort_heavy = "high"   # effort for analysis/judge; "xhigh" for max depth
+        self.effort_light = "medium"  # effort for light tasks (re-evals, reviews, sizing)
         self.max_tokens = max_tokens
-        self.temperature = temperature
+        self.temperature = temperature  # kept for compat; NOT sent to Opus 4.8 (any task)
         self.max_retries = max_retries
         
         # Initialize cache
@@ -502,15 +808,19 @@ class ClaudeClient:
                     "text": prompt
                 })
                 
-                # Create message with images and tool use (Opus for best analysis quality)
-                # Strategy docs go in system message with cache_control for Anthropic prompt caching
+                # Create message with images and tool use (Opus 4.8 for best analysis quality).
+                # Strategy docs go in system message with cache_control for Anthropic prompt caching.
+                # Opus 4.8: no temperature (400 error), adaptive thinking + explicit effort, and
+                # tool_choice=auto (forced tool use is incompatible with thinking). The system
+                # message instructs the model to always finish by calling submit_trade_analysis.
                 message = await self.async_client.messages.create(
                     model=self.model_heavy,
                     max_tokens=self.max_tokens,
-                    temperature=self.temperature,
+                    thinking={"type": "adaptive"},
+                    output_config={"effort": self.effort_heavy},
                     system=self._build_system_messages(strategy_context),
                     tools=[TRADE_SIGNAL_TOOL],
-                    tool_choice={"type": "tool", "name": "submit_trade_analysis"},
+                    tool_choice={"type": "auto"},
                     messages=[
                         {
                             "role": "user",
@@ -518,6 +828,8 @@ class ClaudeClient:
                         }
                     ]
                 )
+                
+                self._record_usage("analysis", message)
                 
                 # Parse response
                 result = self._parse_tool_response(message)
@@ -616,71 +928,9 @@ class ClaudeClient:
         
         return output
     
-    def analyze_chart(
-        self,
-        chart_image_base64: str,
-        symbol: str,
-        timeframe: str,
-        strategy_context: str,
-        market_data: Optional[Dict[str, Any]] = None,
-        analysis_data: Optional[Dict[str, Any]] = None
-    ) -> AnalysisResult:
-        """
-        Synchronous chart analysis (for backwards compatibility).
-        
-        For new code, prefer analyze_chart_async.
-        """
-        if not self.sync_client:
-            logger.error("Claude client not initialized - missing API key")
-            return self._create_no_trade_result("Claude client not available")
-        
-        try:
-            prompt = self._build_analysis_prompt(
-                symbol, timeframe, strategy_context, market_data, analysis_data
-            )
-            
-            message = self.sync_client.messages.create(
-                model=self.model_heavy,
-                max_tokens=self.max_tokens,
-                temperature=self.temperature,
-                system=self._build_system_messages(strategy_context),
-                tools=[TRADE_SIGNAL_TOOL],
-                tool_choice={"type": "tool", "name": "submit_trade_analysis"},
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": "image/png",
-                                    "data": chart_image_base64
-                                }
-                            },
-                            {
-                                "type": "text",
-                                "text": prompt
-                            }
-                        ]
-                    }
-                ]
-            )
-            
-            return self._parse_tool_response(message)
-            
-        except anthropic.RateLimitError as e:
-            logger.warning(f"Rate limit hit, backing off: {e}")
-            return self._create_no_trade_result("Rate limit reached - try again later")
-        except anthropic.APIConnectionError as e:
-            logger.error(f"Connection error: {e}")
-            return self._create_no_trade_result(f"Connection error: {str(e)}")
-        except anthropic.APIStatusError as e:
-            logger.error(f"API status error {e.status_code}: {e}")
-            return self._create_no_trade_result(f"API error: {str(e)}")
-        except Exception as e:
-            logger.error(f"Error analyzing chart: {e}")
-            return self._create_no_trade_result(f"Analysis error: {str(e)}")
+    # NOTE: the synchronous analyze_chart() wrapper was removed — it had no callers
+    # and silently duplicated the Opus 4.8 request shape (every prompt/param change
+    # had to be made twice). Use analyze_chart_async().
     
     def _build_system_messages(self, strategy_context: str) -> list:
         """Build system messages with prompt caching for strategy docs."""
@@ -689,6 +939,10 @@ class ClaudeClient:
                 "type": "text",
                 "text": "You are an expert ICT (Inner Circle Trading) forex analyst. "
                         "Analyze charts using the ICT methodology described below. "
+                        "OUTPUT REQUIREMENT — ALWAYS: You MUST finish every analysis by calling the "
+                        "submit_trade_analysis tool exactly once. Do NOT reply with plain text instead "
+                        "of the tool call. If there is no valid setup, still call the tool with "
+                        "direction='no_trade' and your reasoning. "
                         "CRITICAL ZONE RULE — NEVER VIOLATE: "
                         "buy_limit ONLY in discount zone (below equilibrium). "
                         "sell_limit ONLY in premium zone (above equilibrium). "
@@ -699,6 +953,12 @@ class ClaudeClient:
                         "Higher timeframes set the direction — lower timeframes only refine the entry. "
                         "2) During Distribution phase, the move is done. Avoid new entries unless displacement confirms a fresh cycle. "
                         "3) M15 direction rules are detailed in the DIRECTIONAL AUTHORITY section of the analysis prompt.",
+            },
+            {
+                # Static ICT methodology — cached so it is not re-billed every call.
+                "type": "text",
+                "text": ANALYSIS_RULES,
+                "cache_control": {"type": "ephemeral"}
             },
             {
                 "type": "text",
@@ -750,13 +1010,9 @@ changed on the chart, either maintain your previous direction or return no_trade
 Flipping direction without citing a confirmed change is NOT allowed.
 """
             prompt += """
-**ENTRY STRATEGY REMINDER -- CHOOSE THE RIGHT ORDER TYPE**:
-Match your order type to market conditions:
-- Use buy_limit/sell_limit at Order Blocks, FVGs, sweep-and-reclaim zones, or prominent wicks WHEN price is still approaching the level
-- Use buy_stop/sell_stop for breakout entries above/below key levels
-- Use 'market' when displacement is confirmed, momentum is strong, and price is AT or NEAR your ideal level — do NOT wait for a pullback that may never come during strong moves
-- Set entry_price to the EXACT level you want to enter at
-IMPORTANT: If you see ACTIVE DISPLACEMENT (strong candles with follow-through), use a MARKET order. Limit orders during strong momentum moves will miss the entry entirely. Only use limit orders when price is clearly ranging or approaching a level you expect it to test.
+**ENTRY STRATEGY REMINDER**: Pick the order type using the single ORDER TYPE SELECTION
+section below (limit = INTO a level, stop = THROUGH a level, market = displacement already
+confirmed per the CORE MANDATE gate). Always set entry_price to the EXACT level you want.
 """
             # Enhanced context from integrated services
             if market_data.get('account_equity'):
@@ -868,16 +1124,13 @@ IMPORTANT: If you see ACTIVE DISPLACEMENT (strong candles with follow-through), 
 - Climax Detected: {"YES" if vp.get('climax_detected') else "NO"}
 """
                 if rel_vol < 0.3:
-                    prompt += """- **CRITICAL WARNING: EXTREMELY LOW VOLUME (<0.3x avg) - AVOID TRADE - insufficient institutional participation**
-"""
-                elif rel_vol < 0.5:
-                    prompt += """- **WARNING: LOW VOLUME (<0.5x avg) - thin market conditions, mention in warnings**
+                    prompt += """- **EXTREMELY LOW VOLUME (<0.3x avg) - return no_trade per the Volume Confirmation Rules (no institutional participation)**
 """
                 elif rel_vol < 0.7:
-                    prompt += """- **CAUTION: BELOW-AVERAGE VOLUME (0.5x-0.7x avg) - Proceed with reduced size, institutional participation is marginal**
+                    prompt += """- **LOW / BELOW-AVERAGE VOLUME (0.3x-0.7x avg) - setup may still be valid; add a warning noting thin participation**
 """
                 elif rel_vol > 2.0:
-                    prompt += """- **BONUS: HIGH VOLUME (>2.0x avg) with displacement = STRONG institutional commitment - boost confidence**
+                    prompt += """- **HIGH VOLUME (>2.0x avg) with displacement = strong institutional commitment; counts as an extra confirmation feeding your base confidence**
 """
             
             # Learning context from past trade reviews
@@ -902,7 +1155,7 @@ IMPORTANT: If you see ACTIVE DISPLACEMENT (strong candles with follow-through), 
             if market_data.get('setup_playbook'):
                 prompt += f"""
 {market_data['setup_playbook']}
-**Use the playbook above: favor PREFERRED setups, avoid or reduce confidence for AVOID setups.**
+**Use the playbook above: favor PREFERRED setups; for AVOID setups, treat it as negative confluence (fewer confirmations toward your base scale) or return no_trade — do not apply an ad-hoc confidence percentage.**
 """
             
             # Bar Extreme Supply/Demand Zones (multi-timeframe)
@@ -982,7 +1235,7 @@ IMPORTANT: If you see ACTIVE DISPLACEMENT (strong candles with follow-through), 
 4. Counter-trend trades (against D1) are valid ONLY when M15 structure has already
    shifted to confirm the reversal (CHoCH or BOS in your direction). Never anticipate
    a reversal before M15 confirms it.
-5. If D1/H4/H1 are NOT aligned, note this as a warning factor (see CONFIDENCE ADJUSTMENT RULES below).
+5. If D1/H4/H1 are NOT aligned, note this as a warning factor (see the CONFIDENCE ADJUSTMENT RULES in the system message).
 """
             
             # =============================================
@@ -1063,12 +1316,15 @@ the higher timeframes lack a clear trend. Scalps are valid reactive trades
 on lower timeframe structure.
 
 ⚠️ COUNTER-TREND SCALP WARNING: If your SCALP direction is AGAINST the D1 bias
-(e.g., D1 is BEARISH but you want to SCALP LONG on M5/M1), you MUST:
-1. Set confidence to 70%+ (the system will cap it to 55% for risk management)
-2. Require at least 2.0:1 R:R — no marginal R:R allowed against the trend
-3. Have 3+ confluences on M5/M1 (not just 2)
-Counter-trend scalps are valid ONLY when M15 has already shifted to confirm the
-reversal. They must clear a higher bar than with-trend scalps.
+(e.g., D1 is BEARISH but you want to SCALP LONG on M5/M1), it must clear a HIGHER bar
+than a with-trend scalp. Only take it when ALL of these are genuinely true:
+1. Your HONEST confidence is already 0.70+ on the base scale (3+ real confirmations).
+   Do NOT inflate the number to reach 0.70 — if the evidence only supports 0.60-0.65,
+   the correct action is no_trade. (The system additionally caps counter-trend scalp
+   confidence for risk management; that cap is not a reason to pad your input.)
+2. At least 2.0:1 R:R — no marginal R:R allowed against the trend.
+3. 3+ confluences on M5/M1 (not just 2).
+Counter-trend scalps are valid ONLY when M15 has already shifted to confirm the reversal.
 
 You MUST use M5/M1 to:
 1. COUNT SWINGS into the POI (4-6 swing rule -- mandatory for reversals)
@@ -1079,8 +1335,10 @@ You MUST use M5/M1 to:
 6. DETECT displacement and FVGs for breakout entry timing
 
 Use M5/M1 context to refine your entry level and assess momentum exhaustion.
-If M5/M1 shows structure aligning with your trade thesis, boost confidence.
-If M5/M1 shows structure AGAINST your thesis (e.g., bearish M1 for a long), reduce confidence.
+M5/M1 alignment is a CONFLUENCE factor, not a numeric tweak (see CONFIDENCE ADJUSTMENT RULES):
+if M5/M1 structure aligns with your thesis, count it as a confirmation toward your base scale.
+If M5/M1 structure is AGAINST your thesis (e.g., bearish M1 for a long), treat it as a missing
+confirmation and add a warning — if it directly invalidates the entry, return no_trade.
 
 ## MANDATORY ANALYSIS WORKFLOW (follow this order)
 
@@ -1110,23 +1368,25 @@ Only return no_trade if NONE of the above passes found a valid setup.
 re-examine the M5/M1 data and charts one more time for scalp opportunities.
 The most common mistake is ignoring clean M5/M1 setups because D1/H4 are unclear.
 
-## ORDER TYPE SELECTION — STOP ORDERS FOR BREAKOUTS
+## ORDER TYPE SELECTION (single source of truth for order_type)
 
-Do NOT default to buy_limit/sell_limit for every trade. Consider the full order type palette:
+Do NOT default to buy_limit/sell_limit for every trade. Match the order type to the setup:
 
-- **buy_limit / sell_limit**: Use when price is APPROACHING a key level (OB, FVG, liquidity pool)
-  and you expect a reversal/reaction. Entry is AWAY from current price.
-- **buy_stop / sell_stop**: Use when price is consolidating NEAR a key breakout level and you
-  expect a break THROUGH it. buy_stop = buy ABOVE current price on breakout. sell_stop = sell
-  BELOW current price on breakdown. Ideal for:
-  • Consolidation above/below a session high/low with displacement building
-  • Price coiling near an equal highs/lows liquidity pool
-  • M15/H1 structure shift pending (CHoCH about to confirm)
-- **market**: Use when displacement is ALREADY happening — confirmed BOS/CHoCH with strong
-  candle bodies and volume. Do not wait for a pullback that may never come.
+- **buy_limit / sell_limit** (INTO a level): price is APPROACHING a key level (OB, FVG,
+  liquidity pool, prominent wick) and you expect a reaction. Entry is AWAY from current price.
+  ZONE RULE (mandatory): buy_limit ONLY in discount, sell_limit ONLY in premium.
+- **buy_stop / sell_stop** (THROUGH a level): price is consolidating NEAR a breakout level and
+  you expect a break through it. buy_stop = buy ABOVE current price; sell_stop = sell BELOW.
+  Ideal for consolidation at a session high/low with displacement building, price coiling at an
+  equal-highs/lows pool, or a pending M15/H1 CHoCH.
+- **market** (displacement already confirmed): use ONLY when the CORE MANDATE market-order gate
+  is satisfied — a displacement candle has CLOSED and a second confirmation (BOS/CHoCH printed,
+  or completed sweep) is present AND price is AT/INSIDE your zone right now (not approaching).
+  Do not wait for a pullback that may never come, but do not use market on prediction either.
 
 If you find yourself always choosing buy_limit or sell_limit, you are likely missing breakout
-setups. Evaluate whether the best entry is INTO a level (limit) or THROUGH a level (stop).
+setups. Decide: is the best entry INTO a level (limit), THROUGH a level (stop), or a confirmed
+displacement you must take NOW (market)?
 """
             
             # =============================================
@@ -1173,7 +1433,7 @@ Unicorn/Breaker setups, buy_stop/sell_stop breakouts):
 - If the breakout follows 4+ swings of accumulation + a sweep = HIGHEST confidence (0.85+).
 - If displacement is confirmed but swing count is low, trade can proceed but cap confidence at 0.75.
 - Use buy_stop/sell_stop at breakout level if price hasn't broken yet; use market if displacement is already underway.
-- Rounding pattern before the breakout = extra confluence, boost confidence.
+- Rounding pattern before the breakout = an extra confirmation feeding your base confidence scale.
 """
             
             # Fibonacci / OTE Context
@@ -1304,7 +1564,7 @@ Treat this as one additional confluence input, NOT an instruction:
 ## 💵 DXY CORRELATION ANALYSIS
 - DXY Trend: {dxy.get('dxy_trend', 'unknown').upper()}
 - Confirmed Direction for {symbol}: {dxy.get('confirmed_direction', 'N/A').upper() if dxy.get('confirmed_direction') else 'N/A'}
-- ⚠️ REDUCE CONFIDENCE if your signal CONFLICTS with DXY direction!
+- ⚠️ If your signal CONFLICTS with DXY direction, treat it as a missing confirmation (weaker confluence toward your base scale) and add a warning — do not apply an ad-hoc confidence percentage (see CONFIDENCE ADJUSTMENT RULES).
 - DXY Bullish = Short EUR/GBP, Long USD pairs
 - DXY Bearish = Long EUR/GBP, Short USD pairs
 """
@@ -1399,7 +1659,7 @@ Treat this as one additional confluence input, NOT an instruction:
 ## 📆 SEASONAL PATTERN
 - {sp.get('current_month', 'N/A')} Bias: {sp.get('current_month_bias', 'unknown').upper()}
 - Historical Accuracy: {sp.get('historical_accuracy', 0)}%
-- ⚠️ If trade ALIGNS with seasonal pattern, boost confidence slightly
+- ⚠️ Treat seasonal alignment as minor supporting confluence only; if it conflicts, note it in `warnings`. Do not apply an ad-hoc confidence percentage (see CONFIDENCE ADJUSTMENT RULES).
 """
         
         if analysis_data:
@@ -1416,106 +1676,19 @@ Treat this as one additional confluence input, NOT an instruction:
             if analysis_data.get('h1_premium_discount'):
                 prompt += f"- H1 Premium/Discount: {analysis_data['h1_premium_discount']}\n"
         
+        # The static methodology (Analysis Required, CORE MANDATE, confidence scale,
+        # CONFIDENCE ADJUSTMENT RULES, Volume Confirmation Rules, dangerous-pair
+        # warnings, precious-metals notes and the worked example) lives in the
+        # prompt-cached ANALYSIS_RULES system block — see _build_system_messages().
+        # Only the pointer below is repeated per call so the model knows where the
+        # authoritative rules are.
         prompt += """
-## Analysis Required
-
-Analyze the chart image and provide:
-
-1. **Market Structure Analysis**
-   - Current trend direction
-   - Recent BOS (Break of Structure) or CHoCH (Change of Character)
-   - Key swing highs and lows
-
-2. **Key ICT Levels**
-   - Fair Value Gaps (FVGs) - unfilled imbalances
-   - Order Blocks - institutional entry zones
-   - Liquidity pools - buy-side and sell-side
-
-3. **Trade Recommendation**
-   Use the submit_trade_analysis tool to provide your structured recommendation.
-
-## ⚠️ CRITICAL WARNINGS - DANGEROUS PAIRS
-
-**NEVER TRADE these pairs - ALWAYS return "no_trade" for:**
-- Any pair ending in "BTC" (e.g., DASHBTC, ETHBTC, LTCBTC)
-- Any pair ending in "BIT" (e.g., XRPBIT, EOSBIT, IOTABIT)
-
-**Why:** These pairs are quoted in Bitcoin, not USD. Our position sizing assumes USD quote currency.
-Trading these causes CATASTROPHIC losses due to incorrect position sizing.
-If the current symbol ends in BTC or BIT, you MUST return direction="no_trade" with reasoning explaining it's a dangerous BTC-quoted pair.
-
-## CORE MANDATE -- CONFIRMED SETUPS FIRST, ANTICIPATORY SECOND:
-You operate in TWO modes:
-
-MODE 1 (PRIMARY) -- REACTIVE: Signal a trade when price has ALREADY confirmed a setup.
-Before recommending a MARKET order, cite at least TWO confirmations that have ALREADY
-OCCURRED on the chart (not "developing" or "likely"):
-1. A displacement candle has CLOSED (strong impulsive move with body > 70% of range)
-2. A Break of Structure (BOS) or Change of Character (CHoCH) has PRINTED on M1/M5
-3. A liquidity sweep has COMPLETED (wick swept a high/low and price reclaimed)
-4. Price is AT or INSIDE a valid FVG/OB entry zone RIGHT NOW (not approaching it)
-If you cannot cite two of these for a MARKET order, do NOT use a market order.
-
-MODE 2 (SECONDARY) -- ANTICIPATORY: When D1+H4 agree on direction but M15 is pulling
-back (opposing), you MAY place a PENDING LIMIT ORDER (buy_limit/sell_limit) at a key
-level (OB, FVG, liquidity sweep zone) in the HTF direction. Requirements:
-- Order type MUST be buy_limit or sell_limit (never market)
-- Entry must be at a specific structural level (name it in reasoning)
-- Confidence capped at 55-60%
-- This is NOT predicting -- it is positioning at a key level where price is likely
-  to react IF it arrives there
-
-NEVER use a MARKET order based on prediction. Anticipation is only valid via pending
-limit orders at defined structural levels.
-
-## Important Rules -- PATIENCE IS THE EDGE:
-- **Do NOT force a trade.** If the setup is not textbook (swing validation, confluence, clear levels), return no_trade. It is ALWAYS better to miss a move than to enter poorly and draw down.
-- **Quality over quantity.** One perfect entry with circular price action confirmation is worth more than five mediocre entries. Wait for the setup to come to you.
-- **Confidence must reflect CONFIRMED evidence, not conviction in a direction.** Use this scale:
-  - 0.60-0.69: One confirmation present, setup developing but incomplete
-  - 0.70-0.79: Two confirmations present, valid but not ideal
-  - 0.80-0.89: Three+ confirmations, strong confluence, kill zone timing
-  - 0.90-1.00: Full confluence: swing validation + displacement + sweep + FVG/OB + volume
-  Do NOT park at exactly 0.75 every time. Your confidence MUST vary based on the actual evidence.
-
-## CONFIDENCE ADJUSTMENT RULES (cap total reduction at -20%):
-Start with your base confidence from setup quality, then apply AT MOST -20% total:
-- D1/H4/H1 misaligned: -10%
-- Low volume (below 0.7x): -5%
-- Against TV consensus: -5%
-- Outside kill zone: already handled by the system (do NOT reduce further)
-- Total reduction MUST NOT exceed -20% from your base confidence.
-The system applies its own session and volume adjustments — do not double-count.
-Your stated confidence is your SETUP QUALITY assessment only. Do NOT pre-discount
-for session timing or volume — the system handles those independently. If you see
-low volume or off-session timing, mention it in your warnings field but do NOT
-reduce your confidence number for it.
-
-- **MINIMUM 1.5:1 R:R on ALL trades** — see R:R GUIDANCE section above for details per trade type.
-- Session timing is handled by the system — focus on setup quality.
-- Identify specific price levels for entry, SL, and TP using M1/M5 precision
-- **CRITICAL: SL must NEVER equal entry price.** For LONG trades, SL must be placed BELOW entry (beyond the nearest swing low or OB). For SHORT trades, SL must be placed ABOVE entry (beyond the nearest swing high or OB). A zero-distance SL is invalid and will be rejected.
-- If genuinely no setup exists (ranging, no structure, no POI nearby), recommend "no_trade" with your reasoning
-- RESPECT news blackouts - recommend no_trade or reduce confidence
-- Consider recent performance and current streak when setting confidence
-- **ONLY trade USD-quoted pairs** (ending in USD, USDT, or standard forex like EURUSD)
-- **Do NOT flip direction without cause.** If market structure has not changed since the last analysis, do not switch from long to short or vice versa. Unchanged chart = unchanged signal or no_trade.
-
-## Volume Confirmation Rules (Institutional Validation):
-- Relative volume must be > 0.7x average for valid setups
-- Displacement + high volume (>1.5x) = Confirmed institutional intent -> boost confidence
-- Liquidity sweep + volume spike (>2x) = Confirmed stop hunt -> high probability reversal
-- LOW VOLUME (<0.5x avg): Thin markets are unreliable -- mention in warnings
-- EXTREMELY LOW VOLUME (<0.3x avg): AVOID TRADE entirely -- no institutional commitment
-- Volume climax (>3x avg) + reversal candle: Possible exhaustion -- watch for reversal
-- Volume trend increasing into displacement: Confirms institutional participation
-
-**Precious Metals Notes (XAUUSD/XAGUSD):**
-- Gold/Silver have wider typical stops than forex (30-50 pips for gold)
-- Consider the gold/silver ratio when analyzing either metal
-- Both metals are safe havens - strong during geopolitical uncertainty
-- Silver is more volatile (~2x gold moves) - adjust position size accordingly
-- Watch USD correlation (typically inverse)
+## Apply the ruleset
+Now produce your recommendation by STRICTLY following the ICT ANALYSIS RULESET in the
+system message: the CORE MANDATE (confirmed setups first), the confidence scale and the
+CONFIDENCE ADJUSTMENT RULES (the single source of truth for the confidence number), the
+Volume Confirmation Rules, the dangerous-pair warnings, and the worked example format.
+Finish by calling the submit_trade_analysis tool exactly once.
 """
         
         return prompt
@@ -1745,6 +1918,152 @@ reduce your confidence number for it.
         
         return tool_input
     
+    @staticmethod
+    def _extract_text(message) -> str:
+        """
+        Concatenate all text blocks from a message response.
+
+        With Opus 4.8 adaptive thinking, the response may lead with a thinking
+        block, so content[0] is not guaranteed to be text. This skips thinking
+        (and any non-text) blocks and returns only the assistant's text output.
+        """
+        if not message or not hasattr(message, 'content') or not message.content:
+            return ""
+        parts = []
+        for block in message.content:
+            # Skip thinking blocks; accept any block exposing string text.
+            if getattr(block, 'type', None) in ('thinking', 'redacted_thinking'):
+                continue
+            text = getattr(block, 'text', None)
+            if isinstance(text, str):
+                parts.append(text)
+        return "".join(parts)
+
+    def _record_usage(self, task: str, message) -> None:
+        """
+        Record token usage + estimated cost for a completed API call.
+
+        Logs a summary line and fire-and-forgets a row into the api_usage table.
+        Never raises: telemetry must not break trading, and mocked responses in
+        tests (whose usage fields are not ints) are silently skipped.
+        """
+        try:
+            usage = getattr(message, "usage", None)
+            if usage is None:
+                return
+            def _tok(attr: str) -> Optional[int]:
+                value = getattr(usage, attr, 0) or 0
+                return value if isinstance(value, int) else None
+            input_tokens = _tok("input_tokens")
+            output_tokens = _tok("output_tokens")
+            cache_read = _tok("cache_read_input_tokens")
+            cache_creation = _tok("cache_creation_input_tokens")
+            if input_tokens is None or output_tokens is None:
+                return  # mocked/malformed usage — skip
+            cache_read = cache_read or 0
+            cache_creation = cache_creation or 0
+
+            cost = (
+                input_tokens * OPUS_48_PRICING["input"]
+                + output_tokens * OPUS_48_PRICING["output"]
+                + cache_read * OPUS_48_PRICING["cache_read"]
+                + cache_creation * OPUS_48_PRICING["cache_write"]
+            ) / 1_000_000
+
+            model_name = getattr(message, "model", "") or self.model_heavy
+            logger.info(
+                f"[USAGE] {task}: in={input_tokens} out={output_tokens} "
+                f"cache_read={cache_read} cache_write={cache_creation} "
+                f"est=${cost:.4f} ({model_name})"
+            )
+
+            async def _persist():
+                try:
+                    from ..api.database import ApiUsageModel, async_session_maker
+                    async with async_session_maker() as session:
+                        session.add(ApiUsageModel(
+                            task=task,
+                            model=str(model_name),
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                            cache_read_tokens=cache_read,
+                            cache_creation_tokens=cache_creation,
+                            estimated_cost_usd=cost,
+                        ))
+                        await session.commit()
+                except Exception as db_err:
+                    logger.debug(f"[USAGE] DB write skipped: {db_err}")
+
+            try:
+                asyncio.get_running_loop()
+                asyncio.create_task(_persist())
+            except RuntimeError:
+                pass  # no running loop (sync context) — log line is still emitted
+        except Exception as e:
+            logger.debug(f"[USAGE] recording skipped: {e}")
+
+    async def _light_json_call(
+        self,
+        task: str,
+        prompt: str,
+        schema: Optional[dict],
+        max_tokens: int,
+    ) -> Tuple[Optional[dict], str]:
+        """
+        Run a light-task Opus 4.8 call that must return a JSON object.
+
+        Single source of truth for the light-task request shape: no temperature
+        (Opus 4.8 rejects it), adaptive thinking + light effort, structured output
+        when a schema is provided (with one retry without the format constraint if
+        the API rejects it), usage telemetry, and thinking-block-safe parsing.
+
+        Returns (parsed_dict_or_None, raw_response_text). Exceptions from the API
+        (other than a schema-format rejection) propagate to the caller, which owns
+        its own defaults.
+        """
+        output_config: Dict[str, Any] = {"effort": self.effort_light}
+        if schema:
+            output_config = {
+                "effort": self.effort_light,
+                "format": {"type": "json_schema", "schema": schema},
+            }
+        try:
+            message = await self.async_client.messages.create(
+                model=self.model_light,
+                max_tokens=max_tokens,
+                thinking={"type": "adaptive"},
+                output_config=output_config,
+                messages=[{"role": "user", "content": prompt}]
+            )
+        except anthropic.BadRequestError as e:
+            if not schema:
+                raise
+            logger.warning(f"[{task}] Structured output rejected ({e}); retrying without format")
+            message = await self.async_client.messages.create(
+                model=self.model_light,
+                max_tokens=max_tokens,
+                thinking={"type": "adaptive"},
+                output_config={"effort": self.effort_light},
+                messages=[{"role": "user", "content": prompt}]
+            )
+
+        self._record_usage(task, message)
+        response_text = self._extract_text(message)
+
+        # Structured output emits a bare JSON object; the fallback path may fence it.
+        try:
+            return json.loads(response_text.strip()), response_text
+        except (json.JSONDecodeError, ValueError):
+            pass
+        import re
+        json_match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)
+        if json_match:
+            try:
+                return json.loads(json_match.group(1)), response_text
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return None, response_text
+
     def _parse_tool_response(self, message) -> AnalysisResult:
         """Parse the tool use response from Claude."""
         tool_input = None
@@ -2001,33 +2320,20 @@ reduce your confidence number for it.
 - After 3+ losses, reduce size significantly
 - After 3+ wins, be cautious (don't get overconfident)
 
-Respond with JSON:
-```json
+Respond with a single JSON object (no surrounding prose) of this shape:
 {{
     "recommended_lots": <float>,
     "reasoning": "<brief explanation>",
     "risk_assessment": "low|medium|high",
     "size_adjustment": "<0.5x|0.75x|1.0x|1.25x|1.5x>"
-}}
-```"""
+}}"""
         
         try:
-            message = await self.async_client.messages.create(
-                model=self.model_light,
-                max_tokens=500,
-                temperature=0.2,
-                messages=[{"role": "user", "content": prompt}]
+            result, response_text = await self._light_json_call(
+                "position_size", prompt, POSITION_SIZE_SCHEMA, max_tokens=2000
             )
-            
-            response_text = message.content[0].text
-            
-            # Parse JSON from response
-            import re
-            json_match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group(1))
-            
-            # Fallback
+            if result is not None:
+                return result
             return {"recommended_lots": base_lots, "reasoning": response_text, "risk_assessment": "medium"}
             
         except Exception as e:
@@ -2079,8 +2385,7 @@ Respond with JSON:
 6. What could have been done better?
 7. Should this type of setup be taken again?
 
-Respond with JSON:
-```json
+Respond with a single JSON object (no surrounding prose) of this shape:
 {{
     "outcome": "win|loss|breakeven",
     "grade": "A|B|C|D|F",
@@ -2090,24 +2395,14 @@ Respond with JSON:
     "learnings": ["<learning1>", "<learning2>"],
     "would_take_again": true|false,
     "improvement_suggestions": ["<suggestion1>"]
-}}
-```"""
+}}"""
         
         try:
-            message = await self.async_client.messages.create(
-                model=self.model_light,
-                max_tokens=1000,
-                temperature=0.3,
-                messages=[{"role": "user", "content": prompt}]
+            result, response_text = await self._light_json_call(
+                "trade_review", prompt, TRADE_REVIEW_SCHEMA, max_tokens=3000
             )
-            
-            response_text = message.content[0].text
-            
-            import re
-            json_match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group(1))
-            
+            if result is not None:
+                return result
             return {"analysis": response_text, "learnings": [], "grade": "N/A"}
             
         except Exception as e:
@@ -2156,30 +2451,24 @@ Respond with JSON:
         trade_type = signal.get('trade_type', 'intraday')
         reasoning = str(signal.get('reasoning', ''))
         
-        # R:R expectations per trade type
+        # R:R expectations per trade type (the full table also lives in JUDGE_RUBRIC)
         _rr_expectations = {'scalp': '1.5:1', 'intraday': '2:1', 'swing': '3:1'}
         expected_rr = _rr_expectations.get(trade_type, '2:1')
         
-        prompt = f"""You are a TRADE JUDGE — a risk-focused second opinion before a trade is executed with real money.
-
-A trade analyst has proposed the following trade. Your job is to check it against learned patterns and risk math. You are NOT re-analyzing the market — the analysis is already done. You are validating whether this trade should proceed NOW at market price, or whether it should be DEMOTED to a pending limit order at a better entry price.
+        # Only per-trade facts here — the judging rubric itself is the (prompt-cached)
+        # JUDGE_RUBRIC system block. See _build_judge_system_messages().
+        prompt = f"""Apply the TRADE JUDGE rubric from the system message to the following trade.
 
 ## Proposed Trade
 - Symbol: {symbol}
 - Direction: {direction.upper()}
-- Trade Type: {trade_type.upper()}
+- Trade Type: {trade_type.upper()} (target R:R {expected_rr}; absolute floor 1.5:1)
 - Confidence: {confidence:.0%}
 - Entry Price: {entry_price}
 - Stop Loss: {stop_loss}
 - Take Profit: {take_profit}
 - Order Type: {order_type}
 - Reasoning: {reasoning}
-
-## Trade Type Context
-- This is a **{trade_type.upper()}** trade. Expected minimum R:R is {expected_rr}.
-- SCALP trades have tighter SL/TP and shorter hold times — this is NORMAL, do not penalize.
-- SWING trades should have wider SL/TP and require full HTF alignment.
-- Judge the R:R against the trade type's expected minimum, not a universal 3:1 standard.
 
 ## Risk Metrics
 - Account Balance: ${risk_metrics.get('account_balance', 0):.2f}
@@ -2194,43 +2483,52 @@ A trade analyst has proposed the following trade. Your job is to check it agains
 ## Past Learning Context
 {learning_context if learning_context else "No historical learnings available yet."}
 
-## Your Validation Checklist
-1. Does this trade match any KNOWN LOSING PATTERNS from past learnings above?
-2. Is the SL on the correct side of entry? Is the TP on the correct side of entry?
-3. Is the risk per trade appropriate for an account of this size?
-4. Is the current session appropriate for this symbol and setup?
-
-## Rules
-- Evaluate every trade on its own merit — technical setup quality, R:R, structure alignment, and known patterns. High-confidence signals with clean structure deserve strong consideration, but confidence alone does not guarantee approval.
-- Verdict DEMOTE if you find a concrete, specific problem with entry price — not vague concerns.
-- Verdict REJECT only for CRITICAL issues (e.g., SL/TP on wrong side, already at max daily trades, matches a known losing pattern). Do NOT reject for stylistic concerns.
-- **NEVER reject a trade solely because of position size % when the position is AT BROKER MINIMUM LOT SIZE.** The trader cannot go smaller — this is the smallest possible position. Evaluate purely on technical merit (setup quality, HTF alignment, known patterns). The trader accepts the elevated risk on minimum-lot symbols because the reward potential justifies it.
-- DEMOTE means: convert to a pending limit order at a better entry price (tighter).
-  - For LONG: suggested_entry should be BELOW current entry (buy cheaper).
-  - For SHORT: suggested_entry should be ABOVE current entry (sell higher).
-  - A good default improvement is 0.1%-0.3% from the proposed entry.
-- NEVER suggest an entry that is WORSE than the proposed entry.
-- Keep your reason to ONE sentence.
-
-Respond ONLY with JSON:
-```json
-{{
-    "verdict": "APPROVE" or "DEMOTE" or "REJECT",
-    "reason": "<one sentence explanation>",
-    "suggested_entry": <float price or null if APPROVE>,
-    "risk_flags": ["<flag1>", "<flag2>"]
-}}
-```"""
+Now run Step 1 and Step 2 from the rubric and respond with the single JSON object."""
         
         try:
-            message = await self.async_client.messages.create(
-                model=self.model_heavy,
-                max_tokens=800,
-                temperature=0.1,
-                messages=[{"role": "user", "content": prompt}]
-            )
+            # Opus 4.8: no temperature, adaptive thinking + effort. No tools here,
+            # so thinking is fully compatible. max_tokens covers thinking + JSON verdict.
+            # Structured outputs (output_config.format) force schema-valid JSON so we do
+            # not have to rely on regex extraction. If the API rejects the format (e.g.
+            # incompatible with adaptive thinking on this model), we retry once without it
+            # and fall back to the regex/plain-JSON parsing below.
+            base_output_config = {
+                "effort": self.effort_heavy,
+                "format": {"type": "json_schema", "schema": JUDGE_OUTPUT_SCHEMA},
+            }
+            # Static rubric goes in a cached system block (billed once per cache window).
+            judge_system = [{
+                "type": "text",
+                "text": JUDGE_RUBRIC,
+                "cache_control": {"type": "ephemeral"},
+            }]
+            try:
+                message = await self.async_client.messages.create(
+                    model=self.model_heavy,
+                    max_tokens=4000,
+                    thinking={"type": "adaptive"},
+                    output_config=base_output_config,
+                    system=judge_system,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+            except anthropic.BadRequestError as e:
+                logger.warning(
+                    f"[JUDGE] Structured output rejected ({e}); retrying without format constraint"
+                )
+                message = await self.async_client.messages.create(
+                    model=self.model_heavy,
+                    max_tokens=4000,
+                    thinking={"type": "adaptive"},
+                    output_config={"effort": self.effort_heavy},
+                    system=judge_system,
+                    messages=[{"role": "user", "content": prompt}]
+                )
             
-            response_text = message.content[0].text
+            self._record_usage("judge", message)
+            
+            # Adaptive thinking may emit a thinking block before the text block,
+            # so extract the text content explicitly rather than assuming content[0].
+            response_text = self._extract_text(message)
             
             import re
             json_match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)
@@ -2332,8 +2630,7 @@ Respond ONLY with JSON:
 4. Provide specific recommendations for next week
 5. Rate overall performance
 
-Respond with JSON:
-```json
+Respond with a single JSON object (no surrounding prose) of this shape:
 {
     "performance_grade": "A|B|C|D|F",
     "summary": "<paragraph summary>",
@@ -2343,24 +2640,14 @@ Respond with JSON:
     "recommendations": ["<rec1>", "<rec2>", "<rec3>"],
     "focus_for_next_week": "<specific focus area>",
     "risk_adjustment": "increase|maintain|decrease"
-}
-```"""
+}"""
         
         try:
-            message = await self.async_client.messages.create(
-                model=self.model_light,
-                max_tokens=1500,
-                temperature=0.3,
-                messages=[{"role": "user", "content": prompt}]
+            result, response_text = await self._light_json_call(
+                "weekly_review", prompt, WEEKLY_REVIEW_SCHEMA, max_tokens=4000
             )
-            
-            response_text = message.content[0].text
-            
-            import re
-            json_match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group(1))
-            
+            if result is not None:
+                return result
             return {"summary": response_text, "recommendations": []}
             
         except Exception as e:
@@ -2456,19 +2743,13 @@ Respond with JSON:
 ```"""
         
         try:
-            message = await self.async_client.messages.create(
-                model=self.model_light,
-                max_tokens=2000,
-                temperature=0.3,
-                messages=[{"role": "user", "content": prompt}]
+            # No schema here: symbol_insights/session_insights are free-form dicts,
+            # which strict structured-output grammar cannot express. The helper still
+            # centralizes the request shape and parses fenced or bare JSON.
+            result, response_text = await self._light_json_call(
+                "weekly_insights", prompt, None, max_tokens=5000
             )
-            
-            response_text = message.content[0].text
-            
-            import re
-            json_match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)
-            if json_match:
-                result = json.loads(json_match.group(1))
+            if result is not None:
                 logger.info(f"Generated weekly insights: Grade {result.get('performance_grade', 'N/A')}")
                 return result
             
@@ -2547,8 +2828,7 @@ Consider:
 - Is recent performance justifying current risk?
 - Any concerning patterns?
 
-Respond with JSON:
-```json
+Respond with a single JSON object (no surrounding prose) of this shape:
 {{
     "recommended_mode": "aggressive|normal|conservative|defensive",
     "reasoning": "<explanation>",
@@ -2556,24 +2836,14 @@ Respond with JSON:
     "setup_filter": "all|A_and_B|A_only",
     "confidence_threshold": <0.6 to 0.9>,
     "warnings": ["<warning if any>"]
-}}
-```"""
+}}"""
         
         try:
-            message = await self.async_client.messages.create(
-                model=self.model_light,
-                max_tokens=800,
-                temperature=0.2,
-                messages=[{"role": "user", "content": prompt}]
+            result, response_text = await self._light_json_call(
+                "scaling_decision", prompt, SCALING_DECISION_SCHEMA, max_tokens=2500
             )
-            
-            response_text = message.content[0].text
-            
-            import re
-            json_match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group(1))
-            
+            if result is not None:
+                return result
             return {"mode": "normal", "reasoning": response_text}
             
         except Exception as e:

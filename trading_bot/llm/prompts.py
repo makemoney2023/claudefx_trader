@@ -1,7 +1,10 @@
 """
 Prompt Templates for Claude Analysis.
 
-Contains structured prompts for different analysis scenarios.
+DEPRECATED: These templates are not used at runtime. The live prompts for chart
+analysis and the trade judge are built inline in ``llm/claude_client.py`` (which
+targets Claude Opus 4.8). This module is retained only for reference and is not
+maintained against the current model/prompting guidance. Do not add new callers.
 """
 
 from typing import Dict, Any, Optional

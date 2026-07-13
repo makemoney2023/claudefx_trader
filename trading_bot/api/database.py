@@ -410,6 +410,28 @@ class SignalDecisionModel(Base):
     outcome_evaluated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
+class ApiUsageModel(Base):
+    """Per-call Claude API usage telemetry (token counts + estimated cost).
+
+    One row per API call, labelled by task ("analysis", "judge", "position_reeval",
+    ...). Powers cost monitoring and verifies prompt-cache hit rates in production.
+    """
+
+    __tablename__ = "api_usage"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    timestamp: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), index=True
+    )
+    task: Mapped[str] = mapped_column(String(40), index=True)
+    model: Mapped[str] = mapped_column(String(60), default="")
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cache_read_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cache_creation_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    estimated_cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
+
+
 class BacktestRunModel(Base):
     """
     Persists backtest runs (ICT, Claude Replay, Walk-Forward Optimizer).

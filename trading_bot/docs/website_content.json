@@ -37,7 +37,7 @@
         "id": "ai-analysis",
         "title": "AI-Powered Analysis",
         "icon": "brain",
-        "description": "Claude Opus 4.5 analyzes charts with vision capabilities",
+        "description": "Claude Opus 4.8 analyzes charts with vision capabilities",
         "features": [
           {
             "name": "Vision-Based Chart Analysis",
@@ -741,7 +741,7 @@
       },
       {
         "question": "How does the AI analysis work?",
-        "answer": "The bot uses Claude Opus 4.5 with vision capabilities to analyze actual chart screenshots. Claude identifies ICT patterns, market structure, and generates trade recommendations with confidence scores and detailed reasoning."
+        "answer": "The bot uses Claude Opus 4.8 with vision capabilities to analyze actual chart screenshots. Claude identifies ICT patterns, market structure, and generates trade recommendations with confidence scores and detailed reasoning."
       },
       {
         "question": "What brokers are supported?",

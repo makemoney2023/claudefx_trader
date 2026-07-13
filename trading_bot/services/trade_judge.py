@@ -91,8 +91,11 @@ async def run_trade_judge(
     risk_metrics: Dict[str, Any],
     learning_context: str = "",
     *,
-    timeout: float = 8.0,
+    timeout: float = 45.0,
 ) -> JudgeOutcome:
+    # Timeout note: the judge runs on Opus 4.8 with adaptive thinking at high effort,
+    # which takes ~10-20s in practice. The old 8s Sonnet-era budget would time out
+    # on nearly every call and (fail-closed) block ALL trades.
     if not claude_client or not getattr(claude_client, "api_key", None):
         return unavailable_outcome("Judge client unavailable — no API key")
 
