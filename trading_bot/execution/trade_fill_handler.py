@@ -93,7 +93,19 @@ class TradeFillHandler:
                         f"⚠ Order reported success but position {result.ticket} not found in MT5! "
                         f"Manual verification required."
                     )
-                    # Don't track the position if it doesn't exist
+                    await bot._record_terminal_decision(
+                        "execution_failure",
+                        symbol,
+                        direction=trade_signal.direction,
+                        entry=result.fill_price or current_price,
+                        sl=final_sl or 0.0,
+                        tp=final_tp or 0.0,
+                        confidence=trade_signal.confidence,
+                        reason=f"Order success but position {result.ticket} not found in MT5",
+                        details={"ticket": result.ticket, "unverified_fill": True},
+                    )
+                    # Don't track the position if it doesn't exist;
+                    # sync_with_mt5 adopts it if the fill appears later
                     return
                 
                 logger.info(f"  ✓ Position verified in MT5")

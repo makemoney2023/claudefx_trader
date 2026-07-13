@@ -198,66 +198,6 @@ def should_use_zone_gate(
     )
 
 
-@dataclass
-class ReplayGateResult:
-    blocked: bool
-    zone_decision: str = "no_gate"
-    reason: str = ""
-
-
-def evaluate_replay_pre_execution_gates(
-    *,
-    direction: str,
-    confidence: float,
-    rr: float,
-    d1_bias: str,
-    pd_result,
-    symbol: str,
-    is_index: bool,
-    utc_hour: int,
-    weak_hours: tuple,
-    zone_settings: ZoneGateSettings,
-) -> ReplayGateResult:
-    """Shared pre-execution gates for Claude replay (zone, legacy D1, TOD)."""
-    if pd_result is not None and should_use_zone_gate(
-        True, zone_settings.gate_mode, symbol, zone_settings.disabled_symbols
-    ):
-        zg = evaluate_zone_gate(
-            direction=direction,
-            confidence=confidence,
-            actual_rr=rr,
-            retrace=pd_result.retracement_percent,
-            zone_str=pd_result.current_zone.value,
-            d1_bias=d1_bias,
-            is_index=is_index,
-            settings=zone_settings,
-            symbol=symbol,
-        )
-        if zg.blocked:
-            return ReplayGateResult(True, zg.decision, zg.reason)
-        return ReplayGateResult(False, zg.decision)
-
-    if zone_settings.gate_mode != "active" or pd_result is None:
-        blocked, reason = evaluate_legacy_d1_gate(
-            direction=direction,
-            confidence=confidence,
-            actual_rr=rr,
-            d1_bias=d1_bias,
-        )
-        if blocked:
-            return ReplayGateResult(True, "legacy_d1_blocked", reason)
-
-    blocked, reason = evaluate_tod_gate(
-        utc_hour=utc_hour,
-        weak_hours=weak_hours,
-        confidence=confidence,
-    )
-    if blocked:
-        return ReplayGateResult(True, "tod_blocked", reason)
-
-    return ReplayGateResult(False, "allowed")
-
-
 def evaluate_m15_gate(ctx: "TradeContext") -> GateOutcome:
     """M15 execution timeframe structure gate."""
     _dir = ctx.direction

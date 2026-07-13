@@ -142,6 +142,36 @@ def _rebase_level(level: float, old_entry: float, new_entry: float) -> float:
     return new_entry + (level - old_entry)
 
 
+def ote_pullback_entry(direction: str, swing_high: float, swing_low: float) -> float:
+    """
+    Direction-aware OTE pullback entry price.
+
+    Longs buy the 79% pullback of an up-move (discount side of the range);
+    shorts sell the 62% pullback of a down-move (premium side). Returns 0.0
+    when the swing range is degenerate.
+    """
+    range_size = swing_high - swing_low
+    if range_size <= 0:
+        return 0.0
+    if direction == "long":
+        return swing_high - (range_size * 0.786)
+    return swing_low + (range_size * 0.618)
+
+
+def rebase_sl_tp_for_new_entry(
+    *,
+    stop_loss: float,
+    take_profit: float,
+    old_entry: float,
+    new_entry: float,
+) -> Tuple[float, float]:
+    """Preserve SL/TP offsets when an entry is moved (keeps R:R and SL side)."""
+    return (
+        _rebase_level(stop_loss, old_entry, new_entry),
+        _rebase_level(take_profit, old_entry, new_entry),
+    )
+
+
 def apply_demote_policy(
     direction: str,
     current_price: float,

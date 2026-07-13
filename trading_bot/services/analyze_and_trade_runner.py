@@ -8,7 +8,13 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from ..config import settings
 from ..utils.logging import get_logger
-from ..utils.win_optimization import apply_demote_policy, build_confidence_decision, classify_a_plus
+from ..utils.win_optimization import (
+    apply_demote_policy,
+    build_confidence_decision,
+    classify_a_plus,
+    ote_pullback_entry,
+    rebase_sl_tp_for_new_entry,
+)
 from ..execution.scaling_position_sizer import SetupGrade
 from ..services.live_trade_gates import (
     compute_booked_risk_percent,
@@ -247,6 +253,17 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
             if bot_state:
                 bot_state.trade_decision(symbol, "rejected", _norm.reject_reason)
                 bot_state.symbol_complete(symbol, "invalid_signal")
+            await bot._record_terminal_decision(
+                "mechanical_reject",
+                symbol,
+                gate_id="normalizer_reject",
+                direction=getattr(trade_signal, "direction", "") or "",
+                entry=trade_signal.entry_price or current_price,
+                sl=trade_signal.stop_loss or 0.0,
+                tp=trade_signal.take_profit or 0.0,
+                confidence=trade_signal.confidence,
+                reason=_norm.reject_reason or "Signal price checks failed",
+            )
             return
         _entry = _norm.entry
         _sl = _norm.sl
@@ -613,6 +630,7 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
             logger.info(f"Trade slot reserved ({bot.daily_trades}/{_max_daily})")
             
             _conf_used_for_sizing = trade_signal.confidence
+            _entry_used_for_sizing = trade_signal.entry_price or current_price
             # Calculate position size with scaling
             size_result = bot.position_sizer.calculate_position_size(
                 equity=account_info.balance,
@@ -749,15 +767,32 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                     logger.warning(f"⚠️ ZONE BLOCK: {zone_validation['reason']}")
                     # Don't block entirely - switch to pending order for better entry
                     if trade_signal.order_type == 'market':
-                        # Switch to limit order at OTE zone
-                        if trade_signal.direction == 'long':
-                            trade_signal.order_type = 'buy_limit'
-                            trade_signal.entry_price = pd_analysis.ote_low  # 79% retracement
-                            logger.info(f"🔄 Converted to BUY LIMIT @ {trade_signal.entry_price:.5f} (OTE zone)")
-                        else:
-                            trade_signal.order_type = 'sell_limit'
-                            trade_signal.entry_price = pd_analysis.ote_high  # 62% retracement
-                            logger.info(f"🔄 Converted to SELL LIMIT @ {trade_signal.entry_price:.5f} (OTE zone)")
+                        # Switch to limit order at the direction-aware OTE
+                        # pullback (longs -> discount side, shorts -> premium)
+                        _ote_entry = ote_pullback_entry(
+                            trade_signal.direction,
+                            pd_analysis.swing_high,
+                            pd_analysis.swing_low,
+                        )
+                        if _ote_entry > 0:
+                            _old_entry = trade_signal.entry_price or current_price
+                            trade_signal.order_type = (
+                                'buy_limit' if trade_signal.direction == 'long'
+                                else 'sell_limit'
+                            )
+                            trade_signal.entry_price = _ote_entry
+                            trade_signal.stop_loss, trade_signal.take_profit = (
+                                rebase_sl_tp_for_new_entry(
+                                    stop_loss=trade_signal.stop_loss or 0.0,
+                                    take_profit=trade_signal.take_profit or 0.0,
+                                    old_entry=_old_entry,
+                                    new_entry=_ote_entry,
+                                )
+                            )
+                            logger.info(
+                                f"🔄 Converted to {trade_signal.order_type.upper()} "
+                                f"@ {_ote_entry:.5f} (OTE pullback, SL/TP rebased)"
+                            )
                 else:
                     logger.info(f"✅ Zone check passed: {zone_validation['reason']}")
             
@@ -820,30 +855,55 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                             f"⚠️ NO DISPLACEMENT: Converting market order to pending "
                             f"(AMD Phase: {amd_state.phase.value})"
                         )
+                        # Entry at nearest FVG midpoint, falling back to the
+                        # direction-aware OTE pullback level
+                        entry_zone = analysis_results.get("fvg", {})
+                        _new_entry = 0.0
                         if trade_signal.direction == 'long':
-                            trade_signal.order_type = 'buy_limit'
-                            # Entry at FVG or OB if available
-                            entry_zone = analysis_results.get("fvg", {})
                             if hasattr(entry_zone, 'bullish_fvgs') and entry_zone.bullish_fvgs:
                                 nearest_fvg = min(entry_zone.bullish_fvgs, key=lambda x: abs(x.midpoint - current_price))
-                                trade_signal.entry_price = nearest_fvg.midpoint
+                                _new_entry = nearest_fvg.midpoint
                             elif pd_analysis:
-                                trade_signal.entry_price = pd_analysis.ote_low
-                            logger.info(f"🔄 Converted to BUY LIMIT @ {trade_signal.entry_price:.5f}")
+                                _new_entry = ote_pullback_entry(
+                                    'long', pd_analysis.swing_high, pd_analysis.swing_low
+                                )
                         else:
-                            trade_signal.order_type = 'sell_limit'
-                            entry_zone = analysis_results.get("fvg", {})
                             if hasattr(entry_zone, 'bearish_fvgs') and entry_zone.bearish_fvgs:
                                 nearest_fvg = min(entry_zone.bearish_fvgs, key=lambda x: abs(x.midpoint - current_price))
-                                trade_signal.entry_price = nearest_fvg.midpoint
+                                _new_entry = nearest_fvg.midpoint
                             elif pd_analysis:
-                                trade_signal.entry_price = pd_analysis.ote_high
-                            logger.info(f"🔄 Converted to SELL LIMIT @ {trade_signal.entry_price:.5f}")
+                                _new_entry = ote_pullback_entry(
+                                    'short', pd_analysis.swing_high, pd_analysis.swing_low
+                                )
+                        if _new_entry > 0:
+                            _old_entry = trade_signal.entry_price or current_price
+                            trade_signal.order_type = (
+                                'buy_limit' if trade_signal.direction == 'long'
+                                else 'sell_limit'
+                            )
+                            trade_signal.entry_price = _new_entry
+                            trade_signal.stop_loss, trade_signal.take_profit = (
+                                rebase_sl_tp_for_new_entry(
+                                    stop_loss=trade_signal.stop_loss or 0.0,
+                                    take_profit=trade_signal.take_profit or 0.0,
+                                    old_entry=_old_entry,
+                                    new_entry=_new_entry,
+                                )
+                            )
+                            logger.info(
+                                f"🔄 Converted to {trade_signal.order_type.upper()} "
+                                f"@ {_new_entry:.5f} (no displacement, SL/TP rebased)"
+                            )
                     else:
                         logger.info("✅ Displacement confirmed - proceeding with market order")
             
-            # GATE 3: Displacement Check for Market Orders
-            if abs(trade_signal.confidence - _conf_used_for_sizing) > 0.001:
+            # RE-SIZE if confidence or entry changed after sizing
+            _entry_now = trade_signal.entry_price or current_price
+            _entry_drifted = (
+                abs(_entry_now - _entry_used_for_sizing) / _entry_used_for_sizing > 0.0005
+                if _entry_used_for_sizing else False
+            )
+            if abs(trade_signal.confidence - _conf_used_for_sizing) > 0.001 or _entry_drifted:
                 if trade_signal.confidence >= 0.85:
                     setup_grade = SetupGrade.A_PLUS
                 elif trade_signal.confidence >= 0.75:
@@ -887,9 +947,10 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                         pass
                 position_size.lots = final_lots
                 logger.info(
-                    f"[CONF-RESIZE] {symbol}: lots re-sized after confidence "
-                    f"{_conf_used_for_sizing:.0%} -> {trade_signal.confidence:.0%} "
-                    f"({final_lots} lots)"
+                    f"[RE-SIZE] {symbol}: lots re-sized "
+                    f"(confidence {_conf_used_for_sizing:.0%} -> {trade_signal.confidence:.0%}, "
+                    f"entry {_entry_used_for_sizing:.5f} -> {_entry_now:.5f}) "
+                    f"= {final_lots} lots"
                 )
             
             # FINAL SAFETY CHECK before execution
@@ -898,6 +959,18 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                 logger.error(f"🚫 BLOCKED: Position size is 0 for {symbol} - trade not executed")
                 if bot_state:
                     bot_state.error(symbol, "Position size 0 - blocked pair")
+                await bot._reject_and_record(
+                    _trade_reservation,
+                    "mechanical_reject",
+                    symbol,
+                    gate_id="zero_lots",
+                    direction=trade_signal.direction,
+                    entry=trade_signal.entry_price or current_price,
+                    sl=trade_signal.stop_loss or 0.0,
+                    tp=trade_signal.take_profit or 0.0,
+                    confidence=trade_signal.confidence,
+                    reason="Position size resolved to 0 lots",
+                )
                 return
             
             if symbol.upper().endswith('BTC') or symbol.upper().endswith('BIT'):
@@ -957,7 +1030,19 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                     logger.warning(f"🚫 Trade blocked by pre-check: {precheck.blockers}")
                     if bot_state:
                         bot_state.error(symbol, f"Pre-check failed: {'; '.join(precheck.blockers)}")
-                    
+                    await bot._reject_and_record(
+                        _trade_reservation,
+                        "mechanical_reject",
+                        symbol,
+                        gate_id="precheck_block",
+                        direction=trade_signal.direction,
+                        entry=trade_signal.entry_price or current_price,
+                        sl=trade_signal.stop_loss or 0.0,
+                        tp=trade_signal.take_profit or 0.0,
+                        confidence=trade_signal.confidence,
+                        reason="; ".join(precheck.blockers),
+                        details={"blockers": list(precheck.blockers)},
+                    )
                     # Blocked trade notifications disabled — only notify on executed trades/TP/SL
                     return
             

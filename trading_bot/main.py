@@ -47,32 +47,16 @@ from .execution.scaling_position_sizer import (
     ScalingPositionSizer,
     SetupGrade,
     enforce_final_risk_cap,
-    verify_post_sizing_risk,
 )
 from .services.news_service import NewsService
 from .services.correlation_service import CorrelationService
-from .services.trade_judge import JudgeOutcome, JudgeVerdict, run_trade_judge
-from .services.live_trade_gates import (
-    effective_max_daily_trades,
-    compute_booked_risk_percent,
-    news_allows_trading,
-    symbol_edge_allows_trading,
-)
+from .services.trade_judge import JudgeOutcome, run_trade_judge
+from .services.live_trade_gates import effective_max_daily_trades
 from .services.entry_gates import (
     ZoneGateSettings,
     should_use_zone_gate,
 )
-from .services.gate_pipeline import (
-    count_confluence,
-    evaluate_entry_gates,
-    evaluate_trade_permission_gates,
-)
-from .services.confidence_modifiers import (
-    SecondaryModifierContext,
-    apply_secondary_modifiers,
-    confidence_decision_to_dict,
-)
-from .utils.win_optimization import apply_demote_policy, build_confidence_decision, classify_a_plus
+from .utils.win_optimization import apply_demote_policy
 from .services.goal_tracker import GoalTracker
 from .services.scaling_manager import ScalingManager, TradingMode
 from .services.session_analytics import SessionAnalytics

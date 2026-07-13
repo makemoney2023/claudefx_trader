@@ -3,11 +3,8 @@
 import pytest
 from types import SimpleNamespace
 
-from trading_bot.services.signal_normalizer import (
-    compute_actual_rr,
-    min_rr_for_symbol,
-    normalize_signal_prices,
-)
+from trading_bot.services.post_claude_gates import compute_actual_rr, resolve_min_rr
+from trading_bot.services.signal_normalizer import normalize_signal_prices
 
 
 class TestNormalizeSignalPrices:
@@ -38,4 +35,4 @@ class TestRRHelpers:
         assert compute_actual_rr(1.10, 1.08, 1.14) == pytest.approx(2.0)
 
     def test_min_rr_forex_intraday(self):
-        assert min_rr_for_symbol("EURUSD", "intraday", 2.0) == 2.0
+        assert resolve_min_rr("EURUSD", "intraday") == 2.0

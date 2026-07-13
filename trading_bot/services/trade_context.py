@@ -39,9 +39,6 @@ class TradeContext:
     confidence_adjustments: List[str] = field(default_factory=list)
     block_reason: Optional[str] = None
 
-    def append_gate(self, stage: str) -> None:
-        self.gate_path.append(stage)
-
     def apply_outcome(self, outcome) -> None:
         """Apply non-blocking gate mutations (confidence caps)."""
         from .gate_outcome import GateOutcome

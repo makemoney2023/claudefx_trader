@@ -134,20 +134,3 @@ def normalize_signal_prices(
     return NormalizedSignal(
         entry, sl, tp, direction, False, "", direction_flipped, audit
     )
-
-
-def compute_actual_rr(entry: float, sl: float, tp: float) -> float:
-    sl_dist = abs(entry - sl)
-    tp_dist = abs(tp - entry)
-    return tp_dist / sl_dist if sl_dist > 0 else 0.0
-
-
-def min_rr_for_symbol(symbol: str, trade_type: str, default_min_rr: float) -> float:
-    from ..config import get_symbol_spec
-
-    spec = get_symbol_spec(symbol)
-    if spec.category == "crypto":
-        by_type = {"scalp": 2.0, "intraday": 2.5, "swing": 3.5}
-    else:
-        by_type = {"scalp": 1.5, "intraday": 2.0, "swing": 3.0}
-    return by_type.get(trade_type or "intraday", default_min_rr)
