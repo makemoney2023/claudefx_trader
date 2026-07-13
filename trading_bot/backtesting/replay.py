@@ -133,12 +133,23 @@ class ClaudeReplayBacktester:
     # Approximate cost per API call (Opus 4.5 with images)
     COST_PER_CALL = 0.08
 
-    def __init__(self, claude_client=None, mt5_client=None, trade_learning_service=None, *, auto_approve_judge: bool = False):
+    def __init__(
+        self,
+        claude_client=None,
+        mt5_client=None,
+        trade_learning_service=None,
+        *,
+        auto_approve_judge: bool = False,
+        invoke_judge: bool = False,
+        replay_account_equity: float = 2000.0,
+    ):
         self._claude = claude_client
         self._data_loader = HistoricalDataLoader(mt5_client)
         self._chart_gen = None
         self._learning_service = trade_learning_service
         self._auto_approve_judge = auto_approve_judge
+        self._invoke_judge = invoke_judge
+        self._replay_account_equity = replay_account_equity
         from ..services.trade_judge import JudgeOutcome, JudgeVerdict
 
         if auto_approve_judge:
@@ -151,6 +162,30 @@ class ClaudeReplayBacktester:
                 verdict=JudgeVerdict.REJECT,
                 reason="replay requires judge invocation (no auto-approve)",
             )
+
+    async def invoke_judge_for_signal(
+        self,
+        symbol: str,
+        trade_signal,
+        *,
+        current_price: float,
+        session_name: str = "",
+    ):
+        """Run the live fail-closed judge adapter during replay."""
+        from ..services.trade_judge import run_replay_trade_judge
+
+        if not self._invoke_judge:
+            return self._default_judge_outcome
+
+        return await run_replay_trade_judge(
+            self._claude,
+            symbol,
+            trade_signal,
+            current_price,
+            session_name=session_name,
+            account_equity=self._replay_account_equity,
+            learning_service=self._learning_service,
+        )
 
     def _evaluate_replay_signal(
         self,
@@ -661,11 +696,20 @@ class ClaudeReplayBacktester:
                     )
 
                     future = m15_data[m15_data.index > window_end].head(200)
+                    _judge_outcome = await self.invoke_judge_for_signal(
+                        symbol,
+                        sig,
+                        current_price=sig.entry_price or current_price,
+                        session_name=snapshot_session,
+                    )
+                    if self._invoke_judge:
+                        result.api_calls += 1
                     trade, policy_result = self._evaluate_replay_signal(
                         replay_sig,
                         future,
                         current_price=sig.entry_price or current_price,
                         pip_size=_pip,
+                        judge_outcome=_judge_outcome,
                     )
                     result.trades.append(trade)
                     result.total_trades += 1
@@ -716,6 +760,8 @@ class ClaudeReplayBacktester:
                         "retracement_pct": round(float(_pd_d1_result.retracement_percent), 3) if _pd_d1_result else None,
                         "in_ote": bool(_pd_d1_result.in_ote) if _pd_d1_result else False,
                         "zone_gate_decision": _zone_gate_decision,
+                        "judge_verdict": policy_result.judge_verdict,
+                        "gate_path": _gate_result.gate_path if _gate_result else [],
                     })
                     if progress_callback:
                         try:
