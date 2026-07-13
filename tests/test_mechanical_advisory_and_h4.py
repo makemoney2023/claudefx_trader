@@ -94,8 +94,12 @@ class TestPipelineWiring:
         return Path(cc.__file__).read_text()
 
     def test_h4_in_multi_timeframe_fetch(self):
-        src = self._main_source()
-        assert "('H4', 100)" in src, "H4 must be fetched for the composite chart"
+        import inspect
+
+        from trading_bot.services.analysis_orchestrator import AnalysisOrchestrator
+
+        src = self._main_source() + inspect.getsource(AnalysisOrchestrator.build_chart_package)
+        assert '("H4", 100)' in src or "('H4', 100)" in src, "H4 must be fetched for the composite chart"
 
     def test_mechanical_setup_flows_to_market_data(self):
         src = self._main_source()

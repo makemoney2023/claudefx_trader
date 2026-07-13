@@ -579,142 +579,19 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
             logger.warning(f"Failed to generate chart for {symbol}")
             return
         
-        # Fetch multi-timeframe data for composite chart and LTF analysis
-        _mtf_dfs = {}  # {timeframe: DataFrame}
-        additional_charts = []
-        try:
-            for _ctf, _ctf_candles in [('D1', 60), ('H4', 100), ('H1', 100), ('M5', 100), ('M1', 100)]:
-                _ctf_df = await bot.data_fetcher.get_ohlcv(
-                    symbol=symbol, timeframe=_ctf, count=_ctf_candles
-                )
-                if _ctf_df is not None and not _ctf_df.empty:
-                    _mtf_dfs[_ctf] = _ctf_df
-            
-            # Fetch last 5 trades for trade markers on M15 chart
-            _trade_markers = []
-            try:
-                if DB_AVAILABLE:
-                    from ..api.database import async_session_maker, TradeModel as _TM
-                    async with async_session_maker() as _tm_sess:
-                        from sqlalchemy import select, desc
-                        _tm_q = select(_TM).where(
-                            _TM.symbol == symbol
-                        ).order_by(desc(_TM.timestamp)).limit(5)
-                        _tm_rows = (await _tm_sess.execute(_tm_q)).scalars().all()
-                        for _t in _tm_rows:
-                            _trade_markers.append({
-                                'time': _t.entry_time or _t.timestamp,
-                                'price': _t.entry_price,
-                                'direction': _t.direction,
-                                'outcome': 'win' if (_t.profit_loss or 0) > 0 else 'loss',
-                                'label': f"{'+' if (_t.r_multiple or 0) >= 0 else ''}{(_t.r_multiple or 0):.1f}R"
-                            })
-                    if _trade_markers:
-                        logger.info(f"[MARKERS] {symbol}: {len(_trade_markers)} trade markers for chart")
-            except Exception as _tm_err:
-                logger.debug(f"[MARKERS] Could not fetch trade markers for {symbol}: {_tm_err}")
-            
-            # Fetch reactive levels for M15 chart heatmap
-            _reactive_levels = []
-            try:
-                if bot.learning_service:
-                    _reactive_levels = await bot.learning_service.get_reactive_levels(symbol, lookback_days=90)
-                    if _reactive_levels:
-                        logger.info(f"[REACTIVE] {symbol}: {len(_reactive_levels)} reactive levels found")
-            except Exception as _rl_err:
-                logger.debug(f"[REACTIVE] Error fetching reactive levels for {symbol}: {_rl_err}")
-            
-            # Compute volume profile for M15 chart (assigned to market_data later)
-            _vp_data = None
-            try:
-                from ..analysis.volume_profile import compute_volume_profile
-                _vp_data = compute_volume_profile(df, num_bins=50)
-                if _vp_data:
-                    logger.info(
-                        f"[VP] {symbol}: POC={_vp_data['poc']:.5f}, "
-                        f"VAH={_vp_data['vah']:.5f}, VAL={_vp_data['val']:.5f}"
-                    )
-            except Exception as _vp_err:
-                logger.debug(f"[VP] Volume profile error for {symbol}: {_vp_err}")
+        _chart_pkg = await bot._analysis_orchestrator.build_chart_package(
+            bot,
+            symbol=symbol,
+            df=df,
+            generate_chart_image=bot._generate_chart_image,
+        )
+        _mtf_dfs = _chart_pkg.mtf_dfs
+        additional_charts = _chart_pkg.additional_charts
+        _vp_data = _chart_pkg.vp_data
+        _bar_extreme_results = _chart_pkg.bar_extreme_results
+        _bar_extreme_zones = _chart_pkg.bar_extreme_zones
 
-            # Detect bar extreme supply/demand zones (assigned to market_data later)
-            _bar_extreme_zones = []
-            _bar_extreme_results: dict = {}
-            try:
-                from ..analysis.bar_extreme_zones import BarExtremeZoneDetector
-                _be_detector = BarExtremeZoneDetector()
-                _current_price = float(df['close'].iloc[-1])
-                for _be_tf, _be_df in [('D1', _mtf_dfs.get('D1')), ('H1', _mtf_dfs.get('H1')), ('M15', df), ('M5', _mtf_dfs.get('M5'))]:
-                    if _be_df is not None and len(_be_df) > 20:
-                        _be_result = _be_detector.detect(_be_df, _current_price, _be_tf)
-                        _bar_extreme_results[f"bar_extreme_{_be_tf.lower()}"] = _be_result.to_dict()
-                        if _be_result.supply_zone:
-                            _bar_extreme_zones.append({"top": _be_result.supply_zone.top, "bottom": _be_result.supply_zone.bottom, "type": "supply", "tf": _be_tf})
-                        if _be_result.demand_zone:
-                            _bar_extreme_zones.append({"top": _be_result.demand_zone.top, "bottom": _be_result.demand_zone.bottom, "type": "demand", "tf": _be_tf})
-                if _bar_extreme_zones:
-                    logger.info(f"[BAR_EXTREME] {symbol}: {len(_bar_extreme_zones)} zones across {len(set(z['tf'] for z in _bar_extreme_zones))} timeframes")
-            except Exception as _be_err:
-                logger.debug(f"[BAR_EXTREME] Error for {symbol}: {_be_err}")
-
-            # Generate composite chart (D1, H4, H1, M15, M5) as primary image
-            _composite_base64 = None
-            try:
-                from ..utils.chart_screenshot import create_composite_chart
-                _composite_panels = []
-                for _panel_tf, _panel_df in [
-                    ('D1', _mtf_dfs.get('D1')),
-                    ('H4', _mtf_dfs.get('H4')),
-                    ('H1', _mtf_dfs.get('H1')),
-                    ('M15', df),
-                    ('M5', _mtf_dfs.get('M5'))
-                ]:
-                    if _panel_df is not None and not _panel_df.empty:
-                        _composite_panels.append({
-                            'timeframe': _panel_tf,
-                            'df': _panel_df,
-                            'overlays': {}
-                        })
-                if len(_composite_panels) >= 2:
-                    _comp_kwargs = {}
-                    if _trade_markers:
-                        _comp_kwargs['trade_markers'] = _trade_markers
-                    if _vp_data:
-                        _comp_kwargs['volume_profile'] = _vp_data
-                    if _reactive_levels:
-                        _comp_kwargs['reactive_levels'] = _reactive_levels
-                    if _bar_extreme_zones:
-                        _comp_kwargs['bar_extreme_zones'] = _bar_extreme_zones
-                    _composite_base64 = await asyncio.to_thread(
-                        create_composite_chart, _composite_panels, symbol,
-                        **_comp_kwargs
-                    )
-                    if _composite_base64:
-                        logger.info(f"[COMPOSITE] {symbol}: Generated {len(_composite_panels)}-panel composite chart")
-            except Exception as _comp_err:
-                logger.warning(f"[COMPOSITE] {symbol}: Failed to generate composite: {_comp_err}")
-            
-            # Generate individual M5/M1 charts for precision entry analysis
-            for ltf in ['M5', 'M1']:
-                ltf_df = _mtf_dfs.get(ltf)
-                if ltf_df is not None and not ltf_df.empty:
-                    ltf_chart = await bot._generate_chart_image(ltf_df, symbol, timeframe=ltf)
-                    if ltf_chart:
-                        additional_charts.append({'base64': ltf_chart, 'timeframe': ltf})
-            
-            # Prepend composite chart as the first additional chart if available
-            if _composite_base64:
-                additional_charts.insert(0, {
-                    'base64': _composite_base64,
-                    'timeframe': 'COMPOSITE (D1/H4/H1/M15/M5)'
-                })
-            
-            if additional_charts:
-                logger.info(f"Sending {len(additional_charts)} charts for {symbol} (composite + LTF)")
-        except Exception as e:
-            logger.warning(f"Failed to generate multi-TF charts for {symbol}: {e}")
-        
-        # Mechanical ICT advisory: rule-based baseline for Claude (never executes)
+                # Mechanical ICT advisory: rule-based baseline for Claude (never executes)
         _mech_setup = bot._mechanical_setup_advisory(symbol, _mtf_dfs.get('H4'), df)
         if _mech_setup:
             analysis_results["mechanical_setup"] = _mech_setup
