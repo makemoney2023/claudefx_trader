@@ -220,7 +220,9 @@ class ClaudeAnalysisStage:
                 "active": sb_status.get('active', False),
                 "window": sb_status.get('window'),
                 "time_remaining_minutes": sb_status.get('time_remaining_minutes', 0),
-                "displacement_confirmed": silver_bullet_ready if 'silver_bullet_ready' in dir() else False
+                "displacement_confirmed": analysis_results.get(
+                    "silver_bullet_status", {}
+                ).get("displacement_confirmed", False),
             }
             if sb_status.get('active'):
                 logger.info(f"🔫 Silver Bullet window active for {symbol}: {sb_status['window']}")
@@ -572,11 +574,12 @@ class ClaudeAnalysisStage:
             market_data["m1_trend"] = mtf_result.m1_analysis.trend if mtf_result.m1_analysis else None
         
         # Add Fibonacci/OTE context to market_data for Claude
-        if fib_analysis:
-            market_data["fibonacci_zone"] = fib_analysis.price_zone.value
-            market_data["in_ote"] = fib_analysis.in_ote
-            market_data["optimal_entry"] = fib_analysis.optimal_entry
-            market_data["fib_levels"] = fib_analysis.fib_levels.to_dict() if fib_analysis.fib_levels else None
+        _fib = analysis_results.get("fibonacci") or {}
+        if _fib:
+            market_data["fibonacci_zone"] = _fib.get("price_zone")
+            market_data["in_ote"] = _fib.get("in_ote")
+            market_data["optimal_entry"] = _fib.get("optimal_entry")
+            market_data["fib_levels"] = _fib.get("fib_levels")
         
         # Inject last signal memory so Claude knows what it said last cycle
         if symbol in bot._last_signal_per_symbol:
@@ -739,5 +742,26 @@ class ClaudeAnalysisStage:
             if bot_state:
                 bot_state.trade_decision(symbol, "no_trade", trade_signal.reasoning[:100] if trade_signal.reasoning else "No setup")
                 bot_state.symbol_complete(symbol, "no_trade")
-            return
-        
+            return ClaudeStageResult(
+                trade_signal=trade_signal,
+                claude_result=claude_result,
+                market_data=market_data,
+                analysis_data=analysis_data,
+                chart_base64=chart_base64,
+                strategy_context=strategy_context,
+                account_info=account_info,
+                current_price=current_price,
+                stop_pipeline=True,
+            )
+
+        return ClaudeStageResult(
+            trade_signal=trade_signal,
+            claude_result=claude_result,
+            market_data=market_data,
+            analysis_data=analysis_data,
+            chart_base64=chart_base64,
+            strategy_context=strategy_context,
+            account_info=account_info,
+            current_price=current_price,
+        )
+

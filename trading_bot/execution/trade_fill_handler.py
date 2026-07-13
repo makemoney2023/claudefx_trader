@@ -384,7 +384,7 @@ class TradeFillHandler:
                     confidence=trade_signal.confidence,
                     reason=result.message or "broker rejected order",
                 )
-                bot._releasetrade_reservation(trade_reservation)
+                bot._release_trade_reservation(trade_reservation)
             
             # Log error to activity feed
             from ..api.routes.activity import add_activity

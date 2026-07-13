@@ -547,12 +547,21 @@ class ClaudeReplayBacktester:
                 sig = claude_result.signal
                 from ..services.signal_normalizer import normalize_signal_prices
 
-                normalize_signal_prices(
+                _norm = normalize_signal_prices(
                     sig,
                     claude_result,
                     current_price,
                     symbol,
                 )
+                if _norm.rejected:
+                    logger.info(
+                        f"[REPLAY] {current.strftime('%m/%d %H:%M')} "
+                        f"NORMALIZER rejected {sig.direction.upper()}: {_norm.reject_reason}"
+                    )
+                    signals_processed += 1
+                    current += timedelta(hours=interval_hours)
+                    step_idx += 1
+                    continue
                 _zone_gate_decision = "no_gate"
                 if sig.direction != 'no_trade' and sig.entry_price and sig.stop_loss and sig.take_profit:
                     from ..config import settings as _bt_settings

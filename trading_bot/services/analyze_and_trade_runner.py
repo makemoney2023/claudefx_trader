@@ -12,7 +12,12 @@ from ..config import settings
 from ..utils.logging import get_logger
 from ..utils.notifications import notify, NotificationType
 from ..utils.win_optimization import apply_demote_policy, build_confidence_decision, classify_a_plus
-from ..execution.scaling_position_sizer import verify_post_sizing_risk
+from ..execution.scaling_position_sizer import SetupGrade
+from ..services.live_trade_gates import (
+    compute_booked_risk_percent,
+    symbol_edge_allows_trading,
+)
+from ..services.scaling_manager import TradingMode
 from ..services.confidence_modifiers import (
     SecondaryModifierContext,
     apply_secondary_modifiers,
@@ -181,6 +186,12 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
         retail_contrarian = _expanded.retail_contrarian
         vix_risk_mode = _expanded.vix_risk_mode
         currency_strength_recommendation = _expanded.currency_strength_recommendation
+        amd_state = _expanded.amd_state
+        displacement_analysis = _expanded.displacement_analysis
+        breaker_blocks = _expanded.breaker_blocks or []
+        silver_bullet_ready = _expanded.silver_bullet_ready
+        ipda_analysis = _expanded.ipda_analysis
+        nwog_target = _expanded.nwog_target
 
         # Get current price
         current_price = float(df['close'].iloc[-1])
@@ -240,7 +251,7 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
             currency_strength_recommendation=currency_strength_recommendation,
             current_price=current_price,
         )
-        if _claude_out.stop_pipeline:
+        if _claude_out is None or _claude_out.stop_pipeline:
             return
         trade_signal = _claude_out.trade_signal
         claude_result = _claude_out.claude_result
@@ -253,7 +264,6 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
 
         # SIGNAL PRICE SANITY CHECKS (A5) — shared normalizer
         # ============================================
-        from .signal_normalizer import normalize_signal_prices
         _norm = normalize_signal_prices(
             trade_signal, claude_result, current_price, symbol
         )
@@ -779,7 +789,7 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
             # Create position size object
             class SimplePositionSize:
                 def __init__(self, lots):
-                    bot.lots = lots
+                    self.lots = lots
             
             position_size = SimplePositionSize(final_lots)
             

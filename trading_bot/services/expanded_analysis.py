@@ -26,6 +26,12 @@ class ExpandedAnalysisResult:
     retail_contrarian: Optional[str] = None
     vix_risk_mode: Optional[str] = None
     currency_strength_recommendation: Optional[str] = None
+    amd_state: Any = None
+    displacement_analysis: Any = None
+    breaker_blocks: Any = None
+    silver_bullet_ready: bool = False
+    ipda_analysis: Any = None
+    nwog_target: Optional[float] = None
 
 
 async def run_expanded_analysis(
@@ -433,6 +439,11 @@ async def run_expanded_analysis(
             
         except Exception as e:
             logger.debug(f"Firecrawl intelligence error: {e}")
-    
 
+    result.amd_state = amd_state
+    result.displacement_analysis = displacement_analysis
+    result.breaker_blocks = breaker_blocks
+    result.silver_bullet_ready = silver_bullet_ready
+    result.ipda_analysis = ipda_analysis
+    result.nwog_target = nwog_target
     return result
