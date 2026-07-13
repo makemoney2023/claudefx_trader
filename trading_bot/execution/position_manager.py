@@ -183,6 +183,9 @@ class PositionManager:
         self._delete_tasks: set = set()
         self.on_position_close = None  # Callback for when position closes
         self.on_reversal_close = None  # Callback for reversal-type closes (profit protection)
+        # While set and in the future, giveback protection uses tighter
+        # thresholds (volatility spike response)
+        self.volatility_tighten_until: Optional[datetime] = None
         
         logger.info("Position manager initialized")
     
@@ -748,6 +751,12 @@ class PositionManager:
                 return await self._protection_close(position, "near_tp_reversal")
         
         _giveback_threshold = 0.65 if _is_crypto else 0.55
+        _tighten_active = (
+            self.volatility_tighten_until is not None
+            and datetime.now(timezone.utc) < self.volatility_tighten_until
+        )
+        if _tighten_active:
+            _giveback_threshold = 0.50 if _is_crypto else 0.40
         if peak_r >= self.giveback_min_peak_r and r_multiple > 0:
             giveback_pct = (peak_r - r_multiple) / peak_r
             if giveback_pct >= _giveback_threshold:

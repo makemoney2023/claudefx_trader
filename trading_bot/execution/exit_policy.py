@@ -28,6 +28,8 @@ class ExitPolicyConfig:
     trailing_start_r: float = 2.0
     trailing_step_r: float = 0.5
     dynamic_trail_lock_fraction: float = 0.50  # lock 50% of profit above 1R
+    be_buffer_fraction_forex: float = 0.25     # BE at entry + 0.25R (live parity)
+    be_buffer_fraction_crypto: float = 0.30
 
 
 @dataclass
@@ -117,16 +119,26 @@ def step_exit_policy(
         outcome = "win" if total > 0 else "loss"
         return outcome, total, state.current_sl
 
-    # TP1 @ 1R — skip partial for A+ runners
-    if not state.a_plus and not state.tp1_hit and fav >= cfg.tp1_r:
+    # TP1 @ 1R — A+ runners skip the partial but still move to break-even
+    # (live: _skip_tp1_partial → _move_to_break_even with buffered SL)
+    if not state.tp1_hit and fav >= cfg.tp1_r:
         state.tp1_hit = True
-        state.realized_r += cfg.tp1_close_fraction * cfg.tp1_r
-        state.remaining_fraction = max(0.0, 1.0 - cfg.tp1_close_fraction)
-        state.current_sl = state.entry  # break-even
+        if not state.a_plus:
+            state.realized_r += cfg.tp1_close_fraction * cfg.tp1_r
+            state.remaining_fraction = max(0.0, 1.0 - cfg.tp1_close_fraction)
+        be_buffer = (
+            cfg.be_buffer_fraction_crypto if state.is_crypto
+            else cfg.be_buffer_fraction_forex
+        )
+        if is_long:
+            state.current_sl = max(state.current_sl, state.entry + be_buffer * sl_dist)
+        else:
+            state.current_sl = min(state.current_sl, state.entry - be_buffer * sl_dist)
 
-    # Dynamic trail 1R–2R: lock fraction of profit above 1R
+    # Dynamic trail 1R–2R: lock 50% of profit ABOVE 1R
+    # (live: locked_profit_r = (r - 1.0) * 0.5, SL at entry + locked_profit_r)
     if state.tp1_hit and not state.tp2_hit and 1.0 <= fav < cfg.tp2_r:
-        lock_r = 1.0 + (fav - 1.0) * cfg.dynamic_trail_lock_fraction
+        lock_r = (fav - 1.0) * cfg.dynamic_trail_lock_fraction
         if is_long:
             state.current_sl = max(state.current_sl, state.entry + lock_r * sl_dist)
         else:
@@ -140,10 +152,12 @@ def step_exit_policy(
             0.0, state.remaining_fraction - cfg.tp2_close_fraction
         )
 
-    # Trailing after TP2 / 2R
+    # Trailing after TP2 / 2R — stepped, matching live:
+    # trail_r = int(r / step) * step; SL locks (trail_r - step)
     if state.peak_r >= cfg.trailing_start_r:
         state.trailing_active = True
-        trail_r = state.peak_r - cfg.trailing_step_r
+        stepped = int(state.peak_r / cfg.trailing_step_r) * cfg.trailing_step_r
+        trail_r = stepped - cfg.trailing_step_r
         if is_long:
             state.current_sl = max(state.current_sl, state.entry + trail_r * sl_dist)
         else:

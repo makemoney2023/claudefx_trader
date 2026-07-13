@@ -71,6 +71,25 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                     bot._post_cooldown_symbols = set()
                 bot._post_cooldown_symbols.add(symbol)
         
+        # VOLATILITY PAUSE: Block new entries during an active spike window
+        _vol_pause = getattr(bot, "_volatility_pause_until", None)
+        if isinstance(_vol_pause, datetime) and datetime.now(timezone.utc) < _vol_pause:
+            _vol_remaining = (_vol_pause - datetime.now(timezone.utc)).total_seconds() / 60
+            logger.warning(
+                f"[VOLATILITY] {symbol}: New entries paused — "
+                f"{_vol_remaining:.0f}min remaining in spike window"
+            )
+            if bot_state:
+                bot_state.symbol_complete(symbol, "volatility_pause")
+            from ..api.routes.activity import add_activity
+            add_activity(
+                "volatility_entry_pause",
+                f"{symbol}: Entry skipped — volatility pause ({_vol_remaining:.0f}min left)",
+                symbol=symbol,
+                details={"remaining_minutes": round(_vol_remaining)},
+            )
+            return
+        
         # CRITICAL: Block dangerous pairs (BTC-quoted pairs have wrong contract values)
         if symbol.upper() in bot.BLOCKED_PAIRS or symbol.upper().endswith('BTC') or symbol.upper().endswith('BIT'):
             logger.error(f"🚫 BLOCKED: {symbol} is a BTC/BIT pair - contract value issues cause massive losses!")

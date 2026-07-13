@@ -315,6 +315,10 @@ class TradingBot:
         # Dynamic learnings: throttle doc updates to at most once per hour
         self._last_learnings_update: Optional[datetime] = None
         
+        # Volatility spike response state
+        self._volatility_pause_until: Optional[datetime] = None
+        self._volatility_spike_expiry: Dict[str, datetime] = {}
+        
         # SAFE Crypto symbols (24/7 trading) - ONLY USD pairs!
         # WARNING: BTC pairs (ETHBTC, DASHBTC, etc.) are EXCLUDED because 
         # their contract value is in BTC, not USD, causing incorrect position sizing
@@ -833,6 +837,7 @@ class TradingBot:
         # Track cycles for Claude re-evaluation frequency
         pos_mgr_cycle = 0
         pending_reeval_cycle = 0
+        vol_check_cycle = 0
         
         while self.running:
             try:
@@ -897,15 +902,6 @@ class TradingBot:
                     if actions:
                         asyncio.create_task(broadcast_trade_update({"event": "position_actions", "actions": actions}))
                     
-                    # Check for high volatility
-                    try:
-                        volatility_alert = await self._check_volatility()
-                        if volatility_alert:
-                            logger.warning(f"POS-MGR: HIGH VOLATILITY: {volatility_alert}")
-                            await self._handle_high_volatility(volatility_alert)
-                    except Exception as e:
-                        logger.warning(f"POS-MGR volatility check error: {e}")
-                    
                     # Claude re-evaluation every 6 cycles (every ~60 seconds)
                     # Fire-and-forget: runs in background so it doesn't block the
                     # 10-second position management cycle (Claude calls can take 30-90s)
@@ -925,6 +921,29 @@ class TradingBot:
                         else:
                             logger.debug("POS-MGR: Skipping Claude re-eval (previous still running)")
                     
+                
+                # Volatility spike check every 3 cycles (~30 seconds).
+                # Runs whenever positions OR pending orders are exposed —
+                # covers pending-cancel and entry-pause even with no fills yet.
+                vol_check_cycle += 1
+                if vol_check_cycle >= 3:
+                    vol_check_cycle = 0
+                    _has_exposure = bool(
+                        (self.position_manager and self.position_manager.positions)
+                        or (
+                            hasattr(self, 'pending_order_manager')
+                            and self.pending_order_manager
+                            and self.pending_order_manager.get_active_orders()
+                        )
+                    )
+                    if _has_exposure:
+                        try:
+                            volatility_alert = await self._check_volatility()
+                            if volatility_alert:
+                                logger.warning(f"POS-MGR: HIGH VOLATILITY: {volatility_alert['message']}")
+                                await self._handle_high_volatility(volatility_alert)
+                        except Exception as e:
+                            logger.warning(f"POS-MGR volatility check error: {e}")
                 
                 # Pending order re-evaluation every 12 cycles (~2 minutes)
                 # Runs regardless of whether there are open positions
@@ -1857,6 +1876,11 @@ class TradingBot:
             
             if result.success:
                 logger.info(f"✓ Emergency close successful for position {largest_loser.ticket}")
+                largest_loser.close_reason = "margin_emergency"
+                try:
+                    await self._handle_position_close(largest_loser)
+                except Exception as cb_err:
+                    logger.error(f"Close lifecycle error for {largest_loser.ticket}: {cb_err}")
                 self.position_manager.remove_position(largest_loser.ticket)
                 
                 # Notify
@@ -2004,6 +2028,7 @@ class TradingBot:
             
             if result.success:
                 pos.closed_profit_loss = weakest["pnl"]
+                pos.close_reason = "position_replaced"
                 await self._handle_position_close(pos)
                 self.position_manager.remove_position(pos.ticket)
                 
@@ -2043,21 +2068,28 @@ class TradingBot:
             traceback.print_exc()
             return False
     
-    async def _check_volatility(self) -> Optional[str]:
+    VOLATILITY_PAUSE_MINUTES = 15
+
+    async def _check_volatility(self) -> Optional[dict]:
         """
-        Check for abnormal volatility across major pairs.
-        Returns alert message if volatility spike detected.
+        Check for abnormal volatility on all configured trading symbols
+        plus any symbols with open positions.
+
+        Returns {"message": str, "symbols": [spiking symbols]} or None.
         """
         try:
+            import pandas as pd
+
             volatility_alerts = []
-            
-            # Check ATR spike on major pairs
-            check_symbols = ['EURUSD', 'GBPUSD', 'USDJPY']
-            
+            spiking_symbols = []
+
+            check_symbols = list(settings.trading.symbols)
+            if self.position_manager:
+                for pos in self.position_manager.get_all_positions():
+                    if pos.symbol not in check_symbols:
+                        check_symbols.append(pos.symbol)
+
             for symbol in check_symbols:
-                if symbol not in settings.trading.symbols:
-                    continue
-                    
                 try:
                     df = await self.data_fetcher.get_ohlcv(
                         symbol=symbol,
@@ -2065,7 +2097,7 @@ class TradingBot:
                         count=50
                     )
                     
-                    if df is None or df.empty:
+                    if df is None or df.empty or len(df) < 15:
                         continue
                     
                     # Calculate ATR
@@ -2074,39 +2106,110 @@ class TradingBot:
                     current_range = float(df['high'].iloc[-1] - df['low'].iloc[-1])
                     
                     # Alert if current candle range is 3x normal ATR
-                    if current_range > atr * 3:
+                    if pd.notna(atr) and atr > 0 and current_range > atr * 3:
                         volatility_alerts.append(
                             f"{symbol}: Range {current_range:.5f} is {current_range/atr:.1f}x ATR"
                         )
+                        spiking_symbols.append(symbol)
                         
                 except Exception as e:
                     logger.debug(f"Error checking volatility for {symbol}: {e}")
             
             if volatility_alerts:
-                return "; ".join(volatility_alerts)
+                return {
+                    "message": "; ".join(volatility_alerts),
+                    "symbols": spiking_symbols,
+                }
             return None
             
         except Exception as e:
             logger.error(f"Error in volatility check: {e}")
             return None
     
-    async def _handle_high_volatility(self, alert: str):
+    async def _handle_high_volatility(self, alert):
         """
-        Handle high volatility conditions.
-        Options: widen stops, close positions, or alert only.
+        Defensive response to a volatility spike (never closes positions):
+
+        1. Pause new entries for VOLATILITY_PAUSE_MINUTES.
+        2. Cancel unfilled pending orders on spiking symbols.
+        3. Tighten giveback protection for in-profit positions via the
+           position manager (existing machinery, no broker SL changes).
         """
         try:
-            # For now, just log and add to activity
+            if isinstance(alert, dict):
+                message = alert.get("message", "")
+                symbols = list(alert.get("symbols", []))
+            else:
+                message = str(alert)
+                symbols = []
+
+            now = datetime.now(timezone.utc)
+            pause_until = now + timedelta(minutes=self.VOLATILITY_PAUSE_MINUTES)
+
+            # Dedupe notifications: only announce symbols not already spiking
+            expiry_map = getattr(self, "_volatility_spike_expiry", None)
+            if expiry_map is None or not isinstance(expiry_map, dict):
+                expiry_map = {}
+            newly_spiking = [
+                s for s in symbols
+                if s not in expiry_map or expiry_map[s] < now
+            ]
+            for s in symbols:
+                expiry_map[s] = pause_until
+            self._volatility_spike_expiry = expiry_map
+
+            # 1. Pause new entries (checked by analyze_and_trade_runner)
+            self._volatility_pause_until = pause_until
+
+            # 3. Tighten giveback protection while the spike window is active
+            if self.position_manager:
+                self.position_manager.volatility_tighten_until = pause_until
+
+            # 2. Cancel unfilled pending orders on spiking symbols
+            cancelled = []
+            if self.pending_order_manager:
+                for sym in symbols:
+                    try:
+                        for order in self.pending_order_manager.get_active_orders(symbol=sym):
+                            ok = await self.pending_order_manager.cancel_order(
+                                order.ticket, reason="volatility_spike"
+                            )
+                            if ok:
+                                cancelled.append(order.ticket)
+                                logger.warning(
+                                    f"[VOLATILITY] Cancelled pending #{order.ticket} "
+                                    f"{sym} — spike in progress"
+                                )
+                    except Exception as cancel_err:
+                        logger.warning(f"[VOLATILITY] Pending cancel error for {sym}: {cancel_err}")
+
             from .api.routes.activity import add_activity
             add_activity(
                 "volatility_alert",
-                f"High volatility detected: {alert}",
+                f"High volatility: {message}",
                 None,
-                {"alert": alert, "action": "monitoring"}
+                {
+                    "alert": message,
+                    "symbols": symbols,
+                    "entries_paused_until": pause_until.isoformat(),
+                    "pending_cancelled": cancelled,
+                    "giveback_tightened": True,
+                }
             )
-            
-            # Future: Could implement emergency close-all
-            # await self._emergency_close_all("Volatility spike")
+
+            if newly_spiking:
+                logger.warning(
+                    f"[VOLATILITY] Spike on {', '.join(newly_spiking)} — new entries "
+                    f"paused {self.VOLATILITY_PAUSE_MINUTES}min, "
+                    f"{len(cancelled)} pending(s) cancelled, giveback tightened"
+                )
+                await notify(
+                    NotificationType.ALERT,
+                    f"⚡ VOLATILITY SPIKE\n\n"
+                    f"{message}\n\n"
+                    f"Entries paused {self.VOLATILITY_PAUSE_MINUTES}min | "
+                    f"{len(cancelled)} pending cancelled | protection tightened"
+                )
             
         except Exception as e:
             logger.error(f"Error handling high volatility: {e}")
@@ -3105,6 +3208,14 @@ Include brief reasoning.
                         result = await self.order_manager.close_position(position.ticket)
                         if result.success:
                             logger.info(f"Closed position {position.ticket} per Claude recommendation")
+                            # Run the unified close lifecycle (P/L from MT5,
+                            # streaks, scaling, risk release, learning) BEFORE
+                            # removing from tracking
+                            position.close_reason = "claude_close"
+                            try:
+                                await self._handle_position_close(position)
+                            except Exception as cb_err:
+                                logger.error(f"Close lifecycle error for {position.ticket}: {cb_err}")
                             self.position_manager.remove_position(position.ticket)
                             
                             from .api.routes.activity import add_activity
@@ -3148,6 +3259,7 @@ Include brief reasoning.
                                 if result.success:
                                     old_sl = position.stop_loss
                                     position.stop_loss = new_sl
+                                    self.position_manager._schedule_persist(position)
                                     logger.info(
                                         f"[TIGHTEN] {position.ticket} ({position.symbol}): "
                                         f"SL {old_sl:.5f} -> {new_sl:.5f} "
@@ -3651,6 +3763,11 @@ Respond with KEEP or CANCEL and brief reasoning (1-2 sentences).
                     result = await self.order_manager.close_position(position.ticket)
                     if result.success:
                         logger.info(f"Emergency closed position {position.ticket}")
+                        position.close_reason = "emergency_close"
+                        try:
+                            await self._handle_position_close(position)
+                        except Exception as cb_err:
+                            logger.error(f"Close lifecycle error for {position.ticket}: {cb_err}")
                         self.position_manager.remove_position(position.ticket)
                     else:
                         logger.error(f"Failed to close position {position.ticket}: {result.message}")

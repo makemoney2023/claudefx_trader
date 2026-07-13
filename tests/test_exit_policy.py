@@ -26,7 +26,7 @@ class TestExitPolicyTP1Partial:
         entry, sl = 1.1000, 1.0980
         risk = entry - sl
         tp = entry + risk * 3
-        # Bar hits 1R then reverses to SL
+        # Bar peaks at 1.6R (close 1.1R + bar high spread) then reverses to SL
         bars = _bars_from_path([entry + risk * 1.1, entry - risk * 0.5])
         outcome, total_r, _, _, _ = simulate_exit_policy_bars(
             direction="long",
@@ -35,9 +35,10 @@ class TestExitPolicyTP1Partial:
             tp=tp,
             bars=bars,
         )
-        # 40% at 1R; dynamic trail locks profit; runner exits ~1.3R on reversal
+        # Live parity: 40% at 1R (+0.40R); dynamic trail locks (1.6-1)*0.5 =
+        # 0.30R above entry; runner (60%) stops there -> 0.40 + 0.6*0.30 = 0.58R
         assert outcome == "win"
-        assert total_r == pytest.approx(1.18, abs=0.08)
+        assert total_r == pytest.approx(0.58, abs=0.05)
 
 
 class TestExitPolicyAPlus:
