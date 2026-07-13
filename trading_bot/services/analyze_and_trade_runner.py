@@ -2675,267 +2675,44 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
             # Respect Claude's explicit pending order choice — do NOT override to market
             # even during distribution phase. Claude knows the entry model.
             
-            # Add spread buffer to SL to prevent premature stop-outs from spread widening
-            _final_sl = trade_signal.stop_loss
-            _final_tp = trade_signal.take_profit
-            try:
-                import MetaTrader5 as mt5
-                _tick = await asyncio.to_thread(mt5.symbol_info_tick, symbol)
-                if _tick and _tick.ask > 0 and _tick.bid > 0:
-                    _spread = _tick.ask - _tick.bid
-                    if _spread > 0 and _final_sl:
-                        if trade_signal.direction == 'long':
-                            # Long SL is below entry, push it down by half a spread
-                            _final_sl = _final_sl - (_spread * 0.5)
-                        else:
-                            # Short SL is above entry, push it up by half a spread
-                            _final_sl = _final_sl + (_spread * 0.5)
-                        logger.info(
-                            f"[SPREAD-BUF] {symbol}: SL adjusted by 0.5x spread ({_spread:.5f}): "
-                            f"{trade_signal.stop_loss:.5f} -> {_final_sl:.5f}"
-                        )
-            except Exception as e:
-                logger.debug(f"[SPREAD-BUF] Could not adjust SL for spread: {e}")
-
-            from ..config import get_symbol_spec as _gss_final
-            _final_spec = _gss_final(symbol)
-            _final_entry = trade_signal.entry_price or current_price
-
-            _verified_lots, _, _verify_reason = verify_post_sizing_risk(
-                final_lots=position_size.lots,
-                target_lots=size_result.lots,
-                entry_price=_final_entry,
-                stop_loss=_final_sl,
+            _exec_result = await bot._execution_coordinator.execute(
+                bot=bot,
                 symbol=symbol,
+                trade_signal=trade_signal,
+                order_type=order_type,
+                entry_price=entry_price,
+                current_price=current_price,
+                position_size=position_size,
+                size_result=size_result,
+                account_info=account_info,
+                market_data=market_data,
+                is_crypto=is_crypto,
+                trade_reservation=_trade_reservation,
             )
-            if _verify_reason:
-                logger.warning(f"[POST-SIZING] {symbol}: blocked — {_verify_reason}")
+            if _exec_result.blocked:
                 await bot._reject_and_record(
                     _trade_reservation,
                     "mechanical_reject",
                     symbol,
-                    gate_id="post_sizing_risk",
+                    gate_id=_exec_result.gate_id,
                     direction=trade_signal.direction,
-                    entry=_final_entry,
-                    sl=_final_sl or 0.0,
-                    tp=_final_tp or 0.0,
+                    entry=_exec_result.final_entry,
+                    sl=_exec_result.final_sl,
+                    tp=_exec_result.final_tp,
                     confidence=trade_signal.confidence,
-                    reason=_verify_reason,
+                    reason=_exec_result.reason,
                 )
                 return
-            position_size.lots = _verified_lots
-
-            _final_lots, _, _final_risk_reason = bot._enforce_final_risk_before_order(
-                symbol=symbol,
-                entry=_final_entry,
-                stop_loss=_final_sl,
-                lots=position_size.lots,
-                account_equity=account_info.equity,
-                symbol_spec=_final_spec,
-                risk_fraction=size_result.risk_percent if hasattr(size_result, 'risk_percent') else None,
-            )
-            if _final_risk_reason:
-                logger.warning(f"[FINAL-RISK] {symbol}: blocked — {_final_risk_reason}")
-                print(f"[FINAL-RISK] {symbol}: BLOCKED — {_final_risk_reason}", flush=True)
-                await bot._reject_and_record(
-                    _trade_reservation,
-                    "mechanical_reject",
-                    symbol,
-                    gate_id="final_risk_block",
-                    direction=trade_signal.direction,
-                    entry=_final_entry,
-                    sl=_final_sl or 0.0,
-                    tp=_final_tp or 0.0,
-                    confidence=trade_signal.confidence,
-                    reason=_final_risk_reason,
-                )
-                return
-            position_size.lots = _final_lots
-            
-            # DRY-RUN MODE: Log the trade but skip actual execution
-            if settings.trading.dry_run:
-                print(
-                    f"[DRY-RUN] Would place {order_type} {trade_signal.direction.upper()} "
-                    f"{symbol} @ {trade_signal.entry_price:.5f} "
-                    f"(SL: {_final_sl:.5f}, TP: {_final_tp:.5f}, "
-                    f"Lots: {position_size.lots}, Conf: {trade_signal.confidence:.0%})",
-                    flush=True
-                )
-                logger.info(
-                    f"[DRY-RUN] {symbol}: {order_type} {trade_signal.direction} "
-                    f"@ {trade_signal.entry_price}, SL={_final_sl}, TP={_final_tp}, "
-                    f"lots={position_size.lots}, confidence={trade_signal.confidence:.0%}"
-                )
+            if _exec_result.dry_run:
                 return None
-            
-            if order_type == 'market':
-                # Tick-level micro-confirmation before market execution
-                _tick_ok = True
-                try:
-                    _tick_info = await bot.mt5_client.get_symbol_info(symbol)
-                    if _tick_info and getattr(_tick_info, 'ask', 0) > 0:
-                        _tick_bid = _tick_info.bid
-                        _tick_ask = _tick_info.ask
-                        _tick_price = _tick_ask if trade_signal.direction == 'long' else _tick_bid
-                        _tick_dev = abs(_tick_price - (trade_signal.entry_price or current_price))
-                        
-                        # Check if price has moved too far from Claude's entry (>0.5x ATR)
-                        _tick_atr = market_data.get('atr_14', 0)
-                        _tick_max_dev = _tick_atr * 0.5 if _tick_atr > 0 else (trade_signal.entry_price or current_price) * 0.003
-                        
-                        if _tick_dev > _tick_max_dev and _tick_max_dev > 0:
-                            # Price moved significantly — recalculate R:R
-                            _new_entry = _tick_price
-                            _new_sl_dist = abs(_new_entry - _final_sl)
-                            _new_tp_dist = abs(_final_tp - _new_entry)
-                            _new_rr = _new_tp_dist / _new_sl_dist if _new_sl_dist > 0 else 0
-                            
-                            if _new_rr < 1.5:
-                                logger.warning(
-                                    f"[TICK-REFINE] {symbol}: Price moved {_tick_dev:.5f} from entry "
-                                    f"(>{_tick_max_dev:.5f} limit). New R:R={_new_rr:.2f} < 1.5. Skipping."
-                                )
-                                print(
-                                    f"[TICK-REFINE] {symbol}: BLOCKED — price slipped {_tick_dev:.5f}, "
-                                    f"R:R dropped to {_new_rr:.2f}:1",
-                                    flush=True
-                                )
-                                _tick_ok = False
-                            else:
-                                trade_signal.entry_price = _new_entry
-                                logger.info(
-                                    f"[TICK-REFINE] {symbol}: Entry adjusted to live tick "
-                                    f"{_new_entry:.5f} (was {current_price:.5f}), R:R={_new_rr:.2f}"
-                                )
-                except Exception as _tick_err:
-                    logger.debug(f"[TICK-REFINE] Error for {symbol}: {_tick_err}")
-                
-                if not _tick_ok:
-                    await bot._reject_and_record(
-                        _trade_reservation,
-                        "mechanical_reject",
-                        symbol,
-                        gate_id="tick_refine_block",
-                        direction=trade_signal.direction,
-                        entry=trade_signal.entry_price or current_price,
-                        sl=_final_sl or 0.0,
-                        tp=_final_tp or 0.0,
-                        confidence=trade_signal.confidence,
-                        reason="Tick refine blocked: price slipped, R:R degraded",
-                    )
-                    return
-                
-                logger.info(f"Executing MARKET order (AMD: {trade_signal.amd_phase})")
-                
-                result = await bot._place_market_with_final_risk(
-                    symbol=symbol,
-                    direction=trade_signal.direction,
-                    lots=position_size.lots,
-                    stop_loss=_final_sl,
-                    take_profit=_final_tp,
-                    account_equity=account_info.equity,
-                    symbol_spec=_final_spec,
-                    risk_fraction=(
-                        size_result.risk_percent
-                        if hasattr(size_result, 'risk_percent')
-                        else None
-                    ),
-                    comment="ICT_Bot",
-                )
-                if result is None:
-                    await bot._reject_and_record(
-                        _trade_reservation,
-                        "mechanical_reject",
-                        symbol,
-                        gate_id="final_risk_block",
-                        direction=trade_signal.direction,
-                        entry=trade_signal.entry_price or current_price,
-                        sl=_final_sl or 0.0,
-                        tp=_final_tp or 0.0,
-                        confidence=trade_signal.confidence,
-                        reason="Final risk blocked market order",
-                    )
-                    return
-            elif order_type in ['buy_limit', 'sell_limit', 'buy_stop', 'sell_stop']:
-                # Use pending order at Claude's specified entry price
-                # Crypto trades 24/7, so give longer expiration
-                if is_crypto:
-                    expiration_minutes = 480  # 8 hours for crypto
-                else:
-                    # For forex, use session remaining but with a minimum of 60 minutes
-                    session = bot.kill_zone_checker.get_current_session() if bot.kill_zone_checker else None
-                    session_remaining = int(getattr(session, 'minutes_remaining', 240)) if session else 240
-                    expiration_minutes = max(session_remaining, 60)  # At least 1 hour
-                    expiration_minutes = min(expiration_minutes, 480)  # Max 8 hours
-                
-                logger.info(
-                    f"⏳ Placing PENDING {order_type} order @ {entry_price}, "
-                    f"expires in {expiration_minutes}min"
-                )
-                
-                # Cancel existing pending orders for the same symbol+direction to prevent pile-up
-                existing_orders = [
-                    o for o in bot.pending_order_manager.get_active_orders(symbol=symbol)
-                    if o.direction == trade_signal.direction
-                ]
-                for old_order in existing_orders:
-                    old_success = await bot._cancel_pending_for_replacement(old_order)
-                    if old_success:
-                        # Clear old signal hash
-                        old_hash = bot._get_signal_hash(symbol, old_order.direction, old_order.price)
-                        bot._recent_signal_hashes.discard(old_hash)
-                        bot._signal_hash_expiry.pop(old_hash, None)
-                        print(
-                            f"[PENDING] Cancelled old #{old_order.ticket} {symbol} {old_order.direction} "
-                            f"@ {old_order.price} — replaced by newer signal @ {entry_price}",
-                            flush=True
-                        )
-                
-                result = await bot.order_manager.place_pending_order(
-                    symbol=symbol,
-                    direction=trade_signal.direction,
-                    order_type=order_type,
-                    volume=position_size.lots,
-                    price=entry_price,
-                    stop_loss=_final_sl,
-                    take_profit=_final_tp,
-                    expiration_minutes=expiration_minutes,
-                    comment="ICT_Bot_Pending"
-                )
-                
-                # Track pending order
-                if result.success and (result.ticket or result.order_id):
-                    await bot.pending_order_manager.add_order(
-                        ticket=result.ticket or result.order_id,
-                        symbol=symbol,
-                        order_type=order_type,
-                        direction=trade_signal.direction,
-                        volume=position_size.lots,
-                        price=entry_price,
-                        stop_loss=_final_sl,
-                        take_profit=_final_tp,
-                        expiration_minutes=expiration_minutes,
-                        risk_percent=size_result.risk_percent if hasattr(size_result, 'risk_percent') else None,
-                        reservation_id=_trade_reservation.reservation_id if _trade_reservation else None,
-                    )
-                    if _trade_reservation:
-                        bot.reservation_ledger.transfer_to_pending(
-                            _trade_reservation,
-                            result.ticket or result.order_id,
-                        )
-            else:
-                # Fallback to market order if order type unclear
-                logger.info(f"📈 Executing MARKET order (fallback from {order_type})")
-                
-                result = await bot.order_manager.place_market_order(
-                    symbol=symbol,
-                    direction=trade_signal.direction,
-                    volume=position_size.lots,
-                    stop_loss=_final_sl,
-                    take_profit=_final_tp,
-                    comment="ICT_Bot"
-                )
-            
+            result = _exec_result.broker_result
+            order_type = _exec_result.order_type
+            entry_price = _exec_result.entry_price
+            _final_sl = _exec_result.final_sl
+            _final_tp = _exec_result.final_tp
+            _final_entry = _exec_result.final_entry
+            _final_spec = _exec_result.symbol_spec
+
             if result.success:
                 _risk_pct = compute_booked_risk_percent(
                     position_size.lots,

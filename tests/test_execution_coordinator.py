@@ -5,11 +5,59 @@ from types import SimpleNamespace
 
 from trading_bot.execution.trade_execution import (
     ExecutionCoordinator,
+    adjust_sl_for_spread,
     auto_convert_to_pending,
     check_position_conflicts,
+    evaluate_tick_refine,
     fix_limit_stop_labels,
+    pending_expiration_minutes,
     validate_limit_zone,
 )
+
+
+class TestSpreadBuffer:
+    def test_long_sl_moves_down(self):
+        assert adjust_sl_for_spread(1.0800, "long", 0.00020) == pytest.approx(1.07990)
+
+    def test_short_sl_moves_up(self):
+        assert adjust_sl_for_spread(1.0900, "short", 0.00020) == pytest.approx(1.09010)
+
+
+class TestTickRefine:
+    def test_blocks_when_rr_degrades(self):
+        result = evaluate_tick_refine(
+            direction="long",
+            entry_price=1.0850,
+            current_price=1.0850,
+            tick_bid=1.0860,
+            tick_ask=1.0862,
+            final_sl=1.0840,
+            final_tp=1.0865,
+            atr_14=0.0010,
+        )
+        assert result.allowed is False
+
+    def test_allows_when_rr_still_ok(self):
+        result = evaluate_tick_refine(
+            direction="long",
+            entry_price=1.0850,
+            current_price=1.0850,
+            tick_bid=1.0851,
+            tick_ask=1.0853,
+            final_sl=1.0800,
+            final_tp=1.0950,
+            atr_14=0.0100,
+        )
+        assert result.allowed is True
+
+
+class TestPendingExpiration:
+    def test_crypto_is_8_hours(self):
+        assert pending_expiration_minutes(is_crypto=True, session_remaining=60) == 480
+
+    def test_forex_clamped(self):
+        assert pending_expiration_minutes(is_crypto=False, session_remaining=30) == 60
+        assert pending_expiration_minutes(is_crypto=False, session_remaining=600) == 480
 
 
 class TestPositionConflicts:
