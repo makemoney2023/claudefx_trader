@@ -13,7 +13,7 @@ import asyncio
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Callable, Tuple
 
 import pandas as pd
 import numpy as np
@@ -24,6 +24,117 @@ from ..utils.json_helpers import sanitize_for_json
 from .replay_simulation import ReplaySignal, ReplayTrade, simulate_raw_trade as _simulate_trade
 
 logger = get_logger(__name__)
+
+DEFAULT_CRYPTO_SYMBOLS = (
+    "BTCUSD",
+    "ETHUSD",
+    "XRPUSD",
+    "ADAUSD",
+    "LTCUSD",
+    "DOGEUSD",
+    "SOLUSD",
+    "DOTUSD",
+    "EOSUSD",
+    "NEOUSD",
+    "ETCUSD",
+    "XMRUSD",
+    "ZECUSD",
+    "DASHUSD",
+    "IOTAUSD",
+    "BITUSD",
+    "USDTUSD",
+)
+
+
+@dataclass
+class GateFixtureComparison:
+    """Live phased vs replay one-shot gate outcome for one fixture."""
+
+    name: str
+    live_blocked: bool
+    replay_blocked: bool
+    live_gate_id: str
+    replay_gate_id: str
+    live_gate_path: List[str]
+    replay_gate_path: List[str]
+
+    @property
+    def paths_match(self) -> bool:
+        return (
+            self.live_blocked == self.replay_blocked
+            and self.live_gate_id == self.replay_gate_id
+            and self.live_gate_path == self.replay_gate_path
+        )
+
+
+def run_phased_live_gates(inp) -> Any:
+    """Mirror live analyze_and_trade_runner phased post-Claude gate calls."""
+    from ..services.post_claude_gates import run_post_claude_gates
+
+    price = run_post_claude_gates(inp, stop_after="price")
+    if price.blocked:
+        return price
+    entry = run_post_claude_gates(
+        inp,
+        start_at="entry",
+        stop_after="entry",
+        gate_path=price.gate_path,
+        carry=price,
+    )
+    if entry.blocked:
+        return entry
+    return run_post_claude_gates(
+        inp,
+        start_at="permission",
+        stop_after="complete",
+        ctx=entry.pipeline_ctx,
+        gate_path=entry.gate_path,
+        carry=entry,
+    )
+
+
+def compare_gate_fixture_batch(
+    fixtures: List[Tuple[str, Any]],
+    *,
+    kill_zone_checker=None,
+) -> Dict[str, Any]:
+    """
+    Run a batch of PostClaudeGateInput fixtures through live-phased and replay paths.
+
+    Returns aggregate block rates and per-fixture parity for replay validation.
+    """
+    from ..services.post_claude_gates import run_post_claude_gates
+
+    comparisons: List[GateFixtureComparison] = []
+    for name, inp in fixtures:
+        replay = run_post_claude_gates(
+            inp, kill_zone_checker=kill_zone_checker, stop_after="complete"
+        )
+        live = run_phased_live_gates(inp)
+        comparisons.append(
+            GateFixtureComparison(
+                name=name,
+                live_blocked=live.blocked,
+                replay_blocked=replay.blocked,
+                live_gate_id=live.gate_id,
+                replay_gate_id=replay.gate_id,
+                live_gate_path=list(live.gate_path),
+                replay_gate_path=list(replay.gate_path),
+            )
+        )
+
+    total = len(comparisons)
+    live_blocks = sum(1 for c in comparisons if c.live_blocked)
+    replay_blocks = sum(1 for c in comparisons if c.replay_blocked)
+    mismatches = [c for c in comparisons if not c.paths_match]
+    return {
+        "total": total,
+        "live_block_rate": live_blocks / total if total else 0.0,
+        "replay_block_rate": replay_blocks / total if total else 0.0,
+        "parity_matches": total - len(mismatches),
+        "mismatches": mismatches,
+        "comparisons": comparisons,
+    }
 
 
 def _detect_session(ts: datetime) -> str:
@@ -142,6 +253,11 @@ class ClaudeReplayBacktester:
         auto_approve_judge: bool = False,
         invoke_judge: bool = False,
         replay_account_equity: float = 2000.0,
+        scaling_manager=None,
+        correlation_service=None,
+        news_service=None,
+        replay_daily_trades: int = 0,
+        crypto_symbols: Optional[Tuple[str, ...]] = None,
     ):
         self._claude = claude_client
         self._data_loader = HistoricalDataLoader(mt5_client)
@@ -150,6 +266,11 @@ class ClaudeReplayBacktester:
         self._auto_approve_judge = auto_approve_judge
         self._invoke_judge = invoke_judge
         self._replay_account_equity = replay_account_equity
+        self._scaling_manager = scaling_manager
+        self._correlation_service = correlation_service
+        self._news_service = news_service
+        self._replay_daily_trades = replay_daily_trades
+        self._crypto_symbols = crypto_symbols or DEFAULT_CRYPTO_SYMBOLS
         from ..services.trade_judge import JudgeOutcome, JudgeVerdict
 
         if auto_approve_judge:
@@ -162,6 +283,95 @@ class ClaudeReplayBacktester:
                 verdict=JudgeVerdict.REJECT,
                 reason="replay requires judge invocation (no auto-approve)",
             )
+
+    def _replay_correlation_check(
+        self, symbol: str, direction: str
+    ) -> Tuple[bool, str]:
+        if self._correlation_service is None:
+            return False, ""
+        return self._correlation_service.should_block_trade(
+            symbol, direction=direction
+        )
+
+    def should_skip_for_news(self, symbol: str) -> Tuple[bool, str]:
+        """Mirror live cycle news blackout / fail-closed calendar checks."""
+        if self._news_service is None:
+            return False, ""
+        is_blackout, reason = self._news_service.is_blackout_period()
+        if is_blackout and symbol not in self._crypto_symbols:
+            return True, f"news_blackout:{reason}"
+        if getattr(self._news_service, "is_calendar_unreliable", lambda: False)():
+            return True, "news_calendar_stale"
+        from ..services.live_trade_gates import news_allows_trading
+
+        allowed, fail_reason = news_allows_trading(self._news_service)
+        if not allowed:
+            return True, fail_reason
+        return False, ""
+
+    def build_post_claude_gate_input(
+        self,
+        *,
+        symbol: str,
+        trade_signal,
+        norm,
+        market_data: Dict[str, Any],
+        analysis_results: Dict[str, Any],
+        pd_analysis,
+        current_price: float,
+        df: pd.DataFrame,
+        snapshot_time: datetime,
+        zone_settings,
+        use_zone_gate: bool,
+        last_signal_direction: Dict[str, Dict[str, Any]],
+        direction_flipped: bool,
+        session_name: str = "",
+        is_kill_zone: bool = False,
+    ):
+        """Build PostClaudeGateInput with optional live parity services."""
+        from ..services.post_claude_gates import (
+            PostClaudeGateInput,
+            SecondaryModifierInput,
+        )
+
+        correlation_check: Optional[Callable[[], Tuple[bool, str]]] = None
+        if self._correlation_service is not None:
+            direction = getattr(trade_signal, "direction", "")
+
+            def _correlation_check(
+                _symbol=symbol, _direction=direction
+            ) -> Tuple[bool, str]:
+                return self._replay_correlation_check(_symbol, _direction)
+
+            correlation_check = _correlation_check
+
+        scaling_aggressive = (
+            self._scaling_manager is not None
+            and getattr(self._scaling_manager.current_mode, "value", "") == "aggressive"
+        )
+        return PostClaudeGateInput(
+            symbol=symbol,
+            trade_signal=trade_signal,
+            norm=norm,
+            market_data=market_data,
+            analysis_results=analysis_results or {},
+            pd_analysis=pd_analysis,
+            current_price=current_price,
+            df=df,
+            snapshot_time=snapshot_time,
+            zone_settings=zone_settings,
+            use_zone_gate=use_zone_gate,
+            last_signal_direction=last_signal_direction,
+            direction_flipped=direction_flipped,
+            apply_secondary_modifiers=True,
+            modifier_input=SecondaryModifierInput(),
+            scaling_manager=self._scaling_manager,
+            daily_trades=self._replay_daily_trades,
+            scaling_aggressive=scaling_aggressive,
+            correlation_check=correlation_check,
+            session_name=session_name,
+            is_kill_zone=is_kill_zone,
+        )
 
     async def invoke_judge_for_signal(
         self,
@@ -598,15 +808,21 @@ class ClaudeReplayBacktester:
                     current += timedelta(hours=interval_hours)
                     step_idx += 1
                     continue
+                _news_skip, _news_reason = self.should_skip_for_news(symbol)
+                if _news_skip:
+                    logger.info(
+                        f"[REPLAY] {current.strftime('%m/%d %H:%M')} "
+                        f"NEWS blocked {symbol}: {_news_reason}"
+                    )
+                    signals_processed += 1
+                    current += timedelta(hours=interval_hours)
+                    step_idx += 1
+                    continue
                 _zone_gate_decision = "no_gate"
                 if sig.direction != 'no_trade' and sig.entry_price and sig.stop_loss and sig.take_profit:
                     from ..config import settings as _bt_settings
                     from ..services.entry_gates import ZoneGateSettings, should_use_zone_gate
-                    from ..services.post_claude_gates import (
-                        PostClaudeGateInput,
-                        SecondaryModifierInput,
-                        run_post_claude_gates,
-                    )
+                    from ..services.post_claude_gates import run_post_claude_gates
                     from ..analysis.kill_zones import KillZoneChecker
 
                     _zone_settings = ZoneGateSettings(
@@ -625,7 +841,9 @@ class ClaudeReplayBacktester:
                     _replay_last_dir: Dict[str, Dict[str, Any]] = getattr(
                         self, "_replay_last_signal_direction", {}
                     )
-                    _pc_inp = PostClaudeGateInput(
+                    _kz = KillZoneChecker()
+                    _session_name = _detect_session(current)
+                    _pc_inp = self.build_post_claude_gate_input(
                         symbol=symbol,
                         trade_signal=sig,
                         norm=_norm,
@@ -639,10 +857,9 @@ class ClaudeReplayBacktester:
                         use_zone_gate=_use_zone,
                         last_signal_direction=_replay_last_dir,
                         direction_flipped=_norm.direction_flipped,
-                        apply_secondary_modifiers=True,
-                        modifier_input=SecondaryModifierInput(),
+                        session_name=_session_name,
+                        is_kill_zone=_kz.is_kill_zone(current),
                     )
-                    _kz = KillZoneChecker()
                     _gate_result = run_post_claude_gates(
                         _pc_inp,
                         kill_zone_checker=_kz,

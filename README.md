@@ -244,7 +244,7 @@ Uses Claude Opus 4.5 vision API to analyze chart screenshots and generate trade 
 - **Trade Judge failure policy**: Judge timeouts, API errors, malformed verdicts, and missing client all map to `UNAVAILABLE` and **block execution entirely** (reservation released). Only an explicit `DEMOTE` permits reduced/pending execution.
 - **A+ exits**: TP1 skip and accelerated profit protection apply only to positions explicitly classified and persisted as A+ at creation; ordinary intraday/swing trades keep standard multi-TP behavior.
 - **Decision telemetry**: Every terminal gate outcome writes a `decision_records` row; blocked/DEMOTE/unfilled decisions receive MFE/MAE and hypothetical TP/SL outcomes via the outcome worker.
-- **Replay limitations**: Backtest/replay routes shared judge, pending, final-risk, confidence, and exit policy, but Windows MT5 broker fills, hedging ticket identity, and live news freshness are not fully simulated on macOS/Linux.
+- **Replay limitations**: Backtest/replay routes shared judge, pending, final-risk, confidence, post-Claude gates, and exit policy. Optional `scaling_manager`, `correlation_service`, and `news_service` can be injected into `ClaudeReplayBacktester` for live parity. Windows MT5 broker fills, hedging ticket identity, and live news calendar freshness are not fully simulated on macOS/Linux.
 
 ### Windows MT5 verification
 
