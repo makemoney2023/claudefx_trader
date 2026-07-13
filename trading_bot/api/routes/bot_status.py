@@ -317,7 +317,7 @@ def get_bot_state() -> BotState:
     return bot_state
 
 
-@router.post("/start")
+@router.post("/start", dependencies=[Depends(RequireAuth())])
 async def start_bot():
     """
     Start the trading bot.
@@ -345,7 +345,7 @@ async def start_bot():
         return {"status": "failed", "message": f"Bot start error: {str(e)}"}
 
 
-@router.post("/stop")
+@router.post("/stop", dependencies=[Depends(RequireAuth())])
 async def stop_bot():
     """
     Stop the trading bot.
