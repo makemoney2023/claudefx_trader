@@ -21,32 +21,68 @@ An AI-powered forex trading bot combining ICT (Inner Circle Trading), Market Mak
 ```
 trading_bot/
 ├── __init__.py              # Package initialization
-├── config.py                # Configuration management
-├── main.py                  # Main entry point
-├── analysis/                # Technical analysis modules
+├── config.py                # Configuration + per-symbol specs
+├── main.py                  # TradingBot orchestrator (cycles, state, telemetry)
+├── analysis/                # 22 technical analysis modules
 │   ├── market_structure.py  # BOS, CHoCH, MSS detection
 │   ├── fair_value_gap.py    # FVG detection
 │   ├── order_blocks.py      # Order block detection
 │   ├── liquidity.py         # Liquidity pool mapping
-│   └── kill_zones.py        # Session timing
+│   ├── kill_zones.py        # Session timing
+│   ├── mtf_analyzer.py      # Multi-timeframe bias
+│   ├── regime_classifier.py # Trend/range regime
+│   ├── amd_cycle.py         # Accumulation/Manipulation/Distribution
+│   ├── silver_bullet.py     # Silver Bullet windows
+│   ├── volume_profile.py    # POC/VAH/VAL
+│   └── ...                  # fibonacci, ipda, nwog, displacement, etc.
 ├── llm/                     # Claude integration
-│   ├── claude_client.py     # Claude API client
+│   ├── claude_client.py     # Claude API client (chart vision + judge)
 │   ├── context_builder.py   # Strategy context loader
 │   └── prompts.py           # Prompt templates
+├── services/                # Pipeline stages + supporting services
+│   ├── trade_pipeline.py            # TradePipeline orchestrator
+│   ├── analyze_and_trade_runner.py  # run_analyze_and_trade (live flow)
+│   ├── analysis_orchestrator.py     # MTF/chart package building
+│   ├── claude_analysis_stage.py     # ClaudeAnalysisStage (run_stage)
+│   ├── expanded_analysis.py         # Extended ICT analysis
+│   ├── post_claude_gates.py         # Shared post-Claude gate chain (live/replay)
+│   ├── entry_gates.py / gate_pipeline.py / scaling_gates.py
+│   ├── signal_normalizer.py         # Price normalization + flip detection
+│   ├── trade_judge.py               # Live + replay judge adapter
+│   ├── trade_context.py             # TradeContext model
+│   ├── scaling_manager.py           # Trading modes + drawdown control
+│   ├── correlation_service.py       # Correlated exposure control
+│   ├── news_service.py              # Economic calendar + blackouts
+│   ├── session_analytics.py         # Per-session performance
+│   ├── goal_tracker.py              # $1K→$100K progress
+│   ├── pending_order_manager.py     # Pending order lifecycle
+│   ├── trade_reservations.py        # Trade slot reservations
+│   ├── trade_learning_service.py    # Post-trade review + knowledge base
+│   └── firecrawl_intelligence.py    # Market intelligence pipeline
 ├── execution/               # Trade execution
-│   ├── risk_manager.py      # Position sizing
-│   ├── order_manager.py     # Order placement
-│   └── position_manager.py  # Position tracking
+│   ├── risk_manager.py              # Base risk model
+│   ├── scaling_position_sizer.py    # Tier-based position sizing
+│   ├── order_manager.py             # Order placement
+│   ├── position_manager.py          # Position tracking + multi-TP exits
+│   ├── exit_policy.py               # A+ / peak-profit / reversal protection
+│   ├── trade_execution.py           # ExecutionCoordinator
+│   └── trade_fill_handler.py        # Post-fill handling + reservation release
+├── backtesting/             # Validation suite
+│   ├── engine.py                    # Standard ICT backtest
+│   ├── replay.py                    # ClaudeReplayBacktester (AI replay)
+│   ├── replay_simulation.py         # Raw trade simulation
+│   ├── execution_policy.py          # Shared judge/pending/exit policy
+│   ├── optimizer.py                 # Walk-forward optimizer
+│   ├── simulator.py / costs.py / metrics.py / report.py
 ├── mt5/                     # MT5 integration
 │   ├── client.py            # MT5 MCP client
 │   └── data_fetcher.py      # Market data retrieval
 ├── strategy/                # Trading strategies
 │   └── ict_strategy.py      # ICT strategy implementation
-├── utils/                   # Utility functions
-│   ├── logging.py           # Structured logging
-│   ├── candle_utils.py      # Candle analysis
-│   └── chart_screenshot.py  # Chart visualization
-└── docs/                    # Strategy documentation
+├── api/                     # FastAPI backend
+│   └── routes/              # 18 route groups + WebSocket server
+├── utils/                   # Utility functions (logging, candles, charts)
+└── docs/                    # 21 ICT strategy documents
     ├── ict_strategy.md
     ├── market_structure.md
     ├── fair_value_gap.md
@@ -192,8 +228,17 @@ npm run dev
 
 ### Running Tests
 
+The suite has 67 test modules (1,180+ tests) covering analysis modules, the staged
+trade pipeline, post-Claude gate parity, judge policy, replay integration, and live
+readiness. New work follows test-driven development.
+
 ```bash
+# Full suite
 pytest tests/ -v
+
+# Pipeline + replay parity focus
+pytest tests/test_pipeline_integration.py tests/test_replay_integration.py \
+       tests/test_post_claude_gates.py -v
 ```
 
 ### Running with Coverage
@@ -204,9 +249,45 @@ pytest tests/ --cov=trading_bot --cov-report=html
 
 ### Running Backtests
 
+Three validation modes are available (see [Backtesting](#backtesting-and-validation)):
+
 ```bash
+# Standard ICT backtest against historical OHLCV
 python -m trading_bot.backtesting.engine
+
+# Claude AI replay / walk-forward optimizer are invoked via the
+# backtesting runner and the dashboard Backtesting page
+python -m trading_bot.backtesting.run
 ```
+
+## Trade Pipeline Architecture
+
+The live analyze-and-trade flow is a staged pipeline. `main.py` orchestrates but
+delegates policy to dedicated modules so live and replay share the same logic.
+
+```
+TradePipeline.run(symbol)
+        │
+        ├── AnalysisOrchestrator      → MTF analysis, ICT modules, chart package
+        ├── ClaudeAnalysisStage       → context build, Claude vision call, no_trade handling
+        ├── signal_normalizer         → price normalization + direction-flip detection
+        ├── post_claude_gates         → shared gate chain (phased in live, one-shot in replay)
+        │     • ATR-SL adjustment, R:R hard floor, counter-trend scalp
+        │     • entry gates (zone / M15 / HTF alignment)
+        │     • permission gates (scaling, correlation, min-confidence)
+        │     • flip guard
+        ├── ExecutionCoordinator      → position sizing + broker order placement
+        └── TradeFillHandler          → fills, DB, notifications, reservation release on failure
+```
+
+Key parity guarantees:
+
+- **Shared gates**: `post_claude_gates.run_post_claude_gates()` is the single source of
+  truth. Live runs it phased (`price` → `entry` → `permission`) so scaling mode can refresh
+  between entry and permission; replay runs it one-shot. Both produce identical `gate_path`.
+- **Shared judge**: `trade_judge.py` exposes the same fail-closed judge to live and replay.
+- **Reservation safety**: execution failures release the trade reservation unless the fill is
+  reconciled from MT5.
 
 ## Trading Strategy
 
@@ -249,6 +330,24 @@ Uses Claude Opus 4.5 vision API to analyze chart screenshots and generate trade 
 ### Windows MT5 verification
 
 Live execution requires Windows with MetaTrader 5 installed. Run `python test_mt5_connection.py` on the Windows host before paper promotion. macOS/Linux development uses simulation mode only.
+
+## Backtesting and Validation
+
+Three modes validate different layers of the system:
+
+1. **Standard ICT backtest** (`backtesting/engine.py`) — strategy against historical
+   OHLCV with simulated spread/slippage/commission. Reports win rate, Sharpe, profit
+   factor, max drawdown, R-multiples.
+2. **Claude Replay** (`backtesting/replay.py`) — replays historical charts through the
+   full AI pipeline (chart → Claude → shared post-Claude gates → judge → exit policy).
+   Optional `scaling_manager`, `correlation_service`, and `news_service` can be injected
+   into `ClaudeReplayBacktester` for live parity. Tracks MFE/MAE and separates raw-strategy
+   R from execution-policy R.
+3. **Walk-forward optimizer** (`backtesting/optimizer.py`) — optimizes gate parameters with
+   in-sample/out-of-sample folds to avoid overfitting.
+
+Live/replay parity is enforced by the shared `post_claude_gates` and `trade_judge` modules
+and verified by `tests/test_replay_integration.py` and `tests/test_readiness_replay_parity.py`.
 
 ## Risk Management (strategy)
 

@@ -16,9 +16,10 @@ MetaTrader 5 (execution)
   Python Backend (FastAPI, async)
   ├── 22 Analysis Modules (ICT concepts)
   ├── Claude AI (chart vision + structured signals)
-  ├── 10 Services (risk, learning, scaling, news, intelligence)
+  ├── Staged Trade Pipeline (analysis → Claude → shared gates → execution → fill)
+  ├── 27 Services (pipeline stages, risk, learning, scaling, news, intelligence)
   ├── Execution Engine (orders, positions, trailing, multi-TP)
-  ├── Backtesting Suite (standard, AI replay, walk-forward)
+  ├── Backtesting Suite (standard, AI replay, walk-forward) — shares live gate/judge policy
   ├── SQLite Database (9 tables, WAL mode)
   └── WebSocket Server (5 channels, real-time push)
        |
@@ -115,7 +116,7 @@ Pending orders receive kill-zone-based expiration (auto-cancel when the active s
 
 **Decision telemetry schema:** `decision_records` captures every terminal gate outcome (approve, demote, reject, mechanical block, expired, cancelled). The outcome worker attaches MFE/MAE and hypothetical TP/SL results to blocked and unfilled decisions for expectancy analytics.
 
-**Replay limitations:** Backtest/replay shares live judge, pending, final-risk, confidence, and exit policy, but macOS/Linux cannot verify Windows MT5 ticket identity, broker tick values, or live news freshness. Run `python test_mt5_connection.py` on Windows before paper promotion.
+**Replay limitations:** Backtest/replay shares live judge, pending, final-risk, confidence, post-Claude gates, and exit policy through the `post_claude_gates` and `trade_judge` modules — verified by dedicated parity tests. Optional `scaling_manager`, `correlation_service`, and `news_service` can be injected into `ClaudeReplayBacktester` to match live gating. macOS/Linux still cannot verify Windows MT5 ticket identity, broker tick values, or live news calendar freshness; run `python test_mt5_connection.py` on Windows before paper promotion.
 
 ### 6. Market Intelligence Pipeline
 
@@ -142,7 +143,7 @@ This is not a prototype. The system includes:
 - **Real-time communication**: WebSocket server with 5 channels (trades, prices, analysis, activity, all), broadcasting 30+ event types from trade lifecycle, signal generation, and bot state changes. Frontend hooks with auto-reconnect, exponential backoff, and ping/pong keepalive
 - **Notifications**: Telegram bot integration for trade alerts, errors, and status updates
 - **State persistence**: Full bot state serialized to JSON for crash recovery (streaks, scaling mode, signal hashes, pending orders, goal tracker snapshots)
-- **Testing**: 36 test modules covering critical paths, edge protection, live readiness, learning system integration, WebSocket infrastructure, and individual analysis modules
+- **Testing**: 67 test modules (1,180+ tests) covering critical paths, the staged trade pipeline, post-Claude gate/replay parity, judge policy, edge protection, live readiness, learning system integration, WebSocket infrastructure, and individual analysis modules
 - **Duplicate prevention**: Signal hashing prevents the same setup from being traded twice
 - **Cooldowns**: Post-loss cooldown (15-30 min) and per-symbol analysis cooldown (5 min) prevent revenge trading and API waste
 
@@ -246,13 +247,13 @@ Every symbol has defined contract size, pip size, pip value, minimum SL distance
 |--------|-------|
 | Analysis modules | 22 |
 | ICT strategy documents | 21 |
-| Backend services | 10 |
+| Backend services | 27 |
 | API route groups | 18 |
 | WebSocket channels | 5 |
 | Database tables | 9 |
 | Dashboard pages | 17 |
 | Dashboard components | 12 |
-| Test modules | 36 |
+| Test modules | 67 (1,180+ tests) |
 | Python dependencies | 20+ |
 
 ---
@@ -288,4 +289,4 @@ As equity grows, the system automatically adjusts position sizing, risk toleranc
 
 ---
 
-*Document generated from codebase review -- March 2026*
+*Document generated from codebase review -- March 2026; updated July 2026 (staged pipeline extraction, shared post-Claude gates, live/replay parity).*
