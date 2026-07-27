@@ -1,7 +1,7 @@
 """
 LLM integration modules for chart analysis and trade decisions.
 
-Provides Claude Opus 4.5 integration for:
+Provides Claude Opus 5 integration for:
 - Chart screenshot analysis using vision API
 - Strategy context loading
 - Trade signal generation

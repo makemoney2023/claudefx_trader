@@ -330,9 +330,9 @@ class ClaudeSettings(BaseSettings):
     )
     
     api_key: str = Field(default="", description="Anthropic API key")
-    model: str = Field(default="claude-sonnet-4-5-20250929", description="Legacy/default model setting. All runtime calls (heavy AND light tasks) now use claude-opus-4-8, set in ClaudeClient.__init__.")
-    max_tokens: int = Field(default=4096, description="Legacy default. Each Opus 4.8 call sets its own budget (thinking + response).")
-    temperature: float = Field(default=0.3, description="Legacy sampling temperature. NOT sent to any Opus 4.8 call, which rejects non-default sampling params.")
+    model: str = Field(default="claude-sonnet-4-5-20250929", description="Legacy/default model setting. All runtime calls (heavy AND light tasks) now use claude-opus-5, set in ClaudeClient.__init__.")
+    max_tokens: int = Field(default=4096, description="Legacy default. Each Opus 5 call sets its own budget (thinking + response).")
+    temperature: float = Field(default=0.3, description="Legacy sampling temperature. NOT sent to any Opus 5 call, which rejects non-default sampling params.")
 
 
 class TradingSettings(BaseSettings):
@@ -683,12 +683,19 @@ def get_mt5_config() -> dict:
 
 
 def get_claude_config() -> dict:
-    """Get Claude configuration as dictionary."""
+    """Get Claude configuration as dictionary.
+
+    Runtime model/effort/max_tokens are owned by ``ClaudeClient`` (Opus 5).
+    ``settings.claude.model`` / ``max_tokens`` / ``temperature`` are legacy
+    knobs and are not what live calls use.
+    """
     return {
         "api_key": settings.claude.api_key,
-        "model": settings.claude.model,
-        "max_tokens": settings.claude.max_tokens,
-        "temperature": settings.claude.temperature,
+        "model": "claude-opus-5",
+        "max_tokens": 32000,
+        # temperature is intentionally omitted — Opus 5 rejects non-default sampling
+        "legacy_settings_model": settings.claude.model,
+        "legacy_settings_max_tokens": settings.claude.max_tokens,
     }
 
 

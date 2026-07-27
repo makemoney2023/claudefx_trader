@@ -225,10 +225,14 @@ async def save_signal_to_db(
 # -----------------------------------------------------------------------------
 # These never change between calls, so they go in prompt-cached system blocks
 # instead of being rebuilt into every re-eval user prompt (the re-eval loops run
-# every ~60-120s on Opus 4.8, so caching pays for itself within one cycle).
+# every ~60-120s on Opus 5, so caching pays for itself within one cycle).
 # =============================================================================
 
 POSITION_REEVAL_RULES = """You re-evaluate an open trading position described in the user message.
+
+## SCOPE
+Deliver only a HOLD / CLOSE / TIGHTEN decision for this open position. Do not widen
+into market re-analysis, strategy advice, or unsolicited checklist items.
 
 ## Context -- BE PATIENT
 Good entries need time to develop. Closing too early is worse than holding through
@@ -261,10 +265,19 @@ Default to HOLD unless there is strong evidence the thesis is broken.
 The FIRST WORD of your reply MUST be exactly one of: HOLD, CLOSE, or TIGHTEN
 (uppercase, nothing before it — no preamble, no markdown, no "My recommendation is").
 After that first word, add a brief 1-2 sentence reasoning on the same or next line.
+No filler and no restating these rules.
 Example: "HOLD — thesis intact, price consolidating above the OB, still +0.4R."
+
+<tone_preference>
+Keep outputs reasonably concise. 1-2 sentences of reasoning max.
+</tone_preference>
 """
 
 PENDING_REEVAL_RULES = """You re-evaluate a pending (unfilled) order described in the user message.
+
+## SCOPE
+Deliver only a KEEP / CANCEL decision for this pending order. Do not widen into
+unsolicited market commentary or strategy advice.
 
 ## Decision
 The order has been waiting without filling. Choose one:
@@ -276,7 +289,12 @@ Consider: Is price moving TOWARD or AWAY from the entry? Has the entry zone been
 ## OUTPUT CONTRACT (strict)
 The FIRST WORD of your reply MUST be exactly KEEP or CANCEL (uppercase, nothing before it —
 no preamble, no markdown). After that first word, add a brief 1-2 sentence reasoning.
+No filler and no restating these rules.
 Example: "KEEP — price still coiling below the FVG, entry zone intact."
+
+<tone_preference>
+Keep outputs reasonably concise. 1-2 sentences of reasoning max.
+</tone_preference>
 """
 
 
@@ -286,7 +304,7 @@ class TradingBot:
     
     Implements the ICT/Market Maker/FVG trading strategy using:
     - MT5 Client for market data and trade execution
-    - Claude Opus 4.8 for intelligent chart analysis
+    - Claude Opus 5 for intelligent chart analysis
     - Comprehensive strategy documentation for LLM context
     """
     
@@ -1447,15 +1465,14 @@ class TradingBot:
                         
                         print(f"[CYCLE] Analyzing {sym} (crypto={is_crypto})...", flush=True)
                         # Per-symbol timeout to prevent one slow symbol from blocking the
-                        # batch. Covers the full pipeline: Opus 4.8 high-effort analysis
-                        # (can exceed 100s with thinking + images) + judge + execution,
-                        # so the old Sonnet-era 120s budget was too tight.
+                        # batch. Covers Opus 5 medium-effort streamed analysis (32k budget,
+                        # thinking + images can still take minutes) + judge + execution.
                         await asyncio.wait_for(
                             self._analyze_and_trade(sym, is_crypto=is_crypto),
-                            timeout=300.0
+                            timeout=420.0
                         )
                     except asyncio.TimeoutError:
-                        logger.error(f"Analysis of {sym} TIMED OUT after 300s - skipping")
+                        logger.error(f"Analysis of {sym} TIMED OUT after 420s - skipping")
                     except Exception as e:
                         logger.error(f"Error analyzing {sym}: {e}")
                 
@@ -2479,7 +2496,7 @@ class TradingBot:
             signal_dict,
             risk_metrics,
             learning_context,
-            timeout=45.0,  # Opus 4.8 + high-effort thinking; 8s would fail-close every trade
+            timeout=45.0,  # Opus 5 + adaptive thinking; 8s would fail-close every trade
         )
         logger.info(
             f"[JUDGE] {symbol} {trade_signal.direction}: {outcome.verdict.value} "
@@ -2512,7 +2529,7 @@ class TradingBot:
             signal_dict,
             risk_metrics,
             learning_context,
-            timeout=45.0,  # Opus 4.8 + high-effort thinking; 8s would fail-close every trade
+            timeout=45.0,  # Opus 5 + adaptive thinking; 8s would fail-close every trade
         )
 
     def _build_pipeline_context(
@@ -3177,13 +3194,13 @@ Apply the evaluation rules from the system message and reply per the OUTPUT CONT
                     })
                     
                     # Get Claude's recommendation (with timeout and validation).
-                    # Opus 4.8: no temperature; adaptive thinking + light effort. Budget
+                    # Opus 5: no temperature; adaptive thinking + light effort. Budget
                     # covers thinking + reply; timeout raised for the bigger model.
                     try:
                         response = await asyncio.wait_for(
                             self.claude_client.async_client.messages.create(
                                 model=self.claude_client.model_light,
-                                max_tokens=2000,
+                                max_tokens=3000,  # thinking + short HOLD/CLOSE/TIGHTEN reply
                                 thinking={"type": "adaptive"},
                                 output_config={"effort": self.claude_client.effort_light},
                                 system=[{
@@ -3196,7 +3213,7 @@ Apply the evaluation rules from the system message and reply per the OUTPUT CONT
                                     "content": chart_content
                                 }]
                             ),
-                            timeout=60  # timeout per position (Opus 4.8 + thinking)
+                            timeout=60  # timeout per position (Opus 5 + thinking)
                         )
                     except asyncio.TimeoutError:
                         logger.warning(f"Claude reevaluation timed out for {position.symbol}")
@@ -3712,11 +3729,11 @@ Apply the evaluation rules from the system message and reply per the OUTPUT CONT
                     pending_chart_content.append({"type": "text", "text": prompt})
                     
                     try:
-                        # Opus 4.8: no temperature; adaptive thinking + light effort.
+                        # Opus 5: no temperature; adaptive thinking + light effort.
                         response = await asyncio.wait_for(
                             self.claude_client.async_client.messages.create(
                                 model=self.claude_client.model_light,
-                                max_tokens=1500,
+                                max_tokens=2500,  # thinking + short KEEP/CANCEL reply
                                 thinking={"type": "adaptive"},
                                 output_config={"effort": self.claude_client.effort_light},
                                 system=[{
@@ -3726,7 +3743,7 @@ Apply the evaluation rules from the system message and reply per the OUTPUT CONT
                                 }],
                                 messages=[{"role": "user", "content": pending_chart_content}]
                             ),
-                            timeout=45  # Opus 4.8 + thinking needs more headroom than Sonnet
+                            timeout=45  # Opus 5 + thinking needs more headroom than Sonnet
                         )
                     except asyncio.TimeoutError:
                         logger.warning(f"Pending order re-eval timed out for {symbol}")

@@ -1,6 +1,6 @@
 # ICT Trading Bot Dependencies
 
-# Claude Opus 4.5 API
+# Claude Opus 5 API
 anthropic>=0.40.0
 
 # Data Processing

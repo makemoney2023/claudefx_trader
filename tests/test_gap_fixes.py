@@ -913,8 +913,10 @@ class TestTradeJudgeMechanical:
             client.model = "test"
             client.model_heavy = "test"
             client.model_light = "test"
-            client.effort_heavy = "high"
-            client.effort_light = "medium"
+            client.effort_heavy = "medium"
+            client.effort_judge = "medium"
+            client.effort_light = "low"
+            client.effort_review = "medium"
             client.max_tokens = 4096
             client.temperature = 0.3
             client.max_retries = 3
@@ -1051,9 +1053,9 @@ class TestTradeJudgeMechanical:
         assert result['verdict'] == 'UNAVAILABLE', "API error should fail closed"
 
     @pytest.mark.asyncio
-    async def test_judge_uses_opus_48_request_shape(self):
-        """Heavy judge call must be Opus 4.8 compatible: no temperature, adaptive
-        thinking, explicit effort. Also verifies a leading thinking block is skipped."""
+    async def test_judge_uses_opus_5_request_shape(self):
+        """Judge call must be Opus 5 compatible: no temperature, adaptive
+        thinking, explicit judge effort. Also verifies a leading thinking block is skipped."""
         client = self._get_claude_client()
 
         thinking_block = MagicMock(type='thinking', thinking='deliberating...')
@@ -1079,9 +1081,9 @@ class TestTradeJudgeMechanical:
         assert result['verdict'] == 'APPROVE'
 
         kwargs = client.async_client.messages.create.call_args.kwargs
-        assert 'temperature' not in kwargs, "Opus 4.8 rejects temperature"
+        assert 'temperature' not in kwargs, "Opus 5 rejects temperature"
         assert kwargs.get('thinking') == {'type': 'adaptive'}
-        assert kwargs.get('output_config', {}).get('effort') == 'high'
+        assert kwargs.get('output_config', {}).get('effort') == 'medium'
         # Structured output: the judge constrains its verdict to a JSON schema.
         fmt = kwargs.get('output_config', {}).get('format', {})
         assert fmt.get('type') == 'json_schema', "Judge should request json_schema output"
@@ -1132,14 +1134,16 @@ class TestTradeJudgeMechanical:
         # The retry must NOT include the format constraint.
         retry_kwargs = client.async_client.messages.create.call_args_list[1].kwargs
         assert 'format' not in retry_kwargs.get('output_config', {})
+        assert retry_kwargs.get('output_config', {}).get('effort') == 'medium', \
+            "Judge retry must keep effort_judge (medium), not fall back to effort_heavy"
 
 
 # ============================================================
-# 21c. Opus 4.8 Everywhere — Strict Tool + Light-Task Shape
+# 21c. Opus 5 Everywhere — Strict Tool + Light-Task Shape
 # ============================================================
 
-class TestOpus48Everywhere:
-    """All Claude calls (light tasks included) run on Opus 4.8 with valid params."""
+class TestOpus5Everywhere:
+    """All Claude calls (light tasks included) run on Opus 5 with valid params."""
 
     def _get_claude_client(self):
         from trading_bot.llm.claude_client import ClaudeClient
@@ -1147,11 +1151,13 @@ class TestOpus48Everywhere:
             client = ClaudeClient.__new__(ClaudeClient)
             client.api_key = "test"
             client.model = "test"
-            client.model_heavy = "claude-opus-4-8"
-            client.model_light = "claude-opus-4-8"
-            client.effort_heavy = "high"
-            client.effort_light = "medium"
-            client.max_tokens = 16000
+            client.model_heavy = "claude-opus-5"
+            client.model_light = "claude-opus-5"
+            client.effort_heavy = "medium"
+            client.effort_judge = "medium"
+            client.effort_light = "low"
+            client.effort_review = "medium"
+            client.max_tokens = 32000
             client.temperature = 0.3
             client.max_retries = 3
             client._cache = MagicMock()
@@ -1163,14 +1169,20 @@ class TestOpus48Everywhere:
             client.async_client = None
             return client
 
-    def test_model_light_is_opus_48(self):
-        """__init__ source must point model_light at Opus 4.8 (no more Sonnet split)."""
+    def test_model_light_is_opus_5(self):
+        """__init__ source must point model_light at Opus 5 (no Sonnet/4.8 split)."""
         import inspect
         from trading_bot.llm.claude_client import ClaudeClient
 
         source = inspect.getsource(ClaudeClient.__init__)
-        assert 'self.model_light = "claude-opus-4-8"' in source
+        assert 'self.model_light = "claude-opus-5"' in source
+        assert 'self.model_heavy = "claude-opus-5"' in source
+        assert 'self.effort_heavy = "medium"' in source
         assert 'self.effort_light' in source
+        assert 'self.effort_judge' in source
+        assert 'self.effort_review' in source
+        # Opus 5 thinking needs headroom above the old 16k ceiling.
+        assert 'max_tokens: int = 32000' in source or 'max_tokens: int = 64000' in source
 
     def test_trade_signal_tool_is_strict(self):
         """The analysis tool must use strict tool use with a strict-compatible schema."""
@@ -1188,7 +1200,7 @@ class TestOpus48Everywhere:
             "strict tool schemas must not contain numeric range constraints"
 
     def test_no_light_call_sends_temperature(self):
-        """All light-task methods must route through the shared Opus 4.8 JSON helper."""
+        """All light-task methods must route through the shared Opus 5 JSON helper."""
         import inspect
         from trading_bot.llm.claude_client import ClaudeClient
 
@@ -1208,7 +1220,7 @@ class TestOpus48Everywhere:
 
     @pytest.mark.asyncio
     async def test_light_task_request_shape(self):
-        """A representative light task must use Opus 4.8 params and skip thinking blocks."""
+        """A review light task must use Opus 5 params, review effort, and skip thinking blocks."""
         client = self._get_claude_client()
 
         thinking_block = MagicMock(type='thinking', thinking='pondering...')
@@ -1227,7 +1239,7 @@ class TestOpus48Everywhere:
 
         assert result['grade'] == 'A', "Should parse text block, skipping the thinking block"
         kwargs = client.async_client.messages.create.call_args.kwargs
-        assert kwargs.get('model') == 'claude-opus-4-8'
+        assert kwargs.get('model') == 'claude-opus-5'
         assert 'temperature' not in kwargs
         assert kwargs.get('thinking') == {'type': 'adaptive'}
         assert kwargs.get('output_config', {}).get('effort') == 'medium'
@@ -1285,7 +1297,7 @@ class TestOpus48Everywhere:
         client = self._get_claude_client()
 
         message = SimpleNamespace(
-            model='claude-opus-4-8',
+            model='claude-opus-5',
             usage=SimpleNamespace(
                 input_tokens=1000,
                 output_tokens=500,
@@ -1299,11 +1311,83 @@ class TestOpus48Everywhere:
 
     def test_opus_pricing_constants(self):
         """Cache read must be cheaper than input; cache write more expensive (1.25x)."""
-        from trading_bot.llm.claude_client import OPUS_48_PRICING
+        from trading_bot.llm.claude_client import OPUS_5_PRICING, OPUS_48_PRICING
 
-        assert OPUS_48_PRICING['cache_read'] < OPUS_48_PRICING['input']
-        assert OPUS_48_PRICING['cache_write'] > OPUS_48_PRICING['input']
-        assert OPUS_48_PRICING['output'] > OPUS_48_PRICING['input']
+        assert OPUS_5_PRICING['cache_read'] < OPUS_5_PRICING['input']
+        assert OPUS_5_PRICING['cache_write'] > OPUS_5_PRICING['input']
+        assert OPUS_5_PRICING['output'] > OPUS_5_PRICING['input']
+        assert OPUS_48_PRICING is OPUS_5_PRICING  # backwards-compatible alias
+
+    def test_analysis_and_judge_verbosity_scope(self):
+        """Opus 5 prompts must include conciseness + scope guidance."""
+        from trading_bot.llm.claude_client import (
+            ANALYSIS_RULES,
+            ANALYSIS_TONE_PREFERENCE,
+            JUDGE_RUBRIC,
+        )
+        from trading_bot.main import PENDING_REEVAL_RULES, POSITION_REEVAL_RULES
+
+        assert '<tone_preference>' in ANALYSIS_TONE_PREFERENCE
+        assert 'concise' in ANALYSIS_TONE_PREFERENCE.lower()
+        # Reasoning length stays in the cached rules; tone reminder is a separate block.
+        assert '4-8 sentences' in ANALYSIS_RULES
+        assert '## SCOPE' in JUDGE_RUBRIC
+        assert '## SCOPE' in POSITION_REEVAL_RULES
+        assert '## SCOPE' in PENDING_REEVAL_RULES
+
+        # tone_preference must be LAST in the system stack (after strategy_context).
+        client = self._get_claude_client()
+        blocks = client._build_system_messages("STRATEGY CONTEXT PLACEHOLDER")
+        assert blocks[-1]['text'] == ANALYSIS_TONE_PREFERENCE
+        assert any(b.get('text') == ANALYSIS_RULES for b in blocks)
+
+    @pytest.mark.asyncio
+    async def test_sizing_uses_low_effort(self):
+        """Narrow sizing helper should use effort_light (low), not review effort."""
+        client = self._get_claude_client()
+        text_block = MagicMock(
+            type='text',
+            text='{"recommended_lots": 0.01, "reasoning": "base", '
+                 '"risk_assessment": "low", "size_adjustment": "1.0x"}',
+        )
+        mock_response = MagicMock()
+        mock_response.content = [text_block]
+        client.async_client = AsyncMock()
+        client.async_client.messages.create = AsyncMock(return_value=mock_response)
+
+        result = await client.recommend_position_size(
+            equity=1000, setup_grade='B', confidence=0.7, symbol='EURUSD'
+        )
+        assert result['recommended_lots'] == 0.01
+        kwargs = client.async_client.messages.create.call_args.kwargs
+        assert kwargs.get('model') == 'claude-opus-5'
+        assert kwargs.get('output_config', {}).get('effort') == 'low'
+
+    @pytest.mark.asyncio
+    async def test_async_messages_create_streams_when_max_tokens_high(self):
+        """Analysis-sized budgets must stream; light budgets keep using create()."""
+        from contextlib import asynccontextmanager
+        client = self._get_claude_client()
+        client.async_client = AsyncMock()
+
+        final = MagicMock()
+        stream_cm = AsyncMock()
+        stream_cm.get_final_message = AsyncMock(return_value=final)
+
+        @asynccontextmanager
+        async def fake_stream(**kwargs):
+            yield stream_cm
+
+        client.async_client.messages.stream = fake_stream
+        client.async_client.messages.create = AsyncMock(return_value=MagicMock(name='create_msg'))
+
+        streamed = await client._async_messages_create(model='claude-opus-5', max_tokens=32000, messages=[])
+        assert streamed is final
+        client.async_client.messages.create.assert_not_called()
+
+        created = await client._async_messages_create(model='claude-opus-5', max_tokens=4000, messages=[])
+        assert created is client.async_client.messages.create.return_value
+        client.async_client.messages.create.assert_called_once()
 
 
 # ============================================================
@@ -1381,10 +1465,10 @@ class TestTradeJudgePerformance:
             assert metric in source, f"Judge prompt missing risk metric: {metric}"
     
     def test_judge_latency_budget(self):
-        """Shared judge adapter should use asyncio.wait_for with an Opus 4.8-sized timeout.
+        """Shared judge adapter should use asyncio.wait_for with an Opus-sized timeout.
 
         The old Sonnet-era 8s budget would fail-close (block) every trade now that the
-        judge runs on Opus 4.8 with high-effort adaptive thinking (~10-20s typical).
+        judge runs on Opus with adaptive thinking (~10-20s typical).
         """
         import inspect
         from trading_bot.services.trade_judge import run_trade_judge
@@ -1392,7 +1476,7 @@ class TestTradeJudgePerformance:
         source = inspect.getsource(run_trade_judge)
         assert 'wait_for' in source, "run_trade_judge should use asyncio.wait_for"
         assert 'timeout: float = 45.0' in source, \
-            "run_trade_judge default timeout should be 45s for Opus 4.8 + thinking"
+            "run_trade_judge default timeout should be 45s for Opus + thinking"
     
     def test_judge_demote_default_price_improvement(self):
         """Default demote should use 0.2% price improvement from current."""

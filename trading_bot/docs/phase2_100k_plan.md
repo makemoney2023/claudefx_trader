@@ -1,7 +1,7 @@
 # Phase 2: $100K Goal Implementation Plan
 
 ## Overview
-This plan implements all missing features to reach the $100K equity goal from $1,000 starting capital. **Claude Opus 4.8 will manage all aspects** - trade decisions, position sizing, risk adjustments, and trade reviews.
+This plan implements all missing features to reach the $100K equity goal from $1,000 starting capital. **Claude Opus 5 will manage all aspects** - trade decisions, position sizing, risk adjustments, and trade reviews.
 
 ---
 
@@ -17,7 +17,7 @@ This plan implements all missing features to reach the $100K equity goal from $1
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    CLAUDE OPUS 4.8                          │
+│                    CLAUDE OPUS 5                            │
 │                   (Central Brain)                           │
 ├─────────────────────────────────────────────────────────────┤
 │  • Trade Analysis & Entry Decisions                         │

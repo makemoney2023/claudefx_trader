@@ -311,8 +311,10 @@ class TestJudgeFailClosed:
             client = ClaudeClient.__new__(ClaudeClient)
             client.api_key = 'test'
             client.model_heavy = 'test'
-            client.effort_heavy = 'high'
-            client.effort_light = 'medium'
+            client.effort_heavy = 'medium'
+            client.effort_judge = 'medium'
+            client.effort_light = 'low'
+            client.effort_review = 'medium'
             client.async_client = None
             return client
 

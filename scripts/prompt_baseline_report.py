@@ -2,16 +2,16 @@
 Prompt baseline report.
 
 Compares the distribution of `signal_decisions` telemetry BEFORE vs AFTER a cutover
-timestamp so we can measure the behavioural impact of the Claude Opus 4.8 migration +
-prompt hardening. Pass the moment the new prompts went live as ``--cutover`` and the
-script prints a side-by-side comparison of decision mix, direction bias, judge verdicts,
-confidence, and (where the outcome worker has evaluated them) hypothetical performance.
+timestamp so we can measure the behavioural impact of Claude model/prompt migrations.
+Pass the moment the new prompts went live as ``--cutover`` and the script prints a
+side-by-side comparison of decision mix, direction bias, judge verdicts, confidence,
+and (where the outcome worker has evaluated them) hypothetical performance.
 
 Usage:
-    python -m scripts.prompt_baseline_report                     # uses PROMPT_V2_CUTOVER
-    python -m scripts.prompt_baseline_report --cutover 2026-07-13T00:00:00
-    python -m scripts.prompt_baseline_report --cutover 2026-07-13 --window-days 14
-    python -m scripts.prompt_baseline_report --cutover 2026-07-13 --db /path/to/trading_bot.db
+    python -m scripts.prompt_baseline_report                     # uses PROMPT_V3_CUTOVER
+    python -m scripts.prompt_baseline_report --cutover 2026-07-27T00:00:00
+    python -m scripts.prompt_baseline_report --cutover 2026-07-27 --window-days 14
+    python -m scripts.prompt_baseline_report --cutover 2026-07-27 --db /path/to/trading_bot.db
 
 The computation helpers (``summarize`` / ``split_by_cutover`` / ``build_report``) are pure
 functions over lists of plain dict rows so they can be unit-tested without a database.
@@ -26,9 +26,12 @@ from statistics import mean, median
 from typing import Any, Dict, List, Optional
 
 # When the Opus 4.8 migration + prompt hardening phase 2 went live (2026-07-13,
-# ~6:40 PM ET). The same evening, all light-task calls were also moved to Opus 4.8
-# and strict tool use was enabled, so this single cutover covers the whole change set.
+# ~6:40 PM ET). Kept for historical comparisons.
 PROMPT_V2_CUTOVER = "2026-07-13T22:40:00+00:00"
+
+# Opus 5 cutover (model ID + verbosity/scope/effort retune). Update if deploy
+# happens later than this wall-clock estimate (2026-07-27 morning ET).
+PROMPT_V3_CUTOVER = "2026-07-27T13:30:00+00:00"
 
 
 # Columns we read from signal_decisions. Kept explicit so a schema change surfaces loudly.
@@ -259,10 +262,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--cutover",
-        default=PROMPT_V2_CUTOVER,
+        default=PROMPT_V3_CUTOVER,
         help=(
             "ISO8601 timestamp when the new prompts went live "
-            f"(default: recorded prompt-v2 cutover {PROMPT_V2_CUTOVER})."
+            f"(default: recorded prompt-v3 / Opus 5 cutover {PROMPT_V3_CUTOVER})."
         ),
     )
     parser.add_argument("--db", default=None, help="Path to trading_bot.db (defaults to project DB).")

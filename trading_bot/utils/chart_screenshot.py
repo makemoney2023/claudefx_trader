@@ -2,7 +2,7 @@
 Chart screenshot generator for Claude vision analysis.
 
 Creates candlestick chart images from OHLCV data that can be
-sent to Claude Opus 4.5 for visual analysis.
+sent to Claude Opus 5 for visual analysis.
 """
 
 import io
@@ -405,7 +405,7 @@ class ChartScreenshot:
             fig_height = 21
 
         # 96 dpi keeps the composite near ~1080p (1920x1344 / 1920x2016) to control
-        # Opus 4.8 high-res image token cost while preserving readable ICT detail.
+        # Opus 5 high-res image token cost while preserving readable ICT detail.
         fig = plt.figure(figsize=(20, fig_height), dpi=96)
         gs = gridspec.GridSpec(grid_rows, grid_cols, hspace=0.30, wspace=0.20)
 
@@ -644,7 +644,7 @@ def create_simple_chart(
     Returns:
         Base64 encoded PNG image
     """
-    # Default 96 dpi keeps the 16x10 figure near ~1080p (1536x960). Opus 4.8 has
+    # Default 96 dpi keeps the 16x10 figure near ~1080p (1536x960). Opus 5 has
     # high-resolution vision that would ingest larger images at up to ~3x the token
     # cost, and this detail level is sufficient for ICT chart reading.
     dpi = kwargs.pop('dpi', 96)

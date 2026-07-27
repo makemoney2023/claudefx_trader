@@ -241,7 +241,7 @@ class ClaudeReplayBacktester:
         result = await bt.run("XAUUSD", start, end, interval_hours=1)
     """
 
-    # Approximate cost per API call (Opus 4.5 with images)
+    # Approximate cost per API call (Opus 5 with images)
     COST_PER_CALL = 0.08
 
     def __init__(

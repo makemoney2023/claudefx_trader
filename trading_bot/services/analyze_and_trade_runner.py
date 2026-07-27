@@ -701,7 +701,7 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                             base_lots=tier.base_lots,
                             max_lots=tier.max_lots
                         ),
-                        timeout=40.0  # Opus 4.8 + thinking needs more headroom than the old Sonnet 15s
+                        timeout=40.0  # Opus 5 + thinking needs more headroom than the old Sonnet 15s
                     )
                     if rec.get('recommended_lots'):
                         claude_size_rec = rec['recommended_lots']

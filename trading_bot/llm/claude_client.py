@@ -1,12 +1,13 @@
 """
-Claude Opus 4.8 Client for Chart Analysis.
+Claude Opus 5 Client for Chart Analysis.
 
 Integrates with Anthropic's Claude API to analyze forex charts
 using vision capabilities and ICT strategy context.
 
 Features:
 - Async/await support for concurrent analysis
-- Adaptive thinking with explicit effort for the heavy analysis/judge calls
+- Adaptive thinking with explicit effort (thinking is on by default on Opus 5;
+  effort is the primary cost/latency control)
 - Tool use for reliable structured JSON output (tool_choice=auto so it is
   compatible with adaptive thinking)
 - Caching layer to avoid duplicate API calls
@@ -443,21 +444,37 @@ CONFIDENCE ADJUSTMENT RULES). Apply this one ladder:
 - Both metals are safe havens - strong during geopolitical uncertainty
 - Silver is more volatile (~2x gold moves) - adjust position size accordingly
 - Watch USD correlation (typically inverse)
+
+Reasoning in the submit_trade_analysis tool must be 4-8 sentences naming specific chart
+confirmations only — no preamble and no generic ICT definitions.
 """
 
 
-# Approximate Claude Opus 4.8 pricing in USD per million tokens, used only for the
+# Conciseness reminder placed LAST in the analysis system message stack (after
+# strategy_context). Opus 5 docs: length is steered by prompting, not effort, and
+# a short reminder near the end of a long system prompt is most effective.
+ANALYSIS_TONE_PREFERENCE = """<tone_preference>
+Keep outputs reasonably concise. Prefer calling submit_trade_analysis over prose.
+Do not restate the ruleset, pad with filler, or narrate a plan before the tool call.
+Call submit_trade_analysis as soon as you have a decision — do not burn the output
+budget on long preambles or restated methodology.
+</tone_preference>"""
+
+
+# Approximate Claude Opus 5 pricing in USD per million tokens, used only for the
 # estimated_cost_usd column in usage telemetry (cache write = 1.25x input for the
-# 5-minute ephemeral tier; cache read = 0.1x input). Update if Anthropic reprices.
-OPUS_48_PRICING = {
+# 5-minute ephemeral tier; cache read = 0.1x input). Same $/MTok as Opus 4.8.
+# Update if Anthropic reprices. Alias kept for older imports/tests during transition.
+OPUS_5_PRICING = {
     "input": 5.00,
     "output": 25.00,
     "cache_read": 0.50,
     "cache_write": 6.25,
 }
+OPUS_48_PRICING = OPUS_5_PRICING  # backwards-compatible alias
 
 
-# JSON schema for the trade judge's structured output (Opus 4.8 structured outputs).
+# JSON schema for the trade judge's structured output (Opus 5 structured outputs).
 # Passed via output_config.format so the verdict is guaranteed-parseable JSON rather
 # than relying on regex extraction. Structured outputs require additionalProperties=false
 # and disallow unsupported constraints (min/maxLength, numeric bounds, etc.).
@@ -475,12 +492,18 @@ JUDGE_OUTPUT_SCHEMA = {
 
 
 # Static trade-judge rubric. Lives in a prompt-cached system block so the judge —
-# which runs on EVERY signal at high effort — only bills these tokens once per
+# which runs on EVERY signal at medium effort — only bills these tokens once per
 # cache window. Per-trade facts (proposed trade, risk metrics, learnings) stay in
 # the user message built by judge_trade().
 JUDGE_RUBRIC = """You are a TRADE JUDGE — a risk-focused second opinion before a trade is executed with real money.
 
 A trade analyst proposes a trade in the user message. Your job is to check it against learned patterns and risk math. You are NOT re-analyzing the market — the analysis is already done. You are validating whether this trade should proceed NOW at market price, or whether it should be DEMOTED to a pending limit order at a better entry price. Judge every trade on its own merit.
+
+## SCOPE
+Deliver exactly the verdict JSON asked for. Do not widen into market re-analysis,
+unsolicited strategy advice, or extra checklist items beyond Step 1/2. List concerns
+in risk_flags (do not under-report); Step 2 decides what blocks the trade. At most
+8 risk_flags.
 
 ## R:R TARGETS (per trade type)
 - SCALP: target 1.5:1 | INTRADAY: target 2:1 | SWING: target 3:1
@@ -527,7 +550,7 @@ APPROVE in all other cases. Confidence alone neither approves nor rejects.
 - NEVER REJECT or DEMOTE solely on position size % when the position is AT BROKER MINIMUM LOT SIZE.
   The trader cannot go smaller; judge purely on technical merit. Record it as a "note:" flag only.
 
-Keep `reason` to ONE sentence.
+Keep `reason` to ONE sentence. No preamble, no markdown, no restating the rubric.
 
 Your entire response must be a single JSON object (no surrounding prose or markdown) with
 exactly this shape:
@@ -535,10 +558,14 @@ exactly this shape:
 - "reason": one sentence explanation
 - "suggested_entry": float price, or null if APPROVE
 - "risk_flags": array of strings, each prefixed "critical:", "warning:", or "note:"
+
+<tone_preference>
+Keep outputs concise. Prefer the JSON verdict over narration.
+</tone_preference>
 """
 
 
-# JSON schemas for light-task structured outputs (Opus 4.8 output_config.format).
+# JSON schemas for light-task structured outputs (Opus 5 output_config.format).
 # Guarantees parseable JSON instead of regex extraction with silent degraded
 # fallbacks. NOTE: generate_weekly_insights is intentionally NOT schema-constrained
 # because its symbol_insights/session_insights are free-form dicts, which the strict
@@ -607,7 +634,7 @@ SCALING_DECISION_SCHEMA = {
 
 class ClaudeClient:
     """
-    Async client for Claude Opus 4.8 chart analysis.
+    Async client for Claude Opus 5 chart analysis.
     
     Uses Anthropic's API with vision capabilities to analyze
     forex chart screenshots and generate trade signals based
@@ -624,7 +651,7 @@ class ClaudeClient:
         self,
         api_key: Optional[str] = None,
         model: Optional[str] = None,
-        max_tokens: int = 16000,
+        max_tokens: int = 32000,
         temperature: float = 0.3,
         max_retries: int = 3,
         cache_ttl: int = 300,
@@ -636,10 +663,12 @@ class ClaudeClient:
         Args:
             api_key: Anthropic API key (uses settings if not provided)
             model: Model to use (uses settings if not provided)
-            max_tokens: Maximum output tokens for heavy analysis calls. On Opus 4.8
-                this caps thinking + response combined, so it is set generously.
+            max_tokens: Maximum output tokens for heavy analysis calls. On Opus 5
+                this caps thinking + response combined. 16k was too tight at
+                higher effort (thinking filled the budget before the tool call);
+                32k is the production floor. Use 64k if you raise effort to xhigh/max.
             temperature: Retained for backwards compatibility only. NOT sent to
-                Opus 4.8 (non-default sampling params return a 400 error); behavior
+                Opus 5 (non-default sampling params return a 400 error); behavior
                 is steered via prompting and the effort parameter instead.
             max_retries: Maximum retry attempts for API calls
             cache_ttl: Cache time-to-live in seconds
@@ -648,14 +677,18 @@ class ClaudeClient:
         self.api_key = api_key or settings.claude.api_key
         # Legacy attribute: no runtime call uses self.model anymore (kept only so
         # external readers of client.model don't break). All calls use model_heavy/
-        # model_light below, both pinned to Opus 4.8.
+        # model_light below, both pinned to Opus 5.
         self.model = model or settings.claude.model
-        self.model_heavy = "claude-opus-4-8"  # Best model for chart analysis + trade judge
-        self.model_light = "claude-opus-4-8"  # Opus 4.8 everywhere — light tasks too (re-evals, reviews)
-        self.effort_heavy = "high"   # effort for analysis/judge; "xhigh" for max depth
-        self.effort_light = "medium"  # effort for light tasks (re-evals, reviews, sizing)
+        self.model_heavy = "claude-opus-5"  # Best model for chart analysis + trade judge
+        self.model_light = "claude-opus-5"  # Opus 5 everywhere — light tasks too (re-evals, reviews)
+        # Effort is the primary cost/latency knob on Opus 5 (thinking stays on).
+        # Keep effort constant within a cached conversation/prompt family.
+        self.effort_heavy = "medium"   # chart analysis — medium on Opus 5 (cost/latency); raise to high/xhigh only after evals
+        self.effort_judge = "medium"   # trade judge: rubric is narrow; medium is enough on Opus 5
+        self.effort_light = "low"      # sizing, scaling, re-evals, and other narrow helpers
+        self.effort_review = "medium"  # trade reviews + weekly insights (need more depth)
         self.max_tokens = max_tokens
-        self.temperature = temperature  # kept for compat; NOT sent to Opus 4.8 (any task)
+        self.temperature = temperature  # kept for compat; NOT sent to Opus 5 (any task)
         self.max_retries = max_retries
         
         # Initialize cache
@@ -675,13 +708,18 @@ class ClaudeClient:
             logger.warning("No Anthropic API key configured")
         else:
             # Initialize both sync and async clients
+            # 600s client timeout: Opus 5 analysis with vision + thinking can run
+            # several minutes; streaming requests need headroom beyond the SDK's
+            # non-stream 10-minute estimate gate.
             self.sync_client = anthropic.Anthropic(
                 api_key=self.api_key,
-                max_retries=max_retries
+                max_retries=max_retries,
+                timeout=600.0,
             )
             self.async_client = AsyncAnthropic(
                 api_key=self.api_key,
-                max_retries=max_retries
+                max_retries=max_retries,
+                timeout=600.0,
             )
             logger.info(f"Claude client initialized — analysis: {self.model_heavy}, light tasks: {self.model_light}")
     
@@ -808,12 +846,13 @@ class ClaudeClient:
                     "text": prompt
                 })
                 
-                # Create message with images and tool use (Opus 4.8 for best analysis quality).
+                # Create message with images and tool use (Opus 5 for best analysis quality).
                 # Strategy docs go in system message with cache_control for Anthropic prompt caching.
-                # Opus 4.8: no temperature (400 error), adaptive thinking + explicit effort, and
+                # Opus 5: no temperature (400 error), adaptive thinking + explicit effort, and
                 # tool_choice=auto (forced tool use is incompatible with thinking). The system
                 # message instructs the model to always finish by calling submit_trade_analysis.
-                message = await self.async_client.messages.create(
+                # Large max_tokens requires streaming via _async_messages_create.
+                message = await self._async_messages_create(
                     model=self.model_heavy,
                     max_tokens=self.max_tokens,
                     thinking={"type": "adaptive"},
@@ -830,6 +869,15 @@ class ClaudeClient:
                 )
                 
                 self._record_usage("analysis", message)
+
+                stop_reason = getattr(message, "stop_reason", None)
+                if stop_reason == "max_tokens":
+                    logger.warning(
+                        f"[ANALYSIS] {symbol} hit max_tokens={self.max_tokens} "
+                        f"(stop_reason=max_tokens). Thinking likely consumed the "
+                        f"budget before submit_trade_analysis — raise max_tokens "
+                        f"or lower effort_heavy if this persists."
+                    )
                 
                 # Parse response
                 result = self._parse_tool_response(message)
@@ -929,11 +977,15 @@ class ClaudeClient:
         return output
     
     # NOTE: the synchronous analyze_chart() wrapper was removed — it had no callers
-    # and silently duplicated the Opus 4.8 request shape (every prompt/param change
+    # and silently duplicated the Opus 5 request shape (every prompt/param change
     # had to be made twice). Use analyze_chart_async().
     
     def _build_system_messages(self, strategy_context: str) -> list:
-        """Build system messages with prompt caching for strategy docs."""
+        """Build system messages with prompt caching for strategy docs.
+
+        Order matters for Opus 5: put the short conciseness reminder AFTER the
+        long cached blocks so it sits near the end of the system stack.
+        """
         return [
             {
                 "type": "text",
@@ -964,7 +1016,12 @@ class ClaudeClient:
                 "type": "text",
                 "text": strategy_context,
                 "cache_control": {"type": "ephemeral"}
-            }
+            },
+            {
+                # Last: Opus 5 verbosity control (effort does not shorten visible text).
+                "type": "text",
+                "text": ANALYSIS_TONE_PREFERENCE,
+            },
         ]
     
     def _build_analysis_prompt(
@@ -1923,7 +1980,7 @@ Finish by calling the submit_trade_analysis tool exactly once.
         """
         Concatenate all text blocks from a message response.
 
-        With Opus 4.8 adaptive thinking, the response may lead with a thinking
+        With Opus 5 adaptive thinking, the response may lead with a thinking
         block, so content[0] is not guaranteed to be text. This skips thinking
         (and any non-text) blocks and returns only the assistant's text output.
         """
@@ -1938,6 +1995,24 @@ Finish by calling the submit_trade_analysis tool exactly once.
             if isinstance(text, str):
                 parts.append(text)
         return "".join(parts)
+
+    # Anthropic's Python SDK rejects non-streaming create() when max_tokens is
+    # large enough that the request could exceed ~10 minutes (empirically >20k).
+    _STREAM_MAX_TOKENS_THRESHOLD = 20000
+
+    async def _async_messages_create(self, **kwargs):
+        """
+        Create a message, streaming when required by the SDK for large max_tokens.
+
+        Streaming still returns the assembled final Message, so callers (usage
+        telemetry, tool parsing) stay unchanged. Prefer create() below the
+        threshold to keep mocks/tests simple for light/judge calls.
+        """
+        max_tokens = int(kwargs.get("max_tokens") or 0)
+        if max_tokens > self._STREAM_MAX_TOKENS_THRESHOLD:
+            async with self.async_client.messages.stream(**kwargs) as stream:
+                return await stream.get_final_message()
+        return await self.async_client.messages.create(**kwargs)
 
     def _record_usage(self, task: str, message) -> None:
         """
@@ -1964,10 +2039,10 @@ Finish by calling the submit_trade_analysis tool exactly once.
             cache_creation = cache_creation or 0
 
             cost = (
-                input_tokens * OPUS_48_PRICING["input"]
-                + output_tokens * OPUS_48_PRICING["output"]
-                + cache_read * OPUS_48_PRICING["cache_read"]
-                + cache_creation * OPUS_48_PRICING["cache_write"]
+                input_tokens * OPUS_5_PRICING["input"]
+                + output_tokens * OPUS_5_PRICING["output"]
+                + cache_read * OPUS_5_PRICING["cache_read"]
+                + cache_creation * OPUS_5_PRICING["cache_write"]
             ) / 1_000_000
 
             model_name = getattr(message, "model", "") or self.model_heavy
@@ -2008,23 +2083,28 @@ Finish by calling the submit_trade_analysis tool exactly once.
         prompt: str,
         schema: Optional[dict],
         max_tokens: int,
+        effort: Optional[str] = None,
     ) -> Tuple[Optional[dict], str]:
         """
-        Run a light-task Opus 4.8 call that must return a JSON object.
+        Run a light-task Opus 5 call that must return a JSON object.
 
         Single source of truth for the light-task request shape: no temperature
-        (Opus 4.8 rejects it), adaptive thinking + light effort, structured output
+        (Opus 5 rejects it), adaptive thinking + effort, structured output
         when a schema is provided (with one retry without the format constraint if
         the API rejects it), usage telemetry, and thinking-block-safe parsing.
+
+        ``effort`` defaults to ``self.effort_light`` (low). Pass ``self.effort_review``
+        for reviews/weekly insights that need more depth.
 
         Returns (parsed_dict_or_None, raw_response_text). Exceptions from the API
         (other than a schema-format rejection) propagate to the caller, which owns
         its own defaults.
         """
-        output_config: Dict[str, Any] = {"effort": self.effort_light}
+        effort_level = effort or self.effort_light
+        output_config: Dict[str, Any] = {"effort": effort_level}
         if schema:
             output_config = {
-                "effort": self.effort_light,
+                "effort": effort_level,
                 "format": {"type": "json_schema", "schema": schema},
             }
         try:
@@ -2043,7 +2123,7 @@ Finish by calling the submit_trade_analysis tool exactly once.
                 model=self.model_light,
                 max_tokens=max_tokens,
                 thinking={"type": "adaptive"},
-                output_config={"effort": self.effort_light},
+                output_config={"effort": effort_level},
                 messages=[{"role": "user", "content": prompt}]
             )
 
@@ -2229,10 +2309,14 @@ Finish by calling the submit_trade_analysis tool exactly once.
             return False
         
         try:
+            # Opus 5 has thinking on by default; a tiny max_tokens can truncate
+            # before any visible text. Keep budget modest but safe.
             message = await self.async_client.messages.create(
                 model=self.model_light,
-                max_tokens=10,
-                messages=[{"role": "user", "content": "Hello"}]
+                max_tokens=256,
+                thinking={"type": "adaptive"},
+                output_config={"effort": "low"},
+                messages=[{"role": "user", "content": "Reply with the single word: ok"}]
             )
             return True
         except Exception as e:
@@ -2247,8 +2331,10 @@ Finish by calling the submit_trade_analysis tool exactly once.
         try:
             message = self.sync_client.messages.create(
                 model=self.model_light,
-                max_tokens=10,
-                messages=[{"role": "user", "content": "Hello"}]
+                max_tokens=256,
+                thinking={"type": "adaptive"},
+                output_config={"effort": "low"},
+                messages=[{"role": "user", "content": "Reply with the single word: ok"}]
             )
             return True
         except Exception as e:
@@ -2320,6 +2406,10 @@ Finish by calling the submit_trade_analysis tool exactly once.
 - After 3+ losses, reduce size significantly
 - After 3+ wins, be cautious (don't get overconfident)
 
+## SCOPE
+Deliver only the size recommendation JSON. Keep reasoning to 1-2 short sentences.
+No market re-analysis and no filler.
+
 Respond with a single JSON object (no surrounding prose) of this shape:
 {{
     "recommended_lots": <float>,
@@ -2385,6 +2475,10 @@ Respond with a single JSON object (no surrounding prose) of this shape:
 6. What could have been done better?
 7. Should this type of setup be taken again?
 
+## SCOPE
+Answer only those questions in the JSON below. Keep analysis to a short paragraph
+(cover the substance, no filler, no redundant summary). Match document length to need.
+
 Respond with a single JSON object (no surrounding prose) of this shape:
 {{
     "outcome": "win|loss|breakeven",
@@ -2399,7 +2493,8 @@ Respond with a single JSON object (no surrounding prose) of this shape:
         
         try:
             result, response_text = await self._light_json_call(
-                "trade_review", prompt, TRADE_REVIEW_SCHEMA, max_tokens=3000
+                "trade_review", prompt, TRADE_REVIEW_SCHEMA, max_tokens=3000,
+                effort=self.effort_review,
             )
             if result is not None:
                 return result
@@ -2486,14 +2581,14 @@ Respond with a single JSON object (no surrounding prose) of this shape:
 Now run Step 1 and Step 2 from the rubric and respond with the single JSON object."""
         
         try:
-            # Opus 4.8: no temperature, adaptive thinking + effort. No tools here,
+            # Opus 5: no temperature, adaptive thinking + effort. No tools here,
             # so thinking is fully compatible. max_tokens covers thinking + JSON verdict.
             # Structured outputs (output_config.format) force schema-valid JSON so we do
             # not have to rely on regex extraction. If the API rejects the format (e.g.
             # incompatible with adaptive thinking on this model), we retry once without it
             # and fall back to the regex/plain-JSON parsing below.
             base_output_config = {
-                "effort": self.effort_heavy,
+                "effort": self.effort_judge,
                 "format": {"type": "json_schema", "schema": JUDGE_OUTPUT_SCHEMA},
             }
             # Static rubric goes in a cached system block (billed once per cache window).
@@ -2519,7 +2614,7 @@ Now run Step 1 and Step 2 from the rubric and respond with the single JSON objec
                     model=self.model_heavy,
                     max_tokens=4000,
                     thinking={"type": "adaptive"},
-                    output_config={"effort": self.effort_heavy},
+                    output_config={"effort": self.effort_judge},
                     system=judge_system,
                     messages=[{"role": "user", "content": prompt}]
                 )
@@ -2630,6 +2725,10 @@ Now run Step 1 and Step 2 from the rubric and respond with the single JSON objec
 4. Provide specific recommendations for next week
 5. Rate overall performance
 
+## SCOPE
+Deliver only the weekly review JSON. Cover the substance; do not pad with filler
+sections, redundant summaries, or boilerplate. Summary: 2-4 sentences max.
+
 Respond with a single JSON object (no surrounding prose) of this shape:
 {
     "performance_grade": "A|B|C|D|F",
@@ -2644,7 +2743,8 @@ Respond with a single JSON object (no surrounding prose) of this shape:
         
         try:
             result, response_text = await self._light_json_call(
-                "weekly_review", prompt, WEEKLY_REVIEW_SCHEMA, max_tokens=4000
+                "weekly_review", prompt, WEEKLY_REVIEW_SCHEMA, max_tokens=4000,
+                effort=self.effort_review,
             )
             if result is not None:
                 return result
@@ -2716,6 +2816,10 @@ Pay special attention to:
 
 Be specific and actionable. These insights will be used to improve future trade analysis.
 
+## SCOPE
+Deliver only the insights JSON below. Cover the substance; do not pad with filler
+sections, redundant summaries, or boilerplate. Summary: 2-3 sentences.
+
 Respond with JSON:
 ```json
 {{
@@ -2747,7 +2851,8 @@ Respond with JSON:
             # which strict structured-output grammar cannot express. The helper still
             # centralizes the request shape and parses fenced or bare JSON.
             result, response_text = await self._light_json_call(
-                "weekly_insights", prompt, None, max_tokens=5000
+                "weekly_insights", prompt, None, max_tokens=5000,
+                effort=self.effort_review,
             )
             if result is not None:
                 logger.info(f"Generated weekly insights: Grade {result.get('performance_grade', 'N/A')}")
@@ -2827,6 +2932,9 @@ Consider:
 - Are we on track for the goal?
 - Is recent performance justifying current risk?
 - Any concerning patterns?
+
+## SCOPE
+Deliver only the scaling JSON. Keep reasoning to 1-2 short sentences. No filler.
 
 Respond with a single JSON object (no surrounding prose) of this shape:
 {{
