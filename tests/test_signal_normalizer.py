@@ -29,6 +29,18 @@ class TestNormalizeSignalPrices:
         result = normalize_signal_prices(sig, SimpleNamespace(key_levels={}), 1.0850)
         assert result.rejected is True
 
+    def test_no_trade_allows_missing_sl_tp(self):
+        """no_trade is a valid decision — do not reject for missing prices."""
+        sig = SimpleNamespace(
+            entry_price=None,
+            stop_loss=None,
+            take_profit=None,
+            direction="no_trade",
+        )
+        result = normalize_signal_prices(sig, SimpleNamespace(key_levels={}), 1.0850)
+        assert result.rejected is False
+        assert result.direction == "no_trade"
+
 
 class TestRRHelpers:
     def test_compute_actual_rr(self):

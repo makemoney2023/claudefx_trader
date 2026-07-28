@@ -42,10 +42,20 @@ def normalize_signal_prices(
     symbol: str = "",
 ) -> NormalizedSignal:
     """Apply SL/TP sanity checks and direction coherence (A5)."""
+    direction = (getattr(trade_signal, "direction", None) or "no_trade").lower()
+    # no_trade is a valid outcome — never require SL/TP for it.
+    if direction == "no_trade":
+        return NormalizedSignal(
+            entry=float(trade_signal.entry_price or current_price or 0.0),
+            sl=float(trade_signal.stop_loss or 0.0),
+            tp=float(trade_signal.take_profit or 0.0),
+            direction="no_trade",
+            rejected=False,
+        )
+
     entry = trade_signal.entry_price or current_price
     sl = trade_signal.stop_loss
     tp = trade_signal.take_profit
-    direction = trade_signal.direction
     audit: List[str] = []
     key_levels = getattr(claude_result, "key_levels", {}) or {}
 
