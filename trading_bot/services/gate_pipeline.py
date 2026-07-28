@@ -58,6 +58,15 @@ def apply_gate_outcomes(ctx: TradeContext, outcome: GateOutcome) -> None:
         )
 
 
+def _truthy_factor(data: Any, *, attr: str, key: str) -> bool:
+    """Support live detector objects and replay dict summaries."""
+    if data is None:
+        return False
+    if isinstance(data, dict):
+        return bool(data.get(key))
+    return bool(hasattr(data, attr) and getattr(data, attr))
+
+
 def count_confluence(ctx: TradeContext) -> tuple[int, list[str]]:
     """Count ICT confluence factors (mirrors main.py E3 block)."""
     _dir = ctx.direction
@@ -67,43 +76,58 @@ def count_confluence(ctx: TradeContext) -> tuple[int, list[str]]:
 
     fvg_data = ar.get("fvg")
     if fvg_data:
-        if _dir == "long" and hasattr(fvg_data, "bullish_fvgs") and fvg_data.bullish_fvgs:
+        if _dir == "long" and _truthy_factor(
+            fvg_data, attr="bullish_fvgs", key="bullish"
+        ):
             count += 1
             factors.append("Bullish FVG")
-        elif _dir == "short" and hasattr(fvg_data, "bearish_fvgs") and fvg_data.bearish_fvgs:
+        elif _dir == "short" and _truthy_factor(
+            fvg_data, attr="bearish_fvgs", key="bearish"
+        ):
             count += 1
             factors.append("Bearish FVG")
 
     ob_data = ar.get("order_blocks")
     if ob_data:
-        if _dir == "long" and hasattr(ob_data, "bullish_obs") and ob_data.bullish_obs:
+        if _dir == "long" and _truthy_factor(
+            ob_data, attr="bullish_obs", key="bullish"
+        ):
             count += 1
             factors.append("Bullish OB")
-        elif _dir == "short" and hasattr(ob_data, "bearish_obs") and ob_data.bearish_obs:
+        elif _dir == "short" and _truthy_factor(
+            ob_data, attr="bearish_obs", key="bearish"
+        ):
             count += 1
             factors.append("Bearish OB")
 
     liq_data = ar.get("liquidity")
     if liq_data:
-        if _dir == "long" and hasattr(liq_data, "nearest_ssl") and liq_data.nearest_ssl:
+        if _dir == "long" and _truthy_factor(
+            liq_data, attr="nearest_ssl", key="nearest_ssl"
+        ):
             count += 1
             factors.append("SSL Liquidity")
-        elif _dir == "short" and hasattr(liq_data, "nearest_bsl") and liq_data.nearest_bsl:
+        elif _dir == "short" and _truthy_factor(
+            liq_data, attr="nearest_bsl", key="nearest_bsl"
+        ):
             count += 1
             factors.append("BSL Liquidity")
 
     amd = ar.get("amd_cycle")
-    if amd and amd.get("phase") == "distribution" and amd.get("expected_direction") == _dir:
+    if isinstance(amd, dict) and amd.get("phase") == "distribution" and amd.get("expected_direction") == _dir:
         count += 1
         factors.append("AMD Distribution")
 
     disp = ar.get("displacement")
-    if disp and disp.get("distribution_confirmed"):
+    if isinstance(disp, dict) and disp.get("distribution_confirmed"):
         count += 1
         factors.append("Displacement")
 
     pd = ar.get("premium_discount")
-    if pd and pd.get("in_ote"):
+    if isinstance(pd, dict) and pd.get("in_ote"):
+        count += 1
+        factors.append("OTE Zone")
+    elif pd is not None and not isinstance(pd, dict) and getattr(pd, "in_ote", False):
         count += 1
         factors.append("OTE Zone")
 

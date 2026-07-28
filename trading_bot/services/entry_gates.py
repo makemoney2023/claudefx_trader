@@ -336,7 +336,9 @@ def evaluate_session_penalty(
     penalty = 0.0
     name = (session_name or "").lower()
     if not is_kill_zone:
-        penalty = asian_penalty if "asian" in name else 0.15
+        # Soft haircut outside kill zones (was 0.15 for non-Asian, which
+        # collapsed 66-70% Claude signals under the 60% confluence override).
+        penalty = asian_penalty if "asian" in name else 0.05
     elif "london close" in name or "london_close" in name:
         penalty = 0.05
     if penalty <= 0:

@@ -60,6 +60,47 @@ class TestGatePipeline:
         assert count == 0
         assert factors == []
 
+    def test_confluence_counts_replay_dict_summaries(self):
+        """Replay packs FVG/OB/liquidity as dicts; gate must count them."""
+        ctx = _ctx(
+            direction="long",
+            analysis_results={
+                "fvg": {"bullish": 6, "bearish": 2, "active": 4},
+                "order_blocks": {"bullish": 1, "bearish": 3},
+                "liquidity": {"nearest_ssl": 4500.0, "nearest_bsl": None},
+                "volume": {"relative_volume": 1.0},
+            },
+        )
+        count, factors = count_confluence(ctx)
+        assert count == 3
+        assert "Bullish FVG" in factors
+        assert "Bullish OB" in factors
+        assert "SSL Liquidity" in factors
+
+    def test_confluence_ignores_zero_count_replay_dicts(self):
+        ctx = _ctx(
+            direction="long",
+            analysis_results={
+                "fvg": {"bullish": 0, "bearish": 4},
+                "order_blocks": {"bullish": 0, "bearish": 2},
+                "liquidity": {"nearest_ssl": None, "nearest_bsl": 4600.0},
+            },
+        )
+        count, factors = count_confluence(ctx)
+        assert count == 0
+        assert factors == []
+
+    def test_non_kill_zone_session_penalty_is_five_percent(self):
+        from trading_bot.services.entry_gates import evaluate_session_penalty
+
+        outcome = evaluate_session_penalty(
+            session_name="london",
+            is_kill_zone=False,
+            off_hours_mode=False,
+        )
+        assert outcome.blocked is False
+        assert outcome.confidence_delta == 0.05
+
     def test_off_hours_blocks_low_rr(self):
         ctx = _ctx(off_hours_mode=True, actual_rr=2.0)
         outcome = evaluate_structure_and_quality_gates(ctx)
