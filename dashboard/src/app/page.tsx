@@ -115,9 +115,11 @@ export default function Dashboard() {
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
         <StatsCard
           title={account?.is_live ? "Account Balance (Live)" : "Account Balance (Demo)"}
-          value={`$${(account?.balance || 10000).toLocaleString()}`}
-          change={account?.profit || 0}
-          changeType={account?.profit && account.profit >= 0 ? 'positive' : 'negative'}
+          // Use ?? not || — balance 0 is valid (unfunded live account) and must not
+          // fall through to the old $10,000 simulation placeholder.
+          value={account ? `$${Number(account.balance).toLocaleString()}` : '—'}
+          change={account?.profit ?? 0}
+          changeType={account?.profit != null && account.profit >= 0 ? 'positive' : 'negative'}
         />
         <StatsCard
           title="Total Trades"
