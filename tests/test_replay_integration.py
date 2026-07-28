@@ -9,6 +9,7 @@ import pytest
 
 from trading_bot.backtesting.replay import (
     ClaudeReplayBacktester,
+    align_timestamp_to_index,
     compare_gate_fixture_batch,
     run_phased_live_gates,
 )
@@ -328,4 +329,24 @@ class TestReplayFixtureValidation:
         assert summary["live_block_rate"] == summary["replay_block_rate"]
         assert not summary["mismatches"]
         assert summary["live_block_rate"] == 0.75
+
+
+class TestReplayTimestampAlignment:
+    """MT5 history indexes are UTC-aware; dashboard dates arrive tz-naive."""
+
+    def test_align_naive_to_utc_aware_index(self):
+        idx = pd.date_range("2026-06-01", periods=4, freq="15min", tz="UTC")
+        naive = datetime(2026, 6, 1, 0, 30, 0)
+        aligned = align_timestamp_to_index(naive, idx)
+        assert aligned.tzinfo is not None
+        mask = idx <= aligned
+        assert bool(mask[0]) and bool(mask[1]) and bool(mask[2])
+        assert not bool(mask[3])
+
+    def test_align_aware_to_naive_index(self):
+        idx = pd.date_range("2026-06-01", periods=3, freq="h")
+        aware = datetime(2026, 6, 1, 1, 0, 0, tzinfo=timezone.utc)
+        aligned = align_timestamp_to_index(aware, idx)
+        assert aligned.tzinfo is None
+        assert (idx <= aligned).sum() == 2
 

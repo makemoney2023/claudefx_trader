@@ -46,6 +46,23 @@ DEFAULT_CRYPTO_SYMBOLS = (
 )
 
 
+def align_timestamp_to_index(value: datetime, index) -> pd.Timestamp:
+    """Align a datetime to a DatetimeIndex timezone for safe comparisons.
+
+    MT5 history frames are often UTC-aware; dashboard/API start/end dates are
+    usually tz-naive. Comparing them directly raises TypeError on modern pandas.
+    """
+    ts = pd.Timestamp(value)
+    idx_tz = getattr(index, "tz", None)
+    if idx_tz is not None:
+        if ts.tzinfo is None:
+            return ts.tz_localize(idx_tz)
+        return ts.tz_convert(idx_tz)
+    if ts.tzinfo is not None:
+        return ts.tz_convert("UTC").tz_localize(None)
+    return ts
+
+
 @dataclass
 class GateFixtureComparison:
     """Live phased vs replay one-shot gate outcome for one fixture."""
@@ -520,7 +537,7 @@ class ClaudeReplayBacktester:
                 step_idx += 1
                 continue
 
-            window_end = current
+            window_end = align_timestamp_to_index(current, m15_data.index)
             lookback_bars = 100
             m15_window = m15_data[m15_data.index <= window_end].tail(lookback_bars)
 
@@ -648,7 +665,8 @@ class ClaudeReplayBacktester:
 
                 _pd_h1_result = None
                 if h1_data is not None and not h1_data.empty:
-                    h1_window = h1_data[h1_data.index <= window_end].tail(100)
+                    h1_cut = align_timestamp_to_index(current, h1_data.index)
+                    h1_window = h1_data[h1_data.index <= h1_cut].tail(100)
                     if len(h1_window) >= 20:
                         try:
                             from ..analysis.market_structure import MarketStructureAnalyzer as _MSA
@@ -677,7 +695,8 @@ class ClaudeReplayBacktester:
 
                 _pd_d1_result = None
                 if d1_data is not None and not d1_data.empty:
-                    d1_window = d1_data[d1_data.index <= window_end].tail(60)
+                    d1_cut = align_timestamp_to_index(current, d1_data.index)
+                    d1_window = d1_data[d1_data.index <= d1_cut].tail(60)
                     if len(d1_window) >= 10:
                         try:
                             from ..analysis.market_structure import MarketStructureAnalyzer as _MSA2
@@ -702,7 +721,9 @@ class ClaudeReplayBacktester:
                 from ..utils.chart_screenshot import create_composite_chart, create_simple_chart
                 chart_panels = [{"timeframe": "M15", "df": m15_window, "overlays": _m15_overlays}]
                 if h1_data is not None and not h1_data.empty:
-                    h1_chart_win = h1_data[h1_data.index <= window_end].tail(100)
+                    h1_chart_win = h1_data[
+                        h1_data.index <= align_timestamp_to_index(current, h1_data.index)
+                    ].tail(100)
                     if len(h1_chart_win) >= 10:
                         chart_panels.insert(0, {"timeframe": "H1", "df": h1_chart_win})
 
