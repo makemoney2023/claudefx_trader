@@ -457,7 +457,8 @@ ANALYSIS_TONE_PREFERENCE = """<tone_preference>
 Keep outputs reasonably concise. Prefer calling submit_trade_analysis over prose.
 Do not restate the ruleset, pad with filler, or narrate a plan before the tool call.
 Call submit_trade_analysis as soon as you have a decision — do not burn the output
-budget on long preambles or restated methodology.
+budget on long preambles or restated methodology. Always include entry, stop_loss,
+and take_profit in the tool call when direction is long or short.
 </tone_preference>"""
 
 
@@ -651,7 +652,7 @@ class ClaudeClient:
         self,
         api_key: Optional[str] = None,
         model: Optional[str] = None,
-        max_tokens: int = 32000,
+        max_tokens: int = 64000,
         temperature: float = 0.3,
         max_retries: int = 3,
         cache_ttl: int = 300,
@@ -664,9 +665,9 @@ class ClaudeClient:
             api_key: Anthropic API key (uses settings if not provided)
             model: Model to use (uses settings if not provided)
             max_tokens: Maximum output tokens for heavy analysis calls. On Opus 5
-                this caps thinking + response combined. 16k was too tight at
-                higher effort (thinking filled the budget before the tool call);
-                32k is the production floor. Use 64k if you raise effort to xhigh/max.
+                this caps thinking + response combined. 32k still truncated some
+                medium-effort XAUUSD analyses before the tool call; 64k is the
+                production floor.
             temperature: Retained for backwards compatibility only. NOT sent to
                 Opus 5 (non-default sampling params return a 400 error); behavior
                 is steered via prompting and the effort parameter instead.

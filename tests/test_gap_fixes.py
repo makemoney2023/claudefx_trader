@@ -1157,7 +1157,7 @@ class TestOpus5Everywhere:
             client.effort_judge = "medium"
             client.effort_light = "low"
             client.effort_review = "medium"
-            client.max_tokens = 32000
+            client.max_tokens = 64000
             client.temperature = 0.3
             client.max_retries = 3
             client._cache = MagicMock()
@@ -1181,8 +1181,8 @@ class TestOpus5Everywhere:
         assert 'self.effort_light' in source
         assert 'self.effort_judge' in source
         assert 'self.effort_review' in source
-        # Opus 5 thinking needs headroom above the old 16k ceiling.
-        assert 'max_tokens: int = 32000' in source or 'max_tokens: int = 64000' in source
+        # Opus 5 thinking needs headroom; 32k still truncated some chart analyses.
+        assert 'max_tokens: int = 64000' in source
 
     def test_trade_signal_tool_is_strict(self):
         """The analysis tool must use strict tool use with a strict-compatible schema."""

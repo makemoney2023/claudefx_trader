@@ -259,7 +259,9 @@ class ClaudeReplayBacktester:
     """
 
     # Approximate cost per API call (Opus 5 with images)
-    COST_PER_CALL = 0.08
+    # Opus 5 medium analysis with prompt cache: ~$0.11–0.35 healthy, up to ~$0.90 if
+    # thinking fills the output budget. Midpoint for UI estimate (not a hard cap).
+    COST_PER_CALL = 0.25
 
     def __init__(
         self,
