@@ -1227,7 +1227,7 @@ class TestOpus5Everywhere:
             client.effort_judge = "medium"
             client.effort_light = "low"
             client.effort_review = "medium"
-            client.max_tokens = 64000
+            client.max_tokens = 16000
             client.temperature = 0.3
             client.max_retries = 3
             client._cache = MagicMock()
@@ -1252,8 +1252,8 @@ class TestOpus5Everywhere:
         assert 'self.effort_light' in source
         assert 'self.effort_judge' in source
         assert 'self.effort_review' in source
-        # Opus 5 thinking needs headroom; 32k still truncated some chart analyses.
-        assert 'max_tokens: int = 64000' in source
+        # Cap analysis budget so runaway thinking can't burn ~$2 before a retry.
+        assert 'max_tokens: int = 16000' in source
 
     def test_trade_signal_tool_is_strict(self):
         """The analysis tool must use strict tool use with a strict-compatible schema."""
@@ -1465,7 +1465,11 @@ class TestOpus5Everywhere:
 
     @pytest.mark.asyncio
     async def test_analysis_retries_without_thinking_after_max_tokens(self):
-        """If thinking fills max_tokens with no tool call, retry once with thinking off + forced tool."""
+        """If thinking fills max_tokens, retry once with thinking off + forced tool.
+
+        Retry must fire even when a partial tool_use block is present — that was
+        how $2 truncated calls slipped through as no_trade without retrying.
+        """
         client = self._get_claude_client()
         client.async_client = AsyncMock()  # truthy so analyze_chart_async proceeds
         client._cache = MagicMock()
@@ -1476,9 +1480,23 @@ class TestOpus5Everywhere:
         client._build_analysis_prompt = MagicMock(return_value='analyze')
         client._build_system_messages = MagicMock(return_value=[])
 
+        # Truncated response that still has a (likely incomplete) tool block.
+        partial_tool = MagicMock()
+        partial_tool.type = 'tool_use'
+        partial_tool.name = 'submit_trade_analysis'
+        partial_tool.input = {
+            'direction': 'no_trade',
+            'confidence': 0.3,
+            'entry_price': None,
+            'stop_loss': None,
+            'take_profit': None,
+            'reasoning': 'truncated',
+            'market_structure': 'ranging',
+            'trade_type': 'intraday',
+        }
         truncated = MagicMock()
         truncated.stop_reason = 'max_tokens'
-        truncated.content = [MagicMock(type='thinking', thinking='...')]
+        truncated.content = [MagicMock(type='thinking', thinking='...'), partial_tool]
 
         tool_block = MagicMock()
         tool_block.type = 'tool_use'
@@ -1511,6 +1529,7 @@ class TestOpus5Everywhere:
         first_kwargs = client._async_messages_create.await_args_list[0].kwargs
         second_kwargs = client._async_messages_create.await_args_list[1].kwargs
         assert first_kwargs.get('output_config', {}).get('effort') == 'low'
+        assert first_kwargs.get('max_tokens') == 16000
         assert second_kwargs.get('thinking') == {'type': 'disabled'}
         assert second_kwargs.get('tool_choice', {}).get('type') == 'tool'
         assert result.signal.direction == 'no_trade'

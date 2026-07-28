@@ -692,7 +692,7 @@ def get_claude_config() -> dict:
     return {
         "api_key": settings.claude.api_key,
         "model": "claude-opus-5",
-        "max_tokens": 64000,
+        "max_tokens": 16000,
         # temperature is intentionally omitted — Opus 5 rejects non-default sampling
         "legacy_settings_model": settings.claude.model,
         "legacy_settings_max_tokens": settings.claude.max_tokens,

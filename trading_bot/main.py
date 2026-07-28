@@ -1465,7 +1465,7 @@ class TradingBot:
                         
                         print(f"[CYCLE] Analyzing {sym} (crypto={is_crypto})...", flush=True)
                         # Per-symbol timeout to prevent one slow symbol from blocking the
-                        # batch. Covers Opus 5 medium-effort streamed analysis (64k budget,
+                        # batch. Covers Opus 5 low-effort streamed analysis (16k budget,
                         # thinking + images can still take minutes) + judge + execution.
                         await asyncio.wait_for(
                             self._analyze_and_trade(sym, is_crypto=is_crypto),

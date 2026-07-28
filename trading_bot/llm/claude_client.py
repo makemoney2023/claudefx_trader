@@ -661,7 +661,7 @@ class ClaudeClient:
         self,
         api_key: Optional[str] = None,
         model: Optional[str] = None,
-        max_tokens: int = 64000,
+        max_tokens: int = 16000,
         temperature: float = 0.3,
         max_retries: int = 3,
         cache_ttl: int = 300,
@@ -674,9 +674,9 @@ class ClaudeClient:
             api_key: Anthropic API key (uses settings if not provided)
             model: Model to use (uses settings if not provided)
             max_tokens: Maximum output tokens for heavy analysis calls. On Opus 5
-                this caps thinking + response combined. 32k still truncated some
-                medium-effort XAUUSD analyses before the tool call; 64k is the
-                production floor.
+                this caps thinking + response combined. Healthy low-effort calls
+                finish in ~1.5k–14k; 16k caps runaway thinking cost (~$0.40) and
+                triggers a thinking-disabled retry instead of a $2 64k burn.
             temperature: Retained for backwards compatibility only. NOT sent to
                 Opus 5 (non-default sampling params return a 400 error); behavior
                 is steered via prompting and the effort parameter instead.
@@ -887,21 +887,16 @@ class ClaudeClient:
                 self._record_usage("analysis", message)
 
                 stop_reason = getattr(message, "stop_reason", None)
-                has_tool = any(
-                    getattr(block, "type", None) == "tool_use"
-                    for block in (getattr(message, "content", None) or [])
-                )
-                # Adaptive thinking can fill the entire max_tokens budget with no tool
-                # call. Retry once with thinking disabled + forced tool (incompatible
-                # with thinking, but fine when thinking is off).
-                if stop_reason == "max_tokens" and not has_tool:
+                # Any max_tokens stop is untrusted — including partial tool_use
+                # blocks that look complete but were cut off mid-generation.
+                if stop_reason == "max_tokens":
                     logger.warning(
                         f"[ANALYSIS] {symbol} hit max_tokens={self.max_tokens} "
-                        f"with no tool call — retrying once with thinking disabled"
+                        f"— retrying once with thinking disabled + forced tool"
                     )
                     message = await self._async_messages_create(
                         model=self.model_heavy,
-                        max_tokens=min(self.max_tokens, 8000),
+                        max_tokens=4000,
                         thinking={"type": "disabled"},
                         output_config={"effort": "low"},
                         system=self._build_system_messages(strategy_context),
@@ -919,18 +914,19 @@ class ClaudeClient:
                     )
                     self._record_usage("analysis_retry", message)
                     stop_reason = getattr(message, "stop_reason", None)
-                    has_tool = any(
-                        getattr(block, "type", None) == "tool_use"
-                        for block in (getattr(message, "content", None) or [])
-                    )
 
-                if stop_reason == "max_tokens" and not has_tool:
+                has_tool = any(
+                    getattr(block, "type", None) == "tool_use"
+                    for block in (getattr(message, "content", None) or [])
+                )
+
+                if stop_reason == "max_tokens":
                     logger.warning(
                         f"[ANALYSIS] {symbol} still truncated after retry — "
                         f"returning no_trade without caching"
                     )
                     result = self._create_no_trade_result(
-                        "Analysis truncated (max_tokens) before tool call"
+                        "Analysis truncated (max_tokens) before complete tool call"
                     )
                     result.analysis_time = time.time() - start_time
                     return result
@@ -939,7 +935,7 @@ class ClaudeClient:
                 result = self._parse_tool_response(message)
                 result.analysis_time = time.time() - start_time
                 
-                # Cache only complete tool responses (never truncated thinking-only).
+                # Cache only complete tool responses (never truncated paths).
                 if use_cache and has_tool:
                     await self._cache.set(symbol, timeframe, image_hash, result, market_data)
                 

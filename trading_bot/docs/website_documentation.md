@@ -33,7 +33,7 @@ The ICT Trading Bot is a sophisticated automated trading system designed to capt
 - **Contextual Learning**: Learns from past trades to improve future recommendations
 - **Confidence Scoring**: Every trade signal includes a confidence level based on multiple factors
 - **Natural Language Reasoning**: Detailed explanations for every trade decision
-- **Claude Opus 5 everywhere**: chart analysis, trade judge, position/pending re-evals, trade reviews, weekly insights, and sizing all run on Opus 5 with adaptive thinking (low effort for analysis with a 64k budget + thinking-disabled retry on truncation; medium for judge/reviews; low for sizing/re-evals)
+- **Claude Opus 5 everywhere**: chart analysis, trade judge, position/pending re-evals, trade reviews, weekly insights, and sizing all run on Opus 5 with adaptive thinking (low effort for analysis with a 16k budget + thinking-disabled forced-tool retry on any max_tokens stop; medium for judge/reviews; low for sizing/re-evals)
 - **Guaranteed-valid outputs**: the analysis tool uses strict tool use and the trade judge uses structured outputs (JSON schema), so signals and verdicts are always schema-valid
 - **Prompt caching**: the static ICT ruleset (`ANALYSIS_RULES`), the trade-judge rubric (`JUDGE_RUBRIC`), the re-eval rules, and strategy docs all live in cached system blocks, cutting repeat token cost per scan cycle
 - **Cost telemetry**: every API call logs a `[USAGE]` line and writes a row to the `api_usage` table (tokens, cache hits, estimated USD cost per task type)
