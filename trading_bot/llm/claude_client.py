@@ -693,7 +693,9 @@ class ClaudeClient:
         self.model_light = "claude-opus-5"  # Opus 5 everywhere — light tasks too (re-evals, reviews)
         # Effort is the primary cost/latency knob on Opus 5 (thinking stays on).
         # Keep effort constant within a cached conversation/prompt family.
-        self.effort_heavy = "medium"   # chart analysis — medium on Opus 5 (cost/latency); raise to high/xhigh only after evals
+        # Chart analysis: low effort — medium still exhausted the 64k thinking+output
+        # budget on some XAUUSD charts (~$1.60 with no tool call). Raise only after evals.
+        self.effort_heavy = "low"
         self.effort_judge = "medium"   # trade judge: rubric is narrow; medium is enough on Opus 5
         self.effort_light = "low"      # sizing, scaling, re-evals, and other narrow helpers
         self.effort_review = "medium"  # trade reviews + weekly insights (need more depth)
@@ -881,20 +883,60 @@ class ClaudeClient:
                 self._record_usage("analysis", message)
 
                 stop_reason = getattr(message, "stop_reason", None)
-                if stop_reason == "max_tokens":
+                has_tool = any(
+                    getattr(block, "type", None) == "tool_use"
+                    for block in (getattr(message, "content", None) or [])
+                )
+                # Adaptive thinking can fill the entire max_tokens budget with no tool
+                # call. Retry once with thinking disabled + forced tool (incompatible
+                # with thinking, but fine when thinking is off).
+                if stop_reason == "max_tokens" and not has_tool:
                     logger.warning(
                         f"[ANALYSIS] {symbol} hit max_tokens={self.max_tokens} "
-                        f"(stop_reason=max_tokens). Thinking likely consumed the "
-                        f"budget before submit_trade_analysis — raise max_tokens "
-                        f"or lower effort_heavy if this persists."
+                        f"with no tool call — retrying once with thinking disabled"
                     )
-                
+                    message = await self._async_messages_create(
+                        model=self.model_heavy,
+                        max_tokens=min(self.max_tokens, 8000),
+                        thinking={"type": "disabled"},
+                        output_config={"effort": "low"},
+                        system=self._build_system_messages(strategy_context),
+                        tools=[TRADE_SIGNAL_TOOL],
+                        tool_choice={
+                            "type": "tool",
+                            "name": "submit_trade_analysis",
+                        },
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": content_blocks,
+                            }
+                        ],
+                    )
+                    self._record_usage("analysis_retry", message)
+                    stop_reason = getattr(message, "stop_reason", None)
+                    has_tool = any(
+                        getattr(block, "type", None) == "tool_use"
+                        for block in (getattr(message, "content", None) or [])
+                    )
+
+                if stop_reason == "max_tokens" and not has_tool:
+                    logger.warning(
+                        f"[ANALYSIS] {symbol} still truncated after retry — "
+                        f"returning no_trade without caching"
+                    )
+                    result = self._create_no_trade_result(
+                        "Analysis truncated (max_tokens) before tool call"
+                    )
+                    result.analysis_time = time.time() - start_time
+                    return result
+
                 # Parse response
                 result = self._parse_tool_response(message)
                 result.analysis_time = time.time() - start_time
                 
-                # Cache result
-                if use_cache:
+                # Cache only complete tool responses (never truncated thinking-only).
+                if use_cache and has_tool:
                     await self._cache.set(symbol, timeframe, image_hash, result, market_data)
                 
                 return result

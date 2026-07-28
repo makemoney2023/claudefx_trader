@@ -245,7 +245,10 @@ export default function BacktestPage() {
       setReplayRunId(run.id)
       setReplayRunning(true)
     } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
       console.error('Failed to start replay backtest:', e)
+      setReplayProgress({ pct: 0, step: msg })
+      alert(`Replay failed to start:\n${msg}`)
     }
   }
 

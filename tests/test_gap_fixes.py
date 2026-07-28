@@ -1223,7 +1223,7 @@ class TestOpus5Everywhere:
             client.model = "test"
             client.model_heavy = "claude-opus-5"
             client.model_light = "claude-opus-5"
-            client.effort_heavy = "medium"
+            client.effort_heavy = "low"
             client.effort_judge = "medium"
             client.effort_light = "low"
             client.effort_review = "medium"
@@ -1247,7 +1247,8 @@ class TestOpus5Everywhere:
         source = inspect.getsource(ClaudeClient.__init__)
         assert 'self.model_light = "claude-opus-5"' in source
         assert 'self.model_heavy = "claude-opus-5"' in source
-        assert 'self.effort_heavy = "medium"' in source
+        # Analysis effort is low — medium still exhausted 64k thinking on XAUUSD charts.
+        assert 'self.effort_heavy = "low"' in source
         assert 'self.effort_light' in source
         assert 'self.effort_judge' in source
         assert 'self.effort_review' in source
@@ -1461,6 +1462,60 @@ class TestOpus5Everywhere:
         created = await client._async_messages_create(model='claude-opus-5', max_tokens=4000, messages=[])
         assert created is client.async_client.messages.create.return_value
         client.async_client.messages.create.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_analysis_retries_without_thinking_after_max_tokens(self):
+        """If thinking fills max_tokens with no tool call, retry once with thinking off + forced tool."""
+        client = self._get_claude_client()
+        client.async_client = AsyncMock()  # truthy so analyze_chart_async proceeds
+        client._cache = MagicMock()
+        client._cache.get = AsyncMock(return_value=None)
+        client._cache.set = AsyncMock()
+        client._check_rate_limit = AsyncMock()
+        client._record_usage = MagicMock()
+        client._build_analysis_prompt = MagicMock(return_value='analyze')
+        client._build_system_messages = MagicMock(return_value=[])
+
+        truncated = MagicMock()
+        truncated.stop_reason = 'max_tokens'
+        truncated.content = [MagicMock(type='thinking', thinking='...')]
+
+        tool_block = MagicMock()
+        tool_block.type = 'tool_use'
+        tool_block.name = 'submit_trade_analysis'
+        tool_block.input = {
+            'direction': 'no_trade',
+            'confidence': 0.4,
+            'entry_price': None,
+            'stop_loss': None,
+            'take_profit': None,
+            'reasoning': 'No setup',
+            'market_structure': 'ranging',
+            'trade_type': 'intraday',
+        }
+        recovered = MagicMock()
+        recovered.stop_reason = 'tool_use'
+        recovered.content = [tool_block]
+
+        client._async_messages_create = AsyncMock(side_effect=[truncated, recovered])
+
+        result = await client.analyze_chart_async(
+            chart_image_base64='abc',
+            symbol='XAUUSD',
+            timeframe='M15',
+            strategy_context='ctx',
+            use_cache=False,
+        )
+
+        assert client._async_messages_create.await_count == 2
+        first_kwargs = client._async_messages_create.await_args_list[0].kwargs
+        second_kwargs = client._async_messages_create.await_args_list[1].kwargs
+        assert first_kwargs.get('output_config', {}).get('effort') == 'low'
+        assert second_kwargs.get('thinking') == {'type': 'disabled'}
+        assert second_kwargs.get('tool_choice', {}).get('type') == 'tool'
+        assert result.signal.direction == 'no_trade'
+        # Truncated incomplete analyses must not be cached.
+        client._cache.set.assert_not_called()
 
 
 # ============================================================

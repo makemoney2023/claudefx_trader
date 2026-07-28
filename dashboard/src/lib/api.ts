@@ -59,7 +59,27 @@ async function fetchApi<T>(endpoint: string, options: FetchOptions = {}): Promis
     clearTimeout(timeoutId)
     
     if (!response.ok) {
-      throw new Error(`API error: ${response.status} ${response.statusText}`)
+      let detail = ''
+      try {
+        const errBody = await response.json()
+        if (typeof errBody?.detail === 'string') {
+          detail = errBody.detail
+        } else if (Array.isArray(errBody?.detail)) {
+          detail = errBody.detail
+            .map((d: { msg?: string }) => d?.msg)
+            .filter(Boolean)
+            .join('; ')
+        } else if (errBody?.detail != null) {
+          detail = JSON.stringify(errBody.detail)
+        }
+      } catch {
+        // ignore non-JSON error bodies
+      }
+      throw new Error(
+        detail
+          ? `API error: ${response.status} ${response.statusText} — ${detail}`
+          : `API error: ${response.status} ${response.statusText}`
+      )
     }
     
     return response.json()
