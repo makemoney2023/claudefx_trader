@@ -14,6 +14,43 @@ from ..utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+# Docs Claude may fetch on demand (replay tool-lookup / slim index).
+STRATEGY_DOC_ALLOWLIST: tuple = (
+    "ict_strategy",
+    "market_structure",
+    "fair_value_gap",
+    "order_blocks",
+    "liquidity_concepts",
+    "optimal_trade_entry",
+    "kill_zones",
+    "swing_validation",
+    "precious_metals",
+    "risk_management",
+    "amd_cycle",
+    "volume_concepts",
+)
+
+# Never ship these into analysis prompts (product/plan docs, not methodology).
+STRATEGY_DOC_BLOCKLIST: tuple = (
+    "website_documentation",
+    "phase2_100k_plan",
+)
+
+_DOC_SUMMARIES: Dict[str, str] = {
+    "ict_strategy": "Core ICT methodology overview",
+    "market_structure": "BOS, CHoCH, MSS and swing structure",
+    "fair_value_gap": "FVG formation and trading",
+    "order_blocks": "Order blocks, breakers, mitigation",
+    "liquidity_concepts": "BSL/SSL, EQH/EQL, sweeps",
+    "optimal_trade_entry": "OTE, Fibonacci, premium/discount",
+    "kill_zones": "Session times and kill-zone strategies",
+    "swing_validation": "Swing count, wicks, sweep-and-reclaim",
+    "precious_metals": "Gold/silver trading notes",
+    "risk_management": "Position sizing and drawdown rules",
+    "amd_cycle": "Power of 3 / Judas swing (AMD)",
+    "volume_concepts": "Volume confirmation and institutional footprint",
+}
+
 
 class ContextBuilder:
     """
@@ -41,6 +78,9 @@ class ContextBuilder:
             return
         
         for doc_file in self.docs_dir.glob("*.md"):
+            # Skip macOS AppleDouble junk (._*.md) which is not valid UTF-8 text.
+            if doc_file.name.startswith("._"):
+                continue
             try:
                 content = doc_file.read_text(encoding='utf-8')
                 self._cache[doc_file.stem] = content
@@ -61,6 +101,59 @@ class ContextBuilder:
             Document content or None
         """
         return self._cache.get(name)
+
+    def get_strategy_doc_index(self) -> str:
+        """Short allowlisted catalog for slim/replay system prompts (not full markdown)."""
+        lines = ["## Available strategy documents",
+                 "Call lookup_strategy_doc to read a document (max 2 lookups per analysis)."]
+        for name in STRATEGY_DOC_ALLOWLIST:
+            if name not in self._cache or name in STRATEGY_DOC_BLOCKLIST:
+                continue
+            summary = _DOC_SUMMARIES.get(name, name.replace("_", " "))
+            lines.append(f"- {name}: {summary}")
+        return "\n".join(lines)
+
+    def lookup_strategy_doc(
+        self,
+        doc_name: Optional[str] = None,
+        query: Optional[str] = None,
+        max_chars: int = 12000,
+    ) -> Dict[str, object]:
+        """
+        Return one allowlisted strategy doc by name or query.
+
+        Blocklisted names are always rejected. Content is truncated to max_chars.
+        """
+        resolved: Optional[str] = None
+        if doc_name:
+            key = str(doc_name).strip().lower().replace(".md", "").replace(" ", "_")
+            if key in STRATEGY_DOC_BLOCKLIST:
+                return {"error": f"Document '{key}' is not available for lookup"}
+            if key in STRATEGY_DOC_ALLOWLIST and key in self._cache:
+                resolved = key
+            else:
+                return {"error": f"Unknown or disallowed document '{doc_name}'"}
+        elif query:
+            q = str(query).strip().lower()
+            if not q:
+                return {"error": "Empty query"}
+            # Prefer exact stem match, then substring on allowlisted names only.
+            for name in STRATEGY_DOC_ALLOWLIST:
+                if name in STRATEGY_DOC_BLOCKLIST or name not in self._cache:
+                    continue
+                if name == q or q in name or q in _DOC_SUMMARIES.get(name, "").lower():
+                    resolved = name
+                    break
+            if resolved is None:
+                return {"error": f"No allowlisted document matched query '{query}'"}
+        else:
+            return {"error": "Provide doc_name or query"}
+
+        content = self._cache[resolved]
+        truncated = len(content) > max_chars
+        if truncated:
+            content = content[:max_chars]
+        return {"doc_name": resolved, "content": content, "truncated": truncated}
     
     def get_ict_context(self) -> str:
         """
@@ -95,13 +188,16 @@ class ContextBuilder:
         ]
         
         for doc_name in priority_docs:
+            if doc_name in STRATEGY_DOC_BLOCKLIST:
+                continue
             if doc_name in self._cache:
                 sections.append(f"### {doc_name.replace('_', ' ').title()}\n\n{self._cache[doc_name]}")
         
-        # Add any remaining documents
+        # Add any remaining documents except blocklisted product/plan docs
         for doc_name, content in self._cache.items():
-            if doc_name not in priority_docs:
-                sections.append(f"### {doc_name.replace('_', ' ').title()}\n\n{content}")
+            if doc_name in priority_docs or doc_name in STRATEGY_DOC_BLOCKLIST:
+                continue
+            sections.append(f"### {doc_name.replace('_', ' ').title()}\n\n{content}")
         
         return "\n\n---\n\n".join(sections)
     
