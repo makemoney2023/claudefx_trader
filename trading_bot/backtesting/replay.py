@@ -729,6 +729,10 @@ class ClaudeReplayBacktester:
                     if len(h1_chart_win) >= 10:
                         chart_panels.insert(0, {"timeframe": "H1", "df": h1_chart_win})
 
+                logger.info(
+                    f"[REPLAY] {current.strftime('%m/%d %H:%M')} rendering chart "
+                    f"({len(chart_panels)} panels)..."
+                )
                 try:
                     chart_b64 = await asyncio.to_thread(
                         create_composite_chart, chart_panels, symbol,
@@ -741,6 +745,9 @@ class ClaudeReplayBacktester:
                     )
 
                 if not chart_b64:
+                    logger.warning(
+                        f"[REPLAY] {current.strftime('%m/%d %H:%M')} chart render returned empty — skipping"
+                    )
                     current += timedelta(hours=interval_hours)
                     continue
 
@@ -804,6 +811,10 @@ class ClaudeReplayBacktester:
                 if symbol in _last_signal_for_symbol:
                     market_data['last_signal'] = _last_signal_for_symbol[symbol]
 
+                logger.info(
+                    f"[REPLAY] {current.strftime('%m/%d %H:%M')} calling Claude "
+                    f"(session={snapshot_session}, price={current_price:.5f})..."
+                )
                 claude_result = await self._claude.analyze_chart_async(
                     chart_image_base64=chart_b64,
                     symbol=symbol,
@@ -811,6 +822,10 @@ class ClaudeReplayBacktester:
                     strategy_context=strategy_ctx,
                     market_data=market_data,
                     analysis_data=analysis_data if analysis_data else None,
+                )
+                logger.info(
+                    f"[REPLAY] {current.strftime('%m/%d %H:%M')} Claude returned "
+                    f"{claude_result.signal.direction} conf={claude_result.signal.confidence:.0%}"
                 )
 
                 sig = claude_result.signal

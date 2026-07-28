@@ -864,6 +864,10 @@ class ClaudeClient:
                 # tool_choice=auto (forced tool use is incompatible with thinking). The system
                 # message instructs the model to always finish by calling submit_trade_analysis.
                 # Large max_tokens requires streaming via _async_messages_create.
+                logger.info(
+                    f"[ANALYSIS] {symbol} {timeframe} requesting Claude "
+                    f"(effort={self.effort_heavy}, max_tokens={self.max_tokens})..."
+                )
                 message = await self._async_messages_create(
                     model=self.model_heavy,
                     max_tokens=self.max_tokens,
