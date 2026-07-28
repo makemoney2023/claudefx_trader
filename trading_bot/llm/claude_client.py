@@ -145,6 +145,38 @@ TRADE_SIGNAL_TOOL = {
 }
 
 
+LOOKUP_STRATEGY_DOC_TOOL = {
+    "name": "lookup_strategy_doc",
+    "description": (
+        "Fetch one ICT strategy document by name or keyword. Use at most twice "
+        "per analysis, only when you need methodology detail beyond ANALYSIS_RULES. "
+        "Then call submit_trade_analysis."
+    ),
+    "strict": True,
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "doc_name": {
+                "type": ["string", "null"],
+                "description": (
+                    "Exact document stem from the Available strategy documents "
+                    "index (e.g. fair_value_gap). Null if using query instead."
+                ),
+            },
+            "query": {
+                "type": ["string", "null"],
+                "description": (
+                    "Keyword to match an allowlisted doc when doc_name is unknown. "
+                    "Null if doc_name is provided."
+                ),
+            },
+        },
+        "required": ["doc_name", "query"],
+        "additionalProperties": False,
+    },
+}
+
+
 @dataclass
 class TradeSignal:
     """
@@ -771,7 +803,9 @@ class ClaudeClient:
         market_data: Optional[Dict[str, Any]] = None,
         analysis_data: Optional[Dict[str, Any]] = None,
         use_cache: bool = True,
-        additional_charts: Optional[List[Dict[str, str]]] = None
+        additional_charts: Optional[List[Dict[str, str]]] = None,
+        strategy_mode: str = "full",
+        context_builder: Optional[Any] = None,
     ) -> AnalysisResult:
         """
         Analyze a chart image asynchronously.
@@ -780,12 +814,15 @@ class ClaudeClient:
             chart_image_base64: Base64 encoded chart image (primary timeframe)
             symbol: Trading symbol (e.g., 'EURUSD')
             timeframe: Chart timeframe (e.g., 'H1')
-            strategy_context: ICT strategy documentation for context
+            strategy_context: ICT strategy documentation for context (full mode)
             market_data: Optional current market data
             analysis_data: Optional pre-computed analysis (FVGs, OBs, etc.)
             use_cache: Whether to use cached results
             additional_charts: Optional list of additional chart images with
                 keys 'base64' (image data) and 'timeframe' (e.g., 'M5', 'M1')
+            strategy_mode: "full" embeds strategy_context; "replay" uses a slim
+                doc index + on-demand lookup_strategy_doc tool loop
+            context_builder: Optional ContextBuilder for replay doc lookup
             
         Returns:
             AnalysisResult with trade signal and analysis
@@ -811,6 +848,23 @@ class ClaudeClient:
         # Build the analysis prompt (outside retry loop)
         prompt = self._build_analysis_prompt(
             symbol, timeframe, strategy_context, market_data, analysis_data
+        )
+
+        is_replay = strategy_mode == "replay"
+        ctx_builder = context_builder
+        if is_replay and ctx_builder is None:
+            from .context_builder import ContextBuilder
+            ctx_builder = ContextBuilder()
+        doc_index = ctx_builder.get_strategy_doc_index() if is_replay and ctx_builder else ""
+        system_messages = self._build_system_messages(
+            strategy_context,
+            strategy_mode=strategy_mode,
+            doc_index=doc_index,
+        )
+        analysis_tools = (
+            [LOOKUP_STRATEGY_DOC_TOOL, TRADE_SIGNAL_TOOL]
+            if is_replay
+            else [TRADE_SIGNAL_TOOL]
         )
         
         # Exponential backoff retry for transient errors
@@ -857,88 +911,107 @@ class ClaudeClient:
                     "type": "text",
                     "text": prompt
                 })
-                
-                # Create message with images and tool use (Opus 5 for best analysis quality).
-                # Strategy docs go in system message with cache_control for Anthropic prompt caching.
-                # Opus 5: no temperature (400 error), adaptive thinking + explicit effort, and
-                # tool_choice=auto (forced tool use is incompatible with thinking). The system
-                # message instructs the model to always finish by calling submit_trade_analysis.
-                # Large max_tokens requires streaming via _async_messages_create.
-                logger.info(
-                    f"[ANALYSIS] {symbol} {timeframe} requesting Claude "
-                    f"(effort={self.effort_heavy}, max_tokens={self.max_tokens})..."
-                )
-                message = await self._async_messages_create(
-                    model=self.model_heavy,
-                    max_tokens=self.max_tokens,
-                    thinking={"type": "adaptive"},
-                    output_config={"effort": self.effort_heavy},
-                    system=self._build_system_messages(strategy_context),
-                    tools=[TRADE_SIGNAL_TOOL],
-                    tool_choice={"type": "auto"},
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": content_blocks
-                        }
-                    ]
-                )
-                
-                self._record_usage("analysis", message)
 
-                stop_reason = getattr(message, "stop_reason", None)
-                # Any max_tokens stop is untrusted — including partial tool_use
-                # blocks that look complete but were cut off mid-generation.
-                if stop_reason == "max_tokens":
-                    logger.warning(
-                        f"[ANALYSIS] {symbol} hit max_tokens={self.max_tokens} "
-                        f"— retrying once with thinking disabled + forced tool"
+                messages: List[Dict[str, Any]] = [
+                    {"role": "user", "content": content_blocks}
+                ]
+                lookup_count = 0
+                max_lookups = 2
+                max_turns = 4
+                message = None
+
+                for turn in range(max_turns):
+                    logger.info(
+                        f"[ANALYSIS] {symbol} {timeframe} requesting Claude "
+                        f"(mode={strategy_mode}, turn={turn + 1}, "
+                        f"effort={self.effort_heavy}, max_tokens={self.max_tokens})..."
                     )
                     message = await self._async_messages_create(
                         model=self.model_heavy,
-                        max_tokens=4000,
-                        thinking={"type": "disabled"},
-                        output_config={"effort": "low"},
-                        system=self._build_system_messages(strategy_context),
-                        tools=[TRADE_SIGNAL_TOOL],
-                        tool_choice={
-                            "type": "tool",
-                            "name": "submit_trade_analysis",
-                        },
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": content_blocks,
-                            }
-                        ],
+                        max_tokens=self.max_tokens,
+                        thinking={"type": "adaptive"},
+                        output_config={"effort": self.effort_heavy},
+                        system=system_messages,
+                        tools=analysis_tools,
+                        tool_choice={"type": "auto"},
+                        messages=messages,
                     )
-                    self._record_usage("analysis_retry", message)
+                    self._record_usage("analysis", message)
                     stop_reason = getattr(message, "stop_reason", None)
+
+                    if stop_reason == "max_tokens":
+                        logger.warning(
+                            f"[ANALYSIS] {symbol} hit max_tokens={self.max_tokens} "
+                            f"— retrying once with thinking disabled + forced tool"
+                        )
+                        message = await self._async_messages_create(
+                            model=self.model_heavy,
+                            max_tokens=4000,
+                            thinking={"type": "disabled"},
+                            output_config={"effort": "low"},
+                            system=system_messages,
+                            tools=[TRADE_SIGNAL_TOOL],
+                            tool_choice={
+                                "type": "tool",
+                                "name": "submit_trade_analysis",
+                            },
+                            messages=messages,
+                        )
+                        self._record_usage("analysis_retry", message)
+                        stop_reason = getattr(message, "stop_reason", None)
+                        if stop_reason == "max_tokens":
+                            result = self._create_no_trade_result(
+                                "Analysis truncated (max_tokens) before complete tool call"
+                            )
+                            result.analysis_time = time.time() - start_time
+                            return result
+                        break
+
+                    submit_block, lookup_blocks = self._split_analysis_tool_uses(message)
+                    if submit_block is not None:
+                        break
+
+                    if is_replay and lookup_blocks:
+                        assistant_content = self._serialize_assistant_content(message)
+                        messages.append({"role": "assistant", "content": assistant_content})
+                        tool_results = []
+                        for block in lookup_blocks:
+                            if lookup_count >= max_lookups:
+                                payload = {
+                                    "error": "lookup limit reached; call submit_trade_analysis"
+                                }
+                            else:
+                                lookup_count += 1
+                                inp = getattr(block, "input", None) or {}
+                                if not isinstance(inp, dict):
+                                    inp = {}
+                                payload = ctx_builder.lookup_strategy_doc(
+                                    doc_name=inp.get("doc_name"),
+                                    query=inp.get("query"),
+                                )
+                                logger.info(
+                                    f"[ANALYSIS] {symbol} lookup_strategy_doc "
+                                    f"#{lookup_count}: {payload.get('doc_name') or payload.get('error')}"
+                                )
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": json.dumps(payload),
+                            })
+                        messages.append({"role": "user", "content": tool_results})
+                        continue
+
+                    # No submit and no (further) lookups — fall through to parser.
+                    break
 
                 has_tool = any(
                     getattr(block, "type", None) == "tool_use"
                     for block in (getattr(message, "content", None) or [])
                 )
-
-                if stop_reason == "max_tokens":
-                    logger.warning(
-                        f"[ANALYSIS] {symbol} still truncated after retry — "
-                        f"returning no_trade without caching"
-                    )
-                    result = self._create_no_trade_result(
-                        "Analysis truncated (max_tokens) before complete tool call"
-                    )
-                    result.analysis_time = time.time() - start_time
-                    return result
-
-                # Parse response
                 result = self._parse_tool_response(message)
                 result.analysis_time = time.time() - start_time
-                
-                # Cache only complete tool responses (never truncated paths).
-                if use_cache and has_tool:
+                if use_cache and has_tool and result.signal.direction:
                     await self._cache.set(symbol, timeframe, image_hash, result, market_data)
-                
                 return result
                 
             except anthropic.RateLimitError as e:
@@ -1032,48 +1105,116 @@ class ClaudeClient:
     # and silently duplicated the Opus 5 request shape (every prompt/param change
     # had to be made twice). Use analyze_chart_async().
     
-    def _build_system_messages(self, strategy_context: str) -> list:
+    @staticmethod
+    def _split_analysis_tool_uses(message) -> Tuple[Optional[Any], List[Any]]:
+        """Return (submit_trade_analysis block or None, lookup_strategy_doc blocks)."""
+        submit = None
+        lookups: List[Any] = []
+        for block in getattr(message, "content", None) or []:
+            if getattr(block, "type", None) != "tool_use":
+                continue
+            name = getattr(block, "name", None)
+            if name == "submit_trade_analysis":
+                submit = block
+            elif name == "lookup_strategy_doc":
+                lookups.append(block)
+        return submit, lookups
+
+    @staticmethod
+    def _serialize_assistant_content(message) -> List[Dict[str, Any]]:
+        """Convert SDK content blocks into JSON-serializable message content."""
+        serialized: List[Dict[str, Any]] = []
+        for block in getattr(message, "content", None) or []:
+            btype = getattr(block, "type", None)
+            if btype == "tool_use":
+                serialized.append({
+                    "type": "tool_use",
+                    "id": block.id,
+                    "name": block.name,
+                    "input": getattr(block, "input", {}) or {},
+                })
+            elif btype == "text":
+                serialized.append({"type": "text", "text": getattr(block, "text", "") or ""})
+            elif btype == "thinking":
+                # Preserve thinking for multi-turn continuity when the API returns it.
+                entry: Dict[str, Any] = {
+                    "type": "thinking",
+                    "thinking": getattr(block, "thinking", "") or "",
+                }
+                signature = getattr(block, "signature", None)
+                if signature:
+                    entry["signature"] = signature
+                serialized.append(entry)
+            elif btype == "redacted_thinking":
+                serialized.append({
+                    "type": "redacted_thinking",
+                    "data": getattr(block, "data", "") or "",
+                })
+        return serialized
+
+    def _build_system_messages(
+        self,
+        strategy_context: str,
+        *,
+        strategy_mode: str = "full",
+        doc_index: str = "",
+    ) -> list:
         """Build system messages with prompt caching for strategy docs.
 
         Order matters for Opus 5: put the short conciseness reminder AFTER the
         long cached blocks so it sits near the end of the system stack.
+
+        strategy_mode:
+          - full: embed strategy_context markdown (live path)
+          - replay: embed a short doc index; Claude fetches docs via lookup_strategy_doc
         """
-        return [
-            {
+        identity = (
+            "You are an expert ICT (Inner Circle Trading) forex analyst. "
+            "Analyze charts using the ICT methodology described below. "
+            "OUTPUT REQUIREMENT — ALWAYS: You MUST finish every analysis by calling the "
+            "submit_trade_analysis tool exactly once. Do NOT reply with plain text instead "
+            "of the tool call. If there is no valid setup, still call the tool with "
+            "direction='no_trade' and your reasoning. "
+            "CRITICAL ZONE RULE — NEVER VIOLATE: "
+            "buy_limit ONLY in discount zone (below equilibrium). "
+            "sell_limit ONLY in premium zone (above equilibrium). "
+            "Buying expensive (premium) or selling cheap (discount) is retail behavior. "
+            "For breakouts, use buy_stop/sell_stop instead. "
+            "CRITICAL STRUCTURE RULES — NEVER VIOLATE: "
+            "1) NEVER go long when D1 AND H4 are both bearish. NEVER go short when D1 AND H4 are both bullish. "
+            "Higher timeframes set the direction — lower timeframes only refine the entry. "
+            "2) During Distribution phase, the move is done. Avoid new entries unless displacement confirms a fresh cycle. "
+            "3) M15 direction rules are detailed in the DIRECTIONAL AUTHORITY section of the analysis prompt."
+        )
+        if strategy_mode == "replay":
+            identity += (
+                " REPLAY MODE: Do NOT expect full strategy markdown in this prompt. "
+                "Call lookup_strategy_doc for methodology details (max 2 lookups), "
+                "then call submit_trade_analysis."
+            )
+            middle = {
                 "type": "text",
-                "text": "You are an expert ICT (Inner Circle Trading) forex analyst. "
-                        "Analyze charts using the ICT methodology described below. "
-                        "OUTPUT REQUIREMENT — ALWAYS: You MUST finish every analysis by calling the "
-                        "submit_trade_analysis tool exactly once. Do NOT reply with plain text instead "
-                        "of the tool call. If there is no valid setup, still call the tool with "
-                        "direction='no_trade' and your reasoning. "
-                        "CRITICAL ZONE RULE — NEVER VIOLATE: "
-                        "buy_limit ONLY in discount zone (below equilibrium). "
-                        "sell_limit ONLY in premium zone (above equilibrium). "
-                        "Buying expensive (premium) or selling cheap (discount) is retail behavior. "
-                        "For breakouts, use buy_stop/sell_stop instead. "
-                        "CRITICAL STRUCTURE RULES — NEVER VIOLATE: "
-                        "1) NEVER go long when D1 AND H4 are both bearish. NEVER go short when D1 AND H4 are both bullish. "
-                        "Higher timeframes set the direction — lower timeframes only refine the entry. "
-                        "2) During Distribution phase, the move is done. Avoid new entries unless displacement confirms a fresh cycle. "
-                        "3) M15 direction rules are detailed in the DIRECTIONAL AUTHORITY section of the analysis prompt.",
-            },
-            {
-                # Static ICT methodology — cached so it is not re-billed every call.
-                "type": "text",
-                "text": ANALYSIS_RULES,
-                "cache_control": {"type": "ephemeral"}
-            },
-            {
+                "text": doc_index or (
+                    "## Available strategy documents\n"
+                    "Call lookup_strategy_doc when you need methodology detail."
+                ),
+                "cache_control": {"type": "ephemeral"},
+            }
+        else:
+            middle = {
                 "type": "text",
                 "text": strategy_context,
-                "cache_control": {"type": "ephemeral"}
-            },
+                "cache_control": {"type": "ephemeral"},
+            }
+        return [
+            {"type": "text", "text": identity},
             {
-                # Last: Opus 5 verbosity control (effort does not shorten visible text).
                 "type": "text",
-                "text": ANALYSIS_TONE_PREFERENCE,
+                "text": ANALYSIS_RULES,
+                "cache_control": {"type": "ephemeral"},
             },
+            middle,
+            {"type": "text", "text": ANALYSIS_TONE_PREFERENCE},
         ]
     
     def _build_analysis_prompt(

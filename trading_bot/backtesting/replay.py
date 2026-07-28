@@ -751,8 +751,6 @@ class ClaudeReplayBacktester:
                     current += timedelta(hours=interval_hours)
                     continue
 
-                strategy_ctx = context_builder.get_ict_context() if context_builder else ""
-
                 market_data: Dict[str, Any] = {
                     'current_price': current_price,
                     'session': snapshot_session,
@@ -813,15 +811,18 @@ class ClaudeReplayBacktester:
 
                 logger.info(
                     f"[REPLAY] {current.strftime('%m/%d %H:%M')} calling Claude "
-                    f"(session={snapshot_session}, price={current_price:.5f})..."
+                    f"(session={snapshot_session}, price={current_price:.5f}, "
+                    f"strategy_mode=replay)..."
                 )
                 claude_result = await self._claude.analyze_chart_async(
                     chart_image_base64=chart_b64,
                     symbol=symbol,
                     timeframe='M15',
-                    strategy_context=strategy_ctx,
+                    strategy_context="",
                     market_data=market_data,
                     analysis_data=analysis_data if analysis_data else None,
+                    strategy_mode="replay",
+                    context_builder=context_builder,
                 )
                 logger.info(
                     f"[REPLAY] {current.strftime('%m/%d %H:%M')} Claude returned "

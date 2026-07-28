@@ -36,6 +36,7 @@ The ICT Trading Bot is a sophisticated automated trading system designed to capt
 - **Claude Opus 5 everywhere**: chart analysis, trade judge, position/pending re-evals, trade reviews, weekly insights, and sizing all run on Opus 5 with adaptive thinking (low effort for analysis with a 16k budget + thinking-disabled forced-tool retry on any max_tokens stop; medium for judge/reviews; low for sizing/re-evals)
 - **Guaranteed-valid outputs**: the analysis tool uses strict tool use and the trade judge uses structured outputs (JSON schema), so signals and verdicts are always schema-valid
 - **Prompt caching**: the static ICT ruleset (`ANALYSIS_RULES`), the trade-judge rubric (`JUDGE_RUBRIC`), the re-eval rules, and strategy docs all live in cached system blocks, cutting repeat token cost per scan cycle
+- **Replay doc lookup**: Claude replay analysis uses a slim doc index plus on-demand `lookup_strategy_doc` (max 2) instead of embedding the full ~30k-token strategy markdown dump every snapshot; live analysis still embeds strategy context
 - **Cost telemetry**: every API call logs a `[USAGE]` line and writes a row to the `api_usage` table (tokens, cache hits, estimated USD cost per task type)
 - **Prompt telemetry**: `scripts/prompt_baseline_report.py` compares signal distributions before/after the prompt-v3 (Opus 5) cutover to measure behavioural drift
 

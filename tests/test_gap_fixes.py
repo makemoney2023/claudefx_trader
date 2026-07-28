@@ -1273,6 +1273,34 @@ class TestOpus5Everywhere:
         assert '"minimum"' not in flat and '"maximum"' not in flat, \
             "strict tool schemas must not contain numeric range constraints"
 
+    def test_lookup_strategy_doc_tool_is_strict(self):
+        """On-demand doc lookup tool must be strict-compatible."""
+        from trading_bot.llm.claude_client import LOOKUP_STRATEGY_DOC_TOOL
+        import json as _json
+
+        assert LOOKUP_STRATEGY_DOC_TOOL['name'] == 'lookup_strategy_doc'
+        assert LOOKUP_STRATEGY_DOC_TOOL.get('strict') is True
+        schema = LOOKUP_STRATEGY_DOC_TOOL['input_schema']
+        assert schema.get('additionalProperties') is False
+        for field in ('doc_name', 'query'):
+            assert field in schema['required']
+        flat = _json.dumps(schema)
+        assert '"minimum"' not in flat and '"maximum"' not in flat
+
+    def test_replay_system_messages_use_index_not_full_docs(self):
+        """Replay mode must not embed the full strategy dump in system messages."""
+        client = self._get_claude_client()
+        msgs = client._build_system_messages(
+            "HUGE STRATEGY DUMP SHOULD NOT APPEAR",
+            strategy_mode="replay",
+        )
+        texts = [m["text"] for m in msgs]
+        assert all("HUGE STRATEGY DUMP SHOULD NOT APPEAR" not in t for t in texts)
+        assert any(
+            "lookup_strategy_doc" in t or "Available strategy documents" in t
+            for t in texts
+        )
+
     def test_no_light_call_sends_temperature(self):
         """All light-task methods must route through the shared Opus 5 JSON helper."""
         import inspect
@@ -1535,6 +1563,71 @@ class TestOpus5Everywhere:
         assert result.signal.direction == 'no_trade'
         # Truncated incomplete analyses must not be cached.
         client._cache.set.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_replay_mode_lookup_then_submit(self):
+        """Replay mode should run a lookup tool turn, then accept submit_trade_analysis."""
+        client = self._get_claude_client()
+        client.async_client = AsyncMock()
+        client._cache = MagicMock()
+        client._cache.get = AsyncMock(return_value=None)
+        client._cache.set = AsyncMock()
+        client._check_rate_limit = AsyncMock()
+        client._record_usage = MagicMock()
+        client._build_analysis_prompt = MagicMock(return_value='analyze')
+
+        lookup_block = MagicMock()
+        lookup_block.type = 'tool_use'
+        lookup_block.id = 'toolu_lookup_1'
+        lookup_block.name = 'lookup_strategy_doc'
+        lookup_block.input = {'doc_name': 'fair_value_gap', 'query': None}
+        first = MagicMock()
+        first.stop_reason = 'tool_use'
+        first.content = [lookup_block]
+
+        submit_block = MagicMock()
+        submit_block.type = 'tool_use'
+        submit_block.name = 'submit_trade_analysis'
+        submit_block.input = {
+            'direction': 'no_trade',
+            'confidence': 0.4,
+            'entry_price': None,
+            'stop_loss': None,
+            'take_profit': None,
+            'reasoning': 'No setup after checking FVG rules',
+            'market_structure': 'ranging',
+            'trade_type': 'intraday',
+        }
+        second = MagicMock()
+        second.stop_reason = 'tool_use'
+        second.content = [submit_block]
+
+        client._async_messages_create = AsyncMock(side_effect=[first, second])
+
+        from trading_bot.llm.context_builder import ContextBuilder
+        result = await client.analyze_chart_async(
+            chart_image_base64='abc',
+            symbol='XAUUSD',
+            timeframe='M15',
+            strategy_context='',
+            use_cache=False,
+            strategy_mode='replay',
+            context_builder=ContextBuilder(),
+        )
+
+        assert client._async_messages_create.await_count == 2
+        second_msgs = client._async_messages_create.await_args_list[1].kwargs['messages']
+        assert any(
+            isinstance(m.get('content'), list)
+            and any(
+                isinstance(b, dict) and b.get('type') == 'tool_result'
+                for b in m['content']
+            )
+            for m in second_msgs
+        )
+        first_tools = client._async_messages_create.await_args_list[0].kwargs['tools']
+        assert any(t.get('name') == 'lookup_strategy_doc' for t in first_tools)
+        assert result.signal.direction == 'no_trade'
 
 
 # ============================================================
