@@ -38,23 +38,23 @@ MODE_CONFIGS = {
     TradingMode.AGGRESSIVE: ModeConfig(
         risk_multiplier=1.15,
         setup_filter='all',
-        confidence_threshold=0.65,
+        confidence_threshold=0.60,
         max_daily_trades=30,
         description="Data collection mode: lower bars to gather trade outcomes for learning"
     ),
     TradingMode.NORMAL: ModeConfig(
         risk_multiplier=1.0,
         setup_filter='A_and_B',
-        confidence_threshold=0.70,
+        confidence_threshold=0.60,
         max_daily_trades=25,
-        description="Standard risk, requires strong conviction (swing validation + confluence)"
+        description="Standard risk, accepts B+ setups at 60%+ confidence"
     ),
     TradingMode.CONSERVATIVE: ModeConfig(
         risk_multiplier=0.5,
         setup_filter='A_and_B',
-        confidence_threshold=0.65,
+        confidence_threshold=0.60,
         max_daily_trades=15,
-        description="Half risk, A+ and A setups only (Mon/Fri caution)"
+        description="Half risk, A+/A/B setups at 60%+ confidence (Mon/Fri caution)"
     ),
     TradingMode.DEFENSIVE: ModeConfig(
         risk_multiplier=0.25,

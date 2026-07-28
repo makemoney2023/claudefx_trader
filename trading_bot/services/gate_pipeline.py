@@ -231,7 +231,7 @@ def evaluate_structure_and_quality_gates(
 
     count, _ = count_confluence(ctx)
     min_conf = 1 if ctx.scaling_aggressive else 2
-    conf_override = 0.65 if ctx.scaling_aggressive else 0.75
+    conf_override = 0.60
     conf_step = evaluate_confluence_gate(
         ctx,
         confluence_count=count,

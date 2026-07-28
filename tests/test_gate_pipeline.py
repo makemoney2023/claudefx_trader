@@ -66,9 +66,14 @@ class TestGatePipeline:
         assert outcome.blocked is True
 
     def test_post_cooldown_blocks_low_confidence(self):
-        ctx = _ctx(post_cooldown=True, confidence=0.70)
+        ctx = _ctx(post_cooldown=True, confidence=0.59)
         outcome = evaluate_structure_and_quality_gates(ctx)
         assert outcome.blocked is True
+
+    def test_low_confluence_allows_at_60(self):
+        ctx = _ctx(confidence=0.60, analysis_results={"volume": {"relative_volume": 1.0}})
+        outcome = evaluate_structure_and_quality_gates(ctx, is_kill_zone=True)
+        assert outcome.blocked is False
 
 
 class TestFlipGuard:

@@ -149,4 +149,5 @@ class TestFinalRiskCharacterization:
 class TestSetupGrade:
     def test_grade_from_confidence(self):
         assert setup_grade_from_confidence(0.86) == "A+"
-        assert setup_grade_from_confidence(0.62) == "C"
+        assert setup_grade_from_confidence(0.62) == "B"
+        assert setup_grade_from_confidence(0.59) == "C"

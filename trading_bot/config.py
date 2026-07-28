@@ -443,7 +443,7 @@ class TradingSettings(BaseSettings):
             "BTCUSD": [12, 13],
             "XRPUSD": [5, 6, 7, 8, 20],
         },
-        description="UTC hours with historically weak win rates per symbol. Trades during these hours require 68%+ confidence."
+        description="UTC hours with historically weak win rates per symbol. Trades during these hours require 60%+ confidence."
     )
 
     # Zone-aware gate settings (replaces legacy D1 direction gate)
@@ -452,7 +452,7 @@ class TradingSettings(BaseSettings):
         description="Zone gate mode: 'active' blocks zone-misaligned trades, 'shadow' logs only (legacy D1 gate still blocks), 'disabled' uses legacy D1 gate"
     )
     zone_misaligned_min_confidence: float = Field(
-        default=0.75,
+        default=0.60,
         description="Min confidence for zone-misaligned trades (long from premium, short from discount)"
     )
     zone_misaligned_min_rr: float = Field(
@@ -460,7 +460,7 @@ class TradingSettings(BaseSettings):
         description="Min R:R for zone-misaligned trades"
     )
     zone_equilibrium_min_confidence: float = Field(
-        default=0.65,
+        default=0.60,
         description="Min confidence for trades from equilibrium zone"
     )
     zone_gate_disabled_symbols: List[str] = Field(

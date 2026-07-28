@@ -64,7 +64,7 @@ def setup_grade_from_confidence(confidence: float) -> str:
         return "A+"
     if confidence >= 0.75:
         return "A"
-    if confidence >= 0.65:
+    if confidence >= 0.60:
         return "B"
     return "C"
 

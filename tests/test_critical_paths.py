@@ -1064,11 +1064,11 @@ class TestDrawdownRecoveryMode:
         )
 
     def test_conservative_mode_config(self):
-        """CONSERVATIVE mode should have risk_multiplier=0.5, confidence_threshold=0.65."""
+        """CONSERVATIVE mode should have risk_multiplier=0.5, confidence_threshold=0.60."""
         from trading_bot.services.scaling_manager import MODE_CONFIGS, TradingMode
         config = MODE_CONFIGS[TradingMode.CONSERVATIVE]
         assert config.risk_multiplier == 0.5
-        assert config.confidence_threshold == 0.65
+        assert config.confidence_threshold == 0.60
         assert config.max_daily_trades == 15
 
     def test_normal_mode_on_no_issues(self):

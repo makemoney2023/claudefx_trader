@@ -61,7 +61,7 @@ The analysis layer implements the complete ICT/SMC framework across **22 dedicat
 
 An **execution model hierarchy** ranks setups by quality: Unicorn (OB + FVG overlap) > Silver Bullet > 2022 Model > Standard OB/FVG. Confluence scoring starts at 0.5 and adds 0.15 per factor (FVG, order block, liquidity sweep, kill zone), producing a quantified confidence level for every setup.
 
-A **zone gate** enforces premium/discount alignment. Trades misaligned with the current zone require higher confidence (0.75 vs 0.60) and higher R:R (3:1 vs 2:1), preventing the most common ICT mistake: buying in premium or selling in discount without strong justification.
+A **zone gate** enforces premium/discount alignment. Trades at or above **60% confidence** are eligible in replay and live; zone-misaligned trades still require higher R:R (3:1), preventing the most common ICT mistake: buying in premium or selling in discount without enough reward.
 
 ### 3. Multi-Layer Risk Management
 

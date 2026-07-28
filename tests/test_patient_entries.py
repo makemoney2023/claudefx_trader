@@ -7,38 +7,38 @@ from trading_bot.services.scaling_manager import ScalingManager, TradingMode, MO
 
 
 class TestRaisedConfidenceThresholds:
-    """Tests that confidence thresholds have been raised across all modes."""
+    """Confidence floor is 60% for non-defensive modes (replay + live)."""
 
     def _create_manager(self, starting_equity: float = 10000) -> ScalingManager:
         manager = ScalingManager(starting_equity=starting_equity)
         return manager
 
-    # ----- AGGRESSIVE mode: 0.65 threshold (data collection) -----
+    # ----- AGGRESSIVE mode: 0.60 threshold -----
 
-    def test_aggressive_threshold_is_065(self):
-        """AGGRESSIVE mode confidence threshold should be 0.65."""
+    def test_aggressive_threshold_is_060(self):
+        """AGGRESSIVE mode confidence threshold should be 0.60."""
         config = MODE_CONFIGS[TradingMode.AGGRESSIVE]
-        assert config.confidence_threshold == 0.65
+        assert config.confidence_threshold == 0.60
 
-    def test_aggressive_rejects_060_confidence(self):
-        """AGGRESSIVE mode should reject trades with 0.60 confidence (below 0.65)."""
+    def test_aggressive_rejects_below_060(self):
+        """AGGRESSIVE mode should reject trades below 0.60 confidence."""
         manager = self._create_manager()
         manager.current_mode = TradingMode.AGGRESSIVE
         should_trade, reason = manager.should_take_trade(
             setup_grade='A',
-            confidence=0.60,
+            confidence=0.59,
             daily_trades=0
         )
         assert should_trade is False
         assert "confidence" in reason.lower() or "threshold" in reason.lower()
 
-    def test_aggressive_accepts_065_confidence(self):
-        """AGGRESSIVE mode should accept trades with 0.65 confidence."""
+    def test_aggressive_accepts_060_confidence(self):
+        """AGGRESSIVE mode should accept trades with 0.60 confidence."""
         manager = self._create_manager()
         manager.current_mode = TradingMode.AGGRESSIVE
         should_trade, reason = manager.should_take_trade(
             setup_grade='A',
-            confidence=0.65,
+            confidence=0.60,
             daily_trades=0
         )
         assert should_trade is True
@@ -54,62 +54,62 @@ class TestRaisedConfidenceThresholds:
         )
         assert should_trade is True
 
-    # ----- NORMAL mode: 0.70 threshold -----
+    # ----- NORMAL mode: 0.60 threshold -----
 
-    def test_normal_threshold_is_070(self):
-        """NORMAL mode confidence threshold should be 0.70."""
+    def test_normal_threshold_is_060(self):
+        """NORMAL mode confidence threshold should be 0.60."""
         config = MODE_CONFIGS[TradingMode.NORMAL]
-        assert config.confidence_threshold == 0.70
+        assert config.confidence_threshold == 0.60
 
-    def test_normal_rejects_065_confidence(self):
-        """NORMAL mode should reject trades with 0.65 confidence (below 0.70)."""
+    def test_normal_rejects_below_060(self):
+        """NORMAL mode should reject trades below 0.60 confidence."""
         manager = self._create_manager()
         manager.current_mode = TradingMode.NORMAL
         should_trade, reason = manager.should_take_trade(
             setup_grade='A',
-            confidence=0.65,
+            confidence=0.59,
             daily_trades=0
         )
         assert should_trade is False
         assert "confidence" in reason.lower() or "threshold" in reason.lower()
 
-    def test_normal_accepts_070_confidence(self):
-        """NORMAL mode should accept trades with 0.70 confidence."""
+    def test_normal_accepts_060_confidence(self):
+        """NORMAL mode should accept trades with 0.60 confidence."""
         manager = self._create_manager()
         manager.current_mode = TradingMode.NORMAL
         should_trade, reason = manager.should_take_trade(
-            setup_grade='A',
-            confidence=0.70,
+            setup_grade='B',
+            confidence=0.60,
             daily_trades=0
         )
         assert should_trade is True
 
-    # ----- CONSERVATIVE mode: 0.65 threshold (lower than NORMAL, with 0.5x risk) -----
+    # ----- CONSERVATIVE mode: 0.60 threshold (0.5x risk) -----
 
-    def test_conservative_threshold_is_065(self):
-        """CONSERVATIVE mode confidence threshold should be 0.65."""
+    def test_conservative_threshold_is_060(self):
+        """CONSERVATIVE mode confidence threshold should be 0.60."""
         config = MODE_CONFIGS[TradingMode.CONSERVATIVE]
-        assert config.confidence_threshold == 0.65
+        assert config.confidence_threshold == 0.60
 
-    def test_conservative_rejects_060_confidence(self):
-        """CONSERVATIVE mode should reject trades with 0.60 confidence (below 0.65)."""
+    def test_conservative_rejects_below_060(self):
+        """CONSERVATIVE mode should reject trades below 0.60 confidence."""
+        manager = self._create_manager()
+        manager.current_mode = TradingMode.CONSERVATIVE
+        should_trade, reason = manager.should_take_trade(
+            setup_grade='A+',
+            confidence=0.59,
+            daily_trades=0
+        )
+        assert should_trade is False
+        assert "confidence" in reason.lower() or "threshold" in reason.lower()
+
+    def test_conservative_accepts_060_confidence(self):
+        """CONSERVATIVE mode should accept trades with 0.60 confidence for A+ setup."""
         manager = self._create_manager()
         manager.current_mode = TradingMode.CONSERVATIVE
         should_trade, reason = manager.should_take_trade(
             setup_grade='A+',
             confidence=0.60,
-            daily_trades=0
-        )
-        assert should_trade is False
-        assert "confidence" in reason.lower() or "threshold" in reason.lower()
-
-    def test_conservative_accepts_085_confidence(self):
-        """CONSERVATIVE mode should accept trades with 0.85 confidence for A+ setup."""
-        manager = self._create_manager()
-        manager.current_mode = TradingMode.CONSERVATIVE
-        should_trade, reason = manager.should_take_trade(
-            setup_grade='A+',
-            confidence=0.85,
             daily_trades=0
         )
         assert should_trade is True

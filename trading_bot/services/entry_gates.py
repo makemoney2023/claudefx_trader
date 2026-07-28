@@ -19,9 +19,9 @@ from .gate_outcome import GateOutcome
 @dataclass
 class ZoneGateSettings:
     gate_mode: str = "active"
-    misaligned_min_confidence: float = 0.75
+    misaligned_min_confidence: float = 0.60
     misaligned_min_rr: float = 3.0
-    equilibrium_min_confidence: float = 0.65
+    equilibrium_min_confidence: float = 0.60
     disabled_symbols: tuple = ()
 
 
@@ -129,7 +129,7 @@ def evaluate_legacy_d1_gate(
     confidence: float,
     actual_rr: float,
     d1_bias: str,
-    min_confidence: float = 0.70,
+    min_confidence: float = 0.60,
     min_rr: float = 3.0,
 ) -> Tuple[bool, str]:
     """Legacy counter-D1 gate when zone gate is inactive."""
@@ -155,7 +155,7 @@ def evaluate_tod_gate(
     utc_hour: int,
     weak_hours: tuple,
     confidence: float,
-    min_confidence: float = 0.68,
+    min_confidence: float = 0.60,
 ) -> Tuple[bool, str]:
     """Time-of-day gate: weak hours need elevated confidence."""
     if utc_hour not in weak_hours:
@@ -172,7 +172,7 @@ def evaluate_volatile_regime_gate(
     *,
     regime_type: str,
     confidence: float,
-    min_confidence: float = 0.70,
+    min_confidence: float = 0.60,
 ) -> Tuple[bool, str]:
     if (regime_type or "").lower() != "volatile_ranging":
         return False, ""
@@ -253,7 +253,7 @@ def evaluate_htf_alignment_gate(ctx: "TradeContext") -> GateOutcome:
             is_scalp
             and not ctx.m15_opposes
             and ctx.actual_rr >= 2.0
-            and ctx.confidence >= 0.70
+            and ctx.confidence >= 0.60
         ):
             return GateOutcome.cap_confidence(0.55, "htf_counter_scalp")
         return GateOutcome.block(
@@ -311,11 +311,11 @@ def evaluate_off_hours_gate(ctx: "TradeContext") -> GateOutcome:
 def evaluate_post_cooldown_gate(ctx: "TradeContext") -> GateOutcome:
     if not ctx.post_cooldown:
         return GateOutcome.pass_through("post_cooldown")
-    if ctx.confidence < 0.75:
+    if ctx.confidence < 0.60:
         return GateOutcome.block(
             gate_id="post_cooldown_confidence",
             reason=(
-                f"First signal after loss cooldown needs 75%+ confidence, "
+                f"First signal after loss cooldown needs 60%+ confidence, "
                 f"got {ctx.confidence:.0%}."
             ),
             stage="post_cooldown",
