@@ -40,7 +40,7 @@ class TestZoneBlockCharacterization:
         result = evaluate_zone_gate(
             direction="long",
             confidence=0.60,
-            actual_rr=2.0,
+            actual_rr=1.9,
             retrace=0.70,
             zone_str="premium",
             d1_bias="bullish",

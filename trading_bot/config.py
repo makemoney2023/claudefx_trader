@@ -456,7 +456,7 @@ class TradingSettings(BaseSettings):
         description="Min confidence for zone-misaligned trades (long from premium, short from discount)"
     )
     zone_misaligned_min_rr: float = Field(
-        default=3.0,
+        default=2.0,
         description="Min R:R for zone-misaligned trades"
     )
     zone_equilibrium_min_confidence: float = Field(

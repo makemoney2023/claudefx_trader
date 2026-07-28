@@ -20,7 +20,7 @@ from .gate_outcome import GateOutcome
 class ZoneGateSettings:
     gate_mode: str = "active"
     misaligned_min_confidence: float = 0.60
-    misaligned_min_rr: float = 3.0
+    misaligned_min_rr: float = 2.0
     equilibrium_min_confidence: float = 0.60
     disabled_symbols: tuple = ()
 

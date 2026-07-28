@@ -21,7 +21,7 @@ class TestZoneGate:
         result = evaluate_zone_gate(
             direction="long",
             confidence=0.60,
-            actual_rr=2.0,
+            actual_rr=1.9,
             retrace=0.70,
             zone_str="premium",
             d1_bias="bullish",
@@ -36,13 +36,29 @@ class TestZoneGate:
         result = evaluate_zone_gate(
             direction="long",
             confidence=0.60,
-            actual_rr=3.0,
+            actual_rr=2.0,
             retrace=0.70,
             zone_str="premium",
             d1_bias="bullish",
             is_index=False,
             settings=ZoneGateSettings(),
             symbol="EURUSD",
+        )
+        assert result.blocked is False
+        assert result.decision == "allowed_misaligned_high_conf"
+
+    def test_allows_short_from_discount_at_rr_2_2(self):
+        """Replay case: SHORT from discount (36%) with conf=63% RR=2.2 should pass."""
+        result = evaluate_zone_gate(
+            direction="short",
+            confidence=0.63,
+            actual_rr=2.2,
+            retrace=0.36,
+            zone_str="discount",
+            d1_bias="bearish",
+            is_index=False,
+            settings=ZoneGateSettings(),
+            symbol="XAUUSD",
         )
         assert result.blocked is False
         assert result.decision == "allowed_misaligned_high_conf"

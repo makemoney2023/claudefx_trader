@@ -195,7 +195,7 @@ class TestEdgeProtectionConfig:
         from trading_bot.config import settings
         assert settings.trading.zone_gate_mode == "active"
         assert settings.trading.zone_misaligned_min_confidence == 0.60
-        assert settings.trading.zone_misaligned_min_rr == 3.0
+        assert settings.trading.zone_misaligned_min_rr == 2.0
         assert settings.trading.zone_equilibrium_min_confidence == 0.60
         assert settings.trading.zone_gate_disabled_symbols == []
 
