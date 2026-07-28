@@ -142,30 +142,86 @@ class TestClaudeResponseValidation:
     def test_confidence_clamped_to_range(self):
         """Confidence should be clamped to 0-1."""
         client = self._get_client()
-        
+        prices = {
+            'entry_price': 1.0850,
+            'stop_loss': 1.0800,
+            'take_profit': 1.0950,
+        }
+
         # Too high
-        data = {'direction': 'long', 'confidence': 1.5}
+        data = {'direction': 'long', 'confidence': 1.5, **prices}
         result = client._validate_trade_signal(data)
         assert result['confidence'] == 1.0
-        
+
         # Negative
-        data = {'direction': 'long', 'confidence': -0.5}
+        data = {'direction': 'long', 'confidence': -0.5, **prices}
         result = client._validate_trade_signal(data)
         assert result['confidence'] == 0.0
-    
+
     def test_negative_prices_set_to_none(self):
-        """Negative price values should be set to None."""
+        """Negative price values should be set to None (and long/short then rejected)."""
         client = self._get_client()
         data = {
-            'direction': 'long', 
+            'direction': 'long',
             'confidence': 0.5,
             'entry_price': -1.0,
             'stop_loss': -5.0,
+            'take_profit': 1.0950,
         }
         result = client._validate_trade_signal(data)
         assert result['entry_price'] is None
         assert result['stop_loss'] is None
-    
+        assert result['direction'] == 'no_trade'
+
+    def test_long_short_missing_sl_or_tp_becomes_no_trade(self):
+        """long/short without entry+SL+TP must be rejected — prices are always required."""
+        client = self._get_client()
+
+        missing_sl = {
+            'direction': 'short',
+            'confidence': 0.7,
+            'entry_price': 3350.0,
+            'stop_loss': None,
+            'take_profit': 3320.0,
+            'reasoning': 'bearish',
+        }
+        result = client._validate_trade_signal(missing_sl)
+        assert result['direction'] == 'no_trade'
+        assert result['confidence'] == 0.0
+
+        missing_tp = {
+            'direction': 'long',
+            'confidence': 0.7,
+            'entry_price': 1.0850,
+            'stop_loss': 1.0800,
+            'take_profit': None,
+        }
+        result = client._validate_trade_signal(missing_tp)
+        assert result['direction'] == 'no_trade'
+
+        missing_entry = {
+            'direction': 'short',
+            'confidence': 0.7,
+            'entry_price': None,
+            'stop_loss': 3360.0,
+            'take_profit': 3320.0,
+        }
+        result = client._validate_trade_signal(missing_entry)
+        assert result['direction'] == 'no_trade'
+
+    def test_no_trade_allows_null_prices(self):
+        """no_trade may omit entry/SL/TP."""
+        client = self._get_client()
+        result = client._validate_trade_signal({
+            'direction': 'no_trade',
+            'confidence': 0.4,
+            'entry_price': None,
+            'stop_loss': None,
+            'take_profit': None,
+        })
+        assert result['direction'] == 'no_trade'
+        assert result['confidence'] == 0.4
+
     def test_non_dict_input_returns_no_trade(self):
         """Non-dict input should return a safe no_trade signal."""
         client = self._get_client()
@@ -176,14 +232,28 @@ class TestClaudeResponseValidation:
     def test_invalid_order_type_defaults_to_market(self):
         """Invalid order_type should default to market."""
         client = self._get_client()
-        data = {'direction': 'long', 'confidence': 0.5, 'order_type': 'invalid'}
+        data = {
+            'direction': 'long',
+            'confidence': 0.5,
+            'entry_price': 1.0850,
+            'stop_loss': 1.0800,
+            'take_profit': 1.0950,
+            'order_type': 'invalid',
+        }
         result = client._validate_trade_signal(data)
         assert result['order_type'] == 'market'
     
     def test_invalid_market_structure_defaults_to_ranging(self):
         """Invalid market_structure should default to ranging."""
         client = self._get_client()
-        data = {'direction': 'long', 'confidence': 0.5, 'market_structure': 'chaotic'}
+        data = {
+            'direction': 'long',
+            'confidence': 0.5,
+            'entry_price': 1.0850,
+            'stop_loss': 1.0800,
+            'take_profit': 1.0950,
+            'market_structure': 'chaotic',
+        }
         result = client._validate_trade_signal(data)
         assert result['market_structure'] == 'ranging'
 
@@ -1193,6 +1263,9 @@ class TestOpus5Everywhere:
         assert schema.get('additionalProperties') is False
         # Nested objects need additionalProperties: false too.
         assert schema['properties']['key_levels'].get('additionalProperties') is False
+        # Entry/SL/TP must be present on every tool call (null only for no_trade).
+        for field in ('entry_price', 'stop_loss', 'take_profit'):
+            assert field in schema['required'], f"{field} must be required on trade tool"
         # Numeric range constraints are unsupported by the strict grammar pipeline.
         import json as _json
         flat = _json.dumps(schema)

@@ -56,15 +56,15 @@ TRADE_SIGNAL_TOOL = {
             },
             "entry_price": {
                 "type": ["number", "null"],
-                "description": "Suggested entry price"
+                "description": "Suggested entry price. REQUIRED number when direction is long or short; null only for no_trade."
             },
             "stop_loss": {
                 "type": ["number", "null"],
-                "description": "Stop loss price — MUST be a different price from entry_price. For LONG: SL must be BELOW entry (place beyond the nearest structure low/OB). For SHORT: SL must be ABOVE entry (place beyond the nearest structure high/OB). NEVER set SL equal to entry."
+                "description": "Stop loss price — REQUIRED number when direction is long or short; null only for no_trade. MUST be a different price from entry_price. For LONG: SL must be BELOW entry (place beyond the nearest structure low/OB). For SHORT: SL must be ABOVE entry (place beyond the nearest structure high/OB). NEVER set SL equal to entry."
             },
             "take_profit": {
                 "type": ["number", "null"],
-                "description": "Take profit price — For LONG: TP must be ABOVE entry. For SHORT: TP must be BELOW entry."
+                "description": "Take profit price — REQUIRED number when direction is long or short; null only for no_trade. For LONG: TP must be ABOVE entry. For SHORT: TP must be BELOW entry."
             },
             "risk_reward": {
                 "type": ["number", "null"],
@@ -130,7 +130,16 @@ TRADE_SIGNAL_TOOL = {
                 "description": "Risk factors or concerns"
             }
         },
-        "required": ["direction", "confidence", "reasoning", "market_structure", "trade_type"],
+        "required": [
+            "direction",
+            "confidence",
+            "entry_price",
+            "stop_loss",
+            "take_profit",
+            "reasoning",
+            "market_structure",
+            "trade_type",
+        ],
         "additionalProperties": False
     }
 }
@@ -1795,6 +1804,21 @@ Finish by calling the submit_trade_analysis tool exactly once.
         entry = tool_input.get('entry_price')
         sl = tool_input.get('stop_loss')
         tp = tool_input.get('take_profit')
+        # Policy: long/short always require entry + SL + TP. Incomplete directional
+        # signals become no_trade so the normalizer never sees "Missing SL or TP".
+        if direction in ('long', 'short') and not (entry and sl and tp):
+            logger.warning(
+                f"Rejecting {direction}: missing entry/SL/TP "
+                f"(entry={entry}, sl={sl}, tp={tp}) — prices are always required"
+            )
+            tool_input['direction'] = 'no_trade'
+            tool_input['confidence'] = 0.0
+            tool_input['reasoning'] = (
+                "Signal rejected: long/short requires entry_price, stop_loss, "
+                "and take_profit"
+            )
+            return tool_input
+
         if direction in ('long', 'short') and entry and sl and tp:
             coherent, reason = validate_signal_coherence(entry, sl, tp, direction)
             if not coherent:
