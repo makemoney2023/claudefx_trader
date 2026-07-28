@@ -4,6 +4,7 @@ import pytest
 
 from trading_bot.services.entry_gates import (
     ZoneGateSettings,
+    evaluate_amd_distribution_gate,
     evaluate_confluence_gate,
     evaluate_legacy_d1_gate,
     evaluate_post_cooldown_gate,
@@ -122,6 +123,33 @@ class TestZoneGate:
         )
         assert result.blocked is False
         assert result.shadow_only is True
+
+
+class TestAmdDistributionGate:
+    def test_blocks_distribution_below_rr_2_0(self):
+        ctx = TradeContext(
+            symbol="XAUUSD",
+            direction="short",
+            confidence=0.70,
+            actual_rr=1.9,
+            analysis_results={"amd_cycle": {"phase": "distribution"}},
+        )
+        outcome = evaluate_amd_distribution_gate(ctx)
+        assert outcome.blocked is True
+        assert outcome.gate_id == "amd_distribution_rr"
+
+    def test_allows_distribution_at_rr_2_0(self):
+        """Replay case: distribution + RR ~2.0-2.3 should no longer hard-block."""
+        ctx = TradeContext(
+            symbol="XAUUSD",
+            direction="short",
+            confidence=0.70,
+            actual_rr=2.0,
+            analysis_results={"amd_cycle": {"phase": "distribution"}},
+        )
+        outcome = evaluate_amd_distribution_gate(ctx)
+        assert outcome.blocked is False
+        assert outcome.confidence_cap == 0.60
 
 
 class TestLegacyD1Gate:

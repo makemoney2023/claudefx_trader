@@ -280,13 +280,13 @@ def evaluate_amd_distribution_gate(ctx: "TradeContext") -> GateOutcome:
         return GateOutcome.pass_through("amd_distribution")
 
     outcome = GateOutcome.pass_through("amd_distribution")
-    if ctx.confidence > 0.55:
-        outcome.confidence_cap = 0.55
-    if ctx.actual_rr < 2.5:
+    if ctx.confidence > 0.60:
+        outcome.confidence_cap = 0.60
+    if ctx.actual_rr < 2.0:
         return GateOutcome.block(
             gate_id="amd_distribution_rr",
             reason=(
-                f"Distribution phase + R:R {ctx.actual_rr:.2f}:1 below 2.5:1 minimum."
+                f"Distribution phase + R:R {ctx.actual_rr:.2f}:1 below 2.0:1 minimum."
             ),
             stage="amd_distribution",
         )
