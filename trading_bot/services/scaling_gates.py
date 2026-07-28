@@ -15,6 +15,17 @@ class FlipGuardSettings:
     min_confidence: float = 0.80
 
 
+def _as_utc(dt: datetime) -> datetime:
+    """Normalize naive/aware datetimes to UTC-aware for safe arithmetic.
+
+    Replay snapshot times are often tz-naive; live tracking uses UTC-aware.
+    Treating naive values as UTC matches MT5 history / backtest convention.
+    """
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def evaluate_flip_guard(
     *,
     symbol: str,
@@ -24,8 +35,13 @@ def evaluate_flip_guard(
     direction_flipped: bool = False,
     reversal_reentry: bool = False,
     settings: Optional[FlipGuardSettings] = None,
+    as_of: Optional[datetime] = None,
 ) -> GateOutcome:
-    """Block low-confidence direction flips within the cooldown window."""
+    """Block low-confidence direction flips within the cooldown window.
+
+    ``as_of`` is the evaluation clock (replay snapshot time). Defaults to
+    wall-clock UTC for live trading.
+    """
     cfg = settings or FlipGuardSettings()
     if direction_flipped:
         return GateOutcome.pass_through("flip_guard_bypass_coherence")
@@ -36,7 +52,8 @@ def evaluate_flip_guard(
         return GateOutcome.pass_through("flip_guard")
 
     last_dir, last_time = last_signal_direction[symbol]
-    minutes_since = (datetime.now(timezone.utc) - last_time).total_seconds() / 60
+    now = _as_utc(as_of) if as_of is not None else datetime.now(timezone.utc)
+    minutes_since = (now - _as_utc(last_time)).total_seconds() / 60
     if (
         last_dir == direction
         or last_dir == "no_trade"

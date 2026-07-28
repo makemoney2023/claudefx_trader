@@ -698,6 +698,7 @@ def run_post_claude_gates(
             direction_flipped=inp.direction_flipped,
             reversal_reentry=getattr(signal, "reversal_reentry", False),
             settings=cfg.flip_guard,
+            as_of=inp.snapshot_time,
         )
         pipeline_ctx.gate_path.extend(flip_outcome.gate_path)
         path.extend(flip_outcome.gate_path)

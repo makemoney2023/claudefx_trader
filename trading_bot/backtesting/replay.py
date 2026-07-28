@@ -12,7 +12,7 @@ Run on weekends with sampled subsets.
 import asyncio
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Callable, Tuple
 
 import pandas as pd
@@ -946,9 +946,16 @@ class ClaudeReplayBacktester:
                         'entry_price': sig.entry_price,
                         'timestamp': current.isoformat(),
                     }
+                    # Store UTC-aware so flip-guard arithmetic never mixes
+                    # naive replay clocks with aware live timestamps.
+                    _flip_ts = (
+                        current
+                        if getattr(current, "tzinfo", None) is not None
+                        else current.replace(tzinfo=timezone.utc)
+                    )
                     self._replay_last_signal_direction[symbol] = (
                         sig.direction,
-                        current,
+                        _flip_ts,
                     )
 
                     future = m15_data[m15_data.index > window_end].head(200)

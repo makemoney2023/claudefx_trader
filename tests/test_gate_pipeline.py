@@ -111,3 +111,40 @@ class TestFlipGuard:
         )
         assert outcome.blocked is False
         assert outcome.gate_path == ["flip_guard_bypass_reversal"]
+
+    def test_handles_naive_last_signal_time_from_replay(self):
+        """Replay stores tz-naive snapshot times; flip guard must not crash."""
+        from datetime import datetime, timezone
+
+        from trading_bot.services.scaling_gates import evaluate_flip_guard
+
+        last = {"XAUUSD": ("short", datetime(2026, 5, 5, 8, 0, 0))}  # naive
+        outcome = evaluate_flip_guard(
+            symbol="XAUUSD",
+            direction="long",
+            confidence=0.75,
+            last_signal_direction=last,
+            as_of=datetime(2026, 5, 5, 8, 5, 0, tzinfo=timezone.utc),
+        )
+        assert outcome.blocked is True
+        assert outcome.gate_id == "direction_flip"
+
+    def test_uses_as_of_for_cooldown_window(self):
+        """Replay must measure cooldown from snapshot time, not wall clock."""
+        from datetime import datetime, timezone
+
+        from trading_bot.services.scaling_gates import evaluate_flip_guard
+
+        last = {
+            "XAUUSD": ("short", datetime(2026, 5, 5, 6, 0, 0, tzinfo=timezone.utc))
+        }
+        # 20 minutes later in replay → cooldown expired (default 15m)
+        outcome = evaluate_flip_guard(
+            symbol="XAUUSD",
+            direction="long",
+            confidence=0.75,
+            last_signal_direction=last,
+            as_of=datetime(2026, 5, 5, 6, 20, 0, tzinfo=timezone.utc),
+        )
+        assert outcome.blocked is False
+        assert outcome.gate_path == ["flip_guard"]
