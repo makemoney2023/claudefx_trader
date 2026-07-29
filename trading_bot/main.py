@@ -3025,7 +3025,7 @@ class TradingBot:
             if self._goal_log_counter >= 10:
                 self._goal_log_counter = 0
                 
-                progress = self.goal_tracker.calculate_progress()
+                progress = self.goal_tracker.calculate_progress(account.equity)
                 
                 logger.info(f"📈 GOAL PROGRESS: {progress['progress_percent']:.1f}% complete")
                 logger.info(f"   Current: ${progress['current_equity']:.2f} / Target: ${progress['target_equity']:.2f}")
