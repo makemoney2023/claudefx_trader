@@ -78,10 +78,13 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
             bot_state.analyzing_symbol(symbol)
         
         # POST-LOSS COOLDOWN: Prevent revenge trading
+        from ..utils.datetime_utils import as_utc
         cooldown_expiry = bot._symbol_loss_cooldowns.get(symbol)
         if cooldown_expiry:
-            if datetime.now(timezone.utc) < cooldown_expiry:
-                remaining = (cooldown_expiry - datetime.now(timezone.utc)).total_seconds() / 60
+            _now_utc = datetime.now(timezone.utc)
+            _cooldown_utc = as_utc(cooldown_expiry)
+            if _now_utc < _cooldown_utc:
+                remaining = (_cooldown_utc - _now_utc).total_seconds() / 60
                 logger.info(f"[LOSS-COOLDOWN] {symbol}: Skipping — {remaining:.0f}min cooldown remaining")
                 if bot_state:
                     bot_state.symbol_complete(symbol, "loss_cooldown")
@@ -97,8 +100,8 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
         
         # VOLATILITY PAUSE: Block new entries during an active spike window
         _vol_pause = getattr(bot, "_volatility_pause_until", None)
-        if isinstance(_vol_pause, datetime) and datetime.now(timezone.utc) < _vol_pause:
-            _vol_remaining = (_vol_pause - datetime.now(timezone.utc)).total_seconds() / 60
+        if isinstance(_vol_pause, datetime) and datetime.now(timezone.utc) < as_utc(_vol_pause):
+            _vol_remaining = (as_utc(_vol_pause) - datetime.now(timezone.utc)).total_seconds() / 60
             logger.warning(
                 f"[VOLATILITY] {symbol}: New entries paused — "
                 f"{_vol_remaining:.0f}min remaining in spike window"

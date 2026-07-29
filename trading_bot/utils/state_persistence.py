@@ -10,10 +10,11 @@ Saves and loads bot state to survive restarts:
 
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional
 
+from .datetime_utils import as_utc, parse_iso_utc
 from .logging import get_logger
 
 logger = get_logger(__name__)
@@ -380,18 +381,15 @@ def load_full_state(bot) -> bool:
         if hasattr(bot, '_recent_signal_hashes') and hasattr(bot, '_signal_hash_expiry'):
             saved_hashes = persistence.load_signal_hashes()
             if saved_hashes:
-                now = datetime.now()
+                now = datetime.now(timezone.utc)
                 restored = 0
                 for h, ts_str in saved_hashes.items():
-                    try:
-                        ts = datetime.fromisoformat(ts_str)
-                        # Keep hashes from the last 30 minutes only
-                        if (now - ts).total_seconds() < 1800:
-                            bot._recent_signal_hashes.add(h)
-                            bot._signal_hash_expiry[h] = ts
-                            restored += 1
-                    except (ValueError, TypeError):
-                        pass
+                    ts = parse_iso_utc(ts_str)
+                    # Keep hashes from the last 30 minutes only
+                    if ts is not None and (now - ts).total_seconds() < 1800:
+                        bot._recent_signal_hashes.add(h)
+                        bot._signal_hash_expiry[h] = ts
+                        restored += 1
                 if restored > 0:
                     logger.info(f"Restored {restored} signal dedup hashes")
         
@@ -399,14 +397,11 @@ def load_full_state(bot) -> bool:
         if hasattr(bot, '_reversal_cooldowns'):
             saved_cooldowns = persistence.load_reversal_cooldowns()
             if saved_cooldowns:
-                now = datetime.now()
+                now = datetime.now(timezone.utc)
                 for symbol, ts_str in saved_cooldowns.items():
-                    try:
-                        ts = datetime.fromisoformat(ts_str)
-                        if (now - ts).total_seconds() < 3600:
-                            bot._reversal_cooldowns[symbol] = ts
-                    except (ValueError, TypeError):
-                        pass
+                    ts = parse_iso_utc(ts_str)
+                    if ts is not None and (now - ts).total_seconds() < 3600:
+                        bot._reversal_cooldowns[symbol] = ts
                 if bot._reversal_cooldowns:
                     logger.info(
                         f"Restored reversal cooldowns for: "
@@ -417,14 +412,11 @@ def load_full_state(bot) -> bool:
         if hasattr(bot, '_symbol_loss_cooldowns'):
             saved_loss_cds = persistence.get('loss_cooldowns', {})
             if saved_loss_cds:
-                now = datetime.now()
+                now = datetime.now(timezone.utc)
                 for symbol, ts_str in saved_loss_cds.items():
-                    try:
-                        ts = datetime.fromisoformat(ts_str)
-                        if ts > now:
-                            bot._symbol_loss_cooldowns[symbol] = ts
-                    except (ValueError, TypeError):
-                        pass
+                    ts = parse_iso_utc(ts_str)
+                    if ts is not None and ts > now:
+                        bot._symbol_loss_cooldowns[symbol] = ts
                 if bot._symbol_loss_cooldowns:
                     logger.info(
                         f"Restored loss cooldowns for: "

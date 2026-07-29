@@ -1200,9 +1200,17 @@ class TradingBot:
             # ============================================
             if hasattr(self, 'firecrawl_service') and self.firecrawl_service:
                 if not hasattr(self, '_last_firecrawl_refresh'):
-                    self._last_firecrawl_refresh = datetime.min
-                
-                time_since_refresh = (datetime.now(timezone.utc) - self._last_firecrawl_refresh).total_seconds() / 60
+                    # Must be UTC-aware — naive datetime.min crashes the cycle:
+                    # "can't subtract offset-naive and offset-aware datetimes"
+                    self._last_firecrawl_refresh = datetime.min.replace(
+                        tzinfo=timezone.utc
+                    )
+
+                from .utils.datetime_utils import as_utc
+                time_since_refresh = (
+                    datetime.now(timezone.utc)
+                    - as_utc(self._last_firecrawl_refresh)
+                ).total_seconds() / 60
                 refresh_min = getattr(getattr(settings, 'firecrawl', None), 'refresh_minutes', 15)
                 
                 if time_since_refresh >= refresh_min:
@@ -3058,7 +3066,10 @@ class TradingBot:
                 try:
                     _pos_age = ""
                     if position.open_time:
-                        _pos_age = f"{(datetime.now(timezone.utc) - position.open_time).total_seconds() / 60:.0f}min"
+                        from .utils.datetime_utils import as_utc
+                        _pos_age = (
+                            f"{(datetime.now(timezone.utc) - as_utc(position.open_time)).total_seconds() / 60:.0f}min"
+                        )
                     _pos_pnl = getattr(position, 'unrealized_pnl', None) or 0
                     print(
                         f"[POS-REEVAL] #{position.ticket} {position.symbol} {position.direction} "
@@ -5091,7 +5102,10 @@ Apply the evaluation rules from the system message and reply per the OUTPUT CONT
             
             last_reversal = self._reversal_cooldowns.get(symbol)
             if last_reversal:
-                minutes_since = (datetime.now(timezone.utc) - last_reversal).total_seconds() / 60
+                from .utils.datetime_utils import as_utc
+                minutes_since = (
+                    datetime.now(timezone.utc) - as_utc(last_reversal)
+                ).total_seconds() / 60
                 if minutes_since < 60:
                     logger.info(
                         f"[REVERSAL] {symbol}: Skipping — reversal cooldown active "
