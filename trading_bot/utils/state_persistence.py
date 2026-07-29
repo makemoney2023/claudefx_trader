@@ -241,6 +241,13 @@ def save_full_state(bot) -> bool:
             }
             persistence.set('loss_cooldowns', loss_cds)
         
+        # Save same-direction circuit breaker streaks
+        if getattr(bot, '_direction_loss_tracker', None) is not None:
+            persistence.set(
+                'direction_loss_streaks',
+                bot._direction_loss_tracker.to_dict(),
+            )
+        
         # Save pending order metadata (expiration times)
         if hasattr(bot, 'pending_order_manager') and bot.pending_order_manager:
             po_meta = {}
@@ -423,6 +430,19 @@ def load_full_state(bot) -> bool:
                         f"Restored loss cooldowns for: "
                         f"{list(bot._symbol_loss_cooldowns.keys())}"
                     )
+        
+        # Load same-direction circuit breaker streaks (stale days are ignored
+        # by the tracker's own date check, so no filtering needed here)
+        if hasattr(bot, '_direction_loss_tracker'):
+            saved_streaks = persistence.get('direction_loss_streaks', {})
+            if saved_streaks:
+                from ..services.direction_circuit_breaker import DirectionLossTracker
+                bot._direction_loss_tracker = DirectionLossTracker.from_dict(
+                    saved_streaks
+                )
+                logger.info(
+                    f"Restored direction loss streaks: {list(saved_streaks.keys())}"
+                )
         
         logger.info("Bot state loaded successfully")
         return True

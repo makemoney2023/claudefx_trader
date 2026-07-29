@@ -347,6 +347,15 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
             build_pipeline_context=bot._build_pipeline_context,
             last_signal_direction=bot._last_signal_direction,
             direction_flipped=_direction_flipped,
+            direction_loss_streak=(
+                bot._direction_loss_tracker.consecutive_losses(
+                    symbol,
+                    getattr(_norm, "direction", "") or "",
+                    datetime.now(timezone.utc),
+                )
+                if getattr(bot, "_direction_loss_tracker", None) is not None
+                else 0
+            ),
         )
 
         _price_gate = run_post_claude_gates(_pc_inp, stop_after="price")

@@ -19,6 +19,10 @@ from .confidence_modifiers import (
 from .entry_gates import ZoneGateSettings
 from .gate_outcome import GateOutcome
 from .gate_pipeline import evaluate_entry_gates, evaluate_trade_permission_gates
+from .direction_circuit_breaker import (
+    DirectionCircuitBreakerSettings,
+    evaluate_direction_circuit_breaker,
+)
 from .scaling_gates import FlipGuardSettings, evaluate_flip_guard
 from .signal_normalizer import NormalizedSignal
 from .trade_context import TradeContext
@@ -32,6 +36,9 @@ class PostClaudeGateSettings:
     asian_penalty: float = 0.05
     counter_trend_rr_floor: float = 2.0
     flip_guard: FlipGuardSettings = field(default_factory=FlipGuardSettings)
+    circuit_breaker: DirectionCircuitBreakerSettings = field(
+        default_factory=DirectionCircuitBreakerSettings
+    )
 
 
 @dataclass
@@ -65,6 +72,7 @@ class PostClaudeGateInput:
     correlation_check: Optional[Callable[[], Tuple[bool, str]]] = None
     last_signal_direction: Optional[Dict] = None
     direction_flipped: bool = False
+    direction_loss_streak: int = 0
     apply_secondary_modifiers: bool = False
     modifier_input: Optional[SecondaryModifierInput] = None
     build_pipeline_context: Optional[Callable[..., Tuple[Any, ZoneGateSettings, bool]]] = None
@@ -682,6 +690,32 @@ def run_post_claude_gates(
             confidence=pipeline_ctx.confidence,
             actual_rr=actual_rr,
             pipeline_ctx=pipeline_ctx,
+            confidence_components=conf_components,
+            min_rr=resolve_min_rr(
+                inp.symbol, getattr(signal, "trade_type", "intraday") or "intraday"
+            ),
+            is_counter_trend_scalp=is_counter,
+        )
+
+    cb_outcome = evaluate_direction_circuit_breaker(
+        symbol=inp.symbol,
+        direction=direction,
+        consecutive_losses=inp.direction_loss_streak,
+        settings=cfg.circuit_breaker,
+    )
+    pipeline_ctx.gate_path.extend(cb_outcome.gate_path)
+    path.extend(cb_outcome.gate_path)
+    if cb_outcome.blocked:
+        return _blocked_result(
+            cb_outcome,
+            entry=entry,
+            sl=sl,
+            tp=tp,
+            direction=direction,
+            confidence=signal.confidence,
+            gate_path=path,
+            pipeline_ctx=pipeline_ctx,
+            actual_rr=actual_rr,
             confidence_components=conf_components,
             min_rr=resolve_min_rr(
                 inp.symbol, getattr(signal, "trade_type", "intraday") or "intraday"

@@ -346,6 +346,7 @@ class ClaudeReplayBacktester:
         direction_flipped: bool,
         session_name: str = "",
         is_kill_zone: bool = False,
+        direction_loss_streak: int = 0,
     ):
         """Build PostClaudeGateInput with optional live parity services."""
         from ..services.post_claude_gates import (
@@ -390,6 +391,7 @@ class ClaudeReplayBacktester:
             correlation_check=correlation_check,
             session_name=session_name,
             is_kill_zone=is_kill_zone,
+            direction_loss_streak=direction_loss_streak,
         )
 
     async def invoke_judge_for_signal(
@@ -532,6 +534,8 @@ class ClaudeReplayBacktester:
         step_idx = 0
         _last_signal_for_symbol: Dict[str, Dict[str, Any]] = {}
         self._replay_last_signal_direction: Dict[str, Any] = {}
+        from ..services.direction_circuit_breaker import DirectionLossTracker
+        self._replay_direction_tracker = DirectionLossTracker()
 
         while current <= end_date and signals_processed < max_signals:
             if current.weekday() >= 5 or (current.weekday() == 4 and current.hour >= 19):
@@ -898,6 +902,11 @@ class ClaudeReplayBacktester:
                         direction_flipped=_norm.direction_flipped,
                         session_name=_session_name,
                         is_kill_zone=_kz.is_kill_zone(current),
+                        direction_loss_streak=(
+                            self._replay_direction_tracker.consecutive_losses(
+                                symbol, sig.direction, current
+                            )
+                        ),
                     )
                     _gate_result = run_post_claude_gates(
                         _pc_inp,
@@ -977,6 +986,9 @@ class ClaudeReplayBacktester:
                     result.trades.append(trade)
                     result.total_trades += 1
                     result.strategy_total_r += trade.r_multiple
+                    self._replay_direction_tracker.record(
+                        symbol, sig.direction, trade.outcome, current
+                    )
 
                     if policy_result.execution_trade:
                         result.execution_policy_trades += 1

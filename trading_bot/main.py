@@ -383,6 +383,11 @@ class TradingBot:
         # Post-loss cooldown: prevent revenge trading by blocking re-entry
         # for 30 minutes after a stop-loss exit on the same symbol
         self._symbol_loss_cooldowns: Dict[str, datetime] = {}  # symbol -> cooldown_expires_at
+
+        # Same-direction circuit breaker: after N consecutive same-direction
+        # losses on a symbol in one UTC day, block that direction until tomorrow
+        from .services.direction_circuit_breaker import DirectionLossTracker
+        self._direction_loss_tracker = DirectionLossTracker()
         self._off_hours_mode: bool = False  # True when outside kill zones (soft-block)
         
         # Analysis cooldown: only call Claude once per 5 minutes per symbol
@@ -4734,9 +4739,34 @@ Apply the evaluation rules from the system message and reply per the OUTPUT CONT
             if profit_loss > 0:
                 self.win_streak += 1
                 self.loss_streak = 0
+                self._direction_loss_tracker.record(
+                    position.symbol, position.direction, "win",
+                    datetime.now(timezone.utc),
+                )
             elif profit_loss < 0:
                 self.loss_streak += 1
                 self.win_streak = 0
+                self._direction_loss_tracker.record(
+                    position.symbol, position.direction, "loss",
+                    datetime.now(timezone.utc),
+                )
+                _cb_streak = self._direction_loss_tracker.consecutive_losses(
+                    position.symbol, position.direction, datetime.now(timezone.utc)
+                )
+                from .services.direction_circuit_breaker import (
+                    DirectionCircuitBreakerSettings as _CBSettings,
+                )
+                _cb_max = _CBSettings().max_consecutive_losses
+                if _cb_max > 0 and _cb_streak >= _cb_max:
+                    logger.warning(
+                        f"[CIRCUIT-BREAKER] {position.symbol}: {_cb_streak} consecutive "
+                        f"{position.direction.upper()} losses today — direction blocked until next UTC day"
+                    )
+                    print(
+                        f"[CIRCUIT-BREAKER] {position.symbol}: {position.direction.upper()} "
+                        f"blocked for the rest of the day ({_cb_streak} consecutive losses)",
+                        flush=True,
+                    )
                 _is_crypto_sym = any(c in position.symbol.upper() for c in ['BTC', 'ETH', 'XRP', 'SOL', 'ADA', 'DOGE'])
                 _cooldown_min = 15 if _is_crypto_sym else 30
                 cooldown_until = datetime.now(timezone.utc) + timedelta(minutes=_cooldown_min)
