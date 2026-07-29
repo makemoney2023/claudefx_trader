@@ -41,9 +41,17 @@ if errorlevel 1 (
     timeout /t 3
 )
 
-if not exist dashboard\.next (
+REM Rebuild when .next is missing, or when called as:
+REM   start_bot_production.bat rebuild
+REM Needed after git pull — NEXT_PUBLIC_* and dashboard JS are baked into .next.
+set "DO_DASHBOARD_BUILD="
+if /I "%~1"=="rebuild" set "DO_DASHBOARD_BUILD=1"
+if not exist dashboard\.next set "DO_DASHBOARD_BUILD=1"
+
+if defined DO_DASHBOARD_BUILD (
     echo Building dashboard for production...
     cd dashboard
+    if exist .next rmdir /s /q .next
     call npm run build
     if errorlevel 1 (
         echo ERROR: Dashboard build failed!
@@ -52,6 +60,10 @@ if not exist dashboard\.next (
     )
     cd ..
     echo Dashboard build complete.
+    echo.
+) else (
+    echo Using existing dashboard\.next build.
+    echo Tip: run "start_bot_production.bat rebuild" after git pull.
     echo.
 )
 
