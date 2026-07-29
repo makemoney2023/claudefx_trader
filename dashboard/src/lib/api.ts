@@ -36,13 +36,18 @@ async function fetchApi<T>(endpoint: string, options: FetchOptions = {}): Promis
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), timeout)
   
-  // Build headers with optional auth
+  // Build headers with optional auth.
+  // Backend middleware requires X-API-Key on all mutating routes, so attach
+  // the key for POST/PUT/PATCH/DELETE whenever one is available (not only
+  // when callers remember requiresAuth: true).
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     ...(fetchOptions.headers as Record<string, string> || {}),
   }
-  
-  if (requiresAuth) {
+
+  const method = (fetchOptions.method || 'GET').toUpperCase()
+  const isMutating = !['GET', 'HEAD', 'OPTIONS'].includes(method)
+  if (requiresAuth || isMutating) {
     const apiKey = getApiKey()
     if (apiKey) {
       headers['X-API-Key'] = apiKey
@@ -247,10 +252,16 @@ export const api = {
     }),
   
   startBot: () =>
-    fetchApi<{ status: string; message: string }>('/api/bot/start', { method: 'POST' }),
+    fetchApi<{ status: string; message: string }>('/api/bot/start', {
+      method: 'POST',
+      requiresAuth: true,
+    }),
 
   stopBot: () =>
-    fetchApi<{ status: string; message: string }>('/api/bot/stop', { method: 'POST' }),
+    fetchApi<{ status: string; message: string }>('/api/bot/stop', {
+      method: 'POST',
+      requiresAuth: true,
+    }),
   
   generateWeeklyReview: () =>
     fetchApi<WeeklyReviewResponse>('/api/bot/weekly-review', { method: 'POST', requiresAuth: true }),
