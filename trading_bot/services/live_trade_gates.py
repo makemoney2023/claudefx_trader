@@ -84,6 +84,12 @@ def apply_post_sizing_verification(
 
 def news_allows_trading(news_service) -> Tuple[bool, str]:
     """Fail-closed calendar check — blocks when feed is stale/unreliable."""
+    try:
+        from ..config import settings
+        if not settings.trading.news_gates_enabled:
+            return True, "news gates disabled"
+    except Exception:
+        pass
     if news_service is None:
         return True, "no news service"
     if not news_service.should_trade():

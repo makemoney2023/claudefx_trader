@@ -791,7 +791,7 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                     )
             
             # Apply news impact position size reduction
-            if bot.news_service:
+            if bot.news_service and settings.trading.news_gates_enabled:
                 try:
                     _news_mult, _news_reason = bot.news_service.should_reduce_size(symbol)
                     if _news_mult < 1.0:
@@ -1053,7 +1053,7 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                     if risk_mult != 1.0:
                         from ..config import normalize_lots as _norm_scale
                         final_lots = _norm_scale(symbol, final_lots * risk_mult)
-                if bot.news_service:
+                if bot.news_service and settings.trading.news_gates_enabled:
                     try:
                         _news_mult, _ = bot.news_service.should_reduce_size(symbol)
                         if _news_mult < 1.0:

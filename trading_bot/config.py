@@ -404,6 +404,14 @@ class TradingSettings(BaseSettings):
         default=False,
         description="Run full analysis pipeline but skip order execution (for testing signal quality)"
     )
+    news_gates_enabled: bool = Field(
+        default=True,
+        description=(
+            "When False, skip news blackout, stale-calendar fail-closed, and "
+            "news size haircuts. Use for paper testing when Firecrawl/calendar "
+            "is unavailable. Set TRADING_NEWS_GATES_ENABLED=false."
+        ),
+    )
     max_position_size: float = Field(
         default=1.0,
         description="Maximum position size in lots per trade"

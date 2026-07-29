@@ -1340,7 +1340,7 @@ class TradingBot:
             # ============================================
             # STEP 2: CHECK NEWS BLACKOUT
             # ============================================
-            if self.news_service:
+            if settings.trading.news_gates_enabled and self.news_service:
                 is_blackout, reason = self.news_service.is_blackout_period()
                 if is_blackout:
                     logger.warning(f"📰 NEWS BLACKOUT: {reason} - skipping new forex trades")
@@ -1354,19 +1354,24 @@ class TradingBot:
                         print("[CYCLE] BLOCKED: News blackout and no crypto symbols", flush=True)
                         return
 
-            # Fail-closed when economic calendar feed is stale/unreliable
-            if self.news_service and self.news_service.is_calendar_unreliable():
-                logger.warning(
-                    "News calendar UNKNOWN/stale — blocking all new trades until refreshed (fail-closed)"
+                # Fail-closed when economic calendar feed is stale/unreliable
+                if self.news_service.is_calendar_unreliable():
+                    logger.warning(
+                        "News calendar UNKNOWN/stale — blocking all new trades until refreshed (fail-closed)"
+                    )
+                    from .api.routes.activity import add_activity
+                    add_activity(
+                        "news_calendar_stale",
+                        "News calendar stale — fail-closed, no new trades",
+                        details={"fail_closed": True},
+                    )
+                    print("[CYCLE] BLOCKED: News calendar stale (fail-closed)", flush=True)
+                    return
+            elif not settings.trading.news_gates_enabled:
+                logger.info(
+                    "News gates disabled (TRADING_NEWS_GATES_ENABLED=false) — "
+                    "skipping blackout/stale-calendar blocks"
                 )
-                from .api.routes.activity import add_activity
-                add_activity(
-                    "news_calendar_stale",
-                    "News calendar stale — fail-closed, no new trades",
-                    details={"fail_closed": True},
-                )
-                print("[CYCLE] BLOCKED: News calendar stale (fail-closed)", flush=True)
-                return
             
             # ============================================
             # STEP 2b: FRIDAY PRE-CLOSE (Weekend Gap Protection)
