@@ -210,6 +210,36 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
             if bot_state:
                 bot_state.symbol_complete(symbol, "no_data")
             return
+
+        from ..mt5.ohlcv_quality import validate_ohlcv
+
+        _quality = validate_ohlcv(
+            df,
+            symbol=symbol,
+            timeframe=settings.timeframes.execution_tf,
+            expected_count=settings.timeframes.execution_tf_candles,
+        )
+        if not _quality.valid:
+            logger.warning(
+                f"[DATA-QUALITY] {symbol}: rejecting analysis — {_quality.reason}"
+            )
+            print(
+                f"[DATA-QUALITY] {symbol}: BLOCKED — {_quality.reason}",
+                flush=True,
+            )
+            try:
+                await bot._record_terminal_decision(
+                    "mechanical_reject",
+                    symbol,
+                    gate_id="market_data_quality",
+                    reason=_quality.reason,
+                    details={"quality_gate": _quality.gate_id},
+                )
+            except Exception as _dq_err:
+                logger.debug(f"[DATA-QUALITY] record failed: {_dq_err}")
+            if bot_state:
+                bot_state.symbol_complete(symbol, "bad_data")
+            return
         
         # Run technical analysis
         if bot_state:

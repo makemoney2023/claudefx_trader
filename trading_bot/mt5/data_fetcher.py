@@ -94,6 +94,21 @@ class DataFetcher:
             
             # Convert to DataFrame
             df = self._to_dataframe(raw_data)
+
+            # Soft quality check: log but still return (hard gate is in the runner
+            # so callers that need raw history — counterfactuals, replay — can opt in)
+            try:
+                from .ohlcv_quality import validate_ohlcv
+
+                quality = validate_ohlcv(
+                    df, symbol=symbol, timeframe=timeframe, expected_count=count
+                )
+                if not quality.valid:
+                    logger.warning(
+                        f"[OHLCV-QUALITY] {symbol} {timeframe}: {quality.reason}"
+                    )
+            except Exception as qerr:
+                logger.debug(f"[OHLCV-QUALITY] check skipped: {qerr}")
             
             # Cache the data
             self._cache[cache_key] = df

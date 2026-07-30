@@ -63,8 +63,9 @@ class Position:
     tp2_hit: bool = False     # TP2 partial close executed
     initial_volume: float = 0.0  # Original volume before partial closes
     
-    # Peak profit tracking (aggressive profit protection)
+    # Peak / trough R tracking (MFE / MAE for expectancy analytics)
     peak_r_multiple: float = 0.0
+    trough_r_multiple: float = 0.0  # most adverse (negative) R seen while open
     peak_unrealized_pnl: float = 0.0
     
     # Near-TP tracking
@@ -125,6 +126,7 @@ class Position:
             "tp2_hit": self.tp2_hit,
             "initial_volume": self.initial_volume,
             "peak_r_multiple": self.peak_r_multiple,
+            "trough_r_multiple": self.trough_r_multiple,
             "peak_unrealized_pnl": self.peak_unrealized_pnl,
             "near_tp_reached": self.near_tp_reached,
             "close_reason": self.close_reason,
@@ -321,6 +323,7 @@ class PositionManager:
                     'tp2_hit': position.tp2_hit,
                     'initial_volume': position.initial_volume,
                     'peak_r_multiple': position.peak_r_multiple,
+                    'trough_r_multiple': position.trough_r_multiple,
                     'peak_unrealized_pnl': position.peak_unrealized_pnl,
                     'near_tp_reached': position.near_tp_reached,
                     'close_reason': position.close_reason or None,
@@ -387,8 +390,9 @@ class PositionManager:
                     position.tp1_hit = getattr(p, 'tp1_hit', False) or False
                     position.tp2_hit = getattr(p, 'tp2_hit', False) or False
                     position.initial_volume = getattr(p, 'initial_volume', 0.0) or position.volume
-                    # Restore peak profit tracking (survives bot restart)
+                    # Restore peak/trough tracking (survives bot restart)
                     position.peak_r_multiple = getattr(p, 'peak_r_multiple', 0.0) or 0.0
+                    position.trough_r_multiple = getattr(p, 'trough_r_multiple', 0.0) or 0.0
                     position.peak_unrealized_pnl = getattr(p, 'peak_unrealized_pnl', 0.0) or 0.0
                     position.near_tp_reached = getattr(p, 'near_tp_reached', False) or False
                     position.close_reason = getattr(p, 'close_reason', '') or ''
@@ -575,7 +579,7 @@ class PositionManager:
             return {'synced': False, 'error': str(e)}
     
     def update_price(self, ticket: int, current_price: float):
-        """Update the current price for a position."""
+        """Update the current price for a position and track peak/trough R."""
         if ticket in self.positions:
             pos = self.positions[ticket]
             pos.current_price = current_price
@@ -586,6 +590,13 @@ class PositionManager:
                 pos.unrealized_pnl = calculate_pl(pos.symbol, current_price - pos.entry_price, pos.volume)
             else:
                 pos.unrealized_pnl = calculate_pl(pos.symbol, pos.entry_price - current_price, pos.volume)
+
+            r_multiple = pos.current_r_multiple
+            if r_multiple > pos.peak_r_multiple:
+                pos.peak_r_multiple = r_multiple
+                pos.peak_unrealized_pnl = pos.unrealized_pnl
+            if r_multiple < pos.trough_r_multiple:
+                pos.trough_r_multiple = r_multiple
     
     async def manage_positions(self, price_data: Dict[str, float]) -> List[Dict[str, Any]]:
         """
@@ -604,13 +615,13 @@ class PositionManager:
             if not current_price:
                 continue
             
+            prev_peak = position.peak_r_multiple
+            prev_trough = position.trough_r_multiple
             self.update_price(ticket, current_price)
-            
-            # Update peak profit tracking before any management decisions
-            r_multiple = position.current_r_multiple
-            if r_multiple > position.peak_r_multiple:
-                position.peak_r_multiple = r_multiple
-                position.peak_unrealized_pnl = position.unrealized_pnl
+            if (
+                position.peak_r_multiple != prev_peak
+                or position.trough_r_multiple != prev_trough
+            ):
                 self._schedule_persist(position)
             
             # Check for management actions

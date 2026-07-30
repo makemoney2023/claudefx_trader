@@ -4849,6 +4849,18 @@ Apply the evaluation rules from the system message and reply per the OUTPUT CONT
                                 risk_pips = abs(position.entry_price - position.stop_loss) / pip_size
                                 if risk_pips > 0:
                                     trade_record.r_multiple = pips / risk_pips
+                            # Persist measured MFE/MAE for expectancy analytics
+                            peak_r = float(getattr(position, "peak_r_multiple", 0.0) or 0.0)
+                            trough_r = float(getattr(position, "trough_r_multiple", 0.0) or 0.0)
+                            trade_record.peak_r_multiple = peak_r
+                            trade_record.trough_r_multiple = trough_r
+                            trade_record.mfe_r = peak_r
+                            trade_record.mae_r = abs(min(0.0, trough_r))
+                            _regime = getattr(self, "_last_regime_by_symbol", {}).get(
+                                position.symbol
+                            )
+                            if _regime:
+                                trade_record.regime = str(_regime)
                             await db_sess.commit()
                             print(f"[CLOSE] {position.symbol}: DB updated — exit={actual_close_price:.5f}, P/L=${profit_loss:+.2f}", flush=True)
                         else:

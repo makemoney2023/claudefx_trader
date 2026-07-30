@@ -78,6 +78,21 @@ class TradeModel(Base):
     profit_loss: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     profit_loss_pips: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     r_multiple: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    # Excursion / execution telemetry (expectancy analytics)
+    peak_r_multiple: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    trough_r_multiple: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    mfe_r: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    mae_r: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    requested_entry: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    fill_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    entry_spread: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    slippage: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    commission: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    swap: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    regime: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    setup_fingerprint: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    exit_events: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     
     # ICT context
     market_structure: Mapped[str] = mapped_column(String(20), default="")
@@ -235,8 +250,9 @@ class PositionStateModel(Base):
     tp2_hit: Mapped[bool] = mapped_column(Boolean, default=False)
     initial_volume: Mapped[float] = mapped_column(Float, default=0)
     
-    # Peak profit tracking (aggressive profit protection — survives restart)
+    # Peak / trough R tracking (aggressive profit protection — survives restart)
     peak_r_multiple: Mapped[float] = mapped_column(Float, default=0)
+    trough_r_multiple: Mapped[float] = mapped_column(Float, default=0)
     peak_unrealized_pnl: Mapped[float] = mapped_column(Float, default=0)
     near_tp_reached: Mapped[bool] = mapped_column(Boolean, default=False)
     
@@ -562,8 +578,22 @@ async def init_db():
             ("trades", "pnl_source", "VARCHAR(20)"),
             # Position state durability fields
             ("position_states", "peak_r_multiple", "FLOAT DEFAULT 0"),
+            ("position_states", "trough_r_multiple", "FLOAT DEFAULT 0"),
             ("position_states", "peak_unrealized_pnl", "FLOAT DEFAULT 0"),
             ("position_states", "near_tp_reached", "BOOLEAN DEFAULT 0"),
+            ("trades", "peak_r_multiple", "FLOAT"),
+            ("trades", "trough_r_multiple", "FLOAT"),
+            ("trades", "mfe_r", "FLOAT"),
+            ("trades", "mae_r", "FLOAT"),
+            ("trades", "requested_entry", "FLOAT"),
+            ("trades", "fill_price", "FLOAT"),
+            ("trades", "entry_spread", "FLOAT"),
+            ("trades", "slippage", "FLOAT"),
+            ("trades", "commission", "FLOAT"),
+            ("trades", "swap", "FLOAT"),
+            ("trades", "regime", "VARCHAR(40)"),
+            ("trades", "setup_fingerprint", "VARCHAR(120)"),
+            ("trades", "exit_events", "JSON"),
             ("position_states", "a_plus", "BOOLEAN DEFAULT 0"),
             ("position_states", "reservation_id", "VARCHAR(50)"),
             ("position_states", "remaining_volume", "FLOAT DEFAULT 0"),
