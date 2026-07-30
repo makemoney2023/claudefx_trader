@@ -606,6 +606,217 @@ class TestJudgeUnavailableRetry:
         assert outcome.verdict == JudgeVerdict.UNAVAILABLE
 
 
+# ============================================================
+# Phase 5 — counterfactual journal
+# ============================================================
+
+class TestCounterfactualJournal:
+    def _journal(self, tmp_path):
+        from trading_bot.services.counterfactual_journal import CounterfactualJournal
+
+        return CounterfactualJournal(path=str(tmp_path / "counterfactuals.jsonl"))
+
+    def _df(self, start, bars):
+        """bars: list of (high, low) tuples, 5-minute spacing."""
+        idx = pd.date_range(start=start, periods=len(bars), freq="5min")
+        return pd.DataFrame(
+            {
+                "open": [(h + l) / 2 for h, l in bars],
+                "high": [h for h, l in bars],
+                "low": [l for h, l in bars],
+                "close": [(h + l) / 2 for h, l in bars],
+            },
+            index=idx,
+        )
+
+    def test_record_and_reload(self, tmp_path):
+        journal = self._journal(tmp_path)
+        rec = journal.record(
+            symbol="XAUUSD", gate_id="htf_both_oppose", outcome_type="mechanical_reject",
+            direction="long", confidence=0.7, entry=4100.0, sl=4090.0, tp=4130.0,
+            reason="test",
+        )
+        assert rec["gate_id"] == "htf_both_oppose"
+        records = journal.load_records()
+        assert len(records) == 1
+        assert records[0]["symbol"] == "XAUUSD"
+        assert records[0]["outcome"] is None
+
+    @pytest.mark.asyncio
+    async def test_tp_first_scores_missed_r(self, tmp_path):
+        from datetime import datetime, timedelta, timezone
+
+        journal = self._journal(tmp_path)
+        blocked_at = datetime.now(timezone.utc) - timedelta(hours=6)
+        journal.record(
+            symbol="XAUUSD", gate_id="htf_both_oppose", outcome_type="mechanical_reject",
+            direction="long", entry=4100.0, sl=4090.0, tp=4130.0,
+            timestamp=blocked_at,
+        )
+        # Bars after the block: price runs straight to TP without touching SL.
+        df = self._df(blocked_at + timedelta(minutes=5), [
+            (4105, 4098), (4115, 4104), (4131, 4114),
+        ])
+        fetch = AsyncMock(return_value=df)
+
+        scored = await journal.score_pending(fetch)
+        assert scored == 1
+        rec = journal.load_records()[0]
+        assert rec["outcome"] == "tp_first"
+        assert rec["outcome_r"] == pytest.approx(3.0)  # 30 gained / 10 risked
+        assert rec["finalized"] is True
+
+    @pytest.mark.asyncio
+    async def test_sl_first_scores_saved_r(self, tmp_path):
+        from datetime import datetime, timedelta, timezone
+
+        journal = self._journal(tmp_path)
+        blocked_at = datetime.now(timezone.utc) - timedelta(hours=6)
+        journal.record(
+            symbol="XAUUSD", gate_id="m15_structure", outcome_type="mechanical_reject",
+            direction="long", entry=4100.0, sl=4090.0, tp=4130.0,
+            timestamp=blocked_at,
+        )
+        df = self._df(blocked_at + timedelta(minutes=5), [
+            (4102, 4095), (4098, 4089),  # SL hit on bar 2
+        ])
+        scored = await journal.score_pending(AsyncMock(return_value=df))
+        assert scored == 1
+        rec = journal.load_records()[0]
+        assert rec["outcome"] == "sl_first"
+        assert rec["outcome_r"] == pytest.approx(-1.0)
+
+    @pytest.mark.asyncio
+    async def test_same_bar_both_counts_as_sl_first(self, tmp_path):
+        from datetime import datetime, timedelta, timezone
+
+        journal = self._journal(tmp_path)
+        blocked_at = datetime.now(timezone.utc) - timedelta(hours=6)
+        journal.record(
+            symbol="XAUUSD", gate_id="zone_gate", outcome_type="mechanical_reject",
+            direction="long", entry=4100.0, sl=4090.0, tp=4130.0,
+            timestamp=blocked_at,
+        )
+        df = self._df(blocked_at + timedelta(minutes=5), [(4131, 4089)])
+        await journal.score_pending(AsyncMock(return_value=df))
+        assert journal.load_records()[0]["outcome"] == "sl_first"
+
+    @pytest.mark.asyncio
+    async def test_neither_finalizes_after_24h(self, tmp_path):
+        from datetime import datetime, timedelta, timezone
+
+        journal = self._journal(tmp_path)
+        blocked_at = datetime.now(timezone.utc) - timedelta(hours=30)
+        journal.record(
+            symbol="XAUUSD", gate_id="tod_gate", outcome_type="mechanical_reject",
+            direction="short", entry=4100.0, sl=4110.0, tp=4070.0,
+            timestamp=blocked_at,
+        )
+        df = self._df(blocked_at + timedelta(minutes=5), [
+            (4103, 4097), (4104, 4096),
+        ])
+        await journal.score_pending(AsyncMock(return_value=df))
+        rec = journal.load_records()[0]
+        assert rec["outcome"] == "neither"
+        assert rec["outcome_r"] == 0.0
+        assert rec["finalized"] is True
+
+    @pytest.mark.asyncio
+    async def test_too_fresh_records_not_scored(self, tmp_path):
+        from datetime import datetime, timedelta, timezone
+
+        journal = self._journal(tmp_path)
+        journal.record(
+            symbol="XAUUSD", gate_id="htf_both_oppose", outcome_type="mechanical_reject",
+            direction="long", entry=4100.0, sl=4090.0, tp=4130.0,
+            timestamp=datetime.now(timezone.utc) - timedelta(hours=1),
+        )
+        fetch = AsyncMock()
+        scored = await journal.score_pending(fetch)
+        assert scored == 0
+        fetch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_priceless_records_never_scored(self, tmp_path):
+        from datetime import datetime, timedelta, timezone
+
+        journal = self._journal(tmp_path)
+        journal.record(
+            symbol="XAUUSD", gate_id="pre_claude_viability", outcome_type="pre_claude_skip",
+            market_price=4100.0,
+            timestamp=datetime.now(timezone.utc) - timedelta(hours=6),
+        )
+        fetch = AsyncMock()
+        scored = await journal.score_pending(fetch)
+        assert scored == 0
+        fetch.assert_not_awaited()
+
+    def test_per_gate_summary(self, tmp_path):
+        import json
+
+        journal = self._journal(tmp_path)
+        records = [
+            {"gate_id": "htf_both_oppose", "outcome": "tp_first", "outcome_r": 2.5},
+            {"gate_id": "htf_both_oppose", "outcome": "sl_first", "outcome_r": -1.0},
+            {"gate_id": "htf_both_oppose", "outcome": None, "outcome_r": None},
+            {"gate_id": "zone_gate", "outcome": "sl_first", "outcome_r": -1.0},
+        ]
+        with open(journal.path, "w") as fh:
+            for r in records:
+                fh.write(json.dumps(r) + "\n")
+
+        summary = journal.summary()
+        htf = summary["gates"]["htf_both_oppose"]
+        assert htf["count"] == 3
+        assert htf["tp_first"] == 1
+        assert htf["sl_first"] == 1
+        assert htf["pending"] == 1
+        assert htf["missed_r"] == pytest.approx(2.5)
+        assert htf["saved_r"] == pytest.approx(1.0)
+        assert summary["gates"]["zone_gate"]["net_saved_r"] == pytest.approx(1.0)
+
+
+class TestCounterfactualWiring:
+    @pytest.mark.asyncio
+    async def test_terminal_decisions_feed_journal(self, tmp_path):
+        """Every terminal decision through the bot hook lands in the journal."""
+        from trading_bot.main import TradingBot
+        from trading_bot.services.counterfactual_journal import CounterfactualJournal
+
+        bot = MagicMock()
+        bot.counterfactual_journal = CounterfactualJournal(
+            path=str(tmp_path / "cf.jsonl")
+        )
+        bot._last_confidence_components = None
+        bot.gate_funnel = MagicMock()
+        bot.gate_funnel.record_decision = AsyncMock(return_value="id1")
+
+        await TradingBot._record_terminal_decision(
+            bot, "mechanical_reject", "XAUUSD",
+            gate_id="htf_both_oppose", direction="long",
+            entry=4100.0, sl=4090.0, tp=4130.0, confidence=0.7,
+            reason="test",
+        )
+
+        records = bot.counterfactual_journal.load_records()
+        assert len(records) == 1
+        assert records[0]["gate_id"] == "htf_both_oppose"
+        assert records[0]["outcome_type"] == "mechanical_reject"
+
+    def test_pre_claude_skip_records_counterfactual(self):
+        import inspect
+        import trading_bot.services.analyze_and_trade_runner as runner_mod
+
+        src = inspect.getsource(runner_mod)
+        assert "counterfactual" in src.lower()
+
+    def test_api_endpoint_exists(self):
+        from trading_bot.api.routes.analysis import router
+
+        paths = [r.path for r in router.routes]
+        assert "/counterfactuals" in paths
+
+
 class TestDefensiveHalt:
     def test_cycle_halts_explicitly_in_defensive_mode(self):
         import inspect

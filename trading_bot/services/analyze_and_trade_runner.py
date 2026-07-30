@@ -302,6 +302,18 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                     symbol=symbol,
                     details={"reasons": _viability.reasons},
                 )
+                _cf_journal = getattr(bot, "counterfactual_journal", None)
+                if _cf_journal is not None:
+                    try:
+                        _cf_journal.record(
+                            symbol=symbol,
+                            gate_id="pre_claude_viability",
+                            outcome_type="pre_claude_skip",
+                            market_price=current_price,
+                            reason=_skip_reason,
+                        )
+                    except Exception as _cf_err:
+                        logger.debug(f"[COUNTERFACTUAL] record failed: {_cf_err}")
                 if bot_state:
                     bot_state.symbol_complete(symbol, "pre_claude_skip")
                 return

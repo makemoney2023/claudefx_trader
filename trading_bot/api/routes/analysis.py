@@ -327,6 +327,28 @@ async def get_session_schedule():
     return checker.get_daily_schedule()
 
 
+# NOTE: must be registered before the catch-all "/{symbol}" route below.
+@router.get("/counterfactuals")
+async def get_counterfactuals(
+    limit: int = Query(50, ge=1, le=500, description="Recent records to include")
+):
+    """
+    Per-gate counterfactual tally: what each decision gate saved vs cost.
+
+    Records come from blocked/rejected trades scored against realized
+    price action (tp_first = the gate cost R, sl_first = the gate saved R).
+    """
+    from ...services.counterfactual_journal import get_counterfactual_journal
+
+    journal = get_counterfactual_journal()
+    summary = journal.summary()
+    records = journal.load_records()
+    return {
+        "summary": summary,
+        "recent": records[-limit:][::-1],
+    }
+
+
 @router.get("/{symbol}", response_model=FullAnalysisResponse)
 async def get_symbol_analysis(
     symbol: str,

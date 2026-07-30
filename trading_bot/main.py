@@ -389,6 +389,12 @@ class TradingBot:
         from .services.direction_circuit_breaker import DirectionLossTracker
         self._direction_loss_tracker = DirectionLossTracker()
         self._off_hours_mode: bool = False  # True when outside kill zones (soft-block)
+
+        # Counterfactual journal: records every blocked/rejected trade and
+        # later scores whether the block saved or cost R
+        from .services.counterfactual_journal import get_counterfactual_journal
+        self.counterfactual_journal = get_counterfactual_journal()
+        self._last_counterfactual_score: Optional[datetime] = None
         
         # Analysis cooldown: only call Claude once per 5 minutes per symbol
         # Saves API costs by skipping redundant analyses on unchanged chart data
@@ -1256,6 +1262,23 @@ class TradingBot:
             # STEP 1: TRACK EQUITY FOR GOAL
             # ============================================
             await self._update_goal_tracker()
+
+            # Score counterfactuals at most once per hour (background task —
+            # OHLCV fetches must not delay the trading cycle)
+            _cf_now = datetime.now(timezone.utc)
+            if (
+                self._last_counterfactual_score is None
+                or (_cf_now - self._last_counterfactual_score).total_seconds() >= 3600
+            ):
+                self._last_counterfactual_score = _cf_now
+                try:
+                    asyncio.create_task(
+                        self.counterfactual_journal.score_pending(
+                            self.data_fetcher.get_ohlcv
+                        )
+                    )
+                except Exception as _cf_err:
+                    logger.debug(f"[COUNTERFACTUAL] score task failed to start: {_cf_err}")
             
             # ============================================
             # STEP 1: CHECK BLOCKERS (only blocks NEW trades, never position management)
@@ -1634,6 +1657,26 @@ class TradingBot:
     ) -> Optional[str]:
         if confidence_components is None:
             confidence_components = getattr(self, "_last_confidence_components", None)
+
+        # Counterfactual journal: every terminal non-trade decision is
+        # recorded so blocked trades can be scored against realized price.
+        _cf_journal = getattr(self, "counterfactual_journal", None)
+        if _cf_journal is not None:
+            try:
+                _cf_journal.record(
+                    symbol=symbol,
+                    gate_id=gate_id or outcome_type,
+                    outcome_type=outcome_type,
+                    direction=direction,
+                    confidence=confidence,
+                    entry=entry or None,
+                    sl=sl or None,
+                    tp=tp or None,
+                    reason=reason,
+                )
+            except Exception as _cf_err:
+                logger.debug(f"[COUNTERFACTUAL] record failed: {_cf_err}")
+
         funnel = getattr(self, "gate_funnel", None) or get_gate_funnel()
         return await funnel.record_decision(
             outcome_type,
