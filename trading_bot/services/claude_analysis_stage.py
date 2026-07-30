@@ -22,6 +22,47 @@ except ImportError:
     bot_state = None
 
 
+async def add_precious_metals_context(bot, symbol: str, market_data: dict) -> None:
+    """
+    Attach gold/silver ratio context to market_data for XAUUSD/XAGUSD.
+
+    The counterpart metal's OHLCV comes back as a pandas DataFrame, whose
+    truthiness is ambiguous — always compare against None explicitly.
+    """
+    if symbol not in bot.PRECIOUS_METALS or not bot.precious_metals_analyzer:
+        return
+    try:
+        gold_price = market_data.get('current_price', 0) if symbol == 'XAUUSD' else 0
+        silver_price = market_data.get('current_price', 0) if symbol == 'XAGUSD' else 0
+
+        other_symbol = 'XAGUSD' if symbol == 'XAUUSD' else 'XAUUSD'
+        other_data = await bot.data_fetcher.get_ohlcv(
+            other_symbol, settings.timeframes.execution_tf
+        )
+        if other_data is not None and 'close' in other_data and len(other_data['close']) > 0:
+            if symbol == 'XAUUSD':
+                silver_price = float(other_data['close'].iloc[-1])
+            else:
+                gold_price = float(other_data['close'].iloc[-1])
+
+        if gold_price > 0 and silver_price > 0:
+            geopolitical = 'normal'
+            if bot.news_service:
+                geo_level = bot.news_service.get_geopolitical_risk_level()
+                geopolitical = geo_level if geo_level else 'normal'
+
+            market_data["precious_metals_context"] = (
+                bot.precious_metals_analyzer.get_context_for_claude(
+                    gold_price=gold_price,
+                    silver_price=silver_price,
+                    geopolitical_risk=geopolitical,
+                )
+            )
+            logger.debug(f"Added precious metals context for {symbol}")
+    except Exception as e:
+        logger.warning(f"Could not add precious metals context: {e}")
+
+
 @dataclass
 class ClaudeStageResult:
     trade_signal: Any
@@ -445,36 +486,7 @@ class ClaudeAnalysisStage:
                 logger.debug(f"Could not build setup playbook: {e}")
         
         # Add precious metals context for gold/silver
-        if symbol in bot.PRECIOUS_METALS and bot.precious_metals_analyzer:
-            try:
-                # Get prices for both metals
-                gold_price = market_data.get('current_price', 0) if symbol == 'XAUUSD' else 0
-                silver_price = market_data.get('current_price', 0) if symbol == 'XAGUSD' else 0
-                
-                # Try to get the other metal's price
-                other_symbol = 'XAGUSD' if symbol == 'XAUUSD' else 'XAUUSD'
-                other_data = await bot.data_fetcher.get_ohlcv(other_symbol, settings.timeframes.execution_tf)
-                if other_data and 'close' in other_data and len(other_data['close']) > 0:
-                    if symbol == 'XAUUSD':
-                        silver_price = float(other_data['close'].iloc[-1])
-                    else:
-                        gold_price = float(other_data['close'].iloc[-1])
-                
-                # Generate precious metals context
-                if gold_price > 0 and silver_price > 0:
-                    geopolitical = 'normal'
-                    if bot.news_service:
-                        geo_level = bot.news_service.get_geopolitical_risk_level()
-                        geopolitical = geo_level if geo_level else 'normal'
-                    
-                    market_data["precious_metals_context"] = bot.precious_metals_analyzer.get_context_for_claude(
-                        gold_price=gold_price,
-                        silver_price=silver_price,
-                        geopolitical_risk=geopolitical
-                    )
-                    logger.debug(f"Added precious metals context for {symbol}")
-            except Exception as e:
-                logger.warning(f"Could not add precious metals context: {e}")
+        await add_precious_metals_context(bot, symbol, market_data)
         
         # Prepare ENRICHED analysis data for Claude (full price levels, not just counts)
         # Use .get() to avoid KeyError if any analyzer failed

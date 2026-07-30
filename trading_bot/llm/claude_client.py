@@ -870,6 +870,7 @@ class ClaudeClient:
         # Exponential backoff retry for transient errors
         max_attempts = 3
         base_delay = 5  # seconds
+        degenerate_retries = 0  # one free retry if Claude returns placeholder reasoning
         
         for attempt in range(1, max_attempts + 1):
             try:
@@ -944,9 +945,12 @@ class ClaudeClient:
                             f"[ANALYSIS] {symbol} hit max_tokens={self.max_tokens} "
                             f"— retrying once with thinking disabled + forced tool"
                         )
+                        # 8k: forced tool calls normally fit in ~2k, but Opus has
+                        # been seen writing very long reasoning fields into the
+                        # tool args; 4k exhausted twice in production (2026-07-30).
                         message = await self._async_messages_create(
                             model=self.model_heavy,
-                            max_tokens=4000,
+                            max_tokens=8000,
                             thinking={"type": "disabled"},
                             output_config={"effort": "low"},
                             system=system_messages,
@@ -1009,6 +1013,30 @@ class ClaudeClient:
                     for block in (getattr(message, "content", None) or [])
                 )
                 result = self._parse_tool_response(message)
+
+                # Degenerate-output guard: a reasoning of "placeholder"/"n/a"/empty
+                # means the model produced a junk tool call (seen live 2026-07-30).
+                # Retry once; if it persists, discard rather than act on it.
+                reasoning_text = getattr(result.signal, "reasoning", "") or ""
+                if self._is_degenerate_reasoning(reasoning_text):
+                    if degenerate_retries < 1 and attempt < max_attempts:
+                        degenerate_retries += 1
+                        logger.warning(
+                            f"[ANALYSIS] {symbol} returned degenerate reasoning "
+                            f"({reasoning_text!r}) — retrying once"
+                        )
+                        continue
+                    logger.warning(
+                        f"[ANALYSIS] {symbol} degenerate reasoning persisted — "
+                        f"discarding response"
+                    )
+                    result = self._create_no_trade_result(
+                        f"Claude returned degenerate reasoning ({reasoning_text!r}) "
+                        f"— response discarded"
+                    )
+                    result.analysis_time = time.time() - start_time
+                    return result
+
                 result.analysis_time = time.time() - start_time
                 if use_cache and has_tool and result.signal.direction:
                     await self._cache.set(symbol, timeframe, image_hash, result, market_data)
@@ -2351,6 +2379,21 @@ Finish by calling the submit_trade_analysis tool exactly once.
             except (json.JSONDecodeError, ValueError):
                 pass
         return None, response_text
+
+    # Literal junk the model has emitted in tool args instead of real analysis.
+    _DEGENERATE_REASONING = {
+        "placeholder", "n/a", "na", "none", "null", "todo", "tbd", "...", "-", "x",
+    }
+
+    @staticmethod
+    def _is_degenerate_reasoning(reasoning: Optional[str]) -> bool:
+        """True when the reasoning field is empty or a known junk literal."""
+        if reasoning is None:
+            return True
+        normalized = reasoning.strip().lower().rstrip(".!")
+        if not normalized:
+            return True
+        return normalized in ClaudeClient._DEGENERATE_REASONING
 
     def _parse_tool_response(self, message) -> AnalysisResult:
         """Parse the tool use response from Claude."""
