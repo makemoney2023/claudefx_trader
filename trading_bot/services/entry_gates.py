@@ -443,3 +443,133 @@ def evaluate_confluence_gate(
         )
     return GateOutcome.pass_through("confluence_gate")
 
+
+@dataclass
+class IctConfirmationResult:
+    """Outcome of setup-family ICT confirmation (shadow or active)."""
+
+    blocked: bool = False
+    would_block: bool = False
+    shadow_only: bool = False
+    gate_id: str = "ict_confirmation"
+    decision: str = "ok"
+    reason: str = ""
+
+    def to_gate_outcome(self) -> GateOutcome:
+        if self.blocked:
+            return GateOutcome.block(
+                gate_id=self.gate_id,
+                reason=self.reason,
+                stage="ict_confirmation_gate",
+            )
+        if self.shadow_only:
+            out = GateOutcome.pass_through("ict_confirmation_shadow")
+            out.gate_id = self.gate_id
+            out.reason = self.reason
+            return out
+        return GateOutcome.pass_through(f"ict_confirmation_{self.decision}")
+
+
+def evaluate_ict_confirmation_gate(
+    *,
+    fingerprint: Any,
+    order_type: str = "market",
+    mode: str = "shadow",
+) -> IctConfirmationResult:
+    """
+    Setup-specific confirmation.
+
+    Families:
+      - liquidity_reversal (market/stop): sweep + MSS/CHoCH + displacement
+      - continuation (market/stop): HTF + MSS/BOS + displacement (sweep optional)
+      - passive_retracement (limit): HTF + displacement-origin zone; no post-entry
+        confirmation forced (limit cannot know fill-time structure)
+
+    mode='shadow' never hard-blocks; mode='active' blocks missing confirms;
+    mode='disabled' skips.
+    """
+    if mode not in ("shadow", "active"):
+        return IctConfirmationResult(decision="disabled")
+
+    family = getattr(fingerprint, "family", "") or ""
+    ot = (order_type or getattr(fingerprint, "order_type", None) or "market").lower()
+    has_sweep = bool(getattr(fingerprint, "has_sweep", False))
+    has_mss = bool(getattr(fingerprint, "has_mss", False))
+    has_disp = bool(getattr(fingerprint, "has_displacement", False))
+    htf = bool(getattr(fingerprint, "htf_aligned", False))
+    zone_ok = bool(getattr(fingerprint, "zone_valid", True))
+
+    missing: list[str] = []
+    decision = "ok"
+
+    if family == "passive_retracement" or ot.endswith("_limit"):
+        if not htf:
+            missing.append("htf_alignment")
+        if not has_disp:
+            missing.append("displacement_origin")
+        if not zone_ok:
+            missing.append("valid_zone")
+        # Do not require sweep/MSS after a limit is working — unknown until fill
+        if missing:
+            decision = "passive_limit_incomplete"
+            reason = (
+                "Passive retracement missing: " + ", ".join(missing)
+            )
+            would = True
+        else:
+            decision = "passive_limit_ok"
+            reason = "Passive limit: HTF + displacement-origin zone OK"
+            would = False
+    elif family == "liquidity_reversal":
+        if not has_sweep:
+            missing.append("directional_sweep")
+        if not has_mss:
+            missing.append("mss_choch")
+        if not has_disp:
+            missing.append("displacement")
+        would = bool(missing)
+        decision = "reversal_incomplete" if would else "reversal_ok"
+        reason = (
+            ("Liquidity reversal missing: " + ", ".join(missing))
+            if would
+            else "Liquidity reversal confirmed (sweep+MSS+displacement)"
+        )
+    else:  # continuation (default)
+        if not htf:
+            missing.append("htf_alignment")
+        if not has_mss:
+            missing.append("mss_bos")
+        if not has_disp:
+            missing.append("displacement")
+        would = bool(missing)
+        decision = "continuation_incomplete" if would else "continuation_ok"
+        reason = (
+            ("Continuation missing: " + ", ".join(missing))
+            if would
+            else "Continuation confirmed (HTF+MSS+displacement)"
+        )
+
+    if not would:
+        return IctConfirmationResult(
+            blocked=False,
+            would_block=False,
+            decision=decision,
+            reason=reason,
+        )
+
+    if mode == "shadow":
+        return IctConfirmationResult(
+            blocked=False,
+            would_block=True,
+            shadow_only=True,
+            decision=f"shadow_{decision}",
+            reason=reason,
+        )
+
+    return IctConfirmationResult(
+        blocked=True,
+        would_block=True,
+        decision=decision,
+        reason=reason,
+    )
+

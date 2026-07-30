@@ -114,6 +114,8 @@ async def save_trade_to_db(
     timeframe: str = "M15",
     session_name: str = "",
     risk_percent: float = None,
+    setup_fingerprint: str = None,
+    regime: str = None,
 ):
     """Save an executed trade to the database with full analysis context."""
     if not DB_AVAILABLE:
@@ -150,6 +152,8 @@ async def save_trade_to_db(
                     confluence_factors=confluence_factors,
                     confluence_count=confluence_count,
                     risk_percent=risk_percent,
+                    setup_fingerprint=(setup_fingerprint or None),
+                    regime=regime,
                 )
                 session.add(trade)
                 await session.commit()

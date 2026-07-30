@@ -481,6 +481,13 @@ class TradingSettings(BaseSettings):
         default=[],
         description="Symbols where zone gate is disabled (falls back to legacy D1 gate)"
     )
+    ict_confirmation_mode: str = Field(
+        default="shadow",
+        description=(
+            "ICT setup confirmation gate: 'shadow' logs would-block only, "
+            "'active' hard-blocks missing confirmations, 'disabled' skips"
+        ),
+    )
 
 
 class TimeframeSettings(BaseSettings):

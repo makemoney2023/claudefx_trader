@@ -10,6 +10,7 @@ from .entry_gates import (
     evaluate_confluence_gate,
     evaluate_direction_alignment_gate,
     evaluate_htf_alignment_gate,
+    evaluate_ict_confirmation_gate,
     evaluate_m15_gate,
     evaluate_off_hours_gate,
     evaluate_post_cooldown_gate,
@@ -67,6 +68,40 @@ def _truthy_factor(data: Any, *, attr: str, key: str) -> bool:
     return bool(hasattr(data, attr) and getattr(data, attr))
 
 
+def _evaluate_ict_confirmation_for_ctx(ctx: TradeContext) -> GateOutcome:
+    """Build fingerprint from context and run shadow/active ICT confirmation."""
+    from ..config import settings
+    from .setup_fingerprint import build_setup_fingerprint
+
+    mode = getattr(settings.trading, "ict_confirmation_mode", "shadow") or "shadow"
+    regime = ""
+    reg = ctx.analysis_results.get("regime") or {}
+    if isinstance(reg, dict):
+        regime = str(reg.get("type") or reg.get("regime") or ctx.regime_type or "")
+    else:
+        regime = str(getattr(reg, "type", None) or ctx.regime_type or "")
+
+    fp = build_setup_fingerprint(
+        direction=ctx.direction,
+        order_type=ctx.order_type or "market",
+        session="",
+        regime=regime,
+        d1_bias=ctx.d1_bias,
+        h4_bias=ctx.h4_bias,
+        analysis_results=ctx.analysis_results,
+    )
+    # Stash for persistence / telemetry
+    ctx.analysis_results = dict(ctx.analysis_results or {})
+    ctx.analysis_results["setup_fingerprint"] = fp.to_dict()
+
+    result = evaluate_ict_confirmation_gate(
+        fingerprint=fp,
+        order_type=ctx.order_type or "market",
+        mode=mode,
+    )
+    return result.to_gate_outcome()
+
+
 def count_confluence(ctx: TradeContext) -> tuple[int, list[str]]:
     """Count ICT confluence factors (mirrors main.py E3 block)."""
     _dir = ctx.direction
@@ -100,18 +135,14 @@ def count_confluence(ctx: TradeContext) -> tuple[int, list[str]]:
             count += 1
             factors.append("Bearish OB")
 
+    # Credit only a directionally valid recent sweep — not merely nearby liquidity
     liq_data = ar.get("liquidity")
     if liq_data:
-        if _dir == "long" and _truthy_factor(
-            liq_data, attr="nearest_ssl", key="nearest_ssl"
-        ):
+        from .setup_fingerprint import has_directional_sweep
+
+        if has_directional_sweep(_dir, liq_data):
             count += 1
-            factors.append("SSL Liquidity")
-        elif _dir == "short" and _truthy_factor(
-            liq_data, attr="nearest_bsl", key="nearest_bsl"
-        ):
-            count += 1
-            factors.append("BSL Liquidity")
+            factors.append("Directional Sweep")
 
     amd = ar.get("amd_cycle")
     if isinstance(amd, dict) and amd.get("phase") == "distribution" and amd.get("expected_direction") == _dir:
@@ -258,7 +289,13 @@ def evaluate_structure_and_quality_gates(
         min_confluence=min_conf,
         confidence_override=conf_override,
     )
-    return _merge_outcome(accumulated, conf_step)
+    accumulated = _merge_outcome(accumulated, conf_step)
+    if conf_step.blocked:
+        return accumulated
+
+    # Setup-family ICT confirmation (default shadow — never hard-blocks until Phase 6)
+    ict_step = _evaluate_ict_confirmation_for_ctx(ctx)
+    return _merge_outcome(accumulated, ict_step)
 
 
 def evaluate_scaling_gates(

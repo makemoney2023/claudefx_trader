@@ -289,6 +289,9 @@ class TradeFillHandler:
                     }))
                     
                     # Save to database with full analysis context
+                    _fp = getattr(trade_signal, "setup_fingerprint", None)
+                    if isinstance(_fp, dict):
+                        _fp = _fp.get("key")
                     await save_trade_to_db(
                         ticket=result.ticket,
                         symbol=symbol,
@@ -317,6 +320,8 @@ class TradeFillHandler:
                         timeframe="M15",
                         session_name=bot.kill_zone_checker.get_current_session().session_name if bot.kill_zone_checker else "",
                         risk_percent=size_result.risk_percent if hasattr(size_result, 'risk_percent') else bot.risk_manager.risk_per_trade,
+                        setup_fingerprint=_fp,
+                        regime=getattr(trade_signal, "regime", None),
                     )
                     
                     # Pending orders: do NOT send Telegram notification.
@@ -451,6 +456,9 @@ class TradeFillHandler:
                     }))
                     
                     # Save trade to database with full analysis context
+                    _fp = getattr(trade_signal, "setup_fingerprint", None)
+                    if isinstance(_fp, dict):
+                        _fp = _fp.get("key")
                     await save_trade_to_db(
                         ticket=result.ticket,
                         symbol=symbol,
@@ -479,6 +487,8 @@ class TradeFillHandler:
                         timeframe="M15",
                         session_name=bot.kill_zone_checker.get_current_session().session_name if bot.kill_zone_checker else "",
                         risk_percent=size_result.risk_percent if hasattr(size_result, 'risk_percent') else bot.risk_manager.risk_per_trade,
+                        setup_fingerprint=_fp,
+                        regime=getattr(trade_signal, "regime", None),
                     )
                     
                     # Send Telegram notification

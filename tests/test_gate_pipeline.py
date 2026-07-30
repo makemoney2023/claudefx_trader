@@ -61,13 +61,20 @@ class TestGatePipeline:
         assert factors == []
 
     def test_confluence_counts_replay_dict_summaries(self):
-        """Replay packs FVG/OB/liquidity as dicts; gate must count them."""
+        """Replay packs FVG/OB/liquidity as dicts; gate must count them.
+
+        Nearby SSL alone no longer counts — only a direction-aligned sweep.
+        """
         ctx = _ctx(
             direction="long",
             analysis_results={
                 "fvg": {"bullish": 6, "bearish": 2, "active": 4},
                 "order_blocks": {"bullish": 1, "bearish": 3},
-                "liquidity": {"nearest_ssl": 4500.0, "nearest_bsl": None},
+                "liquidity": {
+                    "nearest_ssl": 4500.0,
+                    "nearest_bsl": None,
+                    "recent_sweeps": [{"type": "ssl", "reversal_detected": True}],
+                },
                 "volume": {"relative_volume": 1.0},
             },
         )
@@ -75,7 +82,7 @@ class TestGatePipeline:
         assert count == 3
         assert "Bullish FVG" in factors
         assert "Bullish OB" in factors
-        assert "SSL Liquidity" in factors
+        assert "Directional Sweep" in factors
 
     def test_confluence_ignores_zero_count_replay_dicts(self):
         ctx = _ctx(

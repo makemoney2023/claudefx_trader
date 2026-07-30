@@ -603,6 +603,37 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
             return
         _pipeline_ctx = _entry_gate_result.pipeline_ctx
         trade_signal.confidence = _entry_gate_result.confidence
+        _fp_dict = (_pipeline_ctx.analysis_results or {}).get("setup_fingerprint")
+        if _fp_dict:
+            trade_signal.setup_fingerprint = _fp_dict
+            if isinstance(_fp_dict, dict):
+                trade_signal.regime = _fp_dict.get("regime")
+        if "ict_confirmation_shadow" in (_entry_gate_result.gate_path or []):
+            logger.info(
+                f"[ICT-SHADOW] {symbol}: would-block ict_confirmation "
+                f"(fingerprint={getattr(trade_signal, 'setup_fingerprint', None)})"
+            )
+            try:
+                await bot._record_terminal_decision(
+                    "shadow_would_block",
+                    symbol,
+                    gate_id="ict_confirmation",
+                    direction=trade_signal.direction,
+                    entry=trade_signal.entry_price or current_price,
+                    sl=trade_signal.stop_loss or 0.0,
+                    tp=trade_signal.take_profit or 0.0,
+                    confidence=trade_signal.confidence,
+                    reason="ICT confirmation shadow would-block",
+                    details={
+                        "gate_path": list(_entry_gate_result.gate_path or []),
+                        "setup_fingerprint": getattr(
+                            trade_signal, "setup_fingerprint", None
+                        ),
+                        "shadow": True,
+                    },
+                )
+            except Exception as _shadow_err:
+                logger.debug(f"[ICT-SHADOW] record failed: {_shadow_err}")
         confluence_count, confluence_factors = count_confluence(_pipeline_ctx)
         logger.info(
             f"Confluence factors for {symbol}: {confluence_count} "
