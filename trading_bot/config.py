@@ -400,6 +400,15 @@ class TradingSettings(BaseSettings):
         default=True,
         description="Restrict crypto analysis to kill zones only (saves API costs)"
     )
+    claude_kill_zone_only: bool = Field(
+        default=True,
+        description=(
+            "When True, hard-skip Claude analysis/judge/sizing outside ICT kill "
+            "zones (London 2–5, NY 7–10, London Close 10–12 America/New_York). "
+            "Position sync and pending-order management stay on. Set "
+            "TRADING_CLAUDE_KILL_ZONE_ONLY=false only for debugging."
+        ),
+    )
     dry_run: bool = Field(
         default=False,
         description="Run full analysis pipeline but skip order execution (for testing signal quality)"
@@ -715,6 +724,7 @@ def get_trading_config() -> dict:
         "max_daily_trades": settings.trading.max_daily_trades,
         "min_risk_reward": settings.trading.min_risk_reward,
         "allowed_sessions": settings.trading.allowed_sessions,
+        "claude_kill_zone_only": settings.trading.claude_kill_zone_only,
         "max_daily_drawdown": settings.trading.max_daily_drawdown,
         "max_weekly_drawdown": settings.trading.max_weekly_drawdown,
     }

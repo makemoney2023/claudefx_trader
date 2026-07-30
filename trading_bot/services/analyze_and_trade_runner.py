@@ -76,6 +76,26 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
         # Update bot state
         if bot_state:
             bot_state.analyzing_symbol(symbol)
+
+        # Hard-skip Claude outside ICT kill zones (belt-and-suspenders vs cycle gate)
+        from ..analysis.kill_zones import claude_analysis_allowed
+        if bot.kill_zone_checker is not None:
+            _kz_session = bot.kill_zone_checker.get_current_session()
+            if not claude_analysis_allowed(
+                bool(getattr(_kz_session, "is_tradeable", False)),
+                claude_kill_zone_only=settings.trading.claude_kill_zone_only,
+            ):
+                next_kz = getattr(_kz_session, "next_kill_zone", None) or "next kill zone"
+                mins = getattr(_kz_session, "next_kill_zone_in_minutes", None)
+                eta = f" in {mins}min" if mins is not None else ""
+                logger.info(
+                    f"[KZ-GATE] {symbol}: Outside KZ "
+                    f"({getattr(_kz_session, 'session_name', 'unknown')}) — "
+                    f"Claude skipped until {next_kz}{eta}"
+                )
+                if bot_state:
+                    bot_state.symbol_complete(symbol, "outside_kill_zone")
+                return
         
         # POST-LOSS COOLDOWN: Prevent revenge trading
         from ..utils.datetime_utils import as_utc
@@ -1354,6 +1374,12 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
             # =============================================
             # TRADE JUDGE (pre-execution validation)
             # =============================================
+            # Import once before REJECT/DEMOTE/APPROVE branches. A late import
+            # inside only the REJECT path makes Python treat save_signal_to_db as
+            # local for the whole function, so APPROVE crashes with UnboundLocalError
+            # and never reaches order placement.
+            from ..main import save_signal_to_db
+
             print(f"[JUDGE] {symbol}: Sending to trade judge (confidence={trade_signal.confidence:.0%}, dir={trade_signal.direction}, lots={position_size.lots})...", flush=True)
             judge_outcome = await bot._run_trade_judge(
                 symbol, trade_signal, position_size, current_price
@@ -1389,8 +1415,6 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                     f"| flags: [{flags_str}]",
                     flush=True
                 )
-
-                from ..main import save_signal_to_db
 
                 await save_signal_to_db(
                     symbol=symbol,

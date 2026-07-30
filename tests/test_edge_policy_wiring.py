@@ -68,6 +68,28 @@ class TestRunnerWiring:
         assert "mech_agreement_size_multiplier" in src
         assert "playbook_block" in src
 
+    def test_save_signal_to_db_imported_before_judge_branches(self):
+        """APPROVE/DEMOTE must not crash with UnboundLocalError on save_signal_to_db.
+
+        The import must run before any judge branch that awaits save_signal_to_db.
+        Importing only inside the REJECT branch makes Python treat the name as local
+        for the whole function, so APPROVE never reaches order placement.
+        """
+        from trading_bot.services.analyze_and_trade_runner import run_analyze_and_trade
+
+        src = inspect.getsource(run_analyze_and_trade)
+        import_marker = "from ..main import save_signal_to_db"
+        judge_branch = "if judge_outcome.blocks_execution()"
+        import_idx = src.find(import_marker)
+        judge_idx = src.find(judge_branch)
+        assert import_idx != -1, "save_signal_to_db import missing from runner"
+        assert judge_idx != -1, "judge branch missing from runner"
+        assert import_idx < judge_idx, (
+            "save_signal_to_db must be imported before judge branches "
+            "(otherwise APPROVE/DEMOTE hit UnboundLocalError and skip execution)"
+        )
+        assert src.count("await save_signal_to_db(") >= 3
+
     def test_fill_handler_records_slippage_and_regime(self):
         from trading_bot.execution import trade_fill_handler
 

@@ -219,8 +219,14 @@ TRADING_SYMBOLS=["EURUSD", "GBPUSD", "XAUUSD"]
 TRADING_RISK_PER_TRADE=0.01
 TRADING_MAX_DAILY_TRADES=3
 TRADING_MIN_RISK_REWARD=2.0
-TRADING_ALLOWED_SESSIONS=["london", "new_york"]
+TRADING_ALLOWED_SESSIONS=["london", "new_york", "london_close"]
 TRADING_AUTO_START_BOT=false
+
+# Claude API time gate (default true): hard-skip Claude/judge/sizing outside
+# ICT kill zones — London 02:00–05:00, NY 07:00–10:00, London Close 10:00–12:00
+# America/New_York (~7 hrs/day). MT5 sync and position management stay on.
+# Set false only for debugging off-hours analysis.
+TRADING_CLAUDE_KILL_ZONE_ONLY=true
 
 # CORS — set to your VPS IP or domain (see Remote Access section)
 CORS_ORIGINS=http://YOUR_VPS_IP:3000,http://localhost:3000

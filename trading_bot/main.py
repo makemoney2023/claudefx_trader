@@ -26,7 +26,7 @@ from .analysis.market_structure import MarketStructureAnalyzer
 from .analysis.fair_value_gap import FVGDetector
 from .analysis.order_blocks import OrderBlockDetector
 from .analysis.liquidity import LiquidityMapper
-from .analysis.kill_zones import KillZoneChecker
+from .analysis.kill_zones import KillZoneChecker, claude_analysis_allowed
 from .analysis.silver_bullet import SilverBulletDetector
 from .analysis.silver_analysis import SilverAnalyzer
 from .analysis.crypto_analysis import CryptoAnalyzer
@@ -1408,7 +1408,28 @@ class TradingBot:
             # Check if we're in a valid kill zone
             session = self.kill_zone_checker.get_current_session()
             print(f"[CYCLE] Session: {session.session_name}, is_tradeable={session.is_tradeable}, is_kill_zone={session.is_kill_zone}", flush=True)
+            if not claude_analysis_allowed(
+                session.is_tradeable,
+                claude_kill_zone_only=settings.trading.claude_kill_zone_only,
+            ):
+                next_kz = session.next_kill_zone or "next kill zone"
+                mins = session.next_kill_zone_in_minutes
+                eta = f" in {mins}min" if mins is not None else ""
+                print(
+                    f"[CYCLE] Outside KZ ({session.session_name}) — Claude skipped until {next_kz}{eta}",
+                    flush=True,
+                )
+                logger.info(
+                    f"Outside kill zone ({session.session_name}) — "
+                    f"Claude hard-skipped until {next_kz}{eta}"
+                )
+                self._off_hours_mode = True
+                if bot_state:
+                    bot_state.start_cycle(session.session_name, session.is_tradeable)
+                    bot_state.cycle_complete()
+                return
             if not session.is_tradeable:
+                # Flag off: legacy soft-block / crypto-only path for debugging
                 if settings.trading.crypto_kill_zone_only:
                     print(f"[CYCLE] OFF-HOURS ({session.session_name}): soft-block active, analysis continues with caps", flush=True)
                     logger.info(f"Outside kill zone ({session.session_name}) — soft-block: confidence capped, R:R raised")

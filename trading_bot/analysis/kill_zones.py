@@ -82,6 +82,24 @@ class SessionInfo:
     next_kill_zone_in_minutes: Optional[int] = None
 
 
+def claude_analysis_allowed(
+    is_tradeable: bool,
+    *,
+    claude_kill_zone_only: bool = True,
+) -> bool:
+    """
+    Whether Claude analysis (and judge/sizing) may run for this session.
+
+    When ``claude_kill_zone_only`` is True (default), analysis is restricted to
+    ICT kill zones where ``is_tradeable`` is True (London 2–5, NY 7–10,
+    London Close 10–12 America/New_York). Outside those windows, callers must
+    hard-skip Claude to avoid off-hours API spend.
+    """
+    if not claude_kill_zone_only:
+        return True
+    return bool(is_tradeable)
+
+
 # ICT Kill Zones (EST times)
 # Full 24-hour coverage so there's no unnamed gap
 KILL_ZONES = [
