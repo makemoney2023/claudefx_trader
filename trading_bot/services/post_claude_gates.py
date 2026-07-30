@@ -76,6 +76,11 @@ class PostClaudeGateInput:
     apply_secondary_modifiers: bool = False
     modifier_input: Optional[SecondaryModifierInput] = None
     build_pipeline_context: Optional[Callable[..., Tuple[Any, ZoneGateSettings, bool]]] = None
+    # Live/replay parity gates (zone conversion, DXY, displacement)
+    run_parity_gates: bool = True
+    zone_valid: Optional[bool] = None  # None = skip zone conversion
+    zone_reason: str = ""
+    dxy_confirmation: Optional[str] = None
 
 
 @dataclass
@@ -95,6 +100,8 @@ class PostClaudeGateResult:
     pipeline_ctx: Optional[TradeContext] = None
     confidence_components: Optional[Dict] = None
     min_rr: float = 0.0
+    size_multiplier: float = 1.0
+    order_type: str = ""
 
 
 def resolve_min_rr(symbol: str, trade_type: str) -> float:
@@ -238,6 +245,8 @@ def _blocked_result(
     confidence_components: Optional[Dict] = None,
     min_rr: float = 0.0,
     is_counter_trend_scalp: bool = False,
+    size_multiplier: float = 1.0,
+    order_type: str = "",
 ) -> PostClaudeGateResult:
     path = list(gate_path)
     if pipeline_ctx is not None and pipeline_ctx.gate_path:
@@ -259,6 +268,8 @@ def _blocked_result(
         confidence_components=confidence_components,
         min_rr=min_rr,
         is_counter_trend_scalp=is_counter_trend_scalp,
+        size_multiplier=size_multiplier,
+        order_type=order_type,
     )
 
 
@@ -275,6 +286,8 @@ def _pass_result(
     confidence_components: Optional[Dict],
     min_rr: float,
     is_counter_trend_scalp: bool,
+    size_multiplier: float = 1.0,
+    order_type: str = "",
 ) -> PostClaudeGateResult:
     return PostClaudeGateResult(
         blocked=False,
@@ -289,6 +302,8 @@ def _pass_result(
         confidence_components=confidence_components,
         min_rr=min_rr,
         is_counter_trend_scalp=is_counter_trend_scalp,
+        size_multiplier=size_multiplier,
+        order_type=order_type,
     )
 
 
@@ -477,6 +492,174 @@ def _run_price_gates(
         direction=direction,
     )
 
+    size_multiplier = 1.0
+    order_type = (getattr(signal, "order_type", None) or "market").lower()
+
+    if inp.run_parity_gates:
+        from .parity_gates import (
+            apply_zone_conversion_levels,
+            evaluate_displacement_parity,
+            evaluate_dxy_parity,
+            evaluate_zone_conversion,
+            finalize_displacement_conversion,
+        )
+
+        # GATE 1: premium/discount zone → OTE limit conversion
+        if inp.zone_valid is not None:
+            zone_out = evaluate_zone_conversion(
+                zone_valid=bool(inp.zone_valid),
+                zone_reason=inp.zone_reason or "",
+                order_type=order_type,
+                direction=direction,
+                current_entry=entry,
+                current_price=inp.current_price,
+                pd_analysis=inp.pd_analysis,
+            )
+            if zone_out.action == "convert_pending":
+                zone_out = apply_zone_conversion_levels(
+                    zone_out,
+                    stop_loss=sl,
+                    take_profit=tp,
+                    old_entry=entry or inp.current_price,
+                )
+            gate_path.extend(zone_out.gate_path)
+            if zone_out.blocked:
+                return (
+                    _blocked_result(
+                        GateOutcome.block(
+                            gate_id=zone_out.gate_id,
+                            reason=zone_out.reason,
+                            stage=zone_out.gate_id,
+                        ),
+                        entry=entry,
+                        sl=sl,
+                        tp=tp,
+                        direction=direction,
+                        confidence=signal.confidence,
+                        gate_path=gate_path,
+                        actual_rr=actual_rr,
+                        min_rr=min_rr,
+                        is_counter_trend_scalp=is_counter,
+                        size_multiplier=size_multiplier,
+                        order_type=order_type,
+                    ),
+                    entry,
+                    sl,
+                    tp,
+                    direction,
+                    actual_rr,
+                    is_counter,
+                    confidence_components,
+                )
+            if zone_out.action == "convert_pending" and zone_out.new_entry:
+                order_type = zone_out.new_order_type or order_type
+                entry = float(zone_out.new_entry)
+                if zone_out.new_sl is not None:
+                    sl = float(zone_out.new_sl)
+                if zone_out.new_tp is not None:
+                    tp = float(zone_out.new_tp)
+                signal.order_type = order_type
+                signal.entry_price = entry
+                signal.stop_loss = sl
+                signal.take_profit = tp
+                actual_rr = compute_actual_rr(entry, sl, tp)
+
+        # GATE 2: DXY conflict → size haircut (never hard-blocks)
+        dxy_conf = inp.dxy_confirmation
+        if dxy_conf is None:
+            dxy_conf = inp.market_data.get("dxy_confirmation")
+        dxy_out = evaluate_dxy_parity(
+            symbol=inp.symbol,
+            direction=direction,
+            dxy_confirmation=dxy_conf,
+        )
+        gate_path.extend(dxy_out.gate_path)
+        size_multiplier *= float(dxy_out.size_multiplier or 1.0)
+
+        # GATE 3: displacement for market orders
+        disp_raw = inp.analysis_results.get("displacement")
+        amd_raw = inp.analysis_results.get("amd_cycle")
+        dist_confirmed: Optional[bool] = None
+        if disp_raw is not None:
+            if hasattr(disp_raw, "distribution_confirmed"):
+                dist_confirmed = bool(disp_raw.distribution_confirmed)
+            elif isinstance(disp_raw, dict) and "distribution_confirmed" in disp_raw:
+                dist_confirmed = bool(disp_raw["distribution_confirmed"])
+        amd_phase: Optional[str] = None
+        if amd_raw is not None:
+            if hasattr(amd_raw, "phase"):
+                phase_obj = amd_raw.phase
+                amd_phase = (
+                    phase_obj.value if hasattr(phase_obj, "value") else str(phase_obj)
+                )
+            elif isinstance(amd_raw, dict):
+                amd_phase = amd_raw.get("phase")
+        # Also accept flat keys used by fixtures / replay
+        if dist_confirmed is None and "distribution_confirmed" in inp.analysis_results:
+            dist_confirmed = bool(inp.analysis_results["distribution_confirmed"])
+        if amd_phase is None and inp.analysis_results.get("amd_phase"):
+            amd_phase = str(inp.analysis_results["amd_phase"])
+        if amd_phase is None and getattr(signal, "amd_phase", None):
+            amd_phase = str(signal.amd_phase)
+
+        disp_out = evaluate_displacement_parity(
+            order_type=order_type,
+            distribution_confirmed=dist_confirmed,
+            amd_phase=amd_phase,
+        )
+        if disp_out.action == "convert_pending":
+            disp_out = finalize_displacement_conversion(
+                disp_out,
+                direction=direction,
+                current_entry=entry,
+                current_price=inp.current_price,
+                stop_loss=sl,
+                take_profit=tp,
+                fvg_analysis=inp.analysis_results.get("fvg"),
+                pd_analysis=inp.pd_analysis,
+            )
+        gate_path.extend(disp_out.gate_path)
+        if disp_out.blocked:
+            return (
+                _blocked_result(
+                    GateOutcome.block(
+                        gate_id=disp_out.gate_id,
+                        reason=disp_out.reason,
+                        stage=disp_out.gate_id,
+                    ),
+                    entry=entry,
+                    sl=sl,
+                    tp=tp,
+                    direction=direction,
+                    confidence=signal.confidence,
+                    gate_path=gate_path,
+                    actual_rr=actual_rr,
+                    min_rr=min_rr,
+                    is_counter_trend_scalp=is_counter,
+                    size_multiplier=size_multiplier,
+                    order_type=order_type,
+                ),
+                entry,
+                sl,
+                tp,
+                direction,
+                actual_rr,
+                is_counter,
+                confidence_components,
+            )
+        if disp_out.action == "convert_pending" and disp_out.new_entry:
+            order_type = disp_out.new_order_type or order_type
+            entry = float(disp_out.new_entry)
+            if disp_out.new_sl is not None:
+                sl = float(disp_out.new_sl)
+            if disp_out.new_tp is not None:
+                tp = float(disp_out.new_tp)
+            signal.order_type = order_type
+            signal.entry_price = entry
+            signal.stop_loss = sl
+            signal.take_profit = tp
+            actual_rr = compute_actual_rr(entry, sl, tp)
+
     if inp.apply_secondary_modifiers and inp.modifier_input is not None:
         mi = inp.modifier_input
         at_breaker = False
@@ -521,6 +704,8 @@ def _run_price_gates(
             confidence_components=confidence_components,
             min_rr=min_rr,
             is_counter_trend_scalp=is_counter,
+            size_multiplier=size_multiplier,
+            order_type=order_type,
         ),
         entry,
         sl,
@@ -552,12 +737,17 @@ def run_post_claude_gates(
     path = list(gate_path or [])
     signal = inp.trade_signal
 
+    size_multiplier = 1.0
+    order_type = (getattr(signal, "order_type", None) or "").lower()
+
     if start_at == "price":
         price_result, entry, sl, tp, direction, actual_rr, is_counter, conf_components = _run_price_gates(
             inp, cfg, path
         )
         if price_result.blocked or stop_after == "price":
             return price_result
+        size_multiplier = float(price_result.size_multiplier or 1.0)
+        order_type = price_result.order_type or order_type
     else:
         carried = carry or _pass_result(
             gate_path=path,
@@ -581,6 +771,8 @@ def run_post_claude_gates(
         actual_rr = carried.actual_rr
         is_counter = carried.is_counter_trend_scalp
         conf_components = carried.confidence_components
+        size_multiplier = float(getattr(carried, "size_multiplier", 1.0) or 1.0)
+        order_type = getattr(carried, "order_type", "") or order_type
         if start_at in ("permission", "flip", "complete") and ctx is None:
             ctx = carried.pipeline_ctx
 
@@ -622,6 +814,8 @@ def run_post_claude_gates(
                     inp.symbol, getattr(signal, "trade_type", "intraday") or "intraday"
                 ),
                 is_counter_trend_scalp=is_counter,
+                size_multiplier=size_multiplier,
+                order_type=order_type,
             )
         ctx = pipeline_ctx
         if stop_after == "entry":
@@ -639,6 +833,8 @@ def run_post_claude_gates(
                     inp.symbol, getattr(signal, "trade_type", "intraday") or "intraday"
                 ),
                 is_counter_trend_scalp=is_counter,
+                size_multiplier=size_multiplier,
+                order_type=order_type,
             )
 
     pipeline_ctx = ctx
@@ -674,6 +870,8 @@ def run_post_claude_gates(
                 inp.symbol, getattr(signal, "trade_type", "intraday") or "intraday"
             ),
             is_counter_trend_scalp=is_counter,
+            size_multiplier=size_multiplier,
+            order_type=order_type,
         )
     if stop_after == "permission":
         return _pass_result(
@@ -690,6 +888,8 @@ def run_post_claude_gates(
                 inp.symbol, getattr(signal, "trade_type", "intraday") or "intraday"
             ),
             is_counter_trend_scalp=is_counter,
+            size_multiplier=size_multiplier,
+            order_type=order_type,
         )
 
     cb_outcome = evaluate_direction_circuit_breaker(
@@ -716,6 +916,8 @@ def run_post_claude_gates(
                 inp.symbol, getattr(signal, "trade_type", "intraday") or "intraday"
             ),
             is_counter_trend_scalp=is_counter,
+            size_multiplier=size_multiplier,
+            order_type=order_type,
         )
 
     if inp.last_signal_direction is not None:
@@ -747,6 +949,8 @@ def run_post_claude_gates(
                     inp.symbol, getattr(signal, "trade_type", "intraday") or "intraday"
                 ),
                 is_counter_trend_scalp=is_counter,
+                size_multiplier=size_multiplier,
+                order_type=order_type,
             )
 
     path.append("post_claude_gates_complete")
@@ -764,4 +968,6 @@ def run_post_claude_gates(
             inp.symbol, getattr(signal, "trade_type", "intraday") or "intraday"
         ),
         is_counter_trend_scalp=is_counter,
+        size_multiplier=size_multiplier,
+        order_type=order_type,
     )

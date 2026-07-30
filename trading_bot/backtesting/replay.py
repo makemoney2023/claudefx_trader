@@ -74,6 +74,12 @@ class GateFixtureComparison:
     replay_gate_id: str
     live_gate_path: List[str]
     replay_gate_path: List[str]
+    live_size_multiplier: float = 1.0
+    replay_size_multiplier: float = 1.0
+    live_order_type: str = ""
+    replay_order_type: str = ""
+    live_confidence: float = 0.0
+    replay_confidence: float = 0.0
 
     @property
     def paths_match(self) -> bool:
@@ -81,6 +87,9 @@ class GateFixtureComparison:
             self.live_blocked == self.replay_blocked
             and self.live_gate_id == self.replay_gate_id
             and self.live_gate_path == self.replay_gate_path
+            and abs(self.live_size_multiplier - self.replay_size_multiplier) < 1e-9
+            and (self.live_order_type or "") == (self.replay_order_type or "")
+            and abs(self.live_confidence - self.replay_confidence) < 1e-6
         )
 
 
@@ -99,8 +108,10 @@ def run_phased_live_gates(inp) -> Any:
         carry=price,
     )
     if entry.blocked:
+        entry.size_multiplier = price.size_multiplier
+        entry.order_type = price.order_type or entry.order_type
         return entry
-    return run_post_claude_gates(
+    final = run_post_claude_gates(
         inp,
         start_at="permission",
         stop_after="complete",
@@ -108,6 +119,10 @@ def run_phased_live_gates(inp) -> Any:
         gate_path=entry.gate_path,
         carry=entry,
     )
+    # Mutations from price-phase parity gates must survive later phases
+    final.size_multiplier = price.size_multiplier
+    final.order_type = price.order_type or final.order_type
+    return final
 
 
 def compare_gate_fixture_batch(
@@ -124,10 +139,15 @@ def compare_gate_fixture_batch(
 
     comparisons: List[GateFixtureComparison] = []
     for name, inp in fixtures:
+        # Fresh signal copies: phased path mutates trade_signal in place
+        import copy
+
+        replay_inp = copy.deepcopy(inp)
+        live_inp = copy.deepcopy(inp)
         replay = run_post_claude_gates(
-            inp, kill_zone_checker=kill_zone_checker, stop_after="complete"
+            replay_inp, kill_zone_checker=kill_zone_checker, stop_after="complete"
         )
-        live = run_phased_live_gates(inp)
+        live = run_phased_live_gates(live_inp)
         comparisons.append(
             GateFixtureComparison(
                 name=name,
@@ -137,6 +157,14 @@ def compare_gate_fixture_batch(
                 replay_gate_id=replay.gate_id,
                 live_gate_path=list(live.gate_path),
                 replay_gate_path=list(replay.gate_path),
+                live_size_multiplier=float(getattr(live, "size_multiplier", 1.0) or 1.0),
+                replay_size_multiplier=float(
+                    getattr(replay, "size_multiplier", 1.0) or 1.0
+                ),
+                live_order_type=str(getattr(live, "order_type", "") or ""),
+                replay_order_type=str(getattr(replay, "order_type", "") or ""),
+                live_confidence=float(getattr(live, "confidence", 0.0) or 0.0),
+                replay_confidence=float(getattr(replay, "confidence", 0.0) or 0.0),
             )
         )
 
@@ -369,12 +397,16 @@ class ClaudeReplayBacktester:
             self._scaling_manager is not None
             and getattr(self._scaling_manager.current_mode, "value", "") == "aggressive"
         )
+        _ars = analysis_results or {}
+        _zone_valid = _ars.get("zone_valid")
+        if _zone_valid is not None:
+            _zone_valid = bool(_zone_valid)
         return PostClaudeGateInput(
             symbol=symbol,
             trade_signal=trade_signal,
             norm=norm,
             market_data=market_data,
-            analysis_results=analysis_results or {},
+            analysis_results=_ars,
             pd_analysis=pd_analysis,
             current_price=current_price,
             df=df,
@@ -392,6 +424,14 @@ class ClaudeReplayBacktester:
             session_name=session_name,
             is_kill_zone=is_kill_zone,
             direction_loss_streak=direction_loss_streak,
+            run_parity_gates=True,
+            zone_valid=_zone_valid,
+            zone_reason=str(_ars.get("zone_reason") or ""),
+            dxy_confirmation=(
+                market_data.get("dxy_confirmation")
+                if isinstance(market_data, dict)
+                else None
+            ),
         )
 
     async def invoke_judge_for_signal(
