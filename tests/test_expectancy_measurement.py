@@ -10,15 +10,21 @@ import pandas as pd
 import pytest
 
 
-def _m15_bars(n: int = 40, *, gap_at: int | None = None, bad_ohlc: bool = False):
+def _m15_bars(
+    n: int = 40,
+    *,
+    gap_at: int | None = None,
+    gap_duration: timedelta = timedelta(hours=2),
+    bad_ohlc: bool = False,
+    start: datetime = datetime(2026, 7, 30, 10, 0, tzinfo=timezone.utc),
+):
     """Build a clean M15 OHLCV frame; optionally inject a gap or bad bar."""
-    start = datetime(2026, 7, 30, 10, 0, tzinfo=timezone.utc)
     rows = []
     times = []
     t = start
     for i in range(n):
         if gap_at is not None and i == gap_at:
-            t = t + timedelta(hours=2)  # > 3x 15m
+            t = t + gap_duration  # > 3x 15m
         else:
             t = t + timedelta(minutes=15) if i else t
         o = 2000.0 + i
@@ -80,6 +86,52 @@ class TestValidateOhlcv:
         )
         assert result.valid is False
         assert "gap" in result.gate_id or "gap" in result.reason.lower()
+
+    def test_xau_daily_rollover_gap_passes(self):
+        from trading_bot.mt5.ohlcv_quality import validate_ohlcv
+
+        # July is EDT: 21:00–23:00 UTC is the 17:00–19:00 ET rollover window.
+        # Broker M15 history can show a 1h45 interval across this closure.
+        df = _m15_bars(
+            40,
+            gap_at=20,
+            gap_duration=timedelta(hours=1, minutes=45),
+            start=datetime(2026, 7, 30, 16, 0, tzinfo=timezone.utc),
+        )
+        result = validate_ohlcv(
+            df, symbol="XAUUSD", timeframe="M15", expected_count=40, now=_now_after(df)
+        )
+        assert result.valid is True
+
+    def test_forex_gap_during_metals_rollover_still_fails(self):
+        from trading_bot.mt5.ohlcv_quality import validate_ohlcv
+
+        df = _m15_bars(
+            40,
+            gap_at=20,
+            gap_duration=timedelta(hours=1, minutes=45),
+            start=datetime(2026, 7, 30, 16, 0, tzinfo=timezone.utc),
+        )
+        result = validate_ohlcv(
+            df, symbol="EURUSD", timeframe="M15", expected_count=40, now=_now_after(df)
+        )
+        assert result.valid is False
+        assert result.gate_id == "gap"
+
+    def test_long_xau_outage_during_rollover_still_fails(self):
+        from trading_bot.mt5.ohlcv_quality import validate_ohlcv
+
+        df = _m15_bars(
+            40,
+            gap_at=20,
+            gap_duration=timedelta(hours=4),
+            start=datetime(2026, 7, 30, 16, 0, tzinfo=timezone.utc),
+        )
+        result = validate_ohlcv(
+            df, symbol="XAUUSD", timeframe="M15", expected_count=40, now=_now_after(df)
+        )
+        assert result.valid is False
+        assert result.gate_id == "gap"
 
     def test_nan_fails(self):
         from trading_bot.mt5.ohlcv_quality import validate_ohlcv

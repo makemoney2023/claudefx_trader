@@ -3,15 +3,16 @@ OHLCV quality validation for live analysis and trading.
 
 Rejects frames that are too short, stale, NaN-contaminated, OHLC-invalid,
 or contain mid-session gaps that would corrupt ICT structure detection.
-Weekend/session-close gaps are exempted via a multiple of the median bar
-interval rather than calendar heuristics alone.
+Weekend/session-close gaps and bounded metals rollover closures are exempted
+without allowing ordinary daytime outages.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -41,6 +42,8 @@ _TF_MINUTES = {
 # corruption unless they look like a session/weekend break (>= 6h for LTF).
 _GAP_CORRUPTION_MULT = 3.0
 _SESSION_BREAK_HOURS = 6.0
+_METALS_ROLLOVER_MAX_HOURS = 3.0
+_NEW_YORK = ZoneInfo("America/New_York")
 
 
 @dataclass
@@ -62,6 +65,42 @@ def _as_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+
+def _is_expected_metals_rollover_gap(
+    *,
+    symbol: str,
+    previous_bar: pd.Timestamp,
+    current_bar: pd.Timestamp,
+) -> bool:
+    """Return whether a bounded gap overlaps the metals daily rollover.
+
+    MT5 timestamps are UTC. Converting to New York time keeps the 17:00–19:00
+    rollover window correct across daylight-saving transitions.
+    """
+    from trading_bot.config import get_symbol_spec
+
+    if get_symbol_spec(symbol).category != "metal":
+        return False
+
+    previous = _as_utc(previous_bar.to_pydatetime())
+    current = _as_utc(current_bar.to_pydatetime())
+    if current - previous > timedelta(hours=_METALS_ROLLOVER_MAX_HOURS):
+        return False
+
+    previous_ny = previous.astimezone(_NEW_YORK)
+    current_ny = current.astimezone(_NEW_YORK)
+    candidate_dates = {previous_ny.date(), current_ny.date()}
+    for candidate_date in candidate_dates:
+        rollover_start = datetime.combine(
+            candidate_date, time(hour=17), tzinfo=_NEW_YORK
+        )
+        rollover_end = datetime.combine(
+            candidate_date, time(hour=19), tzinfo=_NEW_YORK
+        )
+        if previous_ny < rollover_end and current_ny > rollover_start:
+            return True
+    return False
 
 
 def validate_ohlcv(
@@ -166,9 +205,19 @@ def validate_ohlcv(
         if len(deltas) > 0:
             median = deltas.median()
             if median is not None and median > pd.Timedelta(0):
-                corrupt = deltas[
+                possible_corrupt = deltas[
                     (deltas > median * _GAP_CORRUPTION_MULT)
                     & (deltas < pd.Timedelta(hours=_SESSION_BREAK_HOURS))
+                ]
+                corrupt = possible_corrupt[
+                    [
+                        not _is_expected_metals_rollover_gap(
+                            symbol=symbol,
+                            previous_bar=df.index[df.index.get_loc(timestamp) - 1],
+                            current_bar=timestamp,
+                        )
+                        for timestamp in possible_corrupt.index
+                    ]
                 ]
                 if len(corrupt) > 0:
                     return OhlcvQualityResult.fail(
