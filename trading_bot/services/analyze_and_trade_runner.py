@@ -1231,11 +1231,8 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                 )
                 return
             
-            if symbol.upper().endswith('BTC') or symbol.upper().endswith('BIT'):
-                logger.error(f"🚫 FINAL BLOCK: {symbol} is BTC/BIT pair - REFUSING to execute!")
-                if bot_state:
-                    bot_state.error(symbol, "BTC/BIT pair blocked at execution")
-                return
+            # (BTC/BIT-quoted pairs already blocked at analysis entry above;
+            #  scaling_position_sizer refuses to size them as final backstop.)
             
             # =============================================
             # P0 CRITICAL: MARGIN VALIDATION BEFORE TRADE

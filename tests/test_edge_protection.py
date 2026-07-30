@@ -174,17 +174,11 @@ class TestEdgeScoreComputation:
 
 class TestEdgeProtectionConfig:
 
-    def test_weak_hours_default_btc(self):
-        from trading_bot.config import settings
-        weak = settings.trading.weak_hours_by_symbol.get("BTCUSD", [])
-        assert 12 in weak
-        assert 13 in weak
-
-    def test_weak_hours_default_xrp(self):
-        from trading_bot.config import settings
-        weak = settings.trading.weak_hours_by_symbol.get("XRPUSD", [])
-        assert 5 in weak
-        assert 20 in weak
+    def test_weak_hours_default_empty(self):
+        # Old BTC/XRP tables removed (dead data for a XAUUSD-only bot);
+        # the mechanism stays and is populated per symbol from live stats.
+        from trading_bot.config import TradingSettings
+        assert TradingSettings().weak_hours_by_symbol == {}
 
     def test_weak_hours_unknown_symbol_empty(self):
         from trading_bot.config import settings

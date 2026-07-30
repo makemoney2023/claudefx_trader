@@ -373,3 +373,169 @@ class TestPreClaudeViability:
 
         bot._generate_chart_image.assert_not_awaited()
         pipeline.claude.assert_not_called()
+
+
+# ============================================================
+# Phase 3a — sub-floor caps become explicit, honestly-labeled rejects
+# ============================================================
+
+def _gate_ctx(**kwargs):
+    from trading_bot.services.trade_context import TradeContext
+
+    base = dict(
+        symbol="XAUUSD",
+        direction="long",
+        confidence=0.78,
+        actual_rr=2.5,
+        d1_bias="bullish",
+        h4_bias="bullish",
+        m15_bias="bullish",
+        analysis_results={"volume": {"relative_volume": 1.0}},
+    )
+    base.update(kwargs)
+    return TradeContext(**base)
+
+
+class TestTruthfulGateRejects:
+    """Caps that land below the 0.60 execution floor must reject at their own gate."""
+
+    def test_m15_pullback_rejects_explicitly(self):
+        from trading_bot.services.entry_gates import evaluate_m15_gate
+
+        ctx = _gate_ctx(
+            m15_bias="bearish", order_type="buy_limit",
+            d1_bias="bullish", h4_bias="bullish",
+        )
+        outcome = evaluate_m15_gate(ctx)
+        assert outcome.blocked is True
+        assert outcome.gate_id == "m15_pullback_cap"
+
+    def test_htf_counter_scalp_rejects_explicitly(self):
+        from trading_bot.services.entry_gates import evaluate_htf_alignment_gate
+
+        ctx = _gate_ctx(
+            d1_bias="bearish", h4_bias="bearish", m15_bias="bullish",
+            trade_type="scalp", actual_rr=2.5, confidence=0.70,
+        )
+        ctx.m15_opposes = False
+        outcome = evaluate_htf_alignment_gate(ctx)
+        assert outcome.blocked is True
+        assert outcome.gate_id == "htf_oppose_cap"
+
+    def test_htf_both_oppose_non_scalp_keeps_original_gate_id(self):
+        from trading_bot.services.entry_gates import evaluate_htf_alignment_gate
+
+        ctx = _gate_ctx(
+            d1_bias="bearish", h4_bias="bearish", trade_type="intraday",
+        )
+        ctx.m15_opposes = True
+        outcome = evaluate_htf_alignment_gate(ctx)
+        assert outcome.blocked is True
+        assert outcome.gate_id == "htf_both_oppose"
+
+    def test_htf_single_oppose_cap_at_floor_survives(self):
+        from trading_bot.services.entry_gates import evaluate_htf_alignment_gate
+
+        # 0.60 cap == the execution floor -> still tradeable, keep capping.
+        ctx = _gate_ctx(d1_bias="bearish", h4_bias="bullish", confidence=0.80)
+        ctx.m15_opposes = False
+        outcome = evaluate_htf_alignment_gate(ctx)
+        assert outcome.blocked is False
+        assert outcome.confidence_cap == 0.60
+
+    def test_off_hours_rejects_even_with_great_rr(self):
+        from trading_bot.services.entry_gates import evaluate_off_hours_gate
+
+        ctx = _gate_ctx(off_hours_mode=True, actual_rr=5.0, confidence=0.90)
+        outcome = evaluate_off_hours_gate(ctx)
+        assert outcome.blocked is True
+        assert outcome.gate_id == "off_hours_cap"
+
+    def test_off_hours_off_passes_through(self):
+        from trading_bot.services.entry_gates import evaluate_off_hours_gate
+
+        ctx = _gate_ctx(off_hours_mode=False)
+        outcome = evaluate_off_hours_gate(ctx)
+        assert outcome.blocked is False
+        assert outcome.confidence_cap is None
+
+
+# ============================================================
+# Phase 3b — dead code removal + DEFENSIVE becomes an explicit halt
+# ============================================================
+
+class TestDeadCodeRemoval:
+    def test_soft_kill_zone_path_removed_from_cycle(self):
+        import inspect
+        from trading_bot.main import TradingBot
+
+        src = inspect.getsource(TradingBot._trading_cycle)
+        assert "soft-block active" not in src
+        assert "crypto_kill_zone_only" not in src
+        # Hard skip must survive
+        assert "claude_analysis_allowed" in src
+
+    def test_runner_has_single_btc_block(self):
+        import inspect
+        import trading_bot.services.analyze_and_trade_runner as runner_mod
+
+        src = inspect.getsource(runner_mod)
+        assert "FINAL BLOCK" not in src
+        assert src.count("BTC/BIT pair") >= 1  # analysis-time block survives
+
+    @pytest.mark.asyncio
+    async def test_btc_pair_still_blocked_at_analysis_time(self, monkeypatch):
+        from trading_bot.services.analyze_and_trade_runner import run_analyze_and_trade
+        from trading_bot.config import settings
+
+        monkeypatch.setattr(settings.trading, "claude_kill_zone_only", False)
+
+        bot = MagicMock()
+        bot._symbol_loss_cooldowns = {}
+        bot._volatility_pause_until = None
+        bot.BLOCKED_PAIRS = ["ETHBTC"]
+        bot.scaling_manager = None
+        bot.kill_zone_checker = None
+        bot.data_fetcher.get_ohlcv = AsyncMock()
+
+        with patch("trading_bot.api.routes.activity.add_activity"), patch(
+            "trading_bot.services.analyze_and_trade_runner.bot_state", None
+        ):
+            await run_analyze_and_trade(bot, "ETHBTC")
+
+        bot.data_fetcher.get_ohlcv.assert_not_awaited()
+
+    def test_weak_hours_default_is_empty(self):
+        from trading_bot.config import TradingSettings
+
+        assert TradingSettings().weak_hours_by_symbol == {}
+
+    def test_tod_gate_mechanism_survives(self):
+        from trading_bot.services.entry_gates import evaluate_tod_gate
+
+        blocked, reason = evaluate_tod_gate(
+            utc_hour=12, weak_hours=(12, 13), confidence=0.55
+        )
+        assert blocked is True
+
+
+class TestDefensiveHalt:
+    def test_cycle_halts_explicitly_in_defensive_mode(self):
+        import inspect
+        from trading_bot.main import TradingBot
+
+        src = inspect.getsource(TradingBot._trading_cycle)
+        assert "trading_halted" in src
+        assert "TradingMode.DEFENSIVE" in src
+
+    def test_defensive_scaling_backstop_unchanged(self):
+        """Mid-cycle DEFENSIVE overrides still reject non-A+ setups."""
+        from trading_bot.services.scaling_gates import evaluate_scaling_gate
+        from trading_bot.services.scaling_manager import ScalingManager, TradingMode
+
+        mgr = ScalingManager()
+        mgr.current_mode = TradingMode.DEFENSIVE
+        outcome = evaluate_scaling_gate(
+            setup_grade="B", confidence=0.70, daily_trades=0, scaling_manager=mgr,
+        )
+        assert outcome.blocked is True

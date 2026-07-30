@@ -456,11 +456,8 @@ class TradingSettings(BaseSettings):
         description="When True, walk-forward optimizer output is advisory and never auto-applied"
     )
     weak_hours_by_symbol: Dict[str, List[int]] = Field(
-        default={
-            "BTCUSD": [12, 13],
-            "XRPUSD": [5, 6, 7, 8, 20],
-        },
-        description="UTC hours with historically weak win rates per symbol. Trades during these hours require 60%+ confidence."
+        default={},
+        description="UTC hours with historically weak win rates per symbol. Trades during these hours require 60%+ confidence. (Old BTC/XRP defaults removed — populate per symbol from live stats.)"
     )
 
     # Zone-aware gate settings (replaces legacy D1 direction gate)

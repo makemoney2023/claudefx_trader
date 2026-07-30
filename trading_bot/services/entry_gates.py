@@ -15,6 +15,11 @@ if TYPE_CHECKING:
 
 from .gate_outcome import GateOutcome
 
+# Lowest confidence the pipeline can ever accept: gate_min_confidence
+# defaults to 0.60 and every scaling-mode threshold is >= 0.60, so any
+# gate that caps confidence below this value is a guaranteed reject.
+EXECUTION_CONFIDENCE_FLOOR = 0.60
+
 
 @dataclass
 class ZoneGateSettings:
@@ -223,7 +228,16 @@ def evaluate_m15_gate(ctx: "TradeContext") -> GateOutcome:
     is_pullback = d1_supports and h4_supports and is_pending_limit
 
     if is_pullback:
-        return GateOutcome.cap_confidence(0.55, "m15_pullback")
+        # The old 0.55 pullback cap always died at the 0.60 execution floor.
+        # Same net behavior, but reject here so logs name the real gate.
+        return GateOutcome.block(
+            gate_id="m15_pullback_cap",
+            reason=(
+                f"{_dir.upper()} pullback vs M15 {_m15}: capped at 0.55, "
+                f"below the {EXECUTION_CONFIDENCE_FLOOR:.2f} execution floor."
+            ),
+            stage="m15_gate",
+        )
 
     return GateOutcome.block(
         gate_id="m15_structure",
@@ -255,7 +269,17 @@ def evaluate_htf_alignment_gate(ctx: "TradeContext") -> GateOutcome:
             and ctx.actual_rr >= 2.0
             and ctx.confidence >= 0.60
         ):
-            return GateOutcome.cap_confidence(0.55, "htf_counter_scalp")
+            # Old counter-trend-scalp path capped to 0.55 — always below the
+            # 0.60 floor, so it never traded. Reject honestly at this gate.
+            return GateOutcome.block(
+                gate_id="htf_oppose_cap",
+                reason=(
+                    f"Counter-trend scalp {_dir.upper()} vs D1+H4 {ctx.d1_bias}: "
+                    f"capped at 0.55, below the "
+                    f"{EXECUTION_CONFIDENCE_FLOOR:.2f} execution floor."
+                ),
+                stage="htf_gate",
+            )
         return GateOutcome.block(
             gate_id="htf_both_oppose",
             reason=(
@@ -296,16 +320,17 @@ def evaluate_amd_distribution_gate(ctx: "TradeContext") -> GateOutcome:
 def evaluate_off_hours_gate(ctx: "TradeContext") -> GateOutcome:
     if not ctx.off_hours_mode:
         return GateOutcome.pass_through("off_hours")
-    outcome = GateOutcome.pass_through("off_hours")
-    if ctx.confidence > 0.50:
-        outcome.confidence_cap = 0.50
-    if ctx.actual_rr < 3.0:
-        return GateOutcome.block(
-            gate_id="off_hours_rr",
-            reason=f"Off-hours R:R {ctx.actual_rr:.2f}:1 < 3.0 minimum.",
-            stage="off_hours",
-        )
-    return outcome
+    # Off-hours used to cap confidence at 0.50 — below the 0.60 execution
+    # floor, so no off-hours signal has ever been able to trade. Make the
+    # existing behavior explicit instead of dying later at min_confidence.
+    return GateOutcome.block(
+        gate_id="off_hours_cap",
+        reason=(
+            f"Off-hours entries capped at 0.50 confidence, below the "
+            f"{EXECUTION_CONFIDENCE_FLOOR:.2f} execution floor."
+        ),
+        stage="off_hours",
+    )
 
 
 def evaluate_post_cooldown_gate(ctx: "TradeContext") -> GateOutcome:

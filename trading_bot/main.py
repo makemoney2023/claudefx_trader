@@ -1338,6 +1338,32 @@ class TradingBot:
                         logger.warning(f"Scaling manager mode determination failed: {e}")
             
             # ============================================
+            # DEFENSIVE MODE = EXPLICIT HALT
+            # Severe drawdown means stop entering, not "reject everything at
+            # a 0.90 bar no signal meets". Position management already ran.
+            # ============================================
+            if self.scaling_manager and self.scaling_manager.current_mode == TradingMode.DEFENSIVE:
+                if not getattr(self, "_defensive_halt_logged", False):
+                    self._defensive_halt_logged = True
+                    logger.warning(
+                        "TRADING HALTED: DEFENSIVE mode (severe drawdown) — "
+                        "no new entries until performance recovers"
+                    )
+                    from .api.routes.activity import add_activity
+                    add_activity(
+                        "trading_halted",
+                        "Trading halted — DEFENSIVE mode (severe drawdown). "
+                        "Position management continues.",
+                        details={"mode": "defensive"},
+                    )
+                    if bot_state:
+                        bot_state.error(None, "Trading halted — DEFENSIVE mode")
+                print("[CYCLE] BLOCKED for new trades: DEFENSIVE mode halt (positions still being managed)", flush=True)
+                return
+            else:
+                self._defensive_halt_logged = False
+            
+            # ============================================
             # STEP 2: CHECK NEWS BLACKOUT
             # ============================================
             if settings.trading.news_gates_enabled and self.news_service:
@@ -1430,24 +1456,20 @@ class TradingBot:
                     bot_state.cycle_complete()
                 return
             if not session.is_tradeable:
-                # Flag off: legacy soft-block / crypto-only path for debugging
-                if settings.trading.crypto_kill_zone_only:
-                    print(f"[CYCLE] OFF-HOURS ({session.session_name}): soft-block active, analysis continues with caps", flush=True)
-                    logger.info(f"Outside kill zone ({session.session_name}) — soft-block: confidence capped, R:R raised")
+                # Outside kill zones only crypto may continue (off-hours mode
+                # hard-rejects entries via the off_hours_cap gate anyway).
+                crypto_in_cycle = [s for s in cycle_symbols if s in self.CRYPTO_SYMBOLS]
+                if crypto_in_cycle:
+                    logger.info(
+                        f"Outside kill zone ({session.session_name}) - "
+                        f"forex blocked, {len(crypto_in_cycle)} crypto symbols still active"
+                    )
+                    cycle_symbols = crypto_in_cycle
                     self._off_hours_mode = True
                 else:
-                    crypto_in_cycle = [s for s in cycle_symbols if s in self.CRYPTO_SYMBOLS]
-                    if crypto_in_cycle:
-                        logger.info(
-                            f"Outside kill zone ({session.session_name}) - "
-                            f"forex blocked, {len(crypto_in_cycle)} crypto symbols still active"
-                        )
-                        cycle_symbols = crypto_in_cycle
-                        self._off_hours_mode = True
-                    else:
-                        print(f"[CYCLE] BLOCKED: Outside kill zone ({session.session_name}), no crypto to trade", flush=True)
-                        logger.debug(f"Outside valid trading session ({session.session_name}), skipping cycle")
-                        return
+                    print(f"[CYCLE] BLOCKED: Outside kill zone ({session.session_name}), no crypto to trade", flush=True)
+                    logger.debug(f"Outside valid trading session ({session.session_name}), skipping cycle")
+                    return
             else:
                 self._off_hours_mode = False
             

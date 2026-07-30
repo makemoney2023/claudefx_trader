@@ -58,7 +58,9 @@ class TestM15GateCharacterization:
         assert outcome.blocked is True
         assert outcome.gate_id == "m15_structure"
 
-    def test_m15_pullback_caps_confidence(self):
+    def test_m15_pullback_rejects_below_floor(self):
+        # The 0.55 pullback cap always died at the 0.60 floor; it now
+        # rejects explicitly at this gate with its own gate_id.
         ctx = _ctx(
             m15_bias="bearish",
             order_type="buy_limit",
@@ -66,8 +68,8 @@ class TestM15GateCharacterization:
             h4_bias="bullish",
         )
         outcome = evaluate_m15_gate(ctx)
-        assert outcome.blocked is False
-        assert outcome.confidence_cap == 0.55
+        assert outcome.blocked is True
+        assert outcome.gate_id == "m15_pullback_cap"
 
 
 class TestHTFGateCharacterization:
