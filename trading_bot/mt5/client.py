@@ -156,20 +156,27 @@ class MT5Client:
     }
     
     @staticmethod
+    def _get_filling_modes(symbol_info) -> list:
+        """
+        Allowed filling modes in preference order.
+        Priority: FOK > IOC > RETURN.
+        MT5 filling_mode bitmask: bit 0 = FOK, bit 1 = IOC.
+        """
+        modes = []
+        allowed = getattr(symbol_info, "filling_mode", 0) or 0
+        if allowed & 1:
+            modes.append(0)  # ORDER_FILLING_FOK
+        if allowed & 2:
+            modes.append(1)  # ORDER_FILLING_IOC
+        # Always offer RETURN as last resort when not already present
+        if 2 not in modes:
+            modes.append(2)  # ORDER_FILLING_RETURN
+        return modes or [2]
+
+    @staticmethod
     def _get_filling_type(symbol_info) -> int:
-        """
-        Determine the best filling mode for a symbol.
-        Priority: FOK (most reliable full-fill) > IOC > RETURN (fallback).
-        
-        MT5 filling_mode bitmask: bit 0 (value 1) = FOK, bit 1 (value 2) = IOC
-        """
-        if hasattr(symbol_info, 'filling_mode'):
-            allowed = symbol_info.filling_mode
-            if allowed & 1:  # FOK supported — guarantees full fill or nothing
-                return 0  # ORDER_FILLING_FOK
-            elif allowed & 2:  # IOC supported — partial fills possible
-                return 1  # ORDER_FILLING_IOC
-        return 2  # ORDER_FILLING_RETURN — most brokers accept as fallback
+        """Best single filling mode for a symbol (FOK > IOC > RETURN)."""
+        return MT5Client._get_filling_modes(symbol_info)[0]
     
     # Order type mapping
     ORDER_TYPES = {
@@ -1097,7 +1104,11 @@ class MT5Client:
                     "price": fill_price,
                     "volume": volume,
                     "simulated": True,
-                    "is_pending": is_pending_sim
+                    "is_pending": is_pending_sim,
+                    "converted_to_market": False,
+                    "final_order_type": order_type.lower(),
+                    "sl": stop_loss,
+                    "tp": take_profit,
                 }
             
             # Ensure MT5 connection before critical order operation
@@ -1122,7 +1133,9 @@ class MT5Client:
             
             # Determine order type and whether this is a pending order
             is_pending = order_type.lower() in ('buy_limit', 'sell_limit', 'buy_stop', 'sell_stop', 'buy_stop_limit', 'sell_stop_limit')
-            
+            converted_to_market = False
+            requested_order_type = order_type.lower()
+
             # =============================================
             # PENDING ORDER PRICE VALIDATION (prevents 10015 "Invalid Price")
             # MT5 requires:
@@ -1149,6 +1162,7 @@ class MT5Client:
                         )
                         order_type = 'buy'
                         is_pending = False
+                        converted_to_market = True
                         price = current_ask
                     elif (current_ask - price) < min_pending_distance:
                         adjusted = round(current_ask - min_pending_distance, symbol_info.digits)
@@ -1167,6 +1181,7 @@ class MT5Client:
                         )
                         order_type = 'sell'
                         is_pending = False
+                        converted_to_market = True
                         price = current_bid
                     elif (price - current_bid) < min_pending_distance:
                         adjusted = round(current_bid + min_pending_distance, symbol_info.digits)
@@ -1186,6 +1201,7 @@ class MT5Client:
                         )
                         order_type = 'buy'
                         is_pending = False
+                        converted_to_market = True
                         price = current_ask
                     elif (price - current_ask) < min_pending_distance:
                         adjusted = round(current_ask + min_pending_distance, symbol_info.digits)
@@ -1204,6 +1220,7 @@ class MT5Client:
                         )
                         order_type = 'sell'
                         is_pending = False
+                        converted_to_market = True
                         price = current_bid
                     elif (current_bid - price) < min_pending_distance:
                         adjusted = round(current_bid - min_pending_distance, symbol_info.digits)
@@ -1224,7 +1241,9 @@ class MT5Client:
                     return {"success": False, "error": f"Invalid order type: {order_type}"}
             
             # Build request - determine filling mode from symbol
-            filling_type = self._get_filling_type(symbol_info)
+            filling_modes = self._get_filling_modes(symbol_info)
+            filling_type = filling_modes[0]
+            filling_mode_idx = 0
             
             # Use TRADE_ACTION_PENDING for limit/stop orders, TRADE_ACTION_DEAL for market
             trade_action = mt5.TRADE_ACTION_PENDING if is_pending else mt5.TRADE_ACTION_DEAL
@@ -1376,8 +1395,21 @@ class MT5Client:
                     }
                 
                 if result.retcode == mt5.TRADE_RETCODE_DONE or (is_pending and result.retcode == mt5.TRADE_RETCODE_PLACED):
-                    # Pending: order ticket. Market: position ticket (order), not deal ticket.
+                    # Pending: order ticket. Market: prefer resolved position ticket.
                     ticket = result.order or result.deal
+                    if not is_pending and result.order:
+                        try:
+                            resolved = await self.resolve_fill_position_ticket(
+                                symbol,
+                                int(result.order),
+                                int(result.deal) if result.deal else None,
+                            )
+                            if resolved:
+                                ticket = resolved
+                        except Exception as resolve_exc:
+                            logger.debug(
+                                f"Position ticket resolve skipped: {resolve_exc}"
+                            )
                     # Partial fill detection
                     fill_volume = result.volume if result.volume else volume
                     if abs(fill_volume - volume) > 0.001:
@@ -1385,15 +1417,50 @@ class MT5Client:
                             f"PARTIAL FILL: requested {volume} lots, filled {fill_volume} lots "
                             f"(slippage: {volume - fill_volume:.3f} lots)"
                         )
-                    logger.info(f"Order successful: ticket={ticket}, order={result.order}, deal={result.deal}, price={result.price}, filled={fill_volume}")
+                    final_price = result.price if result.price else request.get("price", price)
+                    logger.info(
+                        f"Order successful: ticket={ticket}, order={result.order}, "
+                        f"deal={result.deal}, price={final_price}, filled={fill_volume}, "
+                        f"converted_to_market={converted_to_market}, "
+                        f"final_order_type={order_type.lower()}"
+                    )
                     return {
                         "success": True,
                         "order_id": result.order,
                         "ticket": ticket,
-                        "price": result.price,
+                        "price": final_price,
                         "volume": fill_volume,
                         "requested_volume": volume,
-                        "partial_fill": abs(fill_volume - volume) > 0.001
+                        "partial_fill": abs(fill_volume - volume) > 0.001,
+                        "converted_to_market": converted_to_market,
+                        "final_order_type": order_type.lower(),
+                        "requested_order_type": requested_order_type,
+                        "sl": request.get("sl", stop_loss),
+                        "tp": request.get("tp", take_profit),
+                    }
+                elif result.retcode == 10030 or (
+                    isinstance(getattr(result, "comment", ""), str)
+                    and "filling" in result.comment.lower()
+                    and attempt < max_retries
+                ):
+                    # Unsupported filling mode — try next allowed mode
+                    if filling_mode_idx + 1 < len(filling_modes):
+                        filling_mode_idx += 1
+                        filling_type = filling_modes[filling_mode_idx]
+                        request["type_filling"] = filling_type
+                        logger.warning(
+                            f"Filling mode rejected (retcode={result.retcode}, "
+                            f"{result.comment}) — retrying with type_filling={filling_type}"
+                        )
+                        continue
+                    logger.error(
+                        f"Order REJECTED by MT5: retcode={result.retcode}, "
+                        f"comment='{result.comment}' (no remaining filling modes)"
+                    )
+                    return {
+                        "success": False,
+                        "error": f"MT5 rejected: {result.comment} (code: {result.retcode})",
+                        "retcode": result.retcode,
                     }
                 elif result.retcode == 10014:
                     logger.error(f"INVALID VOLUME: {volume} lots for {symbol} — {result.comment}")

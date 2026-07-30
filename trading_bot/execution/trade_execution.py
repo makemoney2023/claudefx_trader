@@ -9,7 +9,9 @@ from typing import Any, Callable, List, Optional, Tuple
 from ..config import settings
 from ..execution.scaling_position_sizer import verify_post_sizing_risk
 from ..services.gate_outcome import GateOutcome
+from ..services.trade_reservations import ReservationState
 from ..utils.logging import get_logger
+from ..utils.win_optimization import order_type_matches_direction
 
 logger = get_logger(__name__)
 
@@ -238,6 +240,17 @@ class ExecutionCoordinator:
         order_type = fix_limit_stop_labels(order_type, entry_price, current_price)
         trade_signal.order_type = order_type
 
+        if not order_type_matches_direction(order_type, direction):
+            return ExecutionPrepResult(
+                order_type=order_type,
+                entry_price=entry_price,
+                blocked=True,
+                gate_id="direction_order_type_mismatch",
+                reason=(
+                    f"order_type={order_type} incompatible with direction={direction}"
+                ),
+            )
+
         _, retrace = resolve_premium_discount(analysis_results)
         zone_outcome = validate_limit_zone(order_type, retrace)
         if zone_outcome.blocked:
@@ -461,6 +474,34 @@ class ExecutionCoordinator:
             )
             order_type = "market"
 
+        if (
+            broker_result
+            and getattr(broker_result, "success", False)
+            and getattr(broker_result, "converted_to_market", False)
+        ):
+            order_type = "market"
+            if getattr(broker_result, "final_order_type", None) in ("buy", "sell"):
+                trade_signal.order_type = "market"
+
+        # Transfer reservation immediately on market fills so cycle cancel
+        # cannot release a still-RESERVED slot after broker success.
+        if (
+            broker_result
+            and getattr(broker_result, "success", False)
+            and trade_reservation is not None
+            and getattr(trade_reservation, "state", None) == ReservationState.RESERVED
+        ):
+            is_market_fill = (
+                order_type == "market"
+                or getattr(broker_result, "converted_to_market", False)
+                or getattr(broker_result, "final_order_type", "") in ("buy", "sell")
+            )
+            ticket = getattr(broker_result, "ticket", None) or getattr(
+                broker_result, "order_id", None
+            )
+            if is_market_fill and ticket and hasattr(bot, "reservation_ledger"):
+                bot.reservation_ledger.transfer_to_position(trade_reservation, ticket)
+
         return ExecutionResult(
             broker_result=broker_result,
             order_type=order_type,
@@ -570,6 +611,14 @@ class ExecutionCoordinator:
             expiration_minutes=expiration_minutes,
             comment="ICT_Bot_Pending",
         )
+        # PRICE-FIX may convert limit/stop to a market DEAL — do not track as pending.
+        if getattr(result, "converted_to_market", False):
+            logger.info(
+                f"[PRICE-FIX] {symbol}: {order_type} filled as market "
+                f"({getattr(result, 'final_order_type', 'market')}) — skipping pending track"
+            )
+            return result
+
         if result.success and (result.ticket or result.order_id):
             await bot.pending_order_manager.add_order(
                 ticket=result.ticket or result.order_id,

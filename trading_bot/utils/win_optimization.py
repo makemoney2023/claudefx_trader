@@ -23,6 +23,68 @@ def is_friday_afternoon_entry_block(now_est: datetime) -> bool:
     return now_est.weekday() == 4 and now_est.hour >= 12
 
 
+@dataclass
+class FridaySessionDecision:
+    """Friday close vs entry-block decisions (independent gates)."""
+
+    close_forex: bool
+    entry_symbols: List[str]
+
+
+def apply_friday_session_gates(
+    now_est: datetime,
+    symbols: List[str],
+    crypto_symbols: Set[str],
+) -> FridaySessionDecision:
+    """
+    Apply Friday weekend-close and afternoon entry block independently.
+
+    - close_forex: True at/after 16:30 ET on Friday
+    - entry_symbols: forex removed from noon ET Friday onward (crypto kept)
+    """
+    close_forex = is_friday_weekend_close_time(now_est)
+    entry_symbols = list(symbols)
+    if is_friday_afternoon_entry_block(now_est):
+        entry_symbols = [s for s in symbols if s in crypto_symbols]
+    return FridaySessionDecision(close_forex=close_forex, entry_symbols=entry_symbols)
+
+
+def order_type_matches_direction(order_type: str, direction: str) -> bool:
+    """True when order side is coherent with long/short direction."""
+    ot = (order_type or "market").lower()
+    direction = (direction or "").lower()
+    if ot == "market" or ot in ("", "none"):
+        return True
+    if ot.startswith("buy"):
+        return direction == "long"
+    if ot.startswith("sell"):
+        return direction == "short"
+    return True
+
+
+def displacement_gate_action(
+    order_type: str,
+    *,
+    distribution_confirmed: Optional[bool],
+    amd_phase: Optional[str],
+) -> str:
+    """
+    Decide market vs convert vs reject for displacement gate.
+
+    Returns: 'allow_market' | 'convert_pending' | 'reject' | 'unchanged'
+    """
+    if (order_type or "").lower() != "market":
+        return "unchanged"
+    if distribution_confirmed is None:
+        return "unchanged"
+    if distribution_confirmed:
+        return "allow_market"
+    phase = (amd_phase or "").lower()
+    if phase in ("manipulation", "accumulation"):
+        return "convert_pending"
+    return "reject"
+
+
 def entry_deviation_pct(entry: float, current_price: float) -> float:
     if not entry or current_price <= 0:
         return 0.0

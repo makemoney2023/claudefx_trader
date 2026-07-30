@@ -75,33 +75,31 @@ class GoalTracker:
         Uses logarithmic scale for compound growth representation.
         """
         if current_equity <= self.starting_equity:
-            return {
-                'percent': 0.0,
-                'current': current_equity,
-                'remaining': self.target_equity - current_equity,
-                'multiple_achieved': 1.0
-            }
-        
-        if current_equity >= self.target_equity:
-            return {
-                'percent': 100.0,
-                'current': current_equity,
-                'remaining': 0,
-                'multiple_achieved': current_equity / self.starting_equity
-            }
-        
-        # Logarithmic progress (better for compound growth)
-        log_start = math.log(self.starting_equity)
-        log_target = math.log(self.target_equity)
-        log_current = math.log(current_equity)
-        
-        percent = ((log_current - log_start) / (log_target - log_start)) * 100
-        
+            percent = 0.0
+            remaining = self.target_equity - current_equity
+            multiple = 1.0
+        elif current_equity >= self.target_equity:
+            percent = 100.0
+            remaining = 0
+            multiple = current_equity / self.starting_equity
+        else:
+            # Logarithmic progress (better for compound growth)
+            log_start = math.log(self.starting_equity)
+            log_target = math.log(self.target_equity)
+            log_current = math.log(current_equity)
+            percent = ((log_current - log_start) / (log_target - log_start)) * 100
+            remaining = self.target_equity - current_equity
+            multiple = current_equity / self.starting_equity
+
         return {
             'percent': percent,
             'current': current_equity,
-            'remaining': self.target_equity - current_equity,
-            'multiple_achieved': current_equity / self.starting_equity
+            'remaining': remaining,
+            'multiple_achieved': multiple,
+            # Aliases used by main.py goal logging / activity feed
+            'progress_percent': percent,
+            'current_equity': current_equity,
+            'target_equity': self.target_equity,
         }
     
     def get_milestones(self) -> List[int]:

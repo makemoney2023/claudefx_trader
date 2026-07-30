@@ -56,7 +56,7 @@ from .services.entry_gates import (
     ZoneGateSettings,
     should_use_zone_gate,
 )
-from .utils.win_optimization import apply_demote_policy
+from .utils.win_optimization import apply_demote_policy, apply_friday_session_gates
 from .services.goal_tracker import GoalTracker
 from .services.scaling_manager import ScalingManager, TradingMode
 from .services.session_analytics import SessionAnalytics
@@ -1375,33 +1375,34 @@ class TradingBot:
             
             # ============================================
             # STEP 2b: FRIDAY PRE-CLOSE (Weekend Gap Protection)
+            # Close gate (16:30+) and entry block (noon+) are independent.
             # ============================================
             import pytz
             est_tz = pytz.timezone('US/Eastern')
             now_est = datetime.now(est_tz)
-            if now_est.weekday() == 4:  # Friday
-                if now_est.hour >= 16 and now_est.minute >= 30:
-                    logger.warning("FRIDAY PRE-CLOSE: Closing forex positions before weekend")
-                    # Close all non-crypto positions
-                    for ticket, pos in list(self.position_manager.positions.items()):
-                        if pos.symbol not in self.CRYPTO_SYMBOLS:
-                            try:
-                                result = await self.order_manager.close_position(ticket=ticket)
-                                if result.success:
-                                    logger.info(f"  Closed {pos.symbol} position {ticket} for weekend protection")
-                                    pos.close_reason = 'weekend_protection'
-                                    await self._handle_position_close(pos)
-                                    self.position_manager.remove_position(ticket)
-                            except Exception as e:
-                                logger.error(f"  Failed to close {pos.symbol} position {ticket}: {e}")
-                    
-                    # Also block new entries on Fridays after 12 PM EST
-                    if now_est.hour >= 12:
-                        logger.info("Friday afternoon - no new forex entries")
-                        # Still allow crypto
-                        cycle_symbols = [s for s in cycle_symbols if s in self.CRYPTO_SYMBOLS]
-                        if not cycle_symbols:
-                            return
+            friday = apply_friday_session_gates(
+                now_est,
+                symbols=list(cycle_symbols),
+                crypto_symbols=set(self.CRYPTO_SYMBOLS),
+            )
+            if friday.close_forex:
+                logger.warning("FRIDAY PRE-CLOSE: Closing forex positions before weekend")
+                for ticket, pos in list(self.position_manager.positions.items()):
+                    if pos.symbol not in self.CRYPTO_SYMBOLS:
+                        try:
+                            result = await self.order_manager.close_position(ticket=ticket)
+                            if result.success:
+                                logger.info(f"  Closed {pos.symbol} position {ticket} for weekend protection")
+                                pos.close_reason = 'weekend_protection'
+                                await self._handle_position_close(pos)
+                                self.position_manager.remove_position(ticket)
+                        except Exception as e:
+                            logger.error(f"  Failed to close {pos.symbol} position {ticket}: {e}")
+            if friday.entry_symbols != list(cycle_symbols):
+                logger.info("Friday afternoon - no new forex entries")
+                cycle_symbols = friday.entry_symbols
+                if not cycle_symbols:
+                    return
             
             print(f"[CYCLE] Passed drawdown/profit/limit checks, checking kill zone...", flush=True)
             
@@ -4480,12 +4481,17 @@ Apply the evaluation rules from the system message and reply per the OUTPUT CONT
         return None
 
     def _release_trade_reservation(self, reservation) -> None:
-        if reservation and hasattr(self, 'reservation_ledger') and self.reservation_ledger:
-            if self.reservation_ledger.release(reservation):
-                logger.info(
-                    f"Trade slot released ({self.daily_trades}/"
-                    f"{settings.trading.max_daily_trades})"
-                )
+        """Release only while still RESERVED — never undo a transferred fill/pending."""
+        if not reservation or not hasattr(self, 'reservation_ledger') or not self.reservation_ledger:
+            return
+        from .services.trade_reservations import ReservationState
+        if getattr(reservation, "state", None) != ReservationState.RESERVED:
+            return
+        if self.reservation_ledger.release(reservation):
+            logger.info(
+                f"Trade slot released ({self.daily_trades}/"
+                f"{settings.trading.max_daily_trades})"
+            )
 
     async def _process_pending_closed_trade_events(self, events):
         """Route fast pending fill→close events through the unified close lifecycle."""

@@ -89,14 +89,21 @@ class TestPostSizingVerification:
 
 
 class TestNewsFailClosed:
-    def test_stale_calendar_blocks(self):
+    def test_stale_calendar_blocks(self, monkeypatch):
+        # Pin the gate on so the test doesn't depend on .env.local
+        from trading_bot.config import settings
+        monkeypatch.setattr(settings.trading, "news_gates_enabled", True)
+
         news = MagicMock()
         news.should_trade.return_value = False
         allowed, reason = news_allows_trading(news)
         assert allowed is False
         assert "fail-closed" in reason.lower()
 
-    def test_healthy_calendar_allows(self):
+    def test_healthy_calendar_allows(self, monkeypatch):
+        from trading_bot.config import settings
+        monkeypatch.setattr(settings.trading, "news_gates_enabled", True)
+
         news = MagicMock()
         news.should_trade.return_value = True
         allowed, _ = news_allows_trading(news)

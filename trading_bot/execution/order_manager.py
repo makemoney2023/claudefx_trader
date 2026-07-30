@@ -46,7 +46,12 @@ class OrderResult:
     fill_price: Optional[float] = None
     fill_time: Optional[datetime] = None
     fill_volume: Optional[float] = None
-    
+    converted_to_market: bool = False
+    final_order_type: Optional[str] = None
+    broker_price: Optional[float] = None
+    broker_sl: Optional[float] = None
+    broker_tp: Optional[float] = None
+
     def to_dict(self) -> dict:
         return {
             "success": self.success,
@@ -57,7 +62,39 @@ class OrderResult:
             "fill_price": self.fill_price,
             "fill_time": self.fill_time.isoformat() if self.fill_time else None,
             "fill_volume": self.fill_volume,
+            "converted_to_market": self.converted_to_market,
+            "final_order_type": self.final_order_type,
+            "broker_price": self.broker_price,
+            "broker_sl": self.broker_sl,
+            "broker_tp": self.broker_tp,
         }
+
+    @staticmethod
+    def from_broker_dict(result: dict, *, default_status: OrderStatus) -> "OrderResult":
+        """Build OrderResult from MT5Client.place_order success/failure dict."""
+        converted = bool(result.get("converted_to_market"))
+        final_ot = result.get("final_order_type")
+        # A PRICE-FIX conversion means the broker filled a market DEAL,
+        # so the result is FILLED even when a pending order was requested.
+        status = OrderStatus.FILLED if converted else default_status
+        return OrderResult(
+            success=True,
+            order_id=result.get("order_id"),
+            ticket=result.get("ticket"),
+            status=status,
+            message=(
+                f"Converted to market {final_ot}" if converted
+                else result.get("message") or "Order accepted"
+            ),
+            fill_price=result.get("price"),
+            fill_time=datetime.now(timezone.utc) if status == OrderStatus.FILLED else None,
+            fill_volume=result.get("volume"),
+            converted_to_market=converted,
+            final_order_type=final_ot,
+            broker_price=result.get("price"),
+            broker_sl=result.get("sl"),
+            broker_tp=result.get("tp"),
+        )
 
 
 @dataclass
@@ -234,16 +271,11 @@ class OrderManager:
             )
             
             if result.get('success'):
-                return OrderResult(
-                    success=True,
-                    order_id=result.get('order_id'),
-                    ticket=result.get('ticket'),
-                    status=OrderStatus.FILLED,
-                    message="Order filled successfully",
-                    fill_price=result.get('price'),
-                    fill_time=datetime.now(timezone.utc),
-                    fill_volume=result.get('volume'),
+                out = OrderResult.from_broker_dict(
+                    result, default_status=OrderStatus.FILLED
                 )
+                out.message = "Order filled successfully"
+                return out
             else:
                 return self._error_result(result.get('error', 'Unknown error'))
                 
@@ -413,7 +445,20 @@ class OrderManager:
             if result.get('success'):
                 order_id = result.get('order_id')
                 ticket = result.get('ticket')
-                
+                out = OrderResult.from_broker_dict(
+                    result, default_status=OrderStatus.PENDING
+                )
+                if out.converted_to_market:
+                    logger.info(
+                        f"✓ Pending {order_type} PRICE-FIX converted to market "
+                        f"{out.final_order_type} {symbol}, ticket: {ticket or order_id}"
+                    )
+                    out.message = (
+                        f"Pending {order_type} converted to market "
+                        f"{out.final_order_type}"
+                    )
+                    return out
+
                 # Track pending order locally
                 order = Order(
                     symbol=symbol,
@@ -425,21 +470,18 @@ class OrderManager:
                     comment=comment,
                     expiration=expiration
                 )
-                
+
                 if order_id:
                     self.pending_orders[order_id] = order
                 elif ticket:
                     self.pending_orders[ticket] = order
-                
-                logger.info(f"✓ Pending order placed: {order_type} {symbol} @ {price}, ticket: {ticket or order_id}")
-                
-                return OrderResult(
-                    success=True,
-                    order_id=order_id,
-                    ticket=ticket,
-                    status=OrderStatus.PENDING,
-                    message=f"Pending {order_type} order placed at {price}"
+
+                logger.info(
+                    f"✓ Pending order placed: {order_type} {symbol} @ {price}, "
+                    f"ticket: {ticket or order_id}"
                 )
+                out.message = f"Pending {order_type} order placed at {price}"
+                return out
             else:
                 error_msg = result.get('error', 'Unknown error')
                 logger.error(f"Failed to place pending order: {error_msg}")

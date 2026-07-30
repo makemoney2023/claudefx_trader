@@ -16,6 +16,43 @@ from ..api.websocket import broadcast_trade_update
 logger = get_logger(__name__)
 
 
+def _is_market_fill(result: Any, order_type: str) -> bool:
+    """True when broker fill is (or was converted to) a market DEAL."""
+    if getattr(result, "converted_to_market", False):
+        return True
+    final_ot = (getattr(result, "final_order_type", None) or "").lower()
+    if final_ot in ("buy", "sell"):
+        return True
+    return order_type not in ("buy_limit", "sell_limit", "buy_stop", "sell_stop")
+
+
+def _resolve_ticket_from_positions(
+    positions: list,
+    *,
+    reported_ticket: Optional[int],
+    order_id: Optional[int],
+    fill_volume: Optional[float],
+) -> Optional[int]:
+    """Match a live position ticket when broker order/deal identity differs."""
+    if not positions:
+        return None
+    tickets = {getattr(p, "ticket", None) for p in positions}
+    if reported_ticket and reported_ticket in tickets:
+        return reported_ticket
+    if order_id and order_id in tickets:
+        return order_id
+    if len(positions) == 1:
+        return positions[0].ticket
+    if fill_volume is not None:
+        matches = [
+            p for p in positions
+            if abs(float(getattr(p, "volume", 0) or 0) - float(fill_volume)) < 0.001
+        ]
+        if len(matches) == 1:
+            return matches[0].ticket
+    return None
+
+
 class TradeFillHandler:
     """Handles broker success/failure after ExecutionCoordinator.execute()."""
 
@@ -78,20 +115,31 @@ class TradeFillHandler:
             
             # Gap 57: Verify order actually exists in MT5
             # Only verify for market orders — pending orders won't appear in positions yet
-            is_pending_order = order_type in ['buy_limit', 'sell_limit', 'buy_stop', 'sell_stop']
-            if result.ticket and not bot.mt5_client.is_simulation and not is_pending_order:
+            # PRICE-FIX conversions must be treated as market fills.
+            is_market = _is_market_fill(result, order_type)
+            is_pending_order = not is_market
+            if result.ticket and not bot.mt5_client.is_simulation and is_market:
                 await asyncio.sleep(0.5)  # Brief delay for MT5 to process
                 positions = await bot.mt5_client.get_positions(symbol=symbol)
-                
-                # MT5 Position is a dataclass, access attributes directly
-                position_exists = any(
-                    p.ticket == result.ticket for p in positions
+
+                resolved = _resolve_ticket_from_positions(
+                    positions or [],
+                    reported_ticket=result.ticket,
+                    order_id=getattr(result, "order_id", None),
+                    fill_volume=getattr(result, "fill_volume", None),
                 )
-                
-                if not position_exists:
+                if resolved:
+                    if resolved != result.ticket:
+                        logger.warning(
+                            f"[TICKET-RESOLVE] {symbol}: reported ticket "
+                            f"{result.ticket} → position ticket {resolved}"
+                        )
+                        result.ticket = resolved
+                    logger.info(f"  ✓ Position verified in MT5 (ticket={result.ticket})")
+                else:
                     logger.error(
                         f"⚠ Order reported success but position {result.ticket} not found in MT5! "
-                        f"Manual verification required."
+                        f"Retaining reservation for reconcile; sync_with_mt5 may adopt later."
                     )
                     await bot._record_terminal_decision(
                         "execution_failure",
@@ -104,11 +152,15 @@ class TradeFillHandler:
                         reason=f"Order success but position {result.ticket} not found in MT5",
                         details={"ticket": result.ticket, "unverified_fill": True},
                     )
-                    # Don't track the position if it doesn't exist;
-                    # sync_with_mt5 adopts it if the fill appears later
+                    # Keep ownership so reservation scope cannot free the slot
+                    if trade_reservation and hasattr(bot, "reservation_ledger"):
+                        from ..services.trade_reservations import ReservationState
+                        if trade_reservation.state == ReservationState.RESERVED:
+                            bot.reservation_ledger.transfer_to_position(
+                                trade_reservation, result.ticket
+                            )
                     return
                 
-                logger.info(f"  ✓ Position verified in MT5")
             elif is_pending_order:
                 logger.info(f"  ⏳ Pending order placed — will verify when filled")
             
@@ -116,9 +168,19 @@ class TradeFillHandler:
             # Pending orders (buy_limit, sell_limit, etc.) are tracked by pending_order_manager
             # and will be picked up by sync_with_mt5 when they fill
             if result.ticket:
-                # Validate SL/TP are real values before tracking
-                tracked_sl = trade_signal.stop_loss if trade_signal.stop_loss and trade_signal.stop_loss > 0 else None
-                tracked_tp = trade_signal.take_profit if trade_signal.take_profit and trade_signal.take_profit > 0 else None
+                # Prefer spread-adjusted finals from execution; fall back to signal
+                tracked_sl = (
+                    final_sl if final_sl and final_sl > 0
+                    else (trade_signal.stop_loss if trade_signal.stop_loss and trade_signal.stop_loss > 0 else None)
+                )
+                tracked_tp = (
+                    final_tp if final_tp and final_tp > 0
+                    else (trade_signal.take_profit if trade_signal.take_profit and trade_signal.take_profit > 0 else None)
+                )
+                if getattr(result, "broker_sl", None):
+                    tracked_sl = result.broker_sl
+                if getattr(result, "broker_tp", None):
+                    tracked_tp = result.broker_tp
                 if not tracked_sl:
                     logger.error(f"CRITICAL: Position {result.ticket} has no valid SL! trade_signal.stop_loss={trade_signal.stop_loss}")
                 if not tracked_tp:

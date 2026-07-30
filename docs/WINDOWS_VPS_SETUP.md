@@ -228,6 +228,12 @@ TRADING_AUTO_START_BOT=false
 # Set false only for debugging off-hours analysis.
 TRADING_CLAUDE_KILL_ZONE_ONLY=true
 
+# After pulling fill-path / Friday-gate fixes (PRICE-FIX market routing,
+# reservation safety, filling-mode retry, Friday noon vs 16:30 gates),
+# redeploy and restart the backend on the VPS so live MT5 uses the new code:
+#   git pull
+#   Restart-Service / nssm restart / or re-run start script
+
 # CORS — set to your VPS IP or domain (see Remote Access section)
 CORS_ORIGINS=http://YOUR_VPS_IP:3000,http://localhost:3000
 

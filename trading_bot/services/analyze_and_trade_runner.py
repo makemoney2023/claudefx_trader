@@ -12,6 +12,7 @@ from ..utils.win_optimization import (
     apply_demote_policy,
     build_confidence_decision,
     classify_a_plus,
+    displacement_gate_action,
     ote_pullback_entry,
     rebase_sl_tp_for_new_entry,
 )
@@ -910,10 +911,8 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                 )
                 if not zone_validation["valid"]:
                     logger.warning(f"⚠️ ZONE BLOCK: {zone_validation['reason']}")
-                    # Don't block entirely - switch to pending order for better entry
+                    # Convert market to pending at OTE; reject if entry cannot be resolved
                     if trade_signal.order_type == 'market':
-                        # Switch to limit order at the direction-aware OTE
-                        # pullback (longs -> discount side, shorts -> premium)
                         _ote_entry = ote_pullback_entry(
                             trade_signal.direction,
                             pd_analysis.swing_high,
@@ -938,6 +937,23 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                                 f"🔄 Converted to {trade_signal.order_type.upper()} "
                                 f"@ {_ote_entry:.5f} (OTE pullback, SL/TP rebased)"
                             )
+                        else:
+                            await bot._reject_and_record(
+                                _trade_reservation,
+                                "mechanical_reject",
+                                symbol,
+                                gate_id="zone_conversion_failed",
+                                direction=trade_signal.direction,
+                                entry=trade_signal.entry_price or current_price,
+                                sl=trade_signal.stop_loss or 0.0,
+                                tp=trade_signal.take_profit or 0.0,
+                                confidence=trade_signal.confidence,
+                                reason=(
+                                    f"Zone invalid and no OTE entry available: "
+                                    f"{zone_validation['reason']}"
+                                ),
+                            )
+                            return
                 else:
                     logger.info(f"✅ Zone check passed: {zone_validation['reason']}")
             
@@ -992,55 +1008,102 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
             
             # GATE 3: Displacement Check for Market Orders
             # Only allow immediate market execution if displacement is confirmed
-            if trade_signal.order_type == 'market':
-                if displacement_analysis and not displacement_analysis.distribution_confirmed:
-                    # Convert to pending order - wait for displacement
-                    if amd_state and amd_state.phase.value in ['manipulation', 'accumulation']:
-                        logger.warning(
-                            f"⚠️ NO DISPLACEMENT: Converting market order to pending "
-                            f"(AMD Phase: {amd_state.phase.value})"
+            _disp_confirmed = (
+                displacement_analysis.distribution_confirmed
+                if displacement_analysis is not None
+                else None
+            )
+            _amd_phase = (
+                amd_state.phase.value
+                if amd_state is not None and hasattr(amd_state, "phase")
+                else None
+            )
+            _disp_action = displacement_gate_action(
+                trade_signal.order_type,
+                distribution_confirmed=_disp_confirmed,
+                amd_phase=_amd_phase,
+            )
+            if _disp_action == "allow_market":
+                logger.info("✅ Displacement confirmed - proceeding with market order")
+            elif _disp_action == "reject":
+                await bot._reject_and_record(
+                    _trade_reservation,
+                    "mechanical_reject",
+                    symbol,
+                    gate_id="no_displacement",
+                    direction=trade_signal.direction,
+                    entry=trade_signal.entry_price or current_price,
+                    sl=trade_signal.stop_loss or 0.0,
+                    tp=trade_signal.take_profit or 0.0,
+                    confidence=trade_signal.confidence,
+                    reason=(
+                        "Market order blocked: displacement not confirmed "
+                        f"(AMD phase={_amd_phase or 'n/a'})"
+                    ),
+                )
+                return
+            elif _disp_action == "convert_pending":
+                logger.warning(
+                    f"⚠️ NO DISPLACEMENT: Converting market order to pending "
+                    f"(AMD Phase: {_amd_phase})"
+                )
+                entry_zone = analysis_results.get("fvg", {})
+                _new_entry = 0.0
+                if trade_signal.direction == 'long':
+                    if hasattr(entry_zone, 'bullish_fvgs') and entry_zone.bullish_fvgs:
+                        nearest_fvg = min(
+                            entry_zone.bullish_fvgs,
+                            key=lambda x: abs(x.midpoint - current_price),
                         )
-                        # Entry at nearest FVG midpoint, falling back to the
-                        # direction-aware OTE pullback level
-                        entry_zone = analysis_results.get("fvg", {})
-                        _new_entry = 0.0
-                        if trade_signal.direction == 'long':
-                            if hasattr(entry_zone, 'bullish_fvgs') and entry_zone.bullish_fvgs:
-                                nearest_fvg = min(entry_zone.bullish_fvgs, key=lambda x: abs(x.midpoint - current_price))
-                                _new_entry = nearest_fvg.midpoint
-                            elif pd_analysis:
-                                _new_entry = ote_pullback_entry(
-                                    'long', pd_analysis.swing_high, pd_analysis.swing_low
-                                )
-                        else:
-                            if hasattr(entry_zone, 'bearish_fvgs') and entry_zone.bearish_fvgs:
-                                nearest_fvg = min(entry_zone.bearish_fvgs, key=lambda x: abs(x.midpoint - current_price))
-                                _new_entry = nearest_fvg.midpoint
-                            elif pd_analysis:
-                                _new_entry = ote_pullback_entry(
-                                    'short', pd_analysis.swing_high, pd_analysis.swing_low
-                                )
-                        if _new_entry > 0:
-                            _old_entry = trade_signal.entry_price or current_price
-                            trade_signal.order_type = (
-                                'buy_limit' if trade_signal.direction == 'long'
-                                else 'sell_limit'
-                            )
-                            trade_signal.entry_price = _new_entry
-                            trade_signal.stop_loss, trade_signal.take_profit = (
-                                rebase_sl_tp_for_new_entry(
-                                    stop_loss=trade_signal.stop_loss or 0.0,
-                                    take_profit=trade_signal.take_profit or 0.0,
-                                    old_entry=_old_entry,
-                                    new_entry=_new_entry,
-                                )
-                            )
-                            logger.info(
-                                f"🔄 Converted to {trade_signal.order_type.upper()} "
-                                f"@ {_new_entry:.5f} (no displacement, SL/TP rebased)"
-                            )
-                    else:
-                        logger.info("✅ Displacement confirmed - proceeding with market order")
+                        _new_entry = nearest_fvg.midpoint
+                    elif pd_analysis:
+                        _new_entry = ote_pullback_entry(
+                            'long', pd_analysis.swing_high, pd_analysis.swing_low
+                        )
+                else:
+                    if hasattr(entry_zone, 'bearish_fvgs') and entry_zone.bearish_fvgs:
+                        nearest_fvg = min(
+                            entry_zone.bearish_fvgs,
+                            key=lambda x: abs(x.midpoint - current_price),
+                        )
+                        _new_entry = nearest_fvg.midpoint
+                    elif pd_analysis:
+                        _new_entry = ote_pullback_entry(
+                            'short', pd_analysis.swing_high, pd_analysis.swing_low
+                        )
+                if _new_entry > 0:
+                    _old_entry = trade_signal.entry_price or current_price
+                    trade_signal.order_type = (
+                        'buy_limit' if trade_signal.direction == 'long'
+                        else 'sell_limit'
+                    )
+                    trade_signal.entry_price = _new_entry
+                    trade_signal.stop_loss, trade_signal.take_profit = (
+                        rebase_sl_tp_for_new_entry(
+                            stop_loss=trade_signal.stop_loss or 0.0,
+                            take_profit=trade_signal.take_profit or 0.0,
+                            old_entry=_old_entry,
+                            new_entry=_new_entry,
+                        )
+                    )
+                    logger.info(
+                        f"🔄 Converted to {trade_signal.order_type.upper()} "
+                        f"@ {_new_entry:.5f} (no displacement, SL/TP rebased)"
+                    )
+                else:
+                    await bot._reject_and_record(
+                        _trade_reservation,
+                        "mechanical_reject",
+                        symbol,
+                        gate_id="displacement_conversion_failed",
+                        direction=trade_signal.direction,
+                        entry=trade_signal.entry_price or current_price,
+                        sl=trade_signal.stop_loss or 0.0,
+                        tp=trade_signal.take_profit or 0.0,
+                        confidence=trade_signal.confidence,
+                        reason="Displacement missing and no FVG/OTE entry available",
+                    )
+                    return
             
             # RE-SIZE if confidence or entry changed after sizing
             _entry_now = trade_signal.entry_price or current_price
@@ -1808,8 +1871,13 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
         logger.error(f"Error analyzing {symbol}: {e}")
         import traceback
         traceback.print_exc()
-        # Release trade slot if it was reserved before the crash
-        bot._release_trade_reservation(_trade_reservation)
+        # Only release while still RESERVED — never undo a transferred fill/pending
+        from ..services.trade_reservations import ReservationState
+        if (
+            _trade_reservation is not None
+            and getattr(_trade_reservation, "state", None) == ReservationState.RESERVED
+        ):
+            bot._release_trade_reservation(_trade_reservation)
     finally:
         if _trade_reservation_context is not None:
             await _trade_reservation_context.__aexit__(None, None, None)

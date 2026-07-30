@@ -42,6 +42,8 @@ def _make_bot_stub():
     bot.learning_service = None
     bot.claude_client = None
     bot._reversal_cooldowns = {}
+    from trading_bot.services.direction_circuit_breaker import DirectionLossTracker
+    bot._direction_loss_tracker = DirectionLossTracker()
     counters = {"daily_trades": bot.daily_trades}
     bot.reservation_ledger = TradeReservationLedger(
         risk_manager=bot.risk_manager,

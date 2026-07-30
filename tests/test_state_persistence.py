@@ -318,7 +318,8 @@ class TestLoadFullState:
         sp_module._persistence = StatePersistence(tf)
         
         try:
-            now = datetime.now()
+            # Production stores aware-UTC timestamps; loader parses as UTC
+            now = datetime.now(timezone.utc)
             # One recent hash (5 min ago), one expired (2 hours ago)
             sp_module._persistence.save_signal_hashes({
                 'recent_hash': (now - timedelta(minutes=5)).isoformat(),
@@ -354,7 +355,8 @@ class TestLoadFullState:
         sp_module._persistence = StatePersistence(tf)
         
         try:
-            now = datetime.now()
+            # Production stores aware-UTC timestamps; loader parses as UTC
+            now = datetime.now(timezone.utc)
             sp_module._persistence.save_reversal_cooldowns({
                 'BTCUSD': (now - timedelta(minutes=30)).isoformat(),  # Within 1hr
                 'XAUUSD': (now - timedelta(hours=2)).isoformat(),  # Expired
