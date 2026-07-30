@@ -43,6 +43,15 @@ if TYPE_CHECKING:
 _PLAYBOOK_STATS_TTL_SECONDS = 3600
 
 
+async def safe_persist_judge_signal(save_fn, **kwargs) -> None:
+    """Persist judge signal without allowing DB/IO failures to abort execution."""
+    try:
+        await save_fn(**kwargs)
+    except Exception as exc:
+        symbol = kwargs.get("symbol", "?")
+        logger.warning(f"Signal DB persist failed for {symbol}: {exc}")
+
+
 async def _get_playbook_stats(bot: "TradingBot") -> list:
     """Structured setup stats for the playbook gate, cached for 1 hour."""
     try:
@@ -1396,18 +1405,21 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                     f"[JUDGE] {verdict_label} {symbol} {trade_signal.direction}: {reason}"
                 )
 
-                from ..api.routes.activity import add_activity
-                add_activity(
-                    "trade_judge_reject" if verdict_label == "REJECT" else "trade_judge_unavailable",
-                    f"Judge {verdict_label} {symbol} {trade_signal.direction}: {reason}",
-                    symbol,
-                    {
-                        "verdict": verdict_label,
-                        "reason": reason,
-                        "risk_flags": flags,
-                        "confidence": trade_signal.confidence,
-                    }
-                )
+                try:
+                    from ..api.routes.activity import add_activity
+                    add_activity(
+                        "trade_judge_reject" if verdict_label == "REJECT" else "trade_judge_unavailable",
+                        f"Judge {verdict_label} {symbol} {trade_signal.direction}: {reason}",
+                        symbol,
+                        {
+                            "verdict": verdict_label,
+                            "reason": reason,
+                            "risk_flags": flags,
+                            "confidence": trade_signal.confidence,
+                        }
+                    )
+                except Exception as _act_err:
+                    logger.warning(f"Activity feed failed after judge {verdict_label}: {_act_err}")
 
                 flags_str = ", ".join(flags) if flags else "none"
                 print(
@@ -1416,7 +1428,8 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                     flush=True
                 )
 
-                await save_signal_to_db(
+                await safe_persist_judge_signal(
+                    save_signal_to_db,
                     symbol=symbol,
                     direction=trade_signal.direction,
                     confidence=trade_signal.confidence,
@@ -1564,21 +1577,24 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                     f"{trade_signal.order_type} @ {demoted_entry:.5f} (reason: {reason})"
                 )
                 
-                # Log to activity feed
-                from ..api.routes.activity import add_activity
-                add_activity(
-                    "trade_judge_demote",
-                    f"Judge demoted {symbol} {trade_signal.direction}: {reason}",
-                    symbol,
-                    {
-                        "verdict": "DEMOTE",
-                        "reason": reason,
-                        "original_entry": current_price,
-                        "demoted_entry": demoted_entry,
-                        "risk_flags": flags,
-                        "confidence": trade_signal.confidence,
-                    }
-                )
+                # Log to activity feed (non-critical — must not abort execution)
+                try:
+                    from ..api.routes.activity import add_activity
+                    add_activity(
+                        "trade_judge_demote",
+                        f"Judge demoted {symbol} {trade_signal.direction}: {reason}",
+                        symbol,
+                        {
+                            "verdict": "DEMOTE",
+                            "reason": reason,
+                            "original_entry": current_price,
+                            "demoted_entry": demoted_entry,
+                            "risk_flags": flags,
+                            "confidence": trade_signal.confidence,
+                        }
+                    )
+                except Exception as _act_err:
+                    logger.warning(f"Activity feed failed after judge DEMOTE: {_act_err}")
                 
                 # Print DEMOTE to terminal
                 flags_str = ", ".join(flags) if flags else "none"
@@ -1588,8 +1604,9 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                     flush=True
                 )
                 
-                # Save demoted signal to DB for correlation
-                await save_signal_to_db(
+                # Save demoted signal to DB for correlation (non-critical)
+                await safe_persist_judge_signal(
+                    save_signal_to_db,
                     symbol=symbol,
                     direction=trade_signal.direction,
                     confidence=trade_signal.confidence,
@@ -1624,18 +1641,22 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                 if flags:
                     logger.info(f"[JUDGE] Approved {symbol} with flags: {flags}")
                 
-                from ..api.routes.activity import add_activity
-                add_activity(
-                    "trade_judge_approve",
-                    f"Judge approved {symbol} {trade_signal.direction} ({trade_signal.confidence:.0%})",
-                    symbol,
-                    {
-                        "verdict": "APPROVE",
-                        "reason": reason,
-                        "risk_flags": flags,
-                        "confidence": trade_signal.confidence,
-                    }
-                )
+                # Non-critical I/O — must not abort order placement after APPROVE
+                try:
+                    from ..api.routes.activity import add_activity
+                    add_activity(
+                        "trade_judge_approve",
+                        f"Judge approved {symbol} {trade_signal.direction} ({trade_signal.confidence:.0%})",
+                        symbol,
+                        {
+                            "verdict": "APPROVE",
+                            "reason": reason,
+                            "risk_flags": flags,
+                            "confidence": trade_signal.confidence,
+                        }
+                    )
+                except Exception as _act_err:
+                    logger.warning(f"Activity feed failed after judge APPROVE: {_act_err}")
                 
                 # Print APPROVE to terminal
                 flags_str = ", ".join(flags) if flags else "none"
@@ -1645,8 +1666,8 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                     flush=True
                 )
                 
-                # Save approved signal to DB for correlation
-                await save_signal_to_db(
+                await safe_persist_judge_signal(
+                    save_signal_to_db,
                     symbol=symbol,
                     direction=trade_signal.direction,
                     confidence=trade_signal.confidence,

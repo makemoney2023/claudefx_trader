@@ -421,6 +421,8 @@ class ExecutionCoordinator:
                 ),
                 comment="ICT_Bot",
             )
+            # None means final-risk cap blocked before broker send.
+            # A failed OrderResult is a broker rejection — pass through for reconcile.
             if broker_result is None:
                 return ExecutionResult(
                     blocked=True,

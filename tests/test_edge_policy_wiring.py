@@ -88,7 +88,8 @@ class TestRunnerWiring:
             "save_signal_to_db must be imported before judge branches "
             "(otherwise APPROVE/DEMOTE hit UnboundLocalError and skip execution)"
         )
-        assert src.count("await save_signal_to_db(") >= 3
+        # Persist via safe wrapper so DB failures cannot abort order placement
+        assert src.count("safe_persist_judge_signal(") >= 3
 
     def test_fill_handler_records_slippage_and_regime(self):
         from trading_bot.execution import trade_fill_handler

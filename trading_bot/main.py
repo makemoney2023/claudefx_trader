@@ -2775,9 +2775,18 @@ class TradingBot:
             take_profit=take_profit,
             comment=comment,
         )
-        if result and result.success:
-            return result
-        return None
+        # Return failed OrderResult so callers can reconcile / log broker errors.
+        # Only risk-cap blocks return None (see above).
+        if result is None:
+            from .execution.order_manager import OrderResult, OrderStatus
+            return OrderResult(
+                success=False,
+                order_id=None,
+                ticket=None,
+                status=OrderStatus.REJECTED,
+                message="No result from broker place_market_order",
+            )
+        return result
 
     async def _place_pending_with_final_risk(
         self,
@@ -2820,9 +2829,18 @@ class TradingBot:
         if expiration_minutes is not None:
             kwargs["expiration_minutes"] = expiration_minutes
         result = await self.order_manager.place_pending_order(**kwargs)
-        if result and result.success:
-            return result
-        return None
+        # Return failed OrderResult so callers can reconcile / log broker errors.
+        # Only risk-cap blocks return None (see above).
+        if result is None:
+            from .execution.order_manager import OrderResult, OrderStatus
+            return OrderResult(
+                success=False,
+                order_id=None,
+                ticket=None,
+                status=OrderStatus.REJECTED,
+                message="No result from broker place_pending_order",
+            )
+        return result
 
     async def _current_market_entry(self, symbol: str, direction: str) -> float:
         try:
