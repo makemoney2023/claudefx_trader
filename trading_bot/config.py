@@ -488,6 +488,17 @@ class TradingSettings(BaseSettings):
             "'active' hard-blocks missing confirmations, 'disabled' skips"
         ),
     )
+    correlation_group_mode: str = Field(
+        default="shadow",
+        description=(
+            "Group exposure sizing: 'shadow' logs only, 'active' caps size by "
+            "correlated-group risk dollars, 'disabled' skips"
+        ),
+    )
+    correlation_max_group_risk_pct: float = Field(
+        default=0.10,
+        description="Max portfolio risk fraction per correlation group",
+    )
 
 
 class TimeframeSettings(BaseSettings):

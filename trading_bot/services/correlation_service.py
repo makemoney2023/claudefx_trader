@@ -276,41 +276,115 @@ class CorrelationService:
         max_group_exposure: float = 0.10  # 10% max per group
     ) -> float:
         """
-        Get maximum allowed volume considering correlation exposure.
-        
-        Args:
-            symbol: Symbol to trade
-            account_balance: Account balance
-            max_group_exposure: Max exposure per correlation group (default 10%)
-            
-        Returns:
-            Maximum allowed volume
+        Legacy volume cap (notional proxy). Prefer get_max_allowed_lots_by_risk.
         """
-        # Find symbol's correlation group
-        groups = self.get_correlation_groups()
-        symbol_group = None
-        
-        for group in groups:
+        return self.get_max_allowed_lots_by_risk(
+            symbol=symbol,
+            account_equity=account_balance,
+            entry_price=0.0,
+            stop_loss=0.0,
+            max_group_risk_pct=max_group_exposure,
+            open_risk_by_symbol=None,
+            legacy_notional=True,
+        )
+
+    def _symbol_group(self, symbol: str) -> Optional[List[str]]:
+        for group in self.get_correlation_groups():
             if symbol in group:
-                symbol_group = group
-                break
-        
-        if not symbol_group:
-            # No correlated symbols - allow normal exposure
-            return account_balance * 0.05  # 5% max
-        
-        # Calculate current group exposure
-        current_exposure = 0.0
-        for sym in symbol_group:
-            if sym in self._open_positions:
-                pos = self._open_positions[sym]
-                current_exposure += pos.volume * 1000  # Assume $1000 per 0.01 lot
-        
-        # Max allowed for this trade
-        max_group = account_balance * max_group_exposure
-        remaining = max_group - current_exposure
-        
-        return max(0, remaining / 1000)  # Convert back to lots
+                return group
+        return None
+
+    def get_max_allowed_lots_by_risk(
+        self,
+        *,
+        symbol: str,
+        account_equity: float,
+        entry_price: float,
+        stop_loss: float,
+        max_group_risk_pct: float = 0.10,
+        open_risk_by_symbol: Optional[Dict[str, float]] = None,
+        legacy_notional: bool = False,
+    ) -> float:
+        """
+        Cap new lots so correlated-group risk dollars stay within equity budget.
+
+        Uses symbol pip_value × SL distance instead of a hardcoded $1000/0.01 lot.
+        """
+        from ..config import get_symbol_spec
+
+        if account_equity <= 0:
+            return 0.0
+
+        group = self._symbol_group(symbol)
+        max_group_risk = account_equity * max_group_risk_pct
+
+        open_risk = 0.0
+        risk_map = open_risk_by_symbol or {}
+        members = group or [symbol]
+        for sym in members:
+            if sym in risk_map:
+                open_risk += float(risk_map[sym])
+            elif legacy_notional and sym in self._open_positions:
+                # Backward-compatible notional proxy when risk map unavailable
+                open_risk += self._open_positions[sym].volume * 100_000 * 0.01
+
+        remaining_risk = max(0.0, max_group_risk - open_risk)
+        if remaining_risk <= 0:
+            return 0.0
+
+        if legacy_notional or not entry_price or not stop_loss:
+            # Convert remaining risk dollars to lots via crude notional proxy
+            return remaining_risk / 1000.0
+
+        spec = get_symbol_spec(symbol)
+        sl_dist = abs(float(entry_price) - float(stop_loss))
+        if sl_dist <= 0 or spec.pip_size <= 0:
+            return 0.0
+        sl_pips = sl_dist / spec.pip_size
+        risk_per_lot = sl_pips * float(spec.pip_value)
+        if risk_per_lot <= 0:
+            return 0.0
+        return remaining_risk / risk_per_lot
+
+    def group_exposure_multiplier(
+        self,
+        *,
+        symbol: str,
+        account_equity: float,
+        entry_price: float,
+        stop_loss: float,
+        requested_lots: float,
+        open_risk_by_symbol: Optional[Dict[str, float]] = None,
+        max_group_risk_pct: float = 0.10,
+    ) -> float:
+        """Return 0..1 size multiplier from group risk headroom vs requested lots."""
+        if requested_lots <= 0:
+            return 1.0
+        allowed = self.get_max_allowed_lots_by_risk(
+            symbol=symbol,
+            account_equity=account_equity,
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            max_group_risk_pct=max_group_risk_pct,
+            open_risk_by_symbol=open_risk_by_symbol,
+        )
+        if allowed <= 0:
+            return 0.0
+        return min(1.0, allowed / requested_lots)
+
+    @staticmethod
+    def get_combined_size_multiplier(
+        *,
+        symbol: str,
+        pairwise_mult: float,
+        group_mult: float,
+        mode: str = "shadow",
+    ) -> float:
+        """Combine pairwise + group caps; shadow ignores group (logs only)."""
+        _ = symbol
+        if mode != "active":
+            return float(pairwise_mult)
+        return min(float(pairwise_mult), float(group_mult))
     
     def update_dynamic_correlations(self, symbol_data: Dict[str, 'pd.DataFrame']) -> None:
         """

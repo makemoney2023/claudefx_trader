@@ -244,6 +244,30 @@ TRADING_NEWS_GATES_ENABLED=true
 # vs cost via the counterfactual journal:
 #   GET http://YOUR_VPS_IP:8000/api/analysis/counterfactuals
 # (per-gate saved_r / missed_r / net_saved_r tallies plus recent records)
+#
+# --- Net expectancy / promotion controls (shadow-first) ---
+# ICT setup confirmation (default shadow — would-block only):
+# TRADING_ICT_CONFIRMATION_MODE=shadow
+# Correlated group risk cap (default shadow — logs only until activated):
+# TRADING_CORRELATION_GROUP_MODE=shadow
+# TRADING_CORRELATION_MAX_GROUP_RISK_PCT=0.10
+#
+# Analytics (advisory until promotion evaluator passes):
+#   GET /api/learning/hierarchical-expectancy
+#   GET /api/learning/calibration
+#   GET /api/learning/exit-policy-comparison
+#   GET /api/analysis/counterfactuals
+#
+# Promotion criteria (replay → paper → live), enforced by
+# trading_bot.backtesting.promotion.evaluate_promotion:
+#   - zero live/replay parity mismatches
+#   - >= 100 paper trades; positive paired net-expectancy bootstrap CI
+#   - profit factor + fill success not worse than baseline
+#   - max DD not materially worse; no single-symbol dependence
+#   - no unresolved data-quality gaps
+# Activate ONE independent policy at a time. Rollback: restore the previous
+# config version keyed by promotion.rollback_config_key and restart the bot.
+# Data-quality terminal gate id: market_data_quality (OHLCV validator).
 
 # CORS — set to your VPS IP or domain (see Remote Access section)
 CORS_ORIGINS=http://YOUR_VPS_IP:3000,http://localhost:3000

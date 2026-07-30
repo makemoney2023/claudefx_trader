@@ -862,10 +862,59 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
             print(f"[DEDUP] {symbol}: Repeat {trade_signal.direction} signal @ {trade_signal.entry_price or current_price:.2f} — allowing (may update pending order)", flush=True)
         
         # ============================================
-        # CORRELATION SIZE ADJUSTMENT
+        # CORRELATION SIZE ADJUSTMENT (pairwise + group risk)
         # ============================================
+        size_multiplier = 1.0
         if bot.correlation_service:
-            size_multiplier = bot.correlation_service.get_position_size_multiplier(symbol)
+            pairwise_mult = bot.correlation_service.get_position_size_multiplier(symbol)
+            group_mode = getattr(
+                settings.trading, "correlation_group_mode", "shadow"
+            ) or "shadow"
+            group_mult = 1.0
+            if group_mode in ("shadow", "active"):
+                try:
+                    _acct = await bot.mt5_client.get_account_info()
+                    _eq = float(getattr(_acct, "equity", 0) or 0) if _acct else 0.0
+                    _open_risk: dict = {}
+                    # Prefer booked risk on open positions when available
+                    for _sym, _pos in getattr(
+                        bot.correlation_service, "_open_positions", {}
+                    ).items():
+                        # Approximate: 1R risk ≈ risk_per_trade * equity when unknown
+                        _open_risk[_sym] = float(
+                            getattr(_pos, "risk_dollars", 0) or 0
+                        )
+                    group_mult = bot.correlation_service.group_exposure_multiplier(
+                        symbol=symbol,
+                        account_equity=_eq or 10_000.0,
+                        entry_price=float(
+                            trade_signal.entry_price or current_price or 0
+                        ),
+                        stop_loss=float(trade_signal.stop_loss or 0),
+                        requested_lots=1.0,  # relative headroom; combined later
+                        open_risk_by_symbol=_open_risk or None,
+                        max_group_risk_pct=float(
+                            getattr(
+                                settings.trading,
+                                "correlation_max_group_risk_pct",
+                                0.10,
+                            )
+                        ),
+                    )
+                    if group_mode == "shadow" and group_mult < 1.0:
+                        logger.info(
+                            f"[CORR-GROUP-SHADOW] {symbol}: group_mult={group_mult:.2f} "
+                            f"(not applied; mode=shadow)"
+                        )
+                except Exception as _corr_err:
+                    logger.debug(f"[CORR-GROUP] sizing skipped: {_corr_err}")
+                    group_mult = 1.0
+            size_multiplier = bot.correlation_service.get_combined_size_multiplier(
+                symbol=symbol,
+                pairwise_mult=pairwise_mult,
+                group_mult=group_mult,
+                mode=group_mode,
+            )
             if size_multiplier < 1.0:
                 logger.info(f"📊 Correlation adjustment: {symbol} size reduced to {size_multiplier*100:.0f}%")
         else:
