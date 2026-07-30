@@ -1733,6 +1733,94 @@ Total R: {review.total_r:.1f}R
             logger.warning(f"Failed to build setup stats: {e}")
             return []
 
+    async def _closed_trade_dicts(self, lookback_days: int = 180) -> List[Dict[str, Any]]:
+        """Normalize closed trades for expectancy / calibration / exit compare."""
+        cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+        async with async_session_maker() as session:
+            q = select(TradeModel).where(
+                and_(
+                    TradeModel.timestamp >= cutoff,
+                    TradeModel.exit_price.isnot(None),
+                )
+            )
+            result = await session.execute(q)
+            trades = result.scalars().all()
+
+        out: List[Dict[str, Any]] = []
+        for t in trades:
+            r = self._sanitize_r(t.r_multiple or 0)
+            slip = float(getattr(t, "slippage", 0) or 0)
+            commission = float(getattr(t, "commission", 0) or 0)
+            swap = float(getattr(t, "swap", 0) or 0)
+            # Cost in R when initial risk distance known; else 0
+            entry = float(t.entry_price or 0)
+            sl = float(t.stop_loss or 0)
+            sl_dist = abs(entry - sl) if entry and sl else 0.0
+            cost_r = 0.0
+            if sl_dist > 0:
+                cost_r = (abs(slip) + abs(commission) + abs(swap)) / sl_dist
+            fp = getattr(t, "setup_fingerprint", None) or ""
+            family = str(fp).split("|", 1)[0] if fp else (t.trade_type or "unknown")
+            out.append(
+                {
+                    "setup_fingerprint": fp or None,
+                    "family": family,
+                    "symbol": t.symbol,
+                    "session": t.session or "unknown",
+                    "regime": getattr(t, "regime", None) or "unknown",
+                    "direction": t.direction or "",
+                    "r_multiple": r,
+                    "net_r": r - cost_r,
+                    "confidence": float(t.claude_confidence or 0),
+                    "won": (t.profit_loss or 0) > 0,
+                    "entry": entry,
+                    "sl": sl,
+                    "tp": float(t.take_profit or 0),
+                    "mfe_r": float(
+                        getattr(t, "mfe_r", None)
+                        or getattr(t, "peak_r_multiple", None)
+                        or 0
+                    ),
+                    "mae_r": float(
+                        getattr(t, "mae_r", None)
+                        or abs(getattr(t, "trough_r_multiple", None) or 0)
+                    ),
+                    "realized_r": r,
+                    "cost_r": cost_r,
+                }
+            )
+        return out
+
+    async def get_hierarchical_expectancy(
+        self, lookback_days: int = 180, min_sample: int = 5
+    ) -> Dict[str, Any]:
+        from ..analysis.hierarchical_expectancy import compute_hierarchical_expectancy
+
+        trades = await self._closed_trade_dicts(lookback_days)
+        return compute_hierarchical_expectancy(trades, min_sample=min_sample)
+
+    async def get_calibration_report(
+        self, lookback_days: int = 90, min_bin: int = 5
+    ) -> Dict[str, Any]:
+        from ..analysis.calibration_metrics import compute_calibration_report
+
+        trades = await self._closed_trade_dicts(lookback_days)
+        samples = [
+            {"confidence": t["confidence"], "won": t["won"]}
+            for t in trades
+            if t.get("confidence") and t["confidence"] > 0
+        ]
+        return compute_calibration_report(samples, min_bin=min_bin)
+
+    async def get_exit_policy_comparison(
+        self, lookback_days: int = 180
+    ) -> Dict[str, Any]:
+        from ..execution.exit_policy_compare import compare_exit_policies
+
+        trades = await self._closed_trade_dicts(lookback_days)
+        usable = [t for t in trades if t.get("mfe_r") or t.get("mae_r")]
+        return compare_exit_policies(usable)
+
     async def get_reactive_levels(
         self,
         symbol: str,

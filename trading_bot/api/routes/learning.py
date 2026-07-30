@@ -465,6 +465,51 @@ async def get_gate_analytics(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/hierarchical-expectancy")
+async def get_hierarchical_expectancy(
+    lookback_days: int = Query(180, ge=1, le=730),
+    min_sample: int = Query(5, ge=1, le=50),
+):
+    """Net expectancy by setup family → symbol → session → regime → fingerprint."""
+    try:
+        service = get_learning_service()
+        return await service.get_hierarchical_expectancy(
+            lookback_days=lookback_days, min_sample=min_sample
+        )
+    except Exception as e:
+        logger.error(f"Error getting hierarchical expectancy: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/calibration")
+async def get_confidence_calibration(
+    lookback_days: int = Query(90, ge=1, le=365),
+    min_bin: int = Query(5, ge=1, le=50),
+):
+    """Reliability bins, Brier score, monotonicity for stated confidence."""
+    try:
+        service = get_learning_service()
+        return await service.get_calibration_report(
+            lookback_days=lookback_days, min_bin=min_bin
+        )
+    except Exception as e:
+        logger.error(f"Error getting calibration report: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/exit-policy-comparison")
+async def get_exit_policy_comparison(
+    lookback_days: int = Query(180, ge=1, le=730),
+):
+    """Compare exit variants using measured MFE/MAE (advisory until promotion)."""
+    try:
+        service = get_learning_service()
+        return await service.get_exit_policy_comparison(lookback_days=lookback_days)
+    except Exception as e:
+        logger.error(f"Error comparing exit policies: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.delete("/prune", dependencies=[Depends(RequireAuth())])
 async def prune_expired_knowledge():
     """
