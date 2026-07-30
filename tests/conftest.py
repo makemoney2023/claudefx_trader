@@ -2,11 +2,20 @@
 Shared test fixtures for ICT Trading Bot tests.
 """
 
+import os
 import pytest
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional
 from unittest.mock import AsyncMock, MagicMock
+
+
+# Keep tests deterministic when the local paper environment activates a
+# behavior-changing gate. Production/backend processes still load .env.local.
+from trading_bot.config import settings as _runtime_settings
+
+os.environ["TRADING_ICT_CONFIRMATION_MODE"] = "shadow"
+_runtime_settings.trading.ict_confirmation_mode = "shadow"
 
 
 # Mock classes for testing without MT5 connection

@@ -113,6 +113,11 @@ class TestDirectionalSweepCredit:
 
 
 class TestIctConfirmationShadow:
+    def test_pytest_runtime_isolated_from_paper_active_env(self):
+        from trading_bot.config import settings
+
+        assert settings.trading.ict_confirmation_mode == "shadow"
+
     def test_reversal_missing_sweep_would_block_shadow(self):
         from trading_bot.services.entry_gates import evaluate_ict_confirmation_gate
         from trading_bot.services.setup_fingerprint import SetupFingerprint

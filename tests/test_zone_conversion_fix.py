@@ -81,11 +81,11 @@ class TestRebaseSlTp:
 
 
 class TestRunnerUsesFixedConversion:
-    def test_runner_no_longer_uses_inverted_ote_fields(self):
+    def test_shared_gate_no_longer_uses_inverted_ote_fields(self):
         import inspect
-        from trading_bot.services import analyze_and_trade_runner
+        from trading_bot.services import parity_gates
 
-        src = inspect.getsource(analyze_and_trade_runner)
+        src = inspect.getsource(parity_gates)
         # The raw premium-side fields must not be used for entry conversion.
         assert "pd_analysis.ote_low" not in src
         assert "pd_analysis.ote_high" not in src
