@@ -45,6 +45,31 @@ def _now_after(df: pd.DataFrame, minutes: int = 5) -> datetime:
     return last + timedelta(minutes=minutes)
 
 
+def _m15_bars_with_recurring_daily_gap(n: int = 200) -> pd.DataFrame:
+    """Build M15 bars with a broker maintenance closure at 03:00 UTC daily."""
+    start = datetime(2026, 7, 27, 0, 0, tzinfo=timezone.utc)
+    times = []
+    current = start
+    while len(times) < n:
+        if current.hour != 3:
+            times.append(current)
+        current += timedelta(minutes=15)
+
+    rows = []
+    for i in range(n):
+        price = 2000.0 + i
+        rows.append(
+            {
+                "open": price,
+                "high": price + 1.0,
+                "low": price - 1.0,
+                "close": price + 0.5,
+                "volume": 100,
+            }
+        )
+    return pd.DataFrame(rows, index=pd.DatetimeIndex(times, name="time"))
+
+
 class TestValidateOhlcv:
     def test_clean_frame_passes(self):
         from trading_bot.mt5.ohlcv_quality import validate_ohlcv
@@ -132,6 +157,17 @@ class TestValidateOhlcv:
         )
         assert result.valid is False
         assert result.gate_id == "gap"
+
+    def test_recurring_broker_specific_xau_maintenance_gaps_pass(self):
+        from trading_bot.mt5.ohlcv_quality import validate_ohlcv
+
+        # The broker's closure need not match a universal market clock. Three
+        # equal gaps at the same UTC time establish a repeated daily schedule.
+        df = _m15_bars_with_recurring_daily_gap()
+        result = validate_ohlcv(
+            df, symbol="XAUUSD", timeframe="M15", expected_count=200, now=_now_after(df)
+        )
+        assert result.valid is True
 
     def test_nan_fails(self):
         from trading_bot.mt5.ohlcv_quality import validate_ohlcv

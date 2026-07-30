@@ -103,6 +103,59 @@ def _is_expected_metals_rollover_gap(
     return False
 
 
+def _recurring_metals_maintenance_gaps(
+    *, symbol: str, gaps: pd.Series
+) -> set[pd.Timestamp]:
+    """Identify a broker's repeated daily metals closure from bar history."""
+    from trading_bot.config import get_symbol_spec
+
+    if get_symbol_spec(symbol).category != "metal" or len(gaps) < 3:
+        return set()
+
+    max_gap = pd.Timedelta(hours=_METALS_ROLLOVER_MAX_HOURS)
+    duration_tolerance = pd.Timedelta(minutes=30)
+    time_tolerance_minutes = 30
+    recognized: set[pd.Timestamp] = set()
+
+    def _utc_timestamp(value: pd.Timestamp) -> pd.Timestamp:
+        timestamp = pd.Timestamp(value)
+        if timestamp.tzinfo is None:
+            return timestamp.tz_localize("UTC")
+        return timestamp.tz_convert("UTC")
+
+    def _minute_of_day(value: pd.Timestamp) -> int:
+        utc_value = _utc_timestamp(value)
+        return utc_value.hour * 60 + utc_value.minute
+
+    for timestamp, duration in gaps.items():
+        if duration > max_gap:
+            continue
+
+        target_minute = _minute_of_day(timestamp)
+        matching_dates = set()
+        matching_timestamps = []
+        for other_timestamp, other_duration in gaps.items():
+            if other_duration > max_gap or abs(other_duration - duration) > duration_tolerance:
+                continue
+
+            other_minute = _minute_of_day(other_timestamp)
+            minute_difference = abs(other_minute - target_minute)
+            circular_difference = min(minute_difference, 1440 - minute_difference)
+            if circular_difference > time_tolerance_minutes:
+                continue
+
+            other_utc = _utc_timestamp(other_timestamp)
+            matching_dates.add(other_utc.date())
+            matching_timestamps.append(other_timestamp)
+
+        if len(matching_dates) >= 3:
+            date_span = max(matching_dates) - min(matching_dates)
+            if date_span <= timedelta(days=4):
+                recognized.update(matching_timestamps)
+
+    return recognized
+
+
 def validate_ohlcv(
     df: Optional[pd.DataFrame],
     *,
@@ -209,12 +262,18 @@ def validate_ohlcv(
                     (deltas > median * _GAP_CORRUPTION_MULT)
                     & (deltas < pd.Timedelta(hours=_SESSION_BREAK_HOURS))
                 ]
+                recurring_maintenance = _recurring_metals_maintenance_gaps(
+                    symbol=symbol, gaps=possible_corrupt
+                )
                 corrupt = possible_corrupt[
                     [
-                        not _is_expected_metals_rollover_gap(
-                            symbol=symbol,
-                            previous_bar=df.index[df.index.get_loc(timestamp) - 1],
-                            current_bar=timestamp,
+                        (
+                            timestamp not in recurring_maintenance
+                            and not _is_expected_metals_rollover_gap(
+                                symbol=symbol,
+                                previous_bar=df.index[df.index.get_loc(timestamp) - 1],
+                                current_bar=timestamp,
+                            )
                         )
                         for timestamp in possible_corrupt.index
                     ]
