@@ -6,7 +6,7 @@ from trading_bot.services.entry_gates import (
     ZoneGateSettings,
     evaluate_amd_distribution_gate,
     evaluate_confluence_gate,
-    evaluate_legacy_d1_gate,
+    evaluate_direction_alignment_gate,
     evaluate_post_cooldown_gate,
     evaluate_tod_gate,
     evaluate_volatile_regime_gate,
@@ -152,25 +152,31 @@ class TestAmdDistributionGate:
         assert outcome.confidence_cap == 0.60
 
 
-class TestLegacyD1Gate:
+class TestDirectionAlignmentGateBasics:
+    """Consolidated direction gate (replaced the legacy D1 gate)."""
+
     def test_blocks_counter_d1_weak_setup(self):
-        blocked, reason = evaluate_legacy_d1_gate(
+        ctx = TradeContext(
+            symbol="EURUSD",
             direction="short",
             confidence=0.55,
             actual_rr=2.0,
             d1_bias="bullish",
         )
-        assert blocked is True
-        assert "DIRECTION-GATE" in reason
+        outcome = evaluate_direction_alignment_gate(ctx)
+        assert outcome.blocked is True
+        assert outcome.gate_id == "direction_alignment"
 
     def test_allows_counter_d1_at_60_with_rr(self):
-        blocked, _ = evaluate_legacy_d1_gate(
+        ctx = TradeContext(
+            symbol="EURUSD",
             direction="short",
             confidence=0.60,
             actual_rr=3.0,
             d1_bias="bullish",
         )
-        assert blocked is False
+        outcome = evaluate_direction_alignment_gate(ctx)
+        assert outcome.blocked is False
 
 
 class TestTodGate:

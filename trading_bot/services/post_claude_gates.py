@@ -168,17 +168,15 @@ def evaluate_rr_hard_floor(
     return None
 
 
-def evaluate_counter_trend_scalp(
+def is_counter_trend_scalp_signal(
     *,
     trade_type: str,
     d1_bias: str,
     direction: str,
-    confidence: float,
-    actual_rr: float,
-    trade_signal: Any,
-    counter_trend_rr_floor: float,
-) -> Tuple[bool, float, Optional[GateOutcome]]:
-    is_counter = (
+) -> bool:
+    """Flag only — enforcement (0.70 cap + RR floor) lives in the pipeline's
+    evaluate_direction_alignment_gate."""
+    return (
         trade_type == "scalp"
         and d1_bias in ("bullish", "bearish")
         and (
@@ -186,27 +184,6 @@ def evaluate_counter_trend_scalp(
             or (d1_bias == "bearish" and direction == "long")
         )
     )
-    if not is_counter:
-        return False, confidence, None
-
-    if confidence > 0.70:
-        confidence = 0.70
-        trade_signal.confidence = confidence
-
-    if actual_rr < counter_trend_rr_floor:
-        return (
-            True,
-            confidence,
-            GateOutcome.block(
-                gate_id="counter_trend_scalp_rr",
-                reason=(
-                    f"Counter-D1-trend scalp R:R {actual_rr:.2f}:1 "
-                    f"below {counter_trend_rr_floor:.1f}:1 minimum"
-                ),
-                stage="counter_trend_scalp",
-            ),
-        )
-    return True, confidence, None
 
 
 def resolve_session_at_time(
@@ -450,38 +427,11 @@ def _run_price_gates(
         )
 
     d1_bias = (inp.market_data.get("d1_bias") or "").lower()
-    is_counter, confidence, counter_block = evaluate_counter_trend_scalp(
+    is_counter = is_counter_trend_scalp_signal(
         trade_type=trade_type,
         d1_bias=d1_bias,
         direction=direction,
-        confidence=signal.confidence,
-        actual_rr=actual_rr,
-        trade_signal=signal,
-        counter_trend_rr_floor=cfg.counter_trend_rr_floor,
     )
-    if counter_block is not None:
-        gate_path.append("counter_trend_scalp")
-        return (
-            _blocked_result(
-                counter_block,
-                entry=entry,
-                sl=sl,
-                tp=tp,
-                direction=direction,
-                confidence=confidence,
-                gate_path=gate_path,
-                actual_rr=actual_rr,
-                min_rr=min_rr,
-                is_counter_trend_scalp=is_counter,
-            ),
-            entry,
-            sl,
-            tp,
-            direction,
-            actual_rr,
-            is_counter,
-            confidence_components,
-        )
 
     if inp.apply_secondary_modifiers and inp.modifier_input is not None:
         mi = inp.modifier_input
@@ -608,6 +558,7 @@ def run_post_claude_gates(
             session_name=session_name,
             is_kill_zone=is_kill,
             asian_penalty=cfg.asian_penalty,
+            scalp_rr_floor=cfg.counter_trend_rr_floor,
         )
         path.extend(pipeline_ctx.gate_path)
         signal.confidence = pipeline_ctx.confidence

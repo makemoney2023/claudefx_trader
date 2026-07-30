@@ -16,8 +16,8 @@ from trading_bot.services.post_claude_gates import (
     apply_atr_sl_adjustment,
     build_reject_details,
     compute_actual_rr,
-    evaluate_counter_trend_scalp,
     evaluate_rr_hard_floor,
+    is_counter_trend_scalp_signal,
     resolve_min_rr,
     resolve_session_at_time,
     run_post_claude_gates,
@@ -83,20 +83,29 @@ class TestPriceGates:
         block = evaluate_rr_hard_floor(1.6, min_rr=2.0, is_aggressive=False)
         assert block is None
 
-    def test_counter_trend_scalp_blocks_low_rr(self):
-        sig = _signal(direction="short", confidence=0.75)
-        is_counter, conf, block = evaluate_counter_trend_scalp(
-            trade_type="scalp",
-            d1_bias="bullish",
+    def test_counter_trend_scalp_flag_and_pipeline_block(self):
+        """Flag detection stays in post-Claude; enforcement moved to the
+        pipeline's direction-alignment gate."""
+        assert is_counter_trend_scalp_signal(
+            trade_type="scalp", d1_bias="bullish", direction="short",
+        ) is True
+        assert is_counter_trend_scalp_signal(
+            trade_type="intraday", d1_bias="bullish", direction="short",
+        ) is False
+
+        from trading_bot.services.entry_gates import evaluate_direction_alignment_gate
+
+        ctx = TradeContext(
+            symbol="EURUSD",
             direction="short",
             confidence=0.75,
             actual_rr=1.5,
-            trade_signal=sig,
-            counter_trend_rr_floor=2.0,
+            d1_bias="bullish",
+            trade_type="scalp",
         )
-        assert is_counter is True
-        assert conf == 0.70
-        assert block is not None
+        outcome = evaluate_direction_alignment_gate(ctx, scalp_rr_floor=2.0)
+        assert outcome.blocked is True
+        assert outcome.gate_id == "direction_alignment"
 
 
 class TestSessionResolution:

@@ -837,3 +837,302 @@ class TestDefensiveHalt:
             setup_grade="B", confidence=0.70, daily_trades=0, scaling_manager=mgr,
         )
         assert outcome.blocked is True
+
+
+# =============================================================================
+# Phase 6: Direction-gate consolidation
+# =============================================================================
+
+def _dir_ctx(
+    *,
+    direction="long",
+    d1="",
+    h4="",
+    m15="",
+    confidence=0.65,
+    rr=3.5,
+    trade_type="intraday",
+    is_index=False,
+    retrace=None,
+    zone="equilibrium",
+):
+    """Minimal TradeContext for direction-gate tests."""
+    from trading_bot.services.trade_context import TradeContext
+
+    pd_analysis = None
+    if retrace is not None:
+        pd_analysis = SimpleNamespace(
+            retracement_percent=retrace,
+            current_zone=SimpleNamespace(value=zone),
+        )
+    return TradeContext(
+        symbol="XAUUSD",
+        direction=direction,
+        confidence=confidence,
+        actual_rr=rr,
+        d1_bias=d1,
+        h4_bias=h4,
+        m15_bias=m15,
+        trade_type=trade_type,
+        is_index=is_index,
+        pd_analysis=pd_analysis,
+        trade_signal=SimpleNamespace(confidence=confidence),
+    )
+
+
+class TestDirectionAlignmentGate:
+    """One gate owns the direction-vs-D1 policy."""
+
+    def test_counter_d1_nonscalp_low_rr_blocks(self):
+        from trading_bot.services.entry_gates import evaluate_direction_alignment_gate
+
+        ctx = _dir_ctx(direction="long", d1="bearish", confidence=0.65, rr=2.5)
+        out = evaluate_direction_alignment_gate(ctx)
+        assert out.blocked is True
+        assert out.gate_id == "direction_alignment"
+
+    def test_counter_d1_nonscalp_quality_passes(self):
+        from trading_bot.services.entry_gates import evaluate_direction_alignment_gate
+
+        ctx = _dir_ctx(direction="long", d1="bearish", confidence=0.65, rr=3.5)
+        out = evaluate_direction_alignment_gate(ctx)
+        assert out.blocked is False
+
+    def test_counter_d1_scalp_rr_floor(self):
+        from trading_bot.services.entry_gates import evaluate_direction_alignment_gate
+
+        ctx = _dir_ctx(
+            direction="short", d1="bullish", trade_type="scalp",
+            confidence=0.68, rr=2.0,
+        )
+        out = evaluate_direction_alignment_gate(ctx, scalp_rr_floor=2.5)
+        assert out.blocked is True
+        assert out.gate_id == "direction_alignment"
+
+    def test_counter_d1_scalp_caps_confidence(self):
+        from trading_bot.services.entry_gates import evaluate_direction_alignment_gate
+
+        ctx = _dir_ctx(
+            direction="short", d1="bullish", trade_type="scalp",
+            confidence=0.85, rr=3.0,
+        )
+        out = evaluate_direction_alignment_gate(ctx, scalp_rr_floor=2.5)
+        assert out.blocked is False
+        assert out.confidence_cap == 0.70
+
+    def test_aligned_passes(self):
+        from trading_bot.services.entry_gates import evaluate_direction_alignment_gate
+
+        ctx = _dir_ctx(direction="long", d1="bullish", confidence=0.55, rr=1.5)
+        out = evaluate_direction_alignment_gate(ctx)
+        assert out.blocked is False
+
+    def test_neutral_d1_passes(self):
+        from trading_bot.services.entry_gates import evaluate_direction_alignment_gate
+
+        ctx = _dir_ctx(direction="long", d1="", confidence=0.55, rr=1.5)
+        out = evaluate_direction_alignment_gate(ctx)
+        assert out.blocked is False
+
+    def test_index_without_d1_support_needs_quality(self):
+        from trading_bot.services.entry_gates import evaluate_direction_alignment_gate
+
+        weak = _dir_ctx(
+            direction="long", d1="", is_index=True, retrace=0.3,
+            confidence=0.55, rr=2.5,
+        )
+        assert evaluate_direction_alignment_gate(weak).blocked is True
+
+        strong = _dir_ctx(
+            direction="long", d1="", is_index=True, retrace=0.3,
+            confidence=0.65, rr=2.5,
+        )
+        assert evaluate_direction_alignment_gate(strong).blocked is False
+
+
+class TestZoneGatePureLocation:
+    """Zone gate keeps location logic only; D1 policy moved out."""
+
+    def test_counter_d1_from_discount_not_blocked_by_zone_gate(self):
+        from trading_bot.services.entry_gates import (
+            ZoneGateSettings, evaluate_zone_gate,
+        )
+
+        res = evaluate_zone_gate(
+            direction="long",
+            confidence=0.55,
+            actual_rr=1.5,
+            retrace=0.3,
+            zone_str="discount",
+            d1_bias="bearish",  # ignored: direction policy lives elsewhere
+            is_index=False,
+            settings=ZoneGateSettings(),
+            symbol="XAUUSD",
+        )
+        assert res.blocked is False
+        assert res.decision == "allowed_zone_aligned"
+
+    def test_misaligned_location_still_blocks(self):
+        from trading_bot.services.entry_gates import (
+            ZoneGateSettings, evaluate_zone_gate,
+        )
+
+        res = evaluate_zone_gate(
+            direction="long",
+            confidence=0.55,
+            actual_rr=1.5,
+            retrace=0.8,
+            zone_str="premium",
+            d1_bias="",
+            is_index=False,
+            settings=ZoneGateSettings(),
+            symbol="XAUUSD",
+        )
+        assert res.blocked is True
+        assert res.decision == "blocked_misaligned"
+
+
+class TestDirectionGatePipelineWiring:
+    def test_zone_inactive_counter_d1_blocks_via_direction_gate(self):
+        from trading_bot.services.entry_gates import ZoneGateSettings
+        from trading_bot.services.gate_pipeline import evaluate_zone_and_regime_gates
+
+        ctx = _dir_ctx(direction="long", d1="bearish", confidence=0.65, rr=2.0)
+        out = evaluate_zone_and_regime_gates(
+            ctx,
+            zone_settings=ZoneGateSettings(gate_mode="disabled"),
+            use_zone_gate=False,
+        )
+        assert out.blocked is True
+        assert out.gate_id == "direction_alignment"
+
+    def test_legacy_d1_gate_gone_from_pipeline(self):
+        import inspect
+        from trading_bot.services import gate_pipeline
+
+        src = inspect.getsource(gate_pipeline)
+        assert "evaluate_legacy_d1_gate" not in src
+
+    def test_post_claude_counter_trend_block_removed(self):
+        import inspect
+        from trading_bot.services import post_claude_gates
+
+        src = inspect.getsource(post_claude_gates)
+        assert "counter_trend_scalp_rr" not in src
+
+
+class TestDirectionGateParity:
+    """Old five-place direction stack vs new consolidated stack.
+
+    Contract: the new stack is never MORE permissive than the old one.
+    Where it is stricter, the divergence must fall in the documented
+    category: counter-D1 non-scalp trades now uniformly need 3:1 RR
+    (the legacy-D1 standard) even when the zone gate is active.
+    """
+
+    @staticmethod
+    def _old_blocked(direction, d1, trade_type, conf, rr, retrace, is_index):
+        """Replica of the pre-consolidation composite (zone gate active)."""
+        opposes = (
+            (d1 == "bullish" and direction == "short")
+            or (d1 == "bearish" and direction == "long")
+        )
+        is_counter_scalp = trade_type == "scalp" and opposes
+        if is_counter_scalp:
+            # post-Claude scalp check; zone gate was skipped for these
+            return rr < 2.5
+
+        in_correct_zone = (
+            (direction == "short" and retrace >= 0.5)
+            or (direction == "long" and retrace <= 0.5)
+        )
+        counter_trend = opposes
+        index_counter = False
+        if is_index and in_correct_zone:
+            index_counter = (
+                (direction == "short" and d1 != "bearish")
+                or (direction == "long" and d1 != "bullish")
+            )
+        if in_correct_zone and (counter_trend or index_counter) and is_index:
+            zone_aligned, zone_misaligned = False, True
+        elif in_correct_zone and counter_trend:
+            zone_aligned, zone_misaligned = False, False
+        else:
+            zone_aligned = in_correct_zone
+            zone_misaligned = (
+                (direction == "long" and retrace >= 0.618)
+                or (direction == "short" and retrace <= 0.382)
+            )
+        if zone_misaligned:
+            return conf < 0.60 or rr < 2.0
+        if not zone_aligned:
+            return conf < 0.60
+        return False
+
+    @staticmethod
+    def _new_blocked(direction, d1, trade_type, conf, rr, retrace, is_index):
+        from trading_bot.services.entry_gates import (
+            ZoneGateSettings,
+            evaluate_direction_alignment_gate,
+            evaluate_zone_gate,
+        )
+
+        ctx = _dir_ctx(
+            direction=direction, d1=d1, trade_type=trade_type,
+            confidence=conf, rr=rr, is_index=is_index, retrace=retrace,
+        )
+        out = evaluate_direction_alignment_gate(ctx, scalp_rr_floor=2.5)
+        if out.blocked:
+            return True
+        opposes = (
+            (d1 == "bullish" and direction == "short")
+            or (d1 == "bearish" and direction == "long")
+        )
+        if trade_type == "scalp" and opposes:
+            return False  # zone gate still skipped for counter scalps
+        res = evaluate_zone_gate(
+            direction=direction,
+            confidence=conf,
+            actual_rr=rr,
+            retrace=retrace,
+            zone_str="grid",
+            d1_bias=d1,
+            is_index=is_index,
+            settings=ZoneGateSettings(),
+            symbol="XAUUSD",
+        )
+        return res.blocked
+
+    def test_new_stack_never_more_permissive(self):
+        import itertools
+
+        grid = itertools.product(
+            ("long", "short"),
+            ("bullish", "bearish", ""),
+            ("scalp", "intraday"),
+            (0.55, 0.65, 0.80),
+            (1.5, 2.2, 2.7, 3.5),
+            (0.2, 0.5, 0.7, 0.8),
+            (False, True),
+        )
+        divergences = []
+        for direction, d1, ttype, conf, rr, retrace, is_index in grid:
+            old = self._old_blocked(direction, d1, ttype, conf, rr, retrace, is_index)
+            new = self._new_blocked(direction, d1, ttype, conf, rr, retrace, is_index)
+            if old and not new:
+                pytest.fail(
+                    f"New stack MORE permissive: {direction} d1={d1} {ttype} "
+                    f"conf={conf} rr={rr} retrace={retrace} index={is_index}"
+                )
+            if new and not old:
+                divergences.append((direction, d1, ttype, conf, rr, retrace, is_index))
+
+        for direction, d1, ttype, conf, rr, retrace, is_index in divergences:
+            opposes = (
+                (d1 == "bullish" and direction == "short")
+                or (d1 == "bearish" and direction == "long")
+            )
+            assert opposes and ttype != "scalp" and rr < 3.0, (
+                f"Undocumented divergence: {direction} d1={d1} {ttype} "
+                f"conf={conf} rr={rr} retrace={retrace} index={is_index}"
+            )

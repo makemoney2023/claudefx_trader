@@ -61,36 +61,20 @@ def evaluate_zone_gate(
     if symbol in settings.disabled_symbols:
         return ZoneGateResult(blocked=False, decision="symbol_disabled")
 
+    # Pure location logic. Direction-vs-D1 policy (counter-trend, index
+    # confirmation) lives in evaluate_direction_alignment_gate; the d1_bias
+    # and is_index parameters are retained only for call-site compatibility.
     _dir = direction.lower()
-    _d1 = (d1_bias or "").lower()
 
     in_correct_zone = (
         (_dir == "short" and retrace >= 0.5)
         or (_dir == "long" and retrace <= 0.5)
     )
-    counter_trend = (
-        (_d1 == "bullish" and _dir == "short")
-        or (_d1 == "bearish" and _dir == "long")
+    zone_aligned = in_correct_zone
+    zone_misaligned = (
+        (_dir == "long" and retrace >= 0.618)
+        or (_dir == "short" and retrace <= 0.382)
     )
-    index_counter = False
-    if is_index and in_correct_zone:
-        index_counter = (
-            (_dir == "short" and _d1 != "bearish")
-            or (_dir == "long" and _d1 != "bullish")
-        )
-
-    if in_correct_zone and (counter_trend or index_counter) and is_index:
-        zone_aligned = False
-        zone_misaligned = True
-    elif in_correct_zone and counter_trend:
-        zone_aligned = False
-        zone_misaligned = False
-    else:
-        zone_aligned = in_correct_zone
-        zone_misaligned = (
-            (_dir == "long" and retrace >= 0.618)
-            or (_dir == "short" and retrace <= 0.382)
-        )
 
     blocked = False
     decision = "allowed_zone_aligned"
@@ -128,31 +112,82 @@ def evaluate_zone_gate(
     return ZoneGateResult(blocked=blocked, decision=decision, reason=reason)
 
 
-def evaluate_legacy_d1_gate(
+def evaluate_direction_alignment_gate(
+    ctx: "TradeContext",
     *,
-    direction: str,
-    confidence: float,
-    actual_rr: float,
-    d1_bias: str,
-    min_confidence: float = 0.60,
-    min_rr: float = 3.0,
-) -> Tuple[bool, str]:
-    """Legacy counter-D1 gate when zone gate is inactive."""
-    _dir = direction.lower()
-    _d1 = (d1_bias or "").lower()
-    is_counter = _d1 in ("bullish", "bearish") and (
+    scalp_rr_floor: float = 2.5,
+) -> GateOutcome:
+    """Single source of truth for direction-vs-D1 policy.
+
+    Consolidates what used to live in five places: the legacy D1 gate, the
+    zone gate's counter-trend and index-counter branches, and the
+    post-Claude counter-trend-scalp cap + RR floor.
+
+    Policy:
+    - Aligned or neutral D1: pass (indices additionally need D1 support or
+      60% conf + 2:1 RR when entering from the correct zone).
+    - Counter-D1 scalp: confidence capped at 0.70, R:R must clear
+      ``scalp_rr_floor``.
+    - Counter-D1 non-scalp: needs 60% confidence + 3:1 R:R (the legacy-D1
+      standard, now applied uniformly whether or not the zone gate is on).
+    """
+    _dir = ctx.direction
+    _d1 = ctx.d1_bias
+    counter_d1 = _d1 in ("bullish", "bearish") and (
         (_d1 == "bullish" and _dir == "short")
         or (_d1 == "bearish" and _dir == "long")
     )
-    if not is_counter:
-        return False, ""
-    if confidence < min_confidence or actual_rr < min_rr:
-        return True, (
-            f"DIRECTION-GATE {direction.upper()} vs D1 {_d1}: "
-            f"need {min_confidence:.0%} conf + {min_rr:.0f}:1 RR, "
-            f"got {confidence:.0%} / {actual_rr:.1f}:1"
+    is_scalp = "scalp" in (ctx.trade_type or "").lower()
+
+    if counter_d1:
+        if is_scalp:
+            if ctx.actual_rr < scalp_rr_floor:
+                return GateOutcome.block(
+                    gate_id="direction_alignment",
+                    reason=(
+                        f"Counter-D1 scalp {_dir.upper()} vs D1 {_d1}: R:R "
+                        f"{ctx.actual_rr:.2f}:1 below {scalp_rr_floor:.1f}:1 floor."
+                    ),
+                    stage="direction_alignment",
+                )
+            if ctx.confidence > 0.70:
+                return GateOutcome.cap_confidence(0.70, "direction_alignment_scalp_cap")
+            return GateOutcome.pass_through("direction_alignment")
+        if ctx.confidence < 0.60 or ctx.actual_rr < 3.0:
+            return GateOutcome.block(
+                gate_id="direction_alignment",
+                reason=(
+                    f"{_dir.upper()} vs D1 {_d1}: counter-trend needs 60% conf "
+                    f"+ 3:1 RR, got {ctx.confidence:.0%} / {ctx.actual_rr:.1f}:1."
+                ),
+                stage="direction_alignment",
+            )
+        return GateOutcome.pass_through("direction_alignment")
+
+    # Indices are trend instruments: entering from the "correct" zone
+    # without explicit D1 support needs quality (old index_counter rule).
+    if ctx.is_index and ctx.pd_analysis is not None:
+        retrace = ctx.pd_analysis.retracement_percent
+        in_correct_zone = (
+            (_dir == "short" and retrace >= 0.5)
+            or (_dir == "long" and retrace <= 0.5)
         )
-    return False, ""
+        d1_supports = (
+            (_d1 == "bullish" and _dir == "long")
+            or (_d1 == "bearish" and _dir == "short")
+        )
+        if in_correct_zone and not d1_supports:
+            if ctx.confidence < 0.60 or ctx.actual_rr < 2.0:
+                return GateOutcome.block(
+                    gate_id="direction_alignment",
+                    reason=(
+                        f"Index {_dir.upper()} without D1 support "
+                        f"(D1={_d1 or 'neutral'}): needs 60% conf + 2:1 RR, "
+                        f"got {ctx.confidence:.0%} / {ctx.actual_rr:.1f}:1."
+                    ),
+                    stage="direction_alignment",
+                )
+    return GateOutcome.pass_through("direction_alignment")
 
 
 def evaluate_tod_gate(

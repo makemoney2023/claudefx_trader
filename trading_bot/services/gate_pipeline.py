@@ -8,8 +8,8 @@ from .entry_gates import (
     ZoneGateSettings,
     evaluate_amd_distribution_gate,
     evaluate_confluence_gate,
+    evaluate_direction_alignment_gate,
     evaluate_htf_alignment_gate,
-    evaluate_legacy_d1_gate,
     evaluate_m15_gate,
     evaluate_off_hours_gate,
     evaluate_post_cooldown_gate,
@@ -151,8 +151,17 @@ def evaluate_zone_and_regime_gates(
     *,
     zone_settings: ZoneGateSettings,
     use_zone_gate: bool,
+    scalp_rr_floor: float = 2.5,
 ) -> GateOutcome:
     accumulated = GateOutcome.pass_through("zone_regime_start")
+
+    # Direction-vs-D1 policy: single consolidated gate (replaces legacy D1,
+    # zone-gate counter-trend branches, and post-Claude counter-scalp check).
+    dir_step = evaluate_direction_alignment_gate(ctx, scalp_rr_floor=scalp_rr_floor)
+    accumulated = _merge_outcome(accumulated, dir_step)
+    if dir_step.blocked:
+        return accumulated
+    apply_gate_outcomes(ctx, dir_step)
 
     if use_zone_gate and ctx.pd_analysis is not None:
         zg = evaluate_zone_gate(
@@ -175,19 +184,6 @@ def evaluate_zone_and_regime_gates(
             )
         if zg.shadow_only:
             accumulated.gate_path.append("zone_gate_shadow")
-    elif not ctx.is_counter_trend_scalp:
-        blocked, reason = evaluate_legacy_d1_gate(
-            direction=ctx.direction,
-            confidence=ctx.confidence,
-            actual_rr=ctx.actual_rr,
-            d1_bias=ctx.d1_bias,
-        )
-        if blocked:
-            return GateOutcome.block(
-                gate_id="legacy_d1",
-                reason=reason,
-                stage="legacy_d1_gate",
-            )
 
     blocked, reason = evaluate_volatile_regime_gate(
         regime_type=ctx.regime_type,
@@ -293,10 +289,14 @@ def evaluate_entry_gates(
     session_name: str = "",
     is_kill_zone: bool = False,
     asian_penalty: float = 0.05,
+    scalp_rr_floor: float = 2.5,
 ) -> GateOutcome:
     """Zone through confluence gates (before scaling mode refresh)."""
     zone_outcome = evaluate_zone_and_regime_gates(
-        ctx, zone_settings=zone_settings, use_zone_gate=use_zone_gate
+        ctx,
+        zone_settings=zone_settings,
+        use_zone_gate=use_zone_gate,
+        scalp_rr_floor=scalp_rr_floor,
     )
     if zone_outcome.blocked:
         ctx.gate_path.extend(zone_outcome.gate_path)
@@ -358,6 +358,7 @@ def evaluate_pre_execution_gates(
     session_name: str = "",
     is_kill_zone: bool = False,
     asian_penalty: float = 0.05,
+    scalp_rr_floor: float = 2.5,
     scaling_manager=None,
     daily_trades: int = 0,
     gate_min_confidence: float = 0.60,
@@ -371,6 +372,7 @@ def evaluate_pre_execution_gates(
         session_name=session_name,
         is_kill_zone=is_kill_zone,
         asian_penalty=asian_penalty,
+        scalp_rr_floor=scalp_rr_floor,
     )
     if entry.blocked:
         return entry
