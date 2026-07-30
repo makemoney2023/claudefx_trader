@@ -11,6 +11,7 @@ from enum import Enum
 from datetime import datetime, timezone
 
 from ..utils.logging import get_logger
+from ..services.spread_policy import MAX_SPREAD_THRESHOLDS as _SPREAD_THRESHOLDS
 
 logger = get_logger(__name__)
 
@@ -134,40 +135,8 @@ class OrderManager:
         
         logger.info("Order manager initialized")
     
-    # Maximum spread thresholds (in price units, not pips)
-    # RELAXED FOR DEMO TESTING - wider spreads allowed
-    MAX_SPREAD_THRESHOLDS = {
-        # Forex majors: ~3-5 pips (tightened for live)
-        'EURUSD': 0.0005, 'GBPUSD': 0.0005, 'AUDUSD': 0.0005,
-        'NZDUSD': 0.0005, 'USDCHF': 0.0005, 'USDCAD': 0.0005,
-        'USDJPY': 0.05,
-        # Forex crosses: ~5-8 pips (tightened for live)
-        'EURGBP': 0.0008, 'EURJPY': 0.08, 'GBPJPY': 0.08,
-        'AUDJPY': 0.08, 'EURAUD': 0.0008, 'GBPAUD': 0.0008,
-        'AUDCAD': 0.0008, 'AUDCHF': 0.0008, 'EURCHF': 0.0008,
-        'EURCAD': 0.0008, 'EURNZD': 0.0008, 'GBPCAD': 0.0008,
-        'GBPCHF': 0.0008, 'GBPNZD': 0.0008, 'NZDJPY': 0.08,
-        'NZDCAD': 0.0008, 'NZDCHF': 0.0008, 'CADJPY': 0.08,
-        'CADCHF': 0.0008, 'CHFJPY': 0.08,
-        # Metals (tightened for live)
-        'XAUUSD': 0.80,   # Gold: max $0.80 spread
-        'XAGUSD': 0.08,   # Silver: max $0.08 spread
-        # Oil / Energy
-        'USOIL': 0.10,    # WTI Crude: max $0.10 spread
-        'WTIUSD': 0.10,
-        'XTIUSD': 0.10,
-        'BRENT': 0.10,
-        'UKOIL': 0.10,
-        'XBRUSD': 0.10,
-        # Indices
-        'US30': 5.0,      # Dow Jones: max 5 points spread
-        'DJ30': 5.0,
-        'NAS100': 3.0,    # Nasdaq 100: max 3 points spread
-        'USTEC': 3.0,
-        'US500': 1.5,     # S&P 500: max 1.5 points spread
-        'SP500': 1.5,
-    }
-    
+    MAX_SPREAD_THRESHOLDS = _SPREAD_THRESHOLDS
+
     async def _check_spread(self, symbol: str) -> tuple:
         """
         Check if current spread is acceptable for trading.
@@ -175,13 +144,28 @@ class OrderManager:
         Returns:
             (is_acceptable, current_spread, max_spread)
         """
+        from ..services.spread_policy import evaluate_spread_state
+        from ..config import settings
+
+        live_mode = not bool(getattr(settings.trading, "dry_run", False)) and not bool(
+            getattr(settings.mt5, "allow_simulation_trades", False)
+            if hasattr(settings, "mt5")
+            else False
+        )
+
         if not self.mt5_client:
-            return True, 0, 0  # Can't check, allow through
+            state = evaluate_spread_state(
+                symbol, spread=None, unavailable=True, live_mode=live_mode
+            )
+            return state.allows_trading, 0, 0
         
         try:
             symbol_info = await self.mt5_client.get_symbol_info(symbol)
             if not symbol_info:
-                return True, 0, 0
+                state = evaluate_spread_state(
+                    symbol, spread=None, unavailable=True, live_mode=live_mode
+                )
+                return state.allows_trading, 0, 0
             
             current_spread = getattr(symbol_info, 'spread', 0) or 0
             ask = getattr(symbol_info, 'ask', 0) or 0
@@ -189,34 +173,28 @@ class OrderManager:
             
             if ask and bid:
                 spread_price = ask - bid
+                mid = (ask + bid) / 2
             else:
                 point = getattr(symbol_info, 'point', 0.00001) or 0.00001
                 spread_price = current_spread * point
-            
-            # Get max threshold
-            symbol_upper = symbol.upper()
-            max_spread = self.MAX_SPREAD_THRESHOLDS.get(symbol_upper)
-            
-            if max_spread is None:
-                # Crypto: max 0.5% of price
-                if any(c in symbol_upper for c in ['BTC', 'ETH', 'XRP', 'ADA', 'LTC', 'DOGE', 'SOL', 'DOT', 'DASH']):
-                    mid_price = (ask + bid) / 2 if ask and bid else 1.0
-                    max_spread = mid_price * 0.005  # 0.5%
-                else:
-                    max_spread = 0.0005  # Default: 5 pips
-            
-            is_acceptable = spread_price <= max_spread
-            
-            if not is_acceptable:
-                logger.warning(
-                    f"SPREAD TOO WIDE for {symbol}: {spread_price:.5f} > max {max_spread:.5f}"
-                )
-            
-            return is_acceptable, spread_price, max_spread
+                mid = 0.0
+
+            state = evaluate_spread_state(
+                symbol,
+                spread=spread_price,
+                mid_price=mid,
+                live_mode=live_mode,
+            )
+            if not state.allows_trading:
+                logger.warning(f"SPREAD BLOCK {symbol}: {state.reason}")
+            return state.allows_trading, spread_price, state.max_spread
             
         except Exception as e:
             logger.warning(f"Could not check spread for {symbol}: {e}")
-            return True, 0, 999  # Allow trade if spread can't be verified (demo mode)
+            state = evaluate_spread_state(
+                symbol, spread=None, unavailable=True, live_mode=live_mode
+            )
+            return state.allows_trading, 0, 999
     
     def set_mt5_client(self, client):
         """Set the MT5 client."""

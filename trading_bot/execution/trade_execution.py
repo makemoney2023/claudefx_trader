@@ -308,6 +308,36 @@ class ExecutionCoordinator:
                         f"{trade_signal.stop_loss:.5f} -> {adjusted:.5f}"
                     )
                     final_sl = adjusted
+                # Re-check net R:R after SL widening
+                from ..services.net_rr import compute_net_rr, evaluate_net_rr_floor
+                from ..services.post_claude_gates import resolve_min_rr
+
+                _net = compute_net_rr(
+                    entry=trade_signal.entry_price or current_price,
+                    sl=final_sl or 0.0,
+                    tp=final_tp or 0.0,
+                    symbol=symbol,
+                    spread=spread,
+                )
+                _min_rr = resolve_min_rr(
+                    symbol, getattr(trade_signal, "trade_type", "intraday") or "intraday"
+                )
+                _net_block = evaluate_net_rr_floor(_net.net_rr, _min_rr)
+                if _net_block is not None:
+                    logger.warning(
+                        f"[NET-RR] {symbol}: blocked after spread SL widen — "
+                        f"{_net_block.reason}"
+                    )
+                    return ExecutionResult(
+                        blocked=True,
+                        gate_id="net_rr_floor",
+                        reason=_net_block.reason,
+                        order_type=order_type,
+                        entry_price=entry_price,
+                        final_sl=final_sl or 0.0,
+                        final_tp=final_tp or 0.0,
+                        final_entry=trade_signal.entry_price or current_price,
+                    )
         except Exception as exc:
             logger.debug(f"[SPREAD-BUF] Could not adjust SL for spread: {exc}")
 

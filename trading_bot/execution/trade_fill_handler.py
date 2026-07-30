@@ -112,6 +112,48 @@ class TradeFillHandler:
             
             logger.info(f"✓ Trade executed: {trade_signal.direction.upper()} {symbol}")
             logger.info(f"  Ticket: {result.ticket}, Fill Price: {result.fill_price}")
+
+            # Partial-fill policy + broker SL/TP drift check
+            from .fill_validation import evaluate_partial_fill, validate_broker_protections
+
+            _req_lots = float(getattr(position_size, "lots", 0) or 0)
+            _fill_lots = float(getattr(result, "fill_volume", 0) or _req_lots)
+            if getattr(result, "partial_fill", False) or (
+                _req_lots > 0 and _fill_lots > 0 and _fill_lots + 1e-9 < _req_lots
+            ):
+                _pf = evaluate_partial_fill(
+                    requested_lots=_req_lots, filled_lots=_fill_lots
+                )
+                if not _pf.accept:
+                    logger.error(f"[PARTIAL-FILL] {symbol}: {_pf.reason}")
+                    await bot._record_terminal_decision(
+                        "execution_failure",
+                        symbol,
+                        direction=trade_signal.direction,
+                        entry=result.fill_price or current_price,
+                        sl=final_sl or 0.0,
+                        tp=final_tp or 0.0,
+                        confidence=trade_signal.confidence,
+                        reason=_pf.reason,
+                        details={"gate_id": _pf.gate_id},
+                    )
+                    return
+
+            _prot = validate_broker_protections(
+                direction=trade_signal.direction,
+                intended_sl=final_sl or trade_signal.stop_loss or 0.0,
+                intended_tp=final_tp or trade_signal.take_profit or 0.0,
+                broker_sl=getattr(result, "broker_sl", None),
+                broker_tp=getattr(result, "broker_tp", None),
+                tolerance_price=abs(
+                    (final_sl or trade_signal.stop_loss or 0.0)
+                    - (trade_signal.entry_price or current_price or 0.0)
+                ) * 0.05
+                if (final_sl or trade_signal.stop_loss)
+                else 0.0,
+            )
+            if not _prot.ok:
+                logger.warning(f"[PROTECTION] {symbol}: {_prot.reason}")
             
             # Gap 57: Verify order actually exists in MT5
             # Only verify for market orders — pending orders won't appear in positions yet

@@ -240,6 +240,46 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
             if bot_state:
                 bot_state.symbol_complete(symbol, "bad_data")
             return
+
+        # Early spread gate — fail before Claude when spread is blocked
+        try:
+            from .spread_policy import evaluate_spread_state
+
+            _spread_val = None
+            _mid = float(df["close"].iloc[-1]) if df is not None and len(df) else 0.0
+            _unavailable = True
+            if bot.mt5_client and getattr(bot.mt5_client, "is_connected", False):
+                try:
+                    _info = await bot.mt5_client.get_symbol_info(symbol)
+                    if _info and getattr(_info, "ask", 0) and getattr(_info, "bid", 0):
+                        _spread_val = float(_info.ask) - float(_info.bid)
+                        _mid = (float(_info.ask) + float(_info.bid)) / 2
+                        _unavailable = False
+                except Exception:
+                    _unavailable = True
+            _live = not bool(getattr(settings.trading, "dry_run", False))
+            _spread_state = evaluate_spread_state(
+                symbol,
+                spread=_spread_val,
+                mid_price=_mid,
+                unavailable=_unavailable,
+                live_mode=_live,
+            )
+            if not _spread_state.allows_trading:
+                logger.warning(f"[SPREAD] {symbol}: {_spread_state.reason}")
+                print(f"[SPREAD] {symbol}: BLOCKED — {_spread_state.reason}", flush=True)
+                await bot._record_terminal_decision(
+                    "mechanical_reject",
+                    symbol,
+                    gate_id="spread_block",
+                    reason=_spread_state.reason,
+                    details={"spread_state": _spread_state.state},
+                )
+                if bot_state:
+                    bot_state.symbol_complete(symbol, "spread_block")
+                return
+        except Exception as _sp_err:
+            logger.debug(f"[SPREAD] early check skipped: {_sp_err}")
         
         # Run technical analysis
         if bot_state:

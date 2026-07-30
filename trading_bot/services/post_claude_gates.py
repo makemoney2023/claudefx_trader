@@ -426,6 +426,50 @@ def _run_price_gates(
             confidence_components,
         )
 
+    # Cost-adjusted R:R (spread/commission) — shared live/replay invariant
+    from .net_rr import compute_net_rr, evaluate_net_rr_floor
+
+    _live_spread = None
+    try:
+        _spread_raw = inp.market_data.get("spread")
+        if _spread_raw is not None:
+            _live_spread = float(_spread_raw)
+    except (TypeError, ValueError):
+        _live_spread = None
+    _net = compute_net_rr(
+        entry=entry,
+        sl=sl,
+        tp=tp,
+        symbol=inp.symbol,
+        spread=_live_spread,
+    )
+    net_block = evaluate_net_rr_floor(
+        _net.net_rr, min_rr, is_aggressive=inp.is_aggressive
+    )
+    gate_path.append("net_rr_ok" if net_block is None else "net_rr_check")
+    if net_block is not None:
+        gate_path.append("net_rr_floor")
+        return (
+            _blocked_result(
+                net_block,
+                entry=entry,
+                sl=sl,
+                tp=tp,
+                direction=direction,
+                confidence=signal.confidence,
+                gate_path=gate_path,
+                actual_rr=_net.net_rr,
+                min_rr=min_rr,
+            ),
+            entry,
+            sl,
+            tp,
+            direction,
+            _net.net_rr,
+            False,
+            confidence_components,
+        )
+
     d1_bias = (inp.market_data.get("d1_bias") or "").lower()
     is_counter = is_counter_trend_scalp_signal(
         trade_type=trade_type,
