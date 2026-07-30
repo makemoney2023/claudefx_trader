@@ -228,3 +228,148 @@ class TestDegenerateReasoningGuard:
         assert result.signal.direction == "no_trade"
         assert "degenerate" in result.signal.reasoning.lower()
         client._cache.set.assert_not_called()
+
+
+# ============================================================
+# Phase 2 — pre-Claude mechanical viability filter
+# ============================================================
+
+class TestPreClaudeViability:
+    """Skip the LLM call only when the gate stack already guarantees rejection."""
+
+    def _check(self, **overrides):
+        from trading_bot.utils.win_optimization import pre_claude_viability
+
+        params = dict(
+            d1_bias="unknown",
+            h4_bias="unknown",
+            m15_bias="unknown",
+            amd_phase="unknown",
+            relative_volume=1.0,
+            in_kill_zone=False,
+            silver_bullet_window=False,
+        )
+        params.update(overrides)
+        return pre_claude_viability(**params)
+
+    def test_both_directions_structurally_blocked_skips(self):
+        """Today's live pattern: D1/H4 bearish blocks longs, M15 bullish blocks shorts."""
+        result = self._check(d1_bias="bearish", h4_bias="bearish", m15_bias="bullish")
+        assert result.proceed is False
+        assert len(result.reasons) >= 2
+
+    def test_kill_zone_overrides_skip(self):
+        result = self._check(
+            d1_bias="bearish", h4_bias="bearish", m15_bias="bullish",
+            in_kill_zone=True,
+        )
+        assert result.proceed is True
+
+    def test_silver_bullet_window_overrides_skip(self):
+        result = self._check(
+            d1_bias="bearish", h4_bias="bearish", m15_bias="bullish",
+            silver_bullet_window=True,
+        )
+        assert result.proceed is True
+
+    def test_dead_volume_alone_skips(self):
+        result = self._check(
+            d1_bias="bullish", h4_bias="bullish", m15_bias="bullish",
+            relative_volume=0.2,
+        )
+        assert result.proceed is False
+        assert any("volume" in r.lower() for r in result.reasons)
+
+    def test_low_but_tradeable_volume_proceeds(self):
+        result = self._check(
+            d1_bias="bullish", h4_bias="bullish", m15_bias="bullish",
+            relative_volume=0.6,
+        )
+        assert result.proceed is True
+
+    def test_one_direction_open_proceeds(self):
+        # Longs blocked by HTF, but M15 bearish leaves shorts fully open.
+        result = self._check(d1_bias="bearish", h4_bias="bearish", m15_bias="bearish")
+        assert result.proceed is True
+
+    def test_amd_manipulation_reopens_ltf_opposed_direction(self):
+        # M15 bullish would block shorts, but manipulation phase bypasses the
+        # M15 gate — shorts viable (HTF only blocks with BOTH D1+H4 bullish).
+        result = self._check(
+            d1_bias="bearish", h4_bias="neutral", m15_bias="bullish",
+            amd_phase="manipulation",
+        )
+        assert result.proceed is True
+
+    def test_unknown_biases_proceed(self):
+        assert self._check().proceed is True
+
+    def test_pullback_cap_counts_as_blocked(self):
+        # D1/H4 bullish + M15 bearish: long only via 0.55-capped pullback
+        # (below the 0.60 floor -> dead end), short blocked by HTF.
+        result = self._check(d1_bias="bullish", h4_bias="bullish", m15_bias="bearish")
+        assert result.proceed is False
+
+    @pytest.mark.asyncio
+    async def test_runner_skips_chart_and_claude_when_unviable(self, monkeypatch):
+        """Wiring: runner must bail before chart generation / Claude stage."""
+        from trading_bot.services.analyze_and_trade_runner import run_analyze_and_trade
+        from trading_bot.config import settings
+
+        monkeypatch.setattr(settings.trading, "claude_kill_zone_only", False)
+        monkeypatch.setattr(settings.trading, "allow_simulation_trades", False)
+
+        df = pd.DataFrame({
+            "open": [4100.0] * 30, "high": [4105.0] * 30,
+            "low": [4095.0] * 30, "close": [4100.0] * 30,
+            "volume": [100.0] * 30,
+        })
+
+        bot = MagicMock()
+        bot._symbol_loss_cooldowns = {}
+        bot._volatility_pause_until = None
+        bot.BLOCKED_PAIRS = set()
+        bot.scaling_manager = None
+        bot.mt5_client.is_simulation = False
+        bot.kill_zone_checker = MagicMock()
+        bot.kill_zone_checker.get_current_session.return_value = SimpleNamespace(
+            is_tradeable=True, is_kill_zone=False, session_name="NY Afternoon",
+            next_kill_zone=None, next_kill_zone_in_minutes=None,
+        )
+        bot.data_fetcher.get_ohlcv = AsyncMock(return_value=df)
+        bot.claude_client.api_key = "test"
+        bot._generate_chart_image = AsyncMock(return_value="chartb64")
+
+        pipeline = bot._trade_pipeline
+        pipeline.analysis.run_core_analysis.return_value = {
+            "volume": {"relative_volume": 0.6, "volume_trend": "decreasing", "spike_bars": []},
+            "amd_cycle": {"phase": "accumulation"},
+        }
+
+        # MTF: D1/H4 bearish (blocks longs), M15 bullish (blocks shorts).
+        def _tf(bias):
+            return SimpleNamespace(bias=SimpleNamespace(value=bias))
+
+        mtf = SimpleNamespace(
+            daily_analysis=_tf("bearish"),
+            h4_analysis=_tf("bearish"),
+            m15_analysis=_tf("bullish"),
+        )
+        expanded = SimpleNamespace(
+            pd_analysis=None, mtf_result=mtf, dxy_confirmation=None,
+            retail_contrarian=None, vix_risk_mode=None,
+            currency_strength_recommendation=None, amd_state=None,
+            displacement_analysis=None, breaker_blocks=[],
+            silver_bullet_ready=False, ipda_analysis=None, nwog_target=None,
+        )
+
+        with patch(
+            "trading_bot.services.expanded_analysis.run_expanded_analysis",
+            AsyncMock(return_value=expanded),
+        ), patch("trading_bot.api.routes.activity.add_activity"), patch(
+            "trading_bot.services.analyze_and_trade_runner.bot_state", None
+        ):
+            await run_analyze_and_trade(bot, "XAUUSD")
+
+        bot._generate_chart_image.assert_not_awaited()
+        pipeline.claude.assert_not_called()

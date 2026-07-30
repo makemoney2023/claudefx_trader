@@ -255,7 +255,57 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
 
         # Get current price
         current_price = float(df['close'].iloc[-1])
-        
+
+        # PRE-CLAUDE VIABILITY: skip the LLM (and chart generation) when the
+        # mechanical gate stack already guarantees rejection of every direction.
+        from ..utils.win_optimization import pre_claude_viability
+
+        def _bias_of(tf_analysis) -> str:
+            bias = getattr(tf_analysis, "bias", None)
+            return getattr(bias, "value", None) or "unknown"
+
+        _in_kill_zone = False
+        if bot.kill_zone_checker is not None:
+            _viab_session = bot.kill_zone_checker.get_current_session()
+            _in_kill_zone = bool(getattr(_viab_session, "is_kill_zone", False))
+        _sb_window = bool(
+            (analysis_results.get("silver_bullet") or {}).get("window_active", False)
+        )
+        _amd_phase = (
+            (analysis_results.get("amd_cycle") or {}).get("phase") or "unknown"
+        )
+        _rel_volume = 1.0
+        _vol = analysis_results.get("volume")
+        if isinstance(_vol, dict):
+            _rel_volume = float(_vol.get("relative_volume", 1.0) or 1.0)
+
+        if mtf_result is not None:
+            _viability = pre_claude_viability(
+                d1_bias=_bias_of(getattr(mtf_result, "daily_analysis", None)),
+                h4_bias=_bias_of(getattr(mtf_result, "h4_analysis", None)),
+                m15_bias=_bias_of(getattr(mtf_result, "m15_analysis", None)),
+                amd_phase=_amd_phase,
+                relative_volume=_rel_volume,
+                in_kill_zone=_in_kill_zone,
+                silver_bullet_window=_sb_window,
+            )
+            if not _viability.proceed:
+                _skip_reason = "; ".join(_viability.reasons)
+                logger.info(
+                    f"[PRE-CLAUDE] {symbol}: analysis skipped — {_skip_reason}"
+                )
+                from ..api.routes.activity import add_activity
+                add_activity(
+                    "analysis_skipped",
+                    f"{symbol}: Claude skipped — gates guarantee rejection "
+                    f"({_skip_reason})",
+                    symbol=symbol,
+                    details={"reasons": _viability.reasons},
+                )
+                if bot_state:
+                    bot_state.symbol_complete(symbol, "pre_claude_skip")
+                return
+
         # Skip Claude analysis if not configured
         if not bot.claude_client or not bot.claude_client.api_key:
             logger.debug(f"Claude not configured, using technical analysis only for {symbol}")

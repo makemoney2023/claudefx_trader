@@ -49,6 +49,84 @@ def apply_friday_session_gates(
     return FridaySessionDecision(close_forex=close_forex, entry_symbols=entry_symbols)
 
 
+@dataclass
+class PreClaudeViability:
+    """Outcome of the cheap pre-LLM viability check."""
+
+    proceed: bool
+    reasons: List[str] = field(default_factory=list)
+
+
+def _direction_structurally_blocked(
+    direction: str,
+    d1_bias: str,
+    h4_bias: str,
+    m15_bias: str,
+    amd_phase: str,
+) -> Optional[str]:
+    """
+    Return a reason string when the entry-gate stack guarantees rejection
+    for this direction, else None.
+
+    Mirrors evaluate_m15_gate / evaluate_htf_alignment_gate. Their
+    0.55-capped exception paths (pullback, counter-trend scalp) land below
+    the 0.60 execution floor, so they are dead ends and count as blocked.
+    Anything ambiguous (neutral/unknown biases) counts as viable.
+    """
+    opposing = "bearish" if direction == "long" else "bullish"
+
+    if m15_bias == opposing and amd_phase != "manipulation":
+        return f"{direction}: M15 {m15_bias} opposes (no manipulation phase)"
+
+    if d1_bias == opposing and h4_bias == opposing:
+        return f"{direction}: D1+H4 both {opposing}"
+
+    return None
+
+
+def pre_claude_viability(
+    *,
+    d1_bias: str,
+    h4_bias: str,
+    m15_bias: str,
+    amd_phase: str = "unknown",
+    relative_volume: float = 1.0,
+    in_kill_zone: bool = False,
+    silver_bullet_window: bool = False,
+) -> PreClaudeViability:
+    """
+    Decide whether calling Claude can possibly produce an executable trade.
+
+    Skips the LLM only when the mechanical gate stack already guarantees
+    rejection of every direction — never on judgment calls. During kill
+    zones and Silver Bullet windows we always analyze (structure can shift
+    fast, and the analysis feeds the dashboard when it matters most).
+    """
+    if in_kill_zone or silver_bullet_window:
+        return PreClaudeViability(proceed=True)
+
+    reasons: List[str] = []
+
+    if relative_volume < 0.3:
+        reasons.append(
+            f"volume {relative_volume:.2f}x < 0.3 — dead market blocks all entries"
+        )
+
+    long_block = _direction_structurally_blocked(
+        "long", d1_bias, h4_bias, m15_bias, amd_phase
+    )
+    short_block = _direction_structurally_blocked(
+        "short", d1_bias, h4_bias, m15_bias, amd_phase
+    )
+    if long_block and short_block:
+        reasons.append(long_block)
+        reasons.append(short_block)
+
+    if reasons:
+        return PreClaudeViability(proceed=False, reasons=reasons)
+    return PreClaudeViability(proceed=True)
+
+
 def order_type_matches_direction(order_type: str, direction: str) -> bool:
     """True when order side is coherent with long/short direction."""
     ot = (order_type or "market").lower()
