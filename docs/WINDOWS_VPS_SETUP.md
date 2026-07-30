@@ -228,11 +228,22 @@ TRADING_AUTO_START_BOT=false
 # Set false only for debugging off-hours analysis.
 TRADING_CLAUDE_KILL_ZONE_ONLY=true
 
-# After pulling fill-path / Friday-gate fixes (PRICE-FIX market routing,
-# reservation safety, filling-mode retry, Friday noon vs 16:30 gates),
-# redeploy and restart the backend on the VPS so live MT5 uses the new code:
+# News gates (blackout windows around red-folder events + stale-calendar
+# fail-closed). The strategy-review changes assume these are ON in live
+# trading — set this in the VPS .env.local:
+TRADING_NEWS_GATES_ENABLED=true
+
+# After pulling strategy-review changes (pre-Claude viability filter,
+# truthful gate rejects, direction-gate consolidation, counterfactual
+# journal) or fill-path / Friday-gate fixes, redeploy and restart the
+# backend on the VPS so live MT5 uses the new code:
 #   git pull
 #   Restart-Service / nssm restart / or re-run start script
+#
+# After a day or two of live running, review what the decision gates saved
+# vs cost via the counterfactual journal:
+#   GET http://YOUR_VPS_IP:8000/api/analysis/counterfactuals
+# (per-gate saved_r / missed_r / net_saved_r tallies plus recent records)
 
 # CORS — set to your VPS IP or domain (see Remote Access section)
 CORS_ORIGINS=http://YOUR_VPS_IP:3000,http://localhost:3000

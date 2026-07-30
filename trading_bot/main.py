@@ -396,10 +396,12 @@ class TradingBot:
         self.counterfactual_journal = get_counterfactual_journal()
         self._last_counterfactual_score: Optional[datetime] = None
         
-        # Analysis cooldown: only call Claude once per 5 minutes per symbol
-        # Saves API costs by skipping redundant analyses on unchanged chart data
+        # Analysis cooldown: throttle Claude per symbol. 270s (not 300) so
+        # consecutive analyses land inside Anthropic's 5-minute prompt-cache
+        # TTL — the cached system prompt stays warm instead of expiring
+        # right before the next call.
         self._last_analysis_time: Dict[str, datetime] = {}  # symbol -> last analysis datetime
-        self._analysis_cooldown_seconds: int = 300  # 5 minutes
+        self._analysis_cooldown_seconds: int = 270
         
         # Dynamic learnings: throttle doc updates to at most once per hour
         self._last_learnings_update: Optional[datetime] = None
