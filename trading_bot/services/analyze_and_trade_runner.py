@@ -1499,10 +1499,46 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
             # and never reaches order placement.
             from ..main import save_signal_to_db
 
-            print(f"[JUDGE] {symbol}: Sending to trade judge (confidence={trade_signal.confidence:.0%}, dir={trade_signal.direction}, lots={position_size.lots})...", flush=True)
-            judge_outcome = await bot._run_trade_judge(
-                symbol, trade_signal, position_size, current_price
+            # A+ FAST PATH: pristine setups skip the judge (saves 10-45s and
+            # one Opus call); anything with doubt still gets judged.
+            from .trade_judge import (
+                JudgeOutcome,
+                JudgeVerdict,
+                qualifies_for_judge_fast_path,
             )
+
+            _j_entry = trade_signal.entry_price or current_price
+            _j_sl = trade_signal.stop_loss or 0.0
+            _j_sl_dist = abs(_j_entry - _j_sl) if _j_sl else 0.0
+            _j_rr = (
+                abs((trade_signal.take_profit or 0.0) - _j_entry) / _j_sl_dist
+                if _j_sl_dist > 0
+                else 0.0
+            )
+            _j_warnings = list(getattr(claude_result, "warnings", None) or [])
+            _j_htf_aligned = bool(getattr(mtf_result, "alignment", False))
+
+            if qualifies_for_judge_fast_path(
+                confidence=trade_signal.confidence,
+                risk_reward=_j_rr,
+                htf_aligned=_j_htf_aligned,
+                warnings=_j_warnings,
+            ):
+                logger.info(
+                    f"[JUDGE] {symbol}: A+ fast path — judge skipped "
+                    f"(conf={trade_signal.confidence:.0%}, RR={_j_rr:.2f}, "
+                    f"HTF aligned, no warnings)"
+                )
+                judge_outcome = JudgeOutcome(
+                    verdict=JudgeVerdict.APPROVE,
+                    reason="A+ setup fast path — judge skipped",
+                    risk_flags=["judge_skipped_a_plus"],
+                )
+            else:
+                print(f"[JUDGE] {symbol}: Sending to trade judge (confidence={trade_signal.confidence:.0%}, dir={trade_signal.direction}, lots={position_size.lots})...", flush=True)
+                judge_outcome = await bot._run_trade_judge(
+                    symbol, trade_signal, position_size, current_price
+                )
             judge_verdict = judge_outcome.to_dict()
 
             if judge_outcome.blocks_execution():

@@ -5,9 +5,12 @@ Shared fail-closed trade judge adapter for regular and reversal entry paths.
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class JudgeVerdict(str, Enum):
@@ -85,6 +88,25 @@ def normalize_judge_response(raw: Optional[Dict[str, Any]]) -> JudgeOutcome:
     )
 
 
+def qualifies_for_judge_fast_path(
+    *,
+    confidence: float,
+    risk_reward: float,
+    htf_aligned: bool,
+    warnings: Optional[List[str]] = None,
+) -> bool:
+    """
+    A+ setups skip the judge: high confidence, strong R:R, full HTF
+    alignment, and zero analysis warnings. Anything less still gets judged.
+    """
+    return (
+        confidence >= 0.85
+        and risk_reward >= 2.5
+        and bool(htf_aligned)
+        and not (warnings or [])
+    )
+
+
 async def run_trade_judge(
     claude_client: Any,
     signal_dict: Dict[str, Any],
@@ -92,6 +114,7 @@ async def run_trade_judge(
     learning_context: str = "",
     *,
     timeout: float = 45.0,
+    retries: int = 1,
 ) -> JudgeOutcome:
     # Timeout note: the judge runs on Opus 5 with adaptive thinking at medium effort,
     # which takes ~10-20s in practice. The old 8s Sonnet-era budget would time out
@@ -102,16 +125,29 @@ async def run_trade_judge(
     if not getattr(claude_client, "async_client", None):
         return unavailable_outcome("Judge client unavailable — async client not configured")
 
-    try:
-        raw = await asyncio.wait_for(
-            claude_client.judge_trade(signal_dict, risk_metrics, learning_context),
-            timeout=timeout,
-        )
-        return normalize_judge_response(raw)
-    except asyncio.TimeoutError:
-        return unavailable_outcome("Judge timeout", flags=["judge_timeout"])
-    except Exception as exc:
-        return unavailable_outcome(f"Judge error: {exc}", flags=["judge_exception"])
+    # Transient failures (timeout/exception/malformed) get one retry before
+    # the fail-closed UNAVAILABLE verdict blocks the trade.
+    attempts = 1 + max(0, retries)
+    outcome = unavailable_outcome("Judge not invoked")
+    for attempt in range(1, attempts + 1):
+        try:
+            raw = await asyncio.wait_for(
+                claude_client.judge_trade(signal_dict, risk_metrics, learning_context),
+                timeout=timeout,
+            )
+            outcome = normalize_judge_response(raw)
+        except asyncio.TimeoutError:
+            outcome = unavailable_outcome("Judge timeout", flags=["judge_timeout"])
+        except Exception as exc:
+            outcome = unavailable_outcome(f"Judge error: {exc}", flags=["judge_exception"])
+        if outcome.verdict != JudgeVerdict.UNAVAILABLE:
+            return outcome
+        if attempt < attempts:
+            logger.warning(
+                f"[JUDGE] UNAVAILABLE ({outcome.reason}) — retrying "
+                f"({attempt}/{attempts - 1} retries used)"
+            )
+    return outcome
 
 
 def build_judge_signal_dict(

@@ -519,6 +519,93 @@ class TestDeadCodeRemoval:
         assert blocked is True
 
 
+# ============================================================
+# Phase 4 — judge scoping: A+ fast path + retry on UNAVAILABLE
+# ============================================================
+
+class TestJudgeFastPath:
+    def _qualifies(self, **overrides):
+        from trading_bot.services.trade_judge import qualifies_for_judge_fast_path
+
+        params = dict(
+            confidence=0.86, risk_reward=2.6, htf_aligned=True, warnings=[],
+        )
+        params.update(overrides)
+        return qualifies_for_judge_fast_path(**params)
+
+    def test_a_plus_setup_qualifies(self):
+        assert self._qualifies() is True
+
+    def test_low_confidence_disqualifies(self):
+        assert self._qualifies(confidence=0.84) is False
+
+    def test_low_rr_disqualifies(self):
+        assert self._qualifies(risk_reward=2.4) is False
+
+    def test_htf_misalignment_disqualifies(self):
+        assert self._qualifies(htf_aligned=False) is False
+
+    def test_warnings_disqualify(self):
+        assert self._qualifies(warnings=["D1/H4 conflict"]) is False
+
+    def test_runner_wires_fast_path_before_judge(self):
+        import inspect
+        import trading_bot.services.analyze_and_trade_runner as runner_mod
+
+        src = inspect.getsource(runner_mod)
+        assert "judge_skipped_a_plus" in src
+        assert src.index("judge_skipped_a_plus") < src.index("_run_trade_judge(")
+
+
+class TestJudgeUnavailableRetry:
+    def _client(self, side_effect):
+        client = MagicMock()
+        client.api_key = "test"
+        client.async_client = object()
+        client.judge_trade = AsyncMock(side_effect=side_effect)
+        return client
+
+    @pytest.mark.asyncio
+    async def test_transient_error_retries_then_approves(self):
+        from trading_bot.services.trade_judge import run_trade_judge, JudgeVerdict
+
+        client = self._client([
+            RuntimeError("api hiccup"),
+            {"verdict": "APPROVE", "reason": "ok", "risk_flags": []},
+        ])
+        outcome = await run_trade_judge(client, {}, {})
+        assert outcome.verdict == JudgeVerdict.APPROVE
+        assert client.judge_trade.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_persistent_failure_stays_fail_closed(self):
+        from trading_bot.services.trade_judge import run_trade_judge, JudgeVerdict
+
+        client = self._client([RuntimeError("down"), RuntimeError("still down")])
+        outcome = await run_trade_judge(client, {}, {})
+        assert outcome.verdict == JudgeVerdict.UNAVAILABLE
+        assert outcome.blocks_execution() is True
+        assert client.judge_trade.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_definitive_verdict_not_retried(self):
+        from trading_bot.services.trade_judge import run_trade_judge, JudgeVerdict
+
+        client = self._client([
+            {"verdict": "REJECT", "reason": "bad idea", "risk_flags": []},
+        ])
+        outcome = await run_trade_judge(client, {}, {})
+        assert outcome.verdict == JudgeVerdict.REJECT
+        assert client.judge_trade.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_missing_client_does_not_retry(self):
+        from trading_bot.services.trade_judge import run_trade_judge, JudgeVerdict
+
+        outcome = await run_trade_judge(None, {}, {})
+        assert outcome.verdict == JudgeVerdict.UNAVAILABLE
+
+
 class TestDefensiveHalt:
     def test_cycle_halts_explicitly_in_defensive_mode(self):
         import inspect
