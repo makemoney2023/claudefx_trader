@@ -2059,3 +2059,79 @@ class TestDirectionFlipCooldown:
                    minutes_since < flip_cooldown_minutes)
         
         assert not is_flip, "no_trade -> long is not a direction flip"
+
+
+# ============================================================
+# 22. MT5 History Window Server-Time Padding Tests
+# ============================================================
+
+class TestHistoryWindowServerTimePadding:
+    """
+    MT5 stores deal timestamps in BROKER SERVER TIME (typically UTC+2/+3),
+    while callers pass real UTC datetimes. A query ending at "now UTC" misses
+    deals from the last ~3 hours (their server-time stamps are in the future
+    relative to UTC), causing stopped-out trades to be misclassified as
+    "cancelled" with P/L $0 by the trade sync.
+
+    get_history must pad the END of the query window forward so just-closed
+    deals are always included. The START must NOT be padded (callers like the
+    daily_trades counter rely on it).
+    """
+
+    def _make_client(self):
+        from trading_bot.mt5.client import MT5Client
+        client = MT5Client(login=12345, password="test", server="TestServer")
+        client._use_simulation = False
+        client._connected = True
+        mock_mt5 = MagicMock()
+        mock_mt5.history_deals_get.return_value = []
+        client._mcp_client = mock_mt5
+        return client, mock_mt5
+
+    @pytest.mark.asyncio
+    async def test_end_time_padded_forward_for_server_time_offset(self):
+        """End bound must be padded at least 3h forward (broker UTC+3 max)."""
+        from datetime import timezone
+        client, mock_mt5 = self._make_client()
+
+        start = datetime.now(timezone.utc) - timedelta(days=1)
+        end = datetime.now(timezone.utc)
+        await client.get_history(start, end)
+
+        assert mock_mt5.history_deals_get.call_count == 1
+        called_args = mock_mt5.history_deals_get.call_args[0]
+        called_start, called_end = called_args[0], called_args[1]
+        assert called_end >= end + timedelta(hours=3), (
+            f"end bound not padded for server-time offset: {called_end} vs requested {end}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_start_time_not_padded(self):
+        """Start bound must be passed through unchanged (daily counters depend on it)."""
+        from datetime import timezone
+        client, mock_mt5 = self._make_client()
+
+        start = datetime.now(timezone.utc) - timedelta(days=1)
+        end = datetime.now(timezone.utc)
+        await client.get_history(start, end)
+
+        called_start = mock_mt5.history_deals_get.call_args[0][0]
+        assert called_start == start, (
+            f"start bound was modified: {called_start} vs requested {start}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_symbol_filtered_query_also_padded(self):
+        """The group-filtered variant (used by trade sync) must get the same pad."""
+        from datetime import timezone
+        client, mock_mt5 = self._make_client()
+
+        start = datetime.now(timezone.utc) - timedelta(days=1)
+        end = datetime.now(timezone.utc)
+        await client.get_history(start, end, symbol="XAUUSD")
+
+        called = mock_mt5.history_deals_get.call_args
+        assert called.kwargs.get('group') == "*XAUUSD*"
+        assert called.args[1] >= end + timedelta(hours=3), (
+            "symbol-filtered history query end bound not padded"
+        )

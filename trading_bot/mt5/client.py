@@ -1960,12 +1960,22 @@ class MT5Client:
             
             mt5 = self._mcp_client
             
+            # MT5 stores deal timestamps in BROKER SERVER TIME (typically UTC+2/+3),
+            # while callers pass real UTC. A window ending at "now UTC" therefore
+            # misses deals from the last few hours (their server-time stamps are in
+            # the future relative to UTC), causing just-closed trades (e.g. stop-outs)
+            # to be invisible to the trade sync and misclassified as cancelled.
+            # Pad ONLY the end bound forward — future deals don't exist, so this can
+            # never pull in spurious extra deals, and start-bound semantics
+            # (e.g. "today's deals" for the daily trade counter) are preserved.
+            padded_end = end_time + timedelta(hours=12)
+            
             # Use MT5's history_deals_get function (non-blocking)
             async with self._lock:
                 if symbol:
-                    deals = await asyncio.to_thread(mt5.history_deals_get, start_time, end_time, group=f"*{symbol}*")
+                    deals = await asyncio.to_thread(mt5.history_deals_get, start_time, padded_end, group=f"*{symbol}*")
                 else:
-                    deals = await asyncio.to_thread(mt5.history_deals_get, start_time, end_time)
+                    deals = await asyncio.to_thread(mt5.history_deals_get, start_time, padded_end)
             
             if deals is None or len(deals) == 0:
                 logger.info(f"No deals found in history from {start_time} to {end_time}")
