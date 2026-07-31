@@ -127,6 +127,54 @@ def resolve_premium_discount(analysis_results: dict) -> Tuple[Optional[str], Opt
     return None, None
 
 
+def _swing_range(analysis_results: dict) -> Tuple[Optional[float], Optional[float]]:
+    """Return (swing_high, swing_low) from premium/discount analysis if present."""
+    pd_data = analysis_results.get("premium_discount") if analysis_results else None
+    if pd_data is None:
+        return None, None
+    try:
+        if isinstance(pd_data, dict):
+            high, low = pd_data.get("swing_high"), pd_data.get("swing_low")
+        else:
+            high = getattr(pd_data, "swing_high", None)
+            low = getattr(pd_data, "swing_low", None)
+        if high is None or low is None:
+            return None, None
+        high_f, low_f = float(high), float(low)
+        if high_f <= low_f:
+            return None, None
+        return high_f, low_f
+    except (TypeError, ValueError):
+        return None, None
+
+
+def entry_retrace_pct(
+    analysis_results: dict,
+    entry_price: Optional[float],
+) -> Optional[float]:
+    """Retracement of the *entry* within the dealing range (not spot).
+
+    Anticipatory sell_limits sit in premium while spot may still be in
+    discount; limit_zone must judge the fill level, not the current print.
+    Falls back to spot retrace when swing bounds are unavailable.
+    """
+    if entry_price is None:
+        _, spot = resolve_premium_discount(analysis_results)
+        return spot
+    try:
+        entry = float(entry_price)
+    except (TypeError, ValueError):
+        _, spot = resolve_premium_discount(analysis_results)
+        return spot
+
+    high, low = _swing_range(analysis_results)
+    if high is not None and low is not None:
+        return (entry - low) / (high - low)
+
+    _, spot = resolve_premium_discount(analysis_results)
+    return spot
+
+
 @dataclass
 class ExecutionPrepResult:
     order_type: str
@@ -251,7 +299,8 @@ class ExecutionCoordinator:
                 ),
             )
 
-        _, retrace = resolve_premium_discount(analysis_results)
+        # Judge ENTRY location (anticipatory limits), not spot print.
+        retrace = entry_retrace_pct(analysis_results, entry_price)
         zone_outcome = validate_limit_zone(order_type, retrace)
         if zone_outcome.blocked:
             return ExecutionPrepResult(

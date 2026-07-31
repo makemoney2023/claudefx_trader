@@ -321,9 +321,9 @@ class TestPreClaudeViability:
         result = self._check(d1_bias="bullish", h4_bias="bullish", m15_bias="bearish")
         assert result.proceed is False
 
-    def test_short_only_extreme_discount_skips_even_outside_kz(self):
-        """Prod 2026-07-31: HTF bearish + M15 bearish + 11% discount → Claude
-        proposes sell_limit, burns ~$1.60, then limit_zone hard-blocks.
+    def test_short_only_extreme_discount_still_calls_claude(self):
+        """Spot in discount must not skip Claude — anticipatory sell_limit into
+        premium is a valid ICT path (limit_zone checks ENTRY, not spot).
         """
         result = self._check(
             d1_bias="bearish",
@@ -331,11 +331,9 @@ class TestPreClaudeViability:
             m15_bias="bearish",
             retrace_pct=0.11,
         )
-        assert result.proceed is False
-        assert any("discount" in r.lower() for r in result.reasons)
+        assert result.proceed is True
 
-    def test_short_only_extreme_discount_skips_inside_kill_zone(self):
-        """Zone hard-block is absolute — do not burn Claude spend in KZ either."""
+    def test_short_only_extreme_discount_inside_kz_still_calls_claude(self):
         result = self._check(
             d1_bias="bearish",
             h4_bias="bearish",
@@ -343,35 +341,14 @@ class TestPreClaudeViability:
             retrace_pct=0.11,
             in_kill_zone=True,
         )
-        assert result.proceed is False
+        assert result.proceed is True
 
-    def test_long_only_extreme_premium_skips(self):
+    def test_long_only_extreme_premium_still_calls_claude(self):
         result = self._check(
             d1_bias="bullish",
             h4_bias="bullish",
             m15_bias="bullish",
             retrace_pct=0.85,
-        )
-        assert result.proceed is False
-        assert any("premium" in r.lower() for r in result.reasons)
-
-    def test_short_preferred_but_discount_aligned_long_open_proceeds(self):
-        """Extreme discount with a viable long path must still call Claude."""
-        # HTF not both bearish → long open; M15 bearish blocks shorts without manip.
-        result = self._check(
-            d1_bias="neutral",
-            h4_bias="bullish",
-            m15_bias="bullish",
-            retrace_pct=0.11,
-        )
-        assert result.proceed is True
-
-    def test_short_only_premium_zone_proceeds(self):
-        result = self._check(
-            d1_bias="bearish",
-            h4_bias="bearish",
-            m15_bias="bearish",
-            retrace_pct=0.72,
         )
         assert result.proceed is True
 

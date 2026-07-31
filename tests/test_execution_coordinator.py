@@ -88,6 +88,84 @@ class TestLimitZone:
         outcome = validate_limit_zone("buy_limit", 0.75)
         assert outcome.blocked is True
 
+    def test_allows_sell_limit_when_retrace_in_premium(self):
+        outcome = validate_limit_zone("sell_limit", 0.72)
+        assert outcome.blocked is False
+
+
+class TestEntryRetrace:
+    """Limit-zone must use ENTRY retrace, not spot — anticipatory ICT limits."""
+
+    def test_entry_retrace_from_swings(self):
+        from trading_bot.execution.trade_execution import entry_retrace_pct
+
+        # Range 4028–4120; entry 4110 ≈ 89% (premium) while spot can sit at 11%.
+        analysis = {
+            "premium_discount": {
+                "swing_high": 4120.21,
+                "swing_low": 4028.30,
+                "retracement_percent": 0.11,
+                "current_zone": "extreme_discount",
+            }
+        }
+        retrace = entry_retrace_pct(analysis, entry_price=4110.0)
+        assert retrace == pytest.approx((4110.0 - 4028.30) / (4120.21 - 4028.30), rel=1e-4)
+        assert retrace > 0.70
+
+    def test_prepare_allows_premium_sell_limit_while_spot_in_discount(self):
+        """Prod failure: spot 11% blocked sell_limit even when entry was premium FVG."""
+        sig = SimpleNamespace(
+            direction="short",
+            entry_price=4110.0,
+            order_type="sell_limit",
+            confidence=0.72,
+            stop_loss=4120.0,
+            take_profit=4065.0,
+        )
+        analysis = {
+            "premium_discount": {
+                "swing_high": 4120.21,
+                "swing_low": 4028.30,
+                "retracement_percent": 0.11,
+                "current_zone": "extreme_discount",
+            }
+        }
+        prep = ExecutionCoordinator().prepare_order(
+            trade_signal=sig,
+            current_price=4085.0,
+            existing_positions=[],
+            analysis_results=analysis,
+        )
+        assert prep.blocked is False
+        assert prep.order_type == "sell_limit"
+
+    def test_prepare_still_blocks_discount_sell_limit_entry(self):
+        sig = SimpleNamespace(
+            direction="short",
+            entry_price=4035.0,  # still in discount of the range
+            order_type="sell_limit",
+            confidence=0.72,
+            stop_loss=4050.0,
+            take_profit=4000.0,
+        )
+        analysis = {
+            "premium_discount": {
+                "swing_high": 4120.21,
+                "swing_low": 4028.30,
+                "retracement_percent": 0.11,
+                "current_zone": "extreme_discount",
+            }
+        }
+        prep = ExecutionCoordinator().prepare_order(
+            trade_signal=sig,
+            current_price=4032.0,
+            existing_positions=[],
+            analysis_results=analysis,
+        )
+        assert prep.blocked is True
+        assert prep.gate_id == "zone_block"
+        assert "discount" in prep.reason.lower()
+
 
 class TestExecutionCoordinator:
     def test_prepare_order_passes_clean(self):
