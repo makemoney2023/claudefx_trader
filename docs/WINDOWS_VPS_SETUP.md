@@ -270,8 +270,9 @@ TRADING_NEWS_GATES_ENABLED=true
 # Data-quality terminal gate id: market_data_quality (OHLCV validator).
 # The validator accepts bounded metals maintenance gaps (up to 3 hours) when
 # they overlap the DST-aware 5–7 PM New York rollover window or when at least
-# three stable gaps establish the broker's repeated daily closure. Isolated
-# daytime gaps, non-metals gaps, and longer outages still fail closed.
+# two stable gaps establish the broker's repeated daily closure (M15 windows
+# often only hold ~2 sessions). Isolated daytime gaps, non-metals gaps, and
+# longer outages still fail closed.
 
 # CORS — set to your VPS IP or domain (see Remote Access section)
 CORS_ORIGINS=http://YOUR_VPS_IP:3000,http://localhost:3000

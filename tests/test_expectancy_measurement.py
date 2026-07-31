@@ -169,6 +169,28 @@ class TestValidateOhlcv:
         )
         assert result.valid is True
 
+    def test_two_day_broker_xau_maintenance_gaps_pass(self):
+        """M15 fetches often span only ~2 sessions — two stable daily gaps must pass.
+
+        Production 2026-07-31: LHFX XAUUSD blocked with
+        '2 mid-session gap(s), largest=0 days 01:15:00' because the detector
+        required three matching dates that cannot fit in a 200-bar window.
+        """
+        from trading_bot.mt5.ohlcv_quality import validate_ohlcv
+
+        # ~120 M15 bars ≈ 1.5–2 trading days → exactly two 03:00 UTC closures.
+        df = _m15_bars_with_recurring_daily_gap(n=120)
+        deltas = df.index.to_series().diff().dropna()
+        mid_session = deltas[
+            (deltas > deltas.median() * 3) & (deltas < pd.Timedelta(hours=6))
+        ]
+        assert len(mid_session) == 2
+
+        result = validate_ohlcv(
+            df, symbol="XAUUSD", timeframe="M15", expected_count=120, now=_now_after(df)
+        )
+        assert result.valid is True
+
     def test_nan_fails(self):
         from trading_bot.mt5.ohlcv_quality import validate_ohlcv
 

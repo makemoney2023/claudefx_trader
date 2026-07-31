@@ -106,15 +106,21 @@ def _is_expected_metals_rollover_gap(
 def _recurring_metals_maintenance_gaps(
     *, symbol: str, gaps: pd.Series
 ) -> set[pd.Timestamp]:
-    """Identify a broker's repeated daily metals closure from bar history."""
+    """Identify a broker's repeated daily metals closure from bar history.
+
+    Two matching dates are enough: a typical M15 fetch (~200 bars) only spans
+    ~2 trading sessions, so a 3-date rule permanently blocked LHFX XAUUSD when
+    the window held exactly two 1h15 daily closures (2026-07-31).
+    """
     from trading_bot.config import get_symbol_spec
 
-    if get_symbol_spec(symbol).category != "metal" or len(gaps) < 3:
+    if get_symbol_spec(symbol).category != "metal" or len(gaps) < 2:
         return set()
 
     max_gap = pd.Timedelta(hours=_METALS_ROLLOVER_MAX_HOURS)
     duration_tolerance = pd.Timedelta(minutes=30)
     time_tolerance_minutes = 30
+    min_matching_dates = 2
     recognized: set[pd.Timestamp] = set()
 
     def _utc_timestamp(value: pd.Timestamp) -> pd.Timestamp:
@@ -148,7 +154,7 @@ def _recurring_metals_maintenance_gaps(
             matching_dates.add(other_utc.date())
             matching_timestamps.append(other_timestamp)
 
-        if len(matching_dates) >= 3:
+        if len(matching_dates) >= min_matching_dates:
             date_span = max(matching_dates) - min(matching_dates)
             if date_span <= timedelta(days=4):
                 recognized.update(matching_timestamps)
