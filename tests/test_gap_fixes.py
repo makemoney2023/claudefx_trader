@@ -1575,6 +1575,7 @@ class TestOpus5Everywhere:
         assert first_kwargs.get('output_config', {}).get('effort') == 'low'
         assert first_kwargs.get('max_tokens') == 16000
         assert second_kwargs.get('thinking') == {'type': 'disabled'}
+        assert second_kwargs.get('max_tokens') == 16000
         assert second_kwargs.get('tool_choice', {}).get('type') == 'tool'
         assert result.signal.direction == 'no_trade'
         # Truncated incomplete analyses must not be cached.

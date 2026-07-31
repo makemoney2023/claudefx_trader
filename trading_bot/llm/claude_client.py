@@ -945,12 +945,13 @@ class ClaudeClient:
                             f"[ANALYSIS] {symbol} hit max_tokens={self.max_tokens} "
                             f"— retrying once with thinking disabled + forced tool"
                         )
-                        # 8k: forced tool calls normally fit in ~2k, but Opus has
-                        # been seen writing very long reasoning fields into the
-                        # tool args; 4k exhausted twice in production (2026-07-30).
+                        # Keep the full analysis budget on retry. Thinking is off, so
+                        # all tokens go to the forced tool JSON — but Opus still writes
+                        # very long reasoning/OB/FVG arrays into tool args. History:
+                        # 4k exhausted (2026-07-30), 8k exhausted (2026-07-31 XAUUSD).
                         message = await self._async_messages_create(
                             model=self.model_heavy,
-                            max_tokens=8000,
+                            max_tokens=self.max_tokens,
                             thinking={"type": "disabled"},
                             output_config={"effort": "low"},
                             system=system_messages,

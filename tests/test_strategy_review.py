@@ -139,7 +139,8 @@ class TestPreciousMetalsContext:
 
 class TestTruncationRetryBudget:
     @pytest.mark.asyncio
-    async def test_retry_after_max_tokens_uses_8000(self):
+    async def test_retry_after_max_tokens_uses_full_budget(self):
+        """Retry must keep the full analysis budget — 8k was exhausted in prod (2026-07-31)."""
         client = _make_claude_client()
 
         truncated = MagicMock()
@@ -160,7 +161,8 @@ class TestTruncationRetryBudget:
 
         assert client._async_messages_create.await_count == 2
         retry_kwargs = client._async_messages_create.await_args_list[1].kwargs
-        assert retry_kwargs.get("max_tokens") == 8000
+        assert retry_kwargs.get("max_tokens") == client.max_tokens
+        assert retry_kwargs.get("max_tokens") == 16000
         assert retry_kwargs.get("thinking") == {"type": "disabled"}
         assert result.signal.reasoning == "No setup after retry"
 
