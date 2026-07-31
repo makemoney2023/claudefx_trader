@@ -6,6 +6,55 @@ from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
 
+def recover_missing_entry_from_mechanical(
+    *,
+    direction: str,
+    stop_loss: Optional[float],
+    take_profit: Optional[float],
+    mechanical_setup: Optional[dict],
+) -> Optional[float]:
+    """Fill a missing Claude entry from mechanical when direction agrees.
+
+    Keeps Claude's SL/TP authoritative. Returns None when mechanical is
+    missing, disagrees on direction, or the mechanical entry is not
+    coherent with Claude's stop/target.
+    """
+    direction = (direction or "").lower()
+    if direction not in ("long", "short"):
+        return None
+    if not mechanical_setup or stop_loss is None or take_profit is None:
+        return None
+
+    mech_dir = str(mechanical_setup.get("direction") or "").lower()
+    if mech_dir != direction:
+        return None
+
+    zone = mechanical_setup.get("entry_zone") or {}
+    raw_entry = (
+        zone.get("optimal")
+        if isinstance(zone, dict)
+        else None
+    )
+    if raw_entry is None:
+        raw_entry = mechanical_setup.get("optimal_entry") or mechanical_setup.get(
+            "entry_price"
+        )
+    try:
+        entry = float(raw_entry)
+    except (TypeError, ValueError):
+        return None
+    if entry <= 0:
+        return None
+
+    sl = float(stop_loss)
+    tp = float(take_profit)
+    if direction == "long" and not (sl < entry < tp):
+        return None
+    if direction == "short" and not (tp < entry < sl):
+        return None
+    return entry
+
+
 @dataclass
 class NormalizedSignal:
     entry: float

@@ -663,6 +663,53 @@ class ClaudeAnalysisStage:
         
         # Extract trade signal from result
         trade_signal = claude_result.signal
+
+        # Recover entry when Claude returns direction + SL/TP but entry=0/None
+        # and the mechanical baseline agrees on direction.
+        _mech_baseline = analysis_results.get("mechanical_setup")
+        if (
+            trade_signal.direction in ("long", "short")
+            and not trade_signal.entry_price
+            and trade_signal.stop_loss
+            and trade_signal.take_profit
+        ):
+            from .signal_normalizer import recover_missing_entry_from_mechanical
+
+            _recovered_entry = recover_missing_entry_from_mechanical(
+                direction=trade_signal.direction,
+                stop_loss=trade_signal.stop_loss,
+                take_profit=trade_signal.take_profit,
+                mechanical_setup=_mech_baseline,
+            )
+            if _recovered_entry is not None:
+                trade_signal.entry_price = _recovered_entry
+                if trade_signal.stop_loss and trade_signal.take_profit:
+                    _risk = abs(_recovered_entry - float(trade_signal.stop_loss))
+                    _reward = abs(float(trade_signal.take_profit) - _recovered_entry)
+                    if _risk > 0:
+                        trade_signal.risk_reward = _reward / _risk
+                _note = (
+                    f"Recovered entry {_recovered_entry:.5f} from mechanical "
+                    f"(Claude omitted entry_price)"
+                )
+                trade_signal.reasoning = (
+                    f"{trade_signal.reasoning} | {_note}"
+                    if trade_signal.reasoning
+                    else _note
+                )
+                logger.info(f"[ENTRY-RECOVER] {symbol}: {_note}")
+                print(f"[ENTRY-RECOVER] {symbol}: {_note}", flush=True)
+            else:
+                logger.warning(
+                    f"[ENTRY-RECOVER] {symbol}: Claude {trade_signal.direction} "
+                    f"missing entry and mechanical recovery unavailable — no_trade"
+                )
+                trade_signal.direction = "no_trade"
+                trade_signal.confidence = 0.0
+                trade_signal.reasoning = (
+                    "Signal rejected: long/short requires entry_price; "
+                    "mechanical recovery unavailable or incoherent"
+                )
         
         # Print detailed analysis block to terminal
         bot._print_analysis_summary(symbol, trade_signal, claude_result, market_data)
@@ -678,7 +725,6 @@ class ClaudeAnalysisStage:
         
         # Mechanical-vs-Claude agreement telemetry (measures LLM value-add
         # over the pure rule-based baseline)
-        _mech_baseline = analysis_results.get("mechanical_setup")
         if _mech_baseline:
             _mech_dir = _mech_baseline.get("direction", "?")
             if trade_signal.direction in ("long", "short"):

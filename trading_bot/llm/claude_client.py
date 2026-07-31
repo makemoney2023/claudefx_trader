@@ -2015,9 +2015,19 @@ Finish by calling the submit_trade_analysis tool exactly once.
         entry = tool_input.get('entry_price')
         sl = tool_input.get('stop_loss')
         tp = tool_input.get('take_profit')
-        # Policy: long/short always require entry + SL + TP. Incomplete directional
-        # signals become no_trade so the normalizer never sees "Missing SL or TP".
+        # Policy: long/short require SL + TP always. Missing entry alone is kept
+        # directional so the analysis stage can recover from mechanical when
+        # directions agree; other incomplete signals become no_trade.
         if direction in ('long', 'short') and not (entry and sl and tp):
+            if sl and tp and not entry:
+                warnings = list(tool_input.get('warnings') or [])
+                warnings.append("entry_price missing; awaiting mechanical recovery")
+                tool_input['warnings'] = warnings
+                logger.warning(
+                    f"Incomplete {direction}: entry missing with SL/TP present "
+                    f"(sl={sl}, tp={tp}) — leaving directional for recovery"
+                )
+                return tool_input
             logger.warning(
                 f"Rejecting {direction}: missing entry/SL/TP "
                 f"(entry={entry}, sl={sl}, tp={tp}) — prices are always required"

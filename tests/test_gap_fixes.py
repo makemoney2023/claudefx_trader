@@ -207,7 +207,23 @@ class TestClaudeResponseValidation:
             'take_profit': 3320.0,
         }
         result = client._validate_trade_signal(missing_entry)
-        assert result['direction'] == 'no_trade'
+        # Keep directional so analysis stage can recover entry from mechanical.
+        assert result['direction'] == 'short'
+        assert result['entry_price'] is None
+        assert result['stop_loss'] == 3360.0
+        assert result['take_profit'] == 3320.0
+
+        zero_entry = {
+            'direction': 'short',
+            'confidence': 0.72,
+            'entry_price': 0.0,
+            'stop_loss': 4110.0,
+            'take_profit': 4081.5,
+        }
+        result = client._validate_trade_signal(zero_entry)
+        assert result['direction'] == 'short'
+        assert result['entry_price'] is None
+        assert result['stop_loss'] == 4110.0
 
     def test_no_trade_allows_null_prices(self):
         """no_trade may omit entry/SL/TP."""

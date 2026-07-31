@@ -4,7 +4,10 @@ import pytest
 from types import SimpleNamespace
 
 from trading_bot.services.post_claude_gates import compute_actual_rr, resolve_min_rr
-from trading_bot.services.signal_normalizer import normalize_signal_prices
+from trading_bot.services.signal_normalizer import (
+    normalize_signal_prices,
+    recover_missing_entry_from_mechanical,
+)
 
 
 class TestNormalizeSignalPrices:
@@ -40,6 +43,44 @@ class TestNormalizeSignalPrices:
         result = normalize_signal_prices(sig, SimpleNamespace(key_levels={}), 1.0850)
         assert result.rejected is False
         assert result.direction == "no_trade"
+
+
+class TestRecoverMissingEntryFromMechanical:
+    def test_fills_entry_when_direction_agrees_and_levels_coherent(self):
+        entry = recover_missing_entry_from_mechanical(
+            direction="short",
+            stop_loss=4110.0,
+            take_profit=4081.5,
+            mechanical_setup={
+                "direction": "short",
+                "entry_zone": {"optimal": 4104.5, "high": 4106.0, "low": 4103.0},
+            },
+        )
+        assert entry == pytest.approx(4104.5)
+
+    def test_rejects_when_mechanical_direction_disagrees(self):
+        entry = recover_missing_entry_from_mechanical(
+            direction="short",
+            stop_loss=4110.0,
+            take_profit=4081.5,
+            mechanical_setup={
+                "direction": "long",
+                "entry_zone": {"optimal": 4104.5},
+            },
+        )
+        assert entry is None
+
+    def test_rejects_when_mech_entry_outside_claude_sl_tp(self):
+        entry = recover_missing_entry_from_mechanical(
+            direction="short",
+            stop_loss=4110.0,
+            take_profit=4081.5,
+            mechanical_setup={
+                "direction": "short",
+                "entry_zone": {"optimal": 4125.0},
+            },
+        )
+        assert entry is None
 
 
 class TestRRHelpers:
