@@ -50,18 +50,41 @@ def parse_get_me_response(data: dict) -> tuple[bool, str, str]:
     return False, "", data.get("description", "Unknown error")
 
 
+def _telegram_connector() -> aiohttp.TCPConnector:
+    """Match live-bot SSL policy (supports TELEGRAM_SSL_VERIFY=false)."""
+    from trading_bot.utils.notifications import build_telegram_ssl_context
+
+    return aiohttp.TCPConnector(ssl=build_telegram_ssl_context())
+
+
+def _format_network_error(exc: BaseException) -> str:
+    msg = str(exc)
+    lowered = msg.lower()
+    if (
+        "certificate verify failed" in lowered
+        or "self-signed certificate" in lowered
+        or "sslcertverificationerror" in lowered
+    ):
+        return (
+            f"SSL error: {exc}\n"
+            "  Fix: add TELEGRAM_SSL_VERIFY=false to .env.local (common on Windows VPS "
+            "with antivirus HTTPS scanning), then re-run this test."
+        )
+    return f"Network error: {exc}"
+
+
 async def fetch_bot_info(bot_token: str) -> tuple[bool, str, str]:
     """Validate bot token via Telegram getMe endpoint."""
     url = f"https://api.telegram.org/bot{bot_token}/getMe"
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(connector=_telegram_connector()) as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as response:
                 data = await response.json()
                 if response.status != 200:
                     return False, "", f"HTTP {response.status}: {data}"
                 return parse_get_me_response(data)
     except aiohttp.ClientError as exc:
-        return False, "", f"Network error: {exc}"
+        return False, "", _format_network_error(exc)
     except asyncio.TimeoutError:
         return False, "", "Request timed out — check VPS outbound HTTPS to api.telegram.org"
 
@@ -80,7 +103,7 @@ async def send_test_message(bot_token: str, chat_id: str) -> tuple[bool, str]:
     }
 
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(connector=_telegram_connector()) as session:
             async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as response:
                 data = await response.json()
                 if response.status == 200 and data.get("ok"):
@@ -88,7 +111,7 @@ async def send_test_message(bot_token: str, chat_id: str) -> tuple[bool, str]:
                 description = data.get("description", await response.text())
                 return False, description[:300]
     except aiohttp.ClientError as exc:
-        return False, f"Network error: {exc}"
+        return False, _format_network_error(exc)
     except asyncio.TimeoutError:
         return False, "Request timed out"
 
@@ -116,9 +139,12 @@ async def test_telegram_connection(
     chat = normalize_env_value(chat_id or os.getenv("TELEGRAM_CHAT_ID"))
 
     print()
+    from trading_bot.utils.notifications import telegram_ssl_verify_enabled
+
     print("Configuration:")
     print(f"  Bot token: {'SET (' + token[:8] + '...)' if token else 'NOT SET'}")
     print(f"  Chat ID:   {chat or 'NOT SET'}")
+    print(f"  SSL verify: {'ON' if telegram_ssl_verify_enabled() else 'OFF (TELEGRAM_SSL_VERIFY=false)'}")
     print()
 
     ok, errors = validate_telegram_config(token, chat)

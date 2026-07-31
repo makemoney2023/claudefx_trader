@@ -8,6 +8,8 @@ Supports:
 
 import aiohttp
 import asyncio
+import os
+import ssl
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 from enum import Enum
@@ -15,6 +17,51 @@ from enum import Enum
 from .logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def telegram_ssl_verify_enabled() -> bool:
+    """
+    Whether Telegram HTTPS should verify TLS certificates.
+
+    Windows VPS hosts often run antivirus HTTPS scanning that injects a
+    self-signed cert into the chain, which breaks Python's default verify.
+    Set TELEGRAM_SSL_VERIFY=false in .env.local on those hosts.
+    """
+    raw = (os.environ.get("TELEGRAM_SSL_VERIFY") or "true").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def build_telegram_ssl_context(verify: Optional[bool] = None) -> ssl.SSLContext:
+    """Build an SSL context for Telegram API calls."""
+    if verify is None:
+        verify = telegram_ssl_verify_enabled()
+
+    if not verify:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
+def _is_ssl_cert_error(exc: BaseException) -> bool:
+    """Return True for certificate verification / TLS MITM failures."""
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return True
+    name = type(exc).__name__
+    if "Certificate" in name or "SSLCert" in name:
+        return True
+    msg = str(exc).lower()
+    return (
+        "certificate verify failed" in msg
+        or "sslcertverificationerror" in msg
+        or "self-signed certificate" in msg
+    )
 
 
 class NotificationType(Enum):
@@ -69,16 +116,82 @@ class TelegramNotifier:
             bot_token: Telegram bot token (or from env TELEGRAM_BOT_TOKEN)
             chat_id: Target chat ID (or from env TELEGRAM_CHAT_ID)
         """
-        import os
-        
         self.bot_token = bot_token or os.environ.get("TELEGRAM_BOT_TOKEN")
         self.chat_id = chat_id or os.environ.get("TELEGRAM_CHAT_ID")
         self.enabled = bool(self.bot_token and self.chat_id)
+        self._ssl_verify = telegram_ssl_verify_enabled()
+        self._ssl_fallback_warned = False
         
         if not self.enabled:
             logger.warning("Telegram notifications disabled - missing bot token or chat ID")
         else:
-            logger.info("Telegram notifications enabled")
+            verify_note = "SSL verify ON" if self._ssl_verify else "SSL verify OFF (TELEGRAM_SSL_VERIFY=false)"
+            logger.info(f"Telegram notifications enabled ({verify_note})")
+            if not self._ssl_verify:
+                logger.warning(
+                    "Telegram TLS verification disabled — only use on VPS hosts where "
+                    "antivirus/proxy injects a self-signed HTTPS certificate"
+                )
+
+    def _client_session(self, verify: Optional[bool] = None) -> aiohttp.ClientSession:
+        """Create an aiohttp session with the Telegram SSL policy."""
+        if verify is None:
+            verify = self._ssl_verify
+        connector = aiohttp.TCPConnector(ssl=build_telegram_ssl_context(verify=verify))
+        return aiohttp.ClientSession(connector=connector)
+
+    def _note_ssl_fallback(self, context: str) -> None:
+        if self._ssl_fallback_warned:
+            return
+        msg = (
+            f"Telegram SSL verification failed during {context} (common on Windows VPS "
+            "with antivirus HTTPS scanning). Retrying with verify disabled. "
+            "Add TELEGRAM_SSL_VERIFY=false to .env.local to make this permanent."
+        )
+        print(f"[TELEGRAM] {msg}", flush=True)
+        logger.warning(msg)
+        self._ssl_fallback_warned = True
+        self._ssl_verify = False
+
+    async def _telegram_post(
+        self,
+        url: str,
+        payload: dict,
+        *,
+        timeout: Optional[aiohttp.ClientTimeout] = None,
+    ) -> tuple[int, Any]:
+        """
+        POST JSON to Telegram and return (status, json_or_text).
+
+        Retries once with SSL verify disabled when the VPS TLS chain is broken
+        by antivirus HTTPS inspection.
+        """
+        verify_attempts = [self._ssl_verify]
+        if self._ssl_verify:
+            verify_attempts.append(False)
+
+        last_error: Optional[BaseException] = None
+        for idx, verify in enumerate(verify_attempts):
+            try:
+                async with self._client_session(verify=verify) as session:
+                    async with session.post(url, json=payload, timeout=timeout) as response:
+                        try:
+                            data = await response.json(content_type=None)
+                        except Exception:
+                            data = await response.text()
+                        if verify is False and idx > 0:
+                            self._note_ssl_fallback(url.split("/")[-1])
+                        return response.status, data
+            except asyncio.TimeoutError:
+                raise
+            except Exception as e:
+                last_error = e
+                if verify and _is_ssl_cert_error(e) and False in verify_attempts:
+                    self._note_ssl_fallback(url.split("/")[-1])
+                    continue
+                raise
+        assert last_error is not None
+        raise last_error
     
     async def send_message(self, text: str, parse_mode: str = "HTML") -> bool:
         """
@@ -95,7 +208,6 @@ class TelegramNotifier:
             return False
         
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-        
         payload = {
             "chat_id": self.chat_id,
             "text": text,
@@ -103,18 +215,21 @@ class TelegramNotifier:
         }
         
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload) as response:
-                    if response.status == 200:
-                        return True
-                    else:
-                        error = await response.text()
-                        print(f"[TELEGRAM] send_message FAILED ({response.status}): {error[:300]}", flush=True)
-                        logger.error(f"Telegram API error: {error}")
-                        return False
+            status, data = await self._telegram_post(url, payload)
+            if status == 200:
+                return True
+            error = data if isinstance(data, str) else str(data)
+            print(f"[TELEGRAM] send_message FAILED ({status}): {error[:300]}", flush=True)
+            logger.error(f"Telegram API error: {error}")
+            return False
         except Exception as e:
             print(f"[TELEGRAM] send_message EXCEPTION: {e}", flush=True)
             logger.error(f"Error sending Telegram message: {e}")
+            if _is_ssl_cert_error(e):
+                logger.error(
+                    "Hint: set TELEGRAM_SSL_VERIFY=false in .env.local on the VPS, "
+                    "then restart the API"
+                )
             return False
     
     async def get_updates(self, offset: int = 0, timeout: int = 1) -> list:
@@ -137,24 +252,25 @@ class TelegramNotifier:
             payload["offset"] = offset
         
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=timeout + 10)) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        results = data.get("result", [])
-                        if results:
-                            logger.debug(f"getUpdates: received {len(results)} update(s)")
-                        return results
-                    else:
-                        error_text = await response.text()
-                        logger.warning(f"getUpdates HTTP {response.status}: {error_text[:200]}")
-                        return []
+            status, data = await self._telegram_post(
+                url,
+                payload,
+                timeout=aiohttp.ClientTimeout(total=timeout + 10),
+            )
+            if status == 200 and isinstance(data, dict):
+                results = data.get("result", [])
+                if results:
+                    logger.debug(f"getUpdates: received {len(results)} update(s)")
+                return results
+            if status != 200:
+                logger.warning(f"getUpdates HTTP {status}: {str(data)[:200]}")
+            return []
         except asyncio.TimeoutError:
             return []  # Normal for long polling
         except Exception as e:
             logger.debug(f"getUpdates error: {e}")
             return []
-    
+   
     async def notify_trade_opened(
         self,
         symbol: str,

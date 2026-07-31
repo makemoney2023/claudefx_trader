@@ -443,6 +443,7 @@ Commands only work from the configured `TELEGRAM_CHAT_ID` for security.
 - Trade alerts require the **trading bot** to be started (dashboard or `TRADING_AUTO_START_BOT=true`)
 - The VPS must allow outbound HTTPS to `api.telegram.org`
 - Command polling starts automatically when the API starts — no webhook or inbound port setup needed
+- If Telegram worked on localhost but fails on the VPS with an SSL/certificate error, set `TELEGRAM_SSL_VERIFY=false` in `.env.local` (see troubleshooting below)
 
 ---
 
@@ -759,6 +760,24 @@ taskkill /F /PID <pid>
 4. Confirm `TELEGRAM_CHAT_ID` matches your numeric ID from @userinfobot
 5. Ensure the VPS can reach `https://api.telegram.org` (outbound HTTPS)
 6. Check backend logs for `Telegram notifications enabled` on startup
+
+### Telegram SSL / certificate verify failed on VPS
+
+**Symptom in logs:**
+`SSLCertVerificationError: self-signed certificate in certificate chain`
+
+**Cause:** Common on Windows VPS when antivirus/firewall HTTPS scanning injects its own certificate. Works on localhost, fails after moving to the VPS.
+
+**Fix:**
+1. Add this to root `.env.local`:
+   ```
+   TELEGRAM_SSL_VERIFY=false
+   ```
+2. Restart the backend API (`stop_bot.bat` then `start_bot_production.bat`)
+3. Re-run `python test_telegram_connection.py`
+4. Confirm startup log shows `Telegram notifications enabled (SSL verify OFF...)`
+
+The bot will also auto-retry once with verify disabled if an SSL cert error is detected, but setting the env var makes it permanent and quieter.
 
 ### Telegram commands not responding
 
