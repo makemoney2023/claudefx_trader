@@ -838,7 +838,8 @@ export interface Trade {
   profit_loss?: number
   profit_loss_pips?: number
   r_multiple?: number
-  status: 'open' | 'closed'
+  status: 'open' | 'closed' | 'cancelled'
+  exit_reason?: string
 }
 
 export interface Position {

@@ -161,17 +161,21 @@ export function TradeMonitor() {
                     </td>
                     <td className={cn(
                       'px-4 py-3 text-right font-medium',
-                      trade.profit_loss !== undefined
-                        ? trade.profit_loss >= 0 ? 'text-green-400' : 'text-red-400'
-                        : 'text-slate-400'
+                      trade.status === 'cancelled'
+                        ? 'text-slate-400'
+                        : trade.profit_loss !== undefined
+                          ? trade.profit_loss > 0 ? 'text-green-400' : trade.profit_loss < 0 ? 'text-red-400' : 'text-slate-400'
+                          : 'text-slate-400'
                     )}>
                       {trade.profit_loss !== undefined ? `$${trade.profit_loss.toFixed(2)}` : '-'}
                     </td>
                     <td className={cn(
                       'px-4 py-3 text-right font-medium',
-                      trade.r_multiple !== undefined
-                        ? trade.r_multiple >= 0 ? 'text-green-400' : 'text-red-400'
-                        : 'text-slate-400'
+                      trade.status === 'cancelled'
+                        ? 'text-slate-400'
+                        : trade.r_multiple !== undefined
+                          ? trade.r_multiple > 0 ? 'text-green-400' : trade.r_multiple < 0 ? 'text-red-400' : 'text-slate-400'
+                          : 'text-slate-400'
                     )}>
                       {trade.r_multiple !== undefined ? `${trade.r_multiple.toFixed(2)}R` : '-'}
                     </td>
@@ -180,11 +184,23 @@ export function TradeMonitor() {
                         'px-2 py-1 text-xs rounded-full',
                         trade.status === 'open'
                           ? 'bg-blue-500/20 text-blue-400'
-                          : trade.profit_loss !== undefined && trade.profit_loss >= 0
-                            ? 'bg-green-500/20 text-green-400'
-                            : 'bg-red-500/20 text-red-400'
+                          : trade.status === 'cancelled'
+                            ? 'bg-slate-500/20 text-slate-300'
+                            : trade.profit_loss !== undefined && trade.profit_loss > 0
+                              ? 'bg-green-500/20 text-green-400'
+                              : trade.profit_loss !== undefined && trade.profit_loss < 0
+                                ? 'bg-red-500/20 text-red-400'
+                                : 'bg-slate-500/20 text-slate-300'
                       )}>
-                        {trade.status === 'open' ? 'Open' : trade.profit_loss !== undefined && trade.profit_loss >= 0 ? 'Win' : 'Loss'}
+                        {trade.status === 'open'
+                          ? 'Open'
+                          : trade.status === 'cancelled'
+                            ? 'Cancelled'
+                            : trade.profit_loss !== undefined && trade.profit_loss > 0
+                              ? 'Win'
+                              : trade.profit_loss !== undefined && trade.profit_loss < 0
+                                ? 'Loss'
+                                : 'Flat'}
                       </span>
                     </td>
                   </tr>

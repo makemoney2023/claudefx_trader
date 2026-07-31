@@ -35,6 +35,37 @@ logger = get_logger(__name__)
 router = APIRouter()
 
 
+def derive_trade_status(trade) -> str:
+    """
+    Derive display status for a trade row.
+
+    Cancelled pending orders are synced with exit_price == entry_price and
+    profit_loss == 0. Callers that treat profit_loss >= 0 as a Win would
+    mislabel those as wins — return "cancelled" so the UI can show Cancelled.
+    """
+    exit_price = getattr(trade, "exit_price", None)
+    if exit_price is None or exit_price == 0:
+        return "open"
+
+    reason = (getattr(trade, "exit_reason", None) or "").lower()
+    if "cancel" in reason:
+        return "cancelled"
+
+    entry_price = float(getattr(trade, "entry_price", 0) or 0)
+    pnl = float(getattr(trade, "profit_loss", 0) or 0)
+    # Sync-orphaned cancels: flat P/L at the entry price, no real fill/close.
+    if (
+        abs(pnl) < 1e-5
+        and abs(float(exit_price) - entry_price) < 1e-5
+        and "closed" not in reason
+        and "sl/tp" not in reason
+        and "filled" not in reason
+    ):
+        return "cancelled"
+
+    return "closed"
+
+
 # Pydantic models for API responses
 class TradeResponse(BaseModel):
     """Trade record response model."""
@@ -53,6 +84,7 @@ class TradeResponse(BaseModel):
     profit_loss_pips: Optional[float] = None
     r_multiple: Optional[float] = None
     status: str = "open"
+    exit_reason: Optional[str] = None
     
     # Claude analysis
     claude_confidence: Optional[float] = None
@@ -178,7 +210,8 @@ async def list_trades(
                     profit_loss=trade.profit_loss,
                     profit_loss_pips=trade.profit_loss_pips,
                     r_multiple=trade.r_multiple,
-                    status="closed" if trade.exit_price else "open",
+                    status=derive_trade_status(trade),
+                    exit_reason=getattr(trade, "exit_reason", None),
                     claude_confidence=trade.claude_confidence,
                     claude_reasoning=trade.claude_reasoning,
                     judge_verdict=getattr(trade, 'judge_verdict', None),
@@ -239,7 +272,8 @@ async def list_trades(
                 profit_loss=trade.profit_loss,
                 profit_loss_pips=trade.profit_loss_pips,
                 r_multiple=trade.r_multiple,
-                status="closed" if trade.exit_price else "open",
+                status=derive_trade_status(trade),
+                exit_reason=getattr(trade, "exit_reason", None),
                 claude_confidence=getattr(trade, 'claude_confidence', None),
                 claude_reasoning=getattr(trade, 'claude_reasoning', None),
                 # New fields default to None when from journal fallback
@@ -285,7 +319,8 @@ async def get_trade(trade_id: str):
                     profit_loss=trade.profit_loss,
                     profit_loss_pips=trade.profit_loss_pips,
                     r_multiple=trade.r_multiple,
-                    status="closed" if trade.exit_price else "open",
+                    status=derive_trade_status(trade),
+                    exit_reason=getattr(trade, "exit_reason", None),
                     claude_confidence=trade.claude_confidence,
                     claude_reasoning=trade.claude_reasoning,
                     judge_verdict=getattr(trade, 'judge_verdict', None),
@@ -324,7 +359,8 @@ async def get_trade(trade_id: str):
         profit_loss=trade.profit_loss,
         profit_loss_pips=trade.profit_loss_pips,
         r_multiple=trade.r_multiple,
-        status="closed" if trade.exit_price else "open",
+        status=derive_trade_status(trade),
+        exit_reason=getattr(trade, "exit_reason", None),
         claude_confidence=getattr(trade, 'claude_confidence', None),
         claude_reasoning=getattr(trade, 'claude_reasoning', None),
     )
