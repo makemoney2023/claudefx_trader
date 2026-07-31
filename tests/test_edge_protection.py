@@ -169,6 +169,42 @@ class TestEdgeScoreComputation:
         from trading_bot.api.routes.performance import _status_from_score
         assert _status_from_score(20) == "blocked"
 
+    def test_single_loss_does_not_block_status(self):
+        """One losing trade must not produce blocked/critical — sample too thin."""
+        from trading_bot.api.routes.performance import (
+            _compute_edge_score,
+            _status_from_score,
+            EDGE_HEALTH_MIN_SAMPLE,
+        )
+        score = _compute_edge_score(0.0, -1.0, 1)
+        assert score < 30  # raw math still looks bad
+        status = _status_from_score(score, n_trades=1)
+        assert status not in ("blocked", "critical"), (
+            f"1 trade must fail-open, got status={status}"
+        )
+        assert EDGE_HEALTH_MIN_SAMPLE >= 10
+
+    def test_ten_losses_can_block(self):
+        """With enough sample, a collapsed edge may be blocked."""
+        from trading_bot.api.routes.performance import (
+            _compute_edge_score,
+            _status_from_score,
+            EDGE_HEALTH_MIN_SAMPLE,
+        )
+        score = _compute_edge_score(0.0, -1.0, EDGE_HEALTH_MIN_SAMPLE)
+        assert _status_from_score(score, n_trades=EDGE_HEALTH_MIN_SAMPLE) == "blocked"
+
+    def test_thin_sample_alert_not_auto_blocked(self):
+        """Alert copy for thin samples must not claim Auto-blocked."""
+        from trading_bot.api.routes.performance import _edge_symbol_alert
+
+        alert = _edge_symbol_alert(
+            symbol="XAUUSD", score=0.5, status="warning", trades=1
+        )
+        assert alert is not None
+        assert "Auto-blocked" not in alert.message
+        assert "building sample" in alert.message.lower() or "insufficient" in alert.message.lower()
+
 
 # ===== Config Validation =====
 

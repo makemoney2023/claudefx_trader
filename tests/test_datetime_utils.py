@@ -71,3 +71,39 @@ class TestLossCooldownCompare:
         cooldown_expiry = (now + timedelta(minutes=20)).replace(tzinfo=None)
         remaining = (as_utc(cooldown_expiry) - now).total_seconds() / 60
         assert remaining > 0
+
+
+class TestSyncTradeHistoryDatetimeCompare:
+    """
+    Trade sync STEP 1 crashed with:
+      Could not update trade 10086631: can't compare offset-naive and offset-aware datetimes
+
+    MT5 deal.time is UTC-aware; SQLite TradeModel.entry_time is often naive.
+    """
+
+    def test_naive_entry_vs_aware_exit_raises_without_as_utc(self):
+        exit_dt = datetime(2026, 7, 31, 14, 50, tzinfo=timezone.utc)
+        open_dt = datetime(2026, 7, 31, 14, 30)  # naive from DB
+        try:
+            _ = exit_dt < open_dt
+            raised = False
+        except TypeError as e:
+            raised = True
+            assert "offset-naive and offset-aware" in str(e)
+        assert raised is True
+
+    def test_as_utc_makes_sync_compare_safe(self):
+        exit_dt = datetime(2026, 7, 31, 14, 50, tzinfo=timezone.utc)
+        open_dt = datetime(2026, 7, 31, 14, 30)  # naive from DB
+        assert as_utc(exit_dt) > as_utc(open_dt)
+
+    def test_sync_trade_history_uses_as_utc_before_compare(self):
+        import inspect
+        from trading_bot.main import TradingBot
+
+        source = inspect.getsource(TradingBot._sync_trade_history)
+        assert "as_utc" in source, (
+            "_sync_trade_history must normalize datetimes with as_utc before comparing"
+        )
+        # The open/exit ordering check must normalize both sides
+        assert "as_utc(_exit_dt)" in source or "as_utc(_open_dt)" in source

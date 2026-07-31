@@ -521,6 +521,11 @@ class EdgeTrackerResponse(BaseModel):
     recent_wr_trend: List[float]
 
 
+# Fail-open until enough closed trades exist. Matches session WR blocking
+# (10+ trades) and playbook gates — one stop-out must not "collapse" the edge.
+EDGE_HEALTH_MIN_SAMPLE = 10
+
+
 def _compute_edge_score(win_rate: float, avg_r: float, n_trades: int) -> float:
     """
     Composite edge health score 0-100.
@@ -532,7 +537,12 @@ def _compute_edge_score(win_rate: float, avg_r: float, n_trades: int) -> float:
     return round(wr_score + r_score + n_score, 1)
 
 
-def _status_from_score(score: float) -> str:
+def _status_from_score(score: float, n_trades: int = 999) -> str:
+    """Map score to status. Thin samples never go critical/blocked (fail-open)."""
+    if n_trades < EDGE_HEALTH_MIN_SAMPLE:
+        if score >= 60:
+            return "healthy"
+        return "warning"
     if score >= 60:
         return "healthy"
     elif score >= 40:
@@ -540,6 +550,37 @@ def _status_from_score(score: float) -> str:
     elif score >= 25:
         return "critical"
     return "blocked"
+
+
+def _edge_symbol_alert(
+    symbol: str,
+    score: float,
+    status: str,
+    trades: int,
+) -> Optional[EdgeAlert]:
+    """Build per-symbol edge alert; never claim auto-block on thin samples."""
+    if trades < EDGE_HEALTH_MIN_SAMPLE:
+        return EdgeAlert(
+            level="info",
+            message=(
+                f"{symbol}: building sample ({trades}/{EDGE_HEALTH_MIN_SAMPLE}). "
+                f"Edge protection inactive (score {score:.0f})."
+            ),
+            symbol=symbol,
+        )
+    if status == "blocked":
+        return EdgeAlert(
+            level="critical",
+            message=f"{symbol} edge collapsed (score {score:.0f}). Auto-blocked.",
+            symbol=symbol,
+        )
+    if status == "critical":
+        return EdgeAlert(
+            level="warning",
+            message=f"{symbol} edge degrading (score {score:.0f}). Watch closely.",
+            symbol=symbol,
+        )
+    return None
 
 
 @router.get("/edge-tracker", response_model=EdgeTrackerResponse)
@@ -574,15 +615,21 @@ async def get_edge_tracker(
 
         if not trades:
             return EdgeTrackerResponse(
-                overall_score=0,
-                overall_status="blocked",
+                overall_score=100,
+                overall_status="healthy",
                 rolling_win_rate=0,
                 rolling_avg_r=0,
                 rolling_total_r=0,
                 rolling_trades=0,
                 window_label=f"Last {window} trades (0 available)",
                 symbols=[],
-                alerts=[EdgeAlert(level="critical", message="No closed trades found")],
+                alerts=[EdgeAlert(
+                    level="info",
+                    message=(
+                        f"No closed trades yet. Edge protection inactive "
+                        f"until {EDGE_HEALTH_MIN_SAMPLE} trades."
+                    ),
+                )],
                 recent_wr_trend=[],
             )
 
@@ -599,7 +646,7 @@ async def get_edge_tracker(
         total_r = sum(r_vals)
 
         overall_score = _compute_edge_score(wr, avg_r, n)
-        overall_status = _status_from_score(overall_score)
+        overall_status = _status_from_score(overall_score, n_trades=n)
 
         sym_data: Dict[str, Dict[str, Any]] = {}
         for t in trades:
@@ -622,7 +669,7 @@ async def get_edge_tracker(
             symbol_edges.append(SymbolEdge(
                 symbol=s, trades=sn, win_rate=round(swr, 4),
                 avg_r=round(sar, 3), total_r=round(str_r, 2),
-                score=ss, status=_status_from_score(ss),
+                score=ss, status=_status_from_score(ss, n_trades=sn),
             ))
         symbol_edges.sort(key=lambda x: x.score, reverse=True)
 
@@ -636,7 +683,15 @@ async def get_edge_tracker(
             recent_wr_trend.append(round(bw / bn, 4) if bn > 0 else 0.0)
 
         alerts: List[EdgeAlert] = []
-        if overall_score < 30:
+        if n < EDGE_HEALTH_MIN_SAMPLE:
+            alerts.append(EdgeAlert(
+                level="info",
+                message=(
+                    f"Building edge sample ({n}/{EDGE_HEALTH_MIN_SAMPLE}). "
+                    f"Score {overall_score:.0f}/100 is informational only — not blocking."
+                ),
+            ))
+        elif overall_score < 30:
             alerts.append(EdgeAlert(
                 level="critical",
                 message=f"Edge health critically low ({overall_score:.0f}/100). Consider pausing trading."
@@ -648,18 +703,9 @@ async def get_edge_tracker(
             ))
 
         for se in symbol_edges:
-            if se.status == "blocked":
-                alerts.append(EdgeAlert(
-                    level="critical",
-                    message=f"{se.symbol} edge collapsed (score {se.score:.0f}). Auto-blocked.",
-                    symbol=se.symbol,
-                ))
-            elif se.status == "critical":
-                alerts.append(EdgeAlert(
-                    level="warning",
-                    message=f"{se.symbol} edge degrading (score {se.score:.0f}). Watch closely.",
-                    symbol=se.symbol,
-                ))
+            alert = _edge_symbol_alert(se.symbol, se.score, se.status, se.trades)
+            if alert:
+                alerts.append(alert)
 
         if len(recent_wr_trend) >= 3 and all(
             recent_wr_trend[i] < recent_wr_trend[i + 1]
@@ -686,14 +732,14 @@ async def get_edge_tracker(
     except Exception as e:
         logger.error(f"Edge tracker error: {e}")
         return EdgeTrackerResponse(
-            overall_score=0,
-            overall_status="blocked",
+            overall_score=100,
+            overall_status="warning",
             rolling_win_rate=0,
             rolling_avg_r=0,
             rolling_total_r=0,
             rolling_trades=0,
             window_label=f"Error: {str(e)[:50]}",
             symbols=[],
-            alerts=[EdgeAlert(level="critical", message=f"Error computing edge: {str(e)[:100]}")],
+            alerts=[EdgeAlert(level="warning", message=f"Error computing edge: {str(e)[:100]}")],
             recent_wr_trend=[],
         )

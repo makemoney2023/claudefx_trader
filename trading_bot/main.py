@@ -4296,9 +4296,13 @@ Apply the evaluation rules from the system message and reply per the OUTPUT CONT
                                 )
                             )
                             if _needs_update:
+                                from .utils.datetime_utils import as_utc
                                 _exit_dt = close_time if isinstance(close_time, datetime) else datetime.now(timezone.utc)
                                 _open_dt = getattr(trade, 'entry_time', None) or getattr(trade, 'timestamp', None)
-                                if _open_dt and isinstance(_open_dt, datetime) and _exit_dt < _open_dt:
+                                # SQLite entry_time is often naive; MT5 deal.time is UTC-aware.
+                                # Comparing mixed tzinfo raises TypeError and aborts the update.
+                                _exit_dt = as_utc(_exit_dt)
+                                if _open_dt and isinstance(_open_dt, datetime) and _exit_dt < as_utc(_open_dt):
                                     logger.warning(f"[SYNC] Trade {trade_id}: close_time ({_exit_dt}) < open_time ({_open_dt}), adjusting")
                                     _exit_dt = datetime.now(timezone.utc)
 
