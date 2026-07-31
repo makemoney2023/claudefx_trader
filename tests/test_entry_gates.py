@@ -151,6 +151,32 @@ class TestAmdDistributionGate:
         assert outcome.blocked is False
         assert outcome.confidence_cap == 0.60
 
+    def test_accepts_amd_cycle_state_object(self):
+        """Live path overwrites amd_cycle with AMDCycleState; gate must not crash."""
+        from trading_bot.analysis.amd_cycle import AMDCycleState, AMDPhase
+
+        ctx = TradeContext(
+            symbol="XAUUSD",
+            direction="short",
+            confidence=0.72,
+            actual_rr=2.01,
+            analysis_results={
+                "amd_cycle": AMDCycleState(
+                    phase=AMDPhase.DISTRIBUTION,
+                    accumulation_high=None,
+                    accumulation_low=None,
+                    manipulation_extreme=None,
+                    manipulation_direction=None,
+                    expected_direction="bearish",
+                    phase_start_time=None,
+                    confidence=0.3,
+                )
+            },
+        )
+        outcome = evaluate_amd_distribution_gate(ctx)
+        assert outcome.blocked is False
+        assert outcome.confidence_cap == 0.60
+
 
 class TestDirectionAlignmentGateBasics:
     """Consolidated direction gate (replaced the legacy D1 gate)."""

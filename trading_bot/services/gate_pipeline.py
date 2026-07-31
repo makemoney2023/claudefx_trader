@@ -145,7 +145,16 @@ def count_confluence(ctx: TradeContext) -> tuple[int, list[str]]:
             factors.append("Directional Sweep")
 
     amd = ar.get("amd_cycle")
-    if isinstance(amd, dict) and amd.get("phase") == "distribution" and amd.get("expected_direction") == _dir:
+    amd_phase = None
+    amd_expected = None
+    if isinstance(amd, dict):
+        amd_phase = amd.get("phase")
+        amd_expected = amd.get("expected_direction")
+    elif amd is not None:
+        phase_obj = getattr(amd, "phase", None)
+        amd_phase = getattr(phase_obj, "value", phase_obj)
+        amd_expected = getattr(amd, "expected_direction", None)
+    if amd_phase == "distribution" and amd_expected == _dir:
         count += 1
         factors.append("AMD Distribution")
 

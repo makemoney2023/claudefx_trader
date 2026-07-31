@@ -329,12 +329,22 @@ def evaluate_htf_alignment_gate(ctx: "TradeContext") -> GateOutcome:
     return GateOutcome.pass_through("htf_gate")
 
 
+def _amd_phase_value(amd_raw) -> str:
+    """Normalize AMD phase from dict or AMDCycleState object."""
+    if amd_raw is None:
+        return ""
+    if isinstance(amd_raw, dict):
+        return str(amd_raw.get("phase") or "").lower()
+    phase = getattr(amd_raw, "phase", None)
+    if phase is None:
+        return ""
+    return str(getattr(phase, "value", phase) or "").lower()
+
+
 def evaluate_amd_distribution_gate(ctx: "TradeContext") -> GateOutcome:
     """AMD distribution phase gate."""
-    bot_amd = ""
-    if ctx.analysis_results.get("amd_cycle"):
-        bot_amd = (ctx.analysis_results["amd_cycle"].get("phase") or "").lower()
-    effective_amd = bot_amd or ctx.amd_phase
+    bot_amd = _amd_phase_value(ctx.analysis_results.get("amd_cycle"))
+    effective_amd = bot_amd or (ctx.amd_phase or "")
     if effective_amd != "distribution":
         return GateOutcome.pass_through("amd_distribution")
 

@@ -507,11 +507,26 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
             except Exception as _zone_err:
                 logger.debug(f"Zone validation pre-check failed: {_zone_err}")
                 _zone_valid = None
-        # Ensure displacement/AMD visible to shared parity gates
+        # Ensure displacement/AMD visible to shared parity gates.
+        # Keep amd_cycle as a dict so entry gates / confluence can use .get();
+        # post_claude_gates already accepts either form.
         if displacement_analysis is not None:
             analysis_results["displacement"] = displacement_analysis
-        if amd_state is not None:
-            analysis_results["amd_cycle"] = amd_state
+        if amd_state is not None and not isinstance(
+            analysis_results.get("amd_cycle"), dict
+        ):
+            analysis_results["amd_cycle"] = {
+                "phase": getattr(
+                    getattr(amd_state, "phase", None),
+                    "value",
+                    getattr(amd_state, "phase", None),
+                ),
+                "expected_direction": getattr(amd_state, "expected_direction", None),
+                "manipulation_extreme": getattr(
+                    amd_state, "manipulation_extreme", None
+                ),
+                "confidence": getattr(amd_state, "confidence", 0.0),
+            }
         _pc_inp = PostClaudeGateInput(
             symbol=symbol,
             trade_signal=trade_signal,
