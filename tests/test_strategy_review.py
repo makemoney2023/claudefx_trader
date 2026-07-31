@@ -139,8 +139,8 @@ class TestPreciousMetalsContext:
 
 class TestTruncationRetryBudget:
     @pytest.mark.asyncio
-    async def test_retry_after_max_tokens_uses_full_budget(self):
-        """Retry must keep the full analysis budget — 8k was exhausted in prod (2026-07-31)."""
+    async def test_retry_after_max_tokens_uses_expanded_budget(self):
+        """Retry uses 32k — 16k still exhausted with thinking off (2026-07-31)."""
         client = _make_claude_client()
 
         truncated = MagicMock()
@@ -161,10 +161,19 @@ class TestTruncationRetryBudget:
 
         assert client._async_messages_create.await_count == 2
         retry_kwargs = client._async_messages_create.await_args_list[1].kwargs
-        assert retry_kwargs.get("max_tokens") == client.max_tokens
-        assert retry_kwargs.get("max_tokens") == 16000
+        assert retry_kwargs.get("max_tokens") == 32000
         assert retry_kwargs.get("thinking") == {"type": "disabled"}
         assert result.signal.reasoning == "No setup after retry"
+
+    def test_trade_signal_tool_caps_verbosity(self):
+        from trading_bot.llm.claude_client import TRADE_SIGNAL_TOOL
+
+        props = TRADE_SIGNAL_TOOL["input_schema"]["properties"]
+        assert "2-4 sentences" in props["reasoning"]["description"]
+        assert "max 3" in props["order_blocks"]["description"].lower()
+        assert "max 3" in props["fvg_zones"]["description"].lower()
+        assert "max 3" in props["liquidity_targets"]["description"].lower()
+        assert "max 3" in props["warnings"]["description"].lower()
 
 
 # ============================================================
@@ -311,6 +320,60 @@ class TestPreClaudeViability:
         # (below the 0.60 floor -> dead end), short blocked by HTF.
         result = self._check(d1_bias="bullish", h4_bias="bullish", m15_bias="bearish")
         assert result.proceed is False
+
+    def test_short_only_extreme_discount_skips_even_outside_kz(self):
+        """Prod 2026-07-31: HTF bearish + M15 bearish + 11% discount → Claude
+        proposes sell_limit, burns ~$1.60, then limit_zone hard-blocks.
+        """
+        result = self._check(
+            d1_bias="bearish",
+            h4_bias="bearish",
+            m15_bias="bearish",
+            retrace_pct=0.11,
+        )
+        assert result.proceed is False
+        assert any("discount" in r.lower() for r in result.reasons)
+
+    def test_short_only_extreme_discount_skips_inside_kill_zone(self):
+        """Zone hard-block is absolute — do not burn Claude spend in KZ either."""
+        result = self._check(
+            d1_bias="bearish",
+            h4_bias="bearish",
+            m15_bias="bearish",
+            retrace_pct=0.11,
+            in_kill_zone=True,
+        )
+        assert result.proceed is False
+
+    def test_long_only_extreme_premium_skips(self):
+        result = self._check(
+            d1_bias="bullish",
+            h4_bias="bullish",
+            m15_bias="bullish",
+            retrace_pct=0.85,
+        )
+        assert result.proceed is False
+        assert any("premium" in r.lower() for r in result.reasons)
+
+    def test_short_preferred_but_discount_aligned_long_open_proceeds(self):
+        """Extreme discount with a viable long path must still call Claude."""
+        # HTF not both bearish → long open; M15 bearish blocks shorts without manip.
+        result = self._check(
+            d1_bias="neutral",
+            h4_bias="bullish",
+            m15_bias="bullish",
+            retrace_pct=0.11,
+        )
+        assert result.proceed is True
+
+    def test_short_only_premium_zone_proceeds(self):
+        result = self._check(
+            d1_bias="bearish",
+            h4_bias="bearish",
+            m15_bias="bearish",
+            retrace_pct=0.72,
+        )
+        assert result.proceed is True
 
     @pytest.mark.asyncio
     async def test_runner_skips_chart_and_claude_when_unviable(self, monkeypatch):

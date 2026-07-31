@@ -72,7 +72,7 @@ TRADE_SIGNAL_TOOL = {
             },
             "reasoning": {
                 "type": "string",
-                "description": "4-8 sentences naming the SPECIFIC confirmations you observed on the charts (e.g. 'M15 swept the 1.0845 low, displaced up, and left an FVG at 1.0862'). State the setup, the entry level and why, and the SL/TP basis. Do NOT restate the rules from the prompt or list generic ICT definitions — only what THIS chart shows."
+                "description": "2-4 sentences max naming SPECIFIC confirmations on THIS chart (sweep/CHoCH/FVG/entry/SL-TP). No rule restatement, no ICT glossary, no long narratives."
             },
             "market_structure": {
                 "type": "string",
@@ -101,17 +101,17 @@ TRADE_SIGNAL_TOOL = {
             "order_blocks": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Descriptions of relevant order blocks"
+                "description": "Max 3 short labels (e.g. 'bearish OB 4112-4115'). Omit if none."
             },
             "fvg_zones": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Descriptions of relevant FVGs"
+                "description": "Max 3 short labels (e.g. 'bearish FVG 4097-4100'). Omit if none."
             },
             "liquidity_targets": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Liquidity targets identified"
+                "description": "Max 3 short labels (e.g. 'BSL 4111.5'). Omit if none."
             },
             "key_levels": {
                 "type": "object",
@@ -127,7 +127,7 @@ TRADE_SIGNAL_TOOL = {
             "warnings": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Risk factors or concerns"
+                "description": "Max 3 short risk notes (e.g. 'Asian thin liquidity'). Empty array if none."
             }
         },
         "required": [
@@ -389,7 +389,7 @@ session low and reclaimed it, an M5 displacement candle closed leaving an FVG at
 - order_type: "buy_limit", entry_price: 1.0847 (into the FVG, discount zone)
 - stop_loss: 1.0833 (below the swept low + buffer — BELOW entry)
 - take_profit: 1.0889 (prior day high / BSL — ABOVE entry), risk_reward: 3.0
-- reasoning: names the sweep, the displacement, the FVG entry, and the SL/TP basis in 4-6 sentences.
+- reasoning: names the sweep, the displacement, the FVG entry, and the SL/TP basis in 2-4 sentences.
 All three prices are absolute levels in the same magnitude as current price; SL and TP are on the
 correct sides of entry; R:R clears the 2:1 intraday minimum.
 
@@ -945,13 +945,12 @@ class ClaudeClient:
                             f"[ANALYSIS] {symbol} hit max_tokens={self.max_tokens} "
                             f"— retrying once with thinking disabled + forced tool"
                         )
-                        # Keep the full analysis budget on retry. Thinking is off, so
-                        # all tokens go to the forced tool JSON — but Opus still writes
-                        # very long reasoning/OB/FVG arrays into tool args. History:
-                        # 4k exhausted (2026-07-30), 8k exhausted (2026-07-31 XAUUSD).
+                        # Thinking off — expand budget so forced tool JSON can finish.
+                        # History: 4k (2026-07-30), 8k then 16k (2026-07-31) all
+                        # exhausted on verbose XAUUSD tool args.
                         message = await self._async_messages_create(
                             model=self.model_heavy,
-                            max_tokens=self.max_tokens,
+                            max_tokens=32000,
                             thinking={"type": "disabled"},
                             output_config={"effort": "low"},
                             system=system_messages,

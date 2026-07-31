@@ -233,10 +233,11 @@ TRADING_CLAUDE_KILL_ZONE_ONLY=true
 # trading — set this in the VPS .env.local:
 TRADING_NEWS_GATES_ENABLED=true
 
-# After pulling strategy-review changes (pre-Claude viability filter,
-# truthful gate rejects, direction-gate consolidation, counterfactual
-# journal) or fill-path / Friday-gate fixes, redeploy and restart the
-# backend on the VPS so live MT5 uses the new code:
+# After pulling strategy-review changes (pre-Claude viability filter —
+# including extreme premium/discount skip when only one direction is
+# viable — truthful gate rejects, direction-gate consolidation,
+# counterfactual journal) or fill-path / Friday-gate fixes, redeploy and
+# restart the backend on the VPS so live MT5 uses the new code:
 #   git pull
 #   Restart-Service / nssm restart / or re-run start script
 #

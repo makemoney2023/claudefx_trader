@@ -346,6 +346,20 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
         if isinstance(_vol, dict):
             _rel_volume = float(_vol.get("relative_volume", 1.0) or 1.0)
 
+        _retrace_pct = None
+        if pd_analysis is not None:
+            _retrace_pct = getattr(pd_analysis, "retracement_percent", None)
+        if _retrace_pct is None:
+            _pd = analysis_results.get("premium_discount") or {}
+            if isinstance(_pd, dict):
+                _retrace_pct = _pd.get("retracement_percent")
+            else:
+                _retrace_pct = getattr(_pd, "retracement_percent", None)
+        try:
+            _retrace_pct = float(_retrace_pct) if _retrace_pct is not None else None
+        except (TypeError, ValueError):
+            _retrace_pct = None
+
         if mtf_result is not None:
             _viability = pre_claude_viability(
                 d1_bias=_bias_of(getattr(mtf_result, "daily_analysis", None)),
@@ -355,6 +369,7 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                 relative_volume=_rel_volume,
                 in_kill_zone=_in_kill_zone,
                 silver_bullet_window=_sb_window,
+                retrace_pct=_retrace_pct,
             )
             if not _viability.proceed:
                 _skip_reason = "; ".join(_viability.reasons)

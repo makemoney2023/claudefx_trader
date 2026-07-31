@@ -84,6 +84,11 @@ def _direction_structurally_blocked(
     return None
 
 
+# Matches trade_execution.validate_limit_zone hard thresholds.
+_EXTREME_DISCOUNT_RETRACE = 0.30
+_EXTREME_PREMIUM_RETRACE = 0.70
+
+
 def pre_claude_viability(
     *,
     d1_bias: str,
@@ -93,24 +98,19 @@ def pre_claude_viability(
     relative_volume: float = 1.0,
     in_kill_zone: bool = False,
     silver_bullet_window: bool = False,
+    retrace_pct: Optional[float] = None,
 ) -> PreClaudeViability:
     """
     Decide whether calling Claude can possibly produce an executable trade.
 
-    Skips the LLM only when the mechanical gate stack already guarantees
-    rejection of every direction — never on judgment calls. During kill
-    zones and Silver Bullet windows we always analyze (structure can shift
-    fast, and the analysis feeds the dashboard when it matters most).
+    Skips the LLM when the mechanical gate stack already guarantees
+    rejection — including extreme premium/discount vs the only-viable
+    direction (limit_zone hard-blocks sell_limit in discount / buy_limit
+    in premium). Kill zones still bypass soft structural/volume skips,
+    but not extreme-zone conflicts (those burn API spend for a guaranteed
+    post-judge block).
     """
-    if in_kill_zone or silver_bullet_window:
-        return PreClaudeViability(proceed=True)
-
     reasons: List[str] = []
-
-    if relative_volume < 0.3:
-        reasons.append(
-            f"volume {relative_volume:.2f}x < 0.3 — dead market blocks all entries"
-        )
 
     long_block = _direction_structurally_blocked(
         "long", d1_bias, h4_bias, m15_bias, amd_phase
@@ -118,6 +118,31 @@ def pre_claude_viability(
     short_block = _direction_structurally_blocked(
         "short", d1_bias, h4_bias, m15_bias, amd_phase
     )
+
+    # Hard zone conflict — applies even inside kill zones.
+    if retrace_pct is not None:
+        if short_block is None and long_block is not None and retrace_pct < _EXTREME_DISCOUNT_RETRACE:
+            reasons.append(
+                f"short-only path but extreme discount (retrace={retrace_pct:.0%}) — "
+                "sell_limit blocked by zone gate; wait for premium pullback"
+            )
+        elif long_block is None and short_block is not None and retrace_pct > _EXTREME_PREMIUM_RETRACE:
+            reasons.append(
+                f"long-only path but extreme premium (retrace={retrace_pct:.0%}) — "
+                "buy_limit blocked by zone gate; wait for discount"
+            )
+
+    if reasons:
+        return PreClaudeViability(proceed=False, reasons=reasons)
+
+    if in_kill_zone or silver_bullet_window:
+        return PreClaudeViability(proceed=True)
+
+    if relative_volume < 0.3:
+        reasons.append(
+            f"volume {relative_volume:.2f}x < 0.3 — dead market blocks all entries"
+        )
+
     if long_block and short_block:
         reasons.append(long_block)
         reasons.append(short_block)
