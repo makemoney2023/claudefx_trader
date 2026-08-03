@@ -471,25 +471,34 @@ class TradingSettings(BaseSettings):
     )
     zone_misaligned_min_confidence: float = Field(
         default=0.60,
-        description="Min confidence for zone-misaligned trades (long from premium, short from discount)"
+        description=(
+            "Deprecated: wrong-zone now requires sweep+displacement instead of "
+            "conf/RR bypass. Retained for settings compatibility."
+        ),
     )
     zone_misaligned_min_rr: float = Field(
         default=2.0,
-        description="Min R:R for zone-misaligned trades"
+        description=(
+            "Deprecated: wrong-zone now requires sweep+displacement instead of "
+            "conf/RR bypass. Retained for settings compatibility."
+        ),
     )
     zone_equilibrium_min_confidence: float = Field(
         default=0.60,
-        description="Min confidence for trades from equilibrium zone"
+        description=(
+            "Deprecated: equilibrium soft-pass removed; location uses 50% mid "
+            "with sweep+displacement override. Retained for compatibility."
+        ),
     )
     zone_gate_disabled_symbols: List[str] = Field(
         default=[],
         description="Symbols where zone gate is disabled (falls back to legacy D1 gate)"
     )
     ict_confirmation_mode: str = Field(
-        default="shadow",
+        default="active",
         description=(
-            "ICT setup confirmation gate: 'shadow' logs would-block only, "
-            "'active' hard-blocks missing confirmations, 'disabled' skips"
+            "ICT setup confirmation gate: 'active' hard-blocks missing confirmations "
+            "(default), 'shadow' logs would-block only, 'disabled' skips"
         ),
     )
     correlation_group_mode: str = Field(

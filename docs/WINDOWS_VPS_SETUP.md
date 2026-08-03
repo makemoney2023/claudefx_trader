@@ -265,10 +265,13 @@ TRADING_NEWS_GATES_ENABLED=true
 #   GET http://YOUR_VPS_IP:8000/api/analysis/counterfactuals
 # (per-gate saved_r / missed_r / net_saved_r tallies plus recent records)
 #
-# --- Net expectancy / promotion controls (shadow-first) ---
-# ICT setup confirmation (default shadow — would-block only):
-# TRADING_ICT_CONFIRMATION_MODE=shadow
-# Correlated group risk cap (default shadow — logs only until activated):
+# --- Direction quality / expectancy controls ---
+# ICT setup confirmation (default ACTIVE — hard-blocks incomplete confirms):
+TRADING_ICT_CONFIRMATION_MODE=active
+# Wrong-zone (short discount / long premium) requires sweep+displacement;
+# conf/RR alone no longer bypasses. Controlled by TRADING_ZONE_GATE_MODE
+# (default active).
+# Correlated group risk cap (still shadow — logs only until activated):
 # TRADING_CORRELATION_GROUP_MODE=shadow
 # TRADING_CORRELATION_MAX_GROUP_RISK_PCT=0.10
 #

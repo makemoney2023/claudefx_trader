@@ -1031,7 +1031,7 @@ class TestZoneGatePureLocation:
             symbol="XAUUSD",
         )
         assert res.blocked is True
-        assert res.decision == "blocked_misaligned"
+        assert "wrong_zone" in res.decision
 
 
 class TestDirectionGatePipelineWiring:
@@ -1174,7 +1174,17 @@ class TestDirectionGateParity:
                 (d1 == "bullish" and direction == "short")
                 or (d1 == "bearish" and direction == "long")
             )
-            assert opposes and ttype != "scalp" and rr < 3.0, (
+            # Known intentional tighten: wrong-zone now hard-blocks without
+            # sweep+displacement (this parity helper never supplies those).
+            wrong_zone = (
+                (direction == "long" and retrace > 0.5)
+                or (direction == "short" and retrace < 0.5)
+            )
+            allowed = (
+                (opposes and ttype != "scalp" and rr < 3.0)
+                or wrong_zone
+            )
+            assert allowed, (
                 f"Undocumented divergence: {direction} d1={d1} {ttype} "
                 f"conf={conf} rr={rr} retrace={retrace} index={is_index}"
             )

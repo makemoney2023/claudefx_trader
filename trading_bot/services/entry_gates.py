@@ -50,8 +50,16 @@ def evaluate_zone_gate(
     settings: ZoneGateSettings,
     symbol: str,
     is_counter_trend_scalp: bool = False,
+    has_sweep: bool = False,
+    has_displacement: bool = False,
 ) -> ZoneGateResult:
-    """Zone-aware direction gate: sell premium, buy discount."""
+    """Zone-aware direction gate: sell premium, buy discount.
+
+    Wrong-zone entries (short below 50% / long above 50%) hard-block unless
+    both a directional sweep and displacement are present. Conf/RR alone no
+    longer bypasses location — that was letting clean FVG fills fire the
+    wrong way from discount shorts / premium longs.
+    """
     if is_counter_trend_scalp:
         return ZoneGateResult(blocked=False, decision="skipped_counter_scalp")
 
@@ -65,41 +73,33 @@ def evaluate_zone_gate(
     # confirmation) lives in evaluate_direction_alignment_gate; the d1_bias
     # and is_index parameters are retained only for call-site compatibility.
     _dir = direction.lower()
+    # confidence/actual_rr/d1_bias/is_index retained for call-site compatibility
 
     in_correct_zone = (
         (_dir == "short" and retrace >= 0.5)
         or (_dir == "long" and retrace <= 0.5)
-    )
-    zone_aligned = in_correct_zone
-    zone_misaligned = (
-        (_dir == "long" and retrace >= 0.618)
-        or (_dir == "short" and retrace <= 0.382)
     )
 
     blocked = False
     decision = "allowed_zone_aligned"
     reason = ""
 
-    if zone_misaligned:
-        if confidence < settings.misaligned_min_confidence or actual_rr < settings.misaligned_min_rr:
-            blocked = True
-            decision = "blocked_misaligned"
+    if not in_correct_zone:
+        structure_ok = bool(has_sweep) and bool(has_displacement)
+        if structure_ok:
+            decision = "allowed_wrong_zone_confirmed"
             reason = (
                 f"ZONE-GATE {direction.upper()} from {zone_str} "
-                f"(retrace={retrace:.0%}, conf={confidence:.0%}, RR={actual_rr:.1f})"
+                f"(retrace={retrace:.0%}) allowed — sweep+displacement confirmed"
             )
         else:
-            decision = "allowed_misaligned_high_conf"
-    elif not zone_aligned:
-        if confidence < settings.equilibrium_min_confidence:
             blocked = True
-            decision = "blocked_equilibrium"
+            decision = "blocked_wrong_zone"
             reason = (
                 f"ZONE-GATE {direction.upper()} from {zone_str} "
-                f"(equilibrium, conf={confidence:.0%})"
+                f"(retrace={retrace:.0%}) — need sweep+displacement "
+                f"(sweep={bool(has_sweep)}, displacement={bool(has_displacement)})"
             )
-        else:
-            decision = "allowed_equilibrium"
 
     if blocked and settings.gate_mode == "shadow":
         return ZoneGateResult(

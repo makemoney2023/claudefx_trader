@@ -73,7 +73,7 @@ def _evaluate_ict_confirmation_for_ctx(ctx: TradeContext) -> GateOutcome:
     from ..config import settings
     from .setup_fingerprint import build_setup_fingerprint
 
-    mode = getattr(settings.trading, "ict_confirmation_mode", "shadow") or "shadow"
+    mode = getattr(settings.trading, "ict_confirmation_mode", "active") or "active"
     regime = ""
     reg = ctx.analysis_results.get("regime") or {}
     if isinstance(reg, dict):
@@ -204,6 +204,11 @@ def evaluate_zone_and_regime_gates(
     apply_gate_outcomes(ctx, dir_step)
 
     if use_zone_gate and ctx.pd_analysis is not None:
+        from .setup_fingerprint import has_directional_sweep, has_displacement
+
+        _ar = ctx.analysis_results or {}
+        _has_sweep = has_directional_sweep(ctx.direction, _ar.get("liquidity"))
+        _has_disp = has_displacement(_ar)
         zg = evaluate_zone_gate(
             direction=ctx.direction,
             confidence=ctx.confidence,
@@ -215,6 +220,8 @@ def evaluate_zone_and_regime_gates(
             settings=zone_settings,
             symbol=ctx.symbol,
             is_counter_trend_scalp=ctx.is_counter_trend_scalp,
+            has_sweep=_has_sweep,
+            has_displacement=_has_disp,
         )
         if zg.blocked:
             return GateOutcome.block(
@@ -302,7 +309,7 @@ def evaluate_structure_and_quality_gates(
     if conf_step.blocked:
         return accumulated
 
-    # Setup-family ICT confirmation (default shadow — never hard-blocks until Phase 6)
+    # Setup-family ICT confirmation (default active — blocks incomplete confirms)
     ict_step = _evaluate_ict_confirmation_for_ctx(ctx)
     return _merge_outcome(accumulated, ict_step)
 

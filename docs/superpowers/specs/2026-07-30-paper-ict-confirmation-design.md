@@ -8,13 +8,18 @@ live deployments.
 
 ## Configuration
 
-- Set `TRADING_ICT_CONFIRMATION_MODE=active` in `.env.local`.
-- Keep `TradingSettings.ict_confirmation_mode` defaulting to `shadow`.
+- `TradingSettings.ict_confirmation_mode` defaults to `active`.
+- Set `TRADING_ICT_CONFIRMATION_MODE=active` explicitly on the VPS `.env.local`
+  (required if an older env still pins `shadow`).
 - Keep correlation group sizing in shadow mode.
 
 In active mode, incomplete continuation and liquidity-reversal confirmations,
 and invalid passive retracement prerequisites, become hard mechanical rejects.
 No confirmation thresholds or setup-family rules change.
+
+Wrong-zone entries (short below 50% retrace / long above 50%) are also
+hard-blocked by the zone gate unless both directional sweep and displacement
+are present — conf/RR alone is no longer a bypass.
 
 ## Data flow
 

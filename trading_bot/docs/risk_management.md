@@ -39,6 +39,15 @@ value is never clamped up to broker `volume_max` (often 100) and logged as a
 false oversize warning. Final dollar risk is still enforced by FINAL-RISK
 immediately before order send.
 
+### Direction quality gates
+
+- **ICT confirmation** defaults to `active`: incomplete passive retracements
+  (limit without displacement-origin), reversals without sweep+MSS+displacement,
+  and continuations without HTF+MSS+displacement are hard rejects.
+- **Zone gate**: shorts below 50% retrace / longs above 50% hard-block unless
+  **both** directional sweep and displacement are present. Confidence and R:R
+  alone no longer bypass wrong-zone location.
+
 ### Lot Size Reference
 
 | Lot Type | Units | Pip Value (USD pairs) |

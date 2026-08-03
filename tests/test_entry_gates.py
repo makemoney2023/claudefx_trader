@@ -17,8 +17,8 @@ from trading_bot.services.trade_context import TradeContext
 
 
 class TestZoneGate:
-    def test_blocks_misaligned_below_60_or_low_rr(self):
-        """Misaligned needs >=60% conf AND min RR; 60% with weak RR still blocks."""
+    def test_blocks_wrong_zone_without_sweep_displacement(self):
+        """Long from premium needs sweep+displacement — conf/RR alone is not enough."""
         result = evaluate_zone_gate(
             direction="long",
             confidence=0.60,
@@ -31,9 +31,9 @@ class TestZoneGate:
             symbol="EURUSD",
         )
         assert result.blocked is True
-        assert "blocked_misaligned" in result.decision
+        assert "wrong_zone" in result.decision
 
-    def test_allows_misaligned_at_60_with_rr(self):
+    def test_allows_wrong_zone_with_sweep_and_displacement(self):
         result = evaluate_zone_gate(
             direction="long",
             confidence=0.60,
@@ -44,12 +44,14 @@ class TestZoneGate:
             is_index=False,
             settings=ZoneGateSettings(),
             symbol="EURUSD",
+            has_sweep=True,
+            has_displacement=True,
         )
         assert result.blocked is False
-        assert result.decision == "allowed_misaligned_high_conf"
+        assert "confirmed" in result.decision
 
-    def test_allows_short_from_discount_at_rr_2_2(self):
-        """Replay case: SHORT from discount (36%) with conf=63% RR=2.2 should pass."""
+    def test_blocks_short_from_discount_even_with_high_rr(self):
+        """High conf/RR no longer bypasses wrong-zone without structure confirms."""
         result = evaluate_zone_gate(
             direction="short",
             confidence=0.63,
@@ -61,10 +63,11 @@ class TestZoneGate:
             settings=ZoneGateSettings(),
             symbol="XAUUSD",
         )
-        assert result.blocked is False
-        assert result.decision == "allowed_misaligned_high_conf"
+        assert result.blocked is True
+        assert "wrong_zone" in result.decision
 
-    def test_allows_equilibrium_at_60(self):
+    def test_blocks_soft_wrong_zone_at_55pct(self):
+        """Long above 50% is wrong-zone (no more equilibrium bypass at 60%)."""
         result = evaluate_zone_gate(
             direction="long",
             confidence=0.60,
@@ -76,23 +79,8 @@ class TestZoneGate:
             settings=ZoneGateSettings(),
             symbol="XAUUSD",
         )
-        assert result.blocked is False
-        assert result.decision == "allowed_equilibrium"
-
-    def test_blocks_equilibrium_below_60(self):
-        result = evaluate_zone_gate(
-            direction="long",
-            confidence=0.59,
-            actual_rr=2.0,
-            retrace=0.55,
-            zone_str="equilibrium",
-            d1_bias="bullish",
-            is_index=False,
-            settings=ZoneGateSettings(),
-            symbol="XAUUSD",
-        )
         assert result.blocked is True
-        assert "blocked_equilibrium" in result.decision
+        assert "wrong_zone" in result.decision
 
     def test_allows_zone_aligned(self):
         result = evaluate_zone_gate(
