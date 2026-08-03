@@ -20,12 +20,14 @@ import {
   Clock,
   Brain,
   Globe,
+  Radar,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 const navigation = [
   { name: 'Dashboard', href: '/', icon: LayoutDashboard },
   { name: 'Bot Activity', href: '/bot', icon: Cpu },
+  { name: 'Opportunities', href: '/opportunities', icon: Radar },
   { name: 'Positions', href: '/positions', icon: Shield },
   { name: 'Intelligence', href: '/intelligence', icon: Globe },
   { name: 'Learning', href: '/learning', icon: Brain },

@@ -228,6 +228,17 @@ TRADING_AUTO_START_BOT=false
 # Set false only for debugging off-hours analysis.
 TRADING_CLAUDE_KILL_ZONE_ONLY=true
 
+# Mechanical opportunity scanner (Market Watch → hot list → Claude cycle).
+# Default false. When true, scans MW + TRADING_SYMBOLS with ICTStrategy
+# (no Claude), promotes top setups into a temporary hot list merged into
+# each trading cycle. Dashboard: /opportunities
+# TRADING_OPPORTUNITY_SCANNER_ENABLED=true
+# TRADING_OPPORTUNITY_SCANNER_INTERVAL_SECONDS=150
+# TRADING_OPPORTUNITY_SCANNER_MAX_UNIVERSE=40
+# TRADING_OPPORTUNITY_SCANNER_HOT_LIST_SIZE=3
+# TRADING_OPPORTUNITY_SCANNER_HOT_TTL_MINUTES=60
+# TRADING_OPPORTUNITY_SCANNER_MIN_RR=1.5
+
 # News gates (blackout windows around red-folder events + stale-calendar
 # fail-closed). The strategy-review changes assume these are ON in live
 # trading — set this in the VPS .env.local:

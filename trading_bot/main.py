@@ -406,6 +406,9 @@ class TradingBot:
         # right before the next call.
         self._last_analysis_time: Dict[str, datetime] = {}  # symbol -> last analysis datetime
         self._analysis_cooldown_seconds: int = 270
+
+        self.opportunity_scanner = None
+        self._opportunity_scan_task = None
         
         # Dynamic learnings: throttle doc updates to at most once per hour
         self._last_learnings_update: Optional[datetime] = None
@@ -561,6 +564,26 @@ class TradingBot:
                     allowed_sessions=settings.trading.allowed_sessions
                 )
             )
+
+            # Mechanical opportunity scanner (hot list; no Claude in scan phase)
+            from .services.opportunity_scanner import OpportunityScanner
+            self.opportunity_scanner = OpportunityScanner(
+                strategy=self.strategy,
+                data_fetcher=self.data_fetcher,
+                mt5_client=self.mt5_client,
+                kill_zone_checker=self.kill_zone_checker,
+                blocked_pairs=self.BLOCKED_PAIRS,
+                crypto_symbols=self.CRYPTO_SYMBOLS,
+                max_universe=settings.trading.opportunity_scanner_max_universe,
+                hot_list_size=settings.trading.opportunity_scanner_hot_list_size,
+                hot_ttl_minutes=settings.trading.opportunity_scanner_hot_ttl_minutes,
+                min_rr=settings.trading.opportunity_scanner_min_rr,
+                execution_tf=settings.timeframes.execution_tf,
+                execution_tf_candles=settings.timeframes.execution_tf_candles,
+                htf=settings.timeframes.higher_tf,
+                htf_candles=settings.timeframes.higher_tf_candles,
+            )
+            self._opportunity_scan_task = None
             
             # Initialize execution components
             self.risk_manager = RiskManager(
@@ -886,6 +909,15 @@ class TradingBot:
         # Launch independent position management loop
         self._position_mgr_task = asyncio.create_task(self._position_management_loop())
         logger.info("Independent position management loop launched (10s interval)")
+
+        if settings.trading.opportunity_scanner_enabled:
+            self._opportunity_scan_task = asyncio.create_task(
+                self._opportunity_scan_loop()
+            )
+            logger.info(
+                "Opportunity scanner loop launched "
+                f"({settings.trading.opportunity_scanner_interval_seconds}s interval)"
+            )
         
         self._last_state_save = datetime.now(timezone.utc)
 
@@ -919,8 +951,37 @@ class TradingBot:
                 except asyncio.CancelledError:
                     pass
                 logger.info("Position management loop stopped")
+            if getattr(self, "_opportunity_scan_task", None):
+                self._opportunity_scan_task.cancel()
+                try:
+                    await self._opportunity_scan_task
+                except asyncio.CancelledError:
+                    pass
+                logger.info("Opportunity scanner loop stopped")
             await self.shutdown()
     
+    async def _opportunity_scan_loop(self):
+        """Background mechanical scanner — no Claude; updates hot list."""
+        interval = max(30, int(settings.trading.opportunity_scanner_interval_seconds))
+        print(
+            f"[SCAN] Opportunity scanner loop started ({interval}s interval)",
+            flush=True,
+        )
+        logger.info(f"Opportunity scanner loop started ({interval}s interval)")
+        while self.running:
+            try:
+                scanner = getattr(self, "opportunity_scanner", None)
+                if scanner is not None:
+                    # Keep data_fetcher reference fresh
+                    scanner.data_fetcher = self.data_fetcher
+                    scanner.mt5_client = self.mt5_client
+                    await scanner.scan_once(base_symbols=settings.trading.symbols)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"[SCAN] scan loop error: {e}")
+            await asyncio.sleep(interval)
+
     async def _position_management_loop(self):
         """
         Independent position management loop.
@@ -1138,7 +1199,13 @@ class TradingBot:
             from .utils.market_hours import get_market_type, MarketType
             
             tradeable_symbols = []
-            configured_symbols = settings.trading.symbols
+            configured_symbols = list(settings.trading.symbols)
+            # Merge temporary scanner hot list (does not mutate TRADING_SYMBOLS)
+            if getattr(self, "opportunity_scanner", None) is not None:
+                from .services.opportunity_scanner import merge_cycle_symbols
+                configured_symbols = merge_cycle_symbols(
+                    configured_symbols, self.opportunity_scanner.hot
+                )
             for symbol in configured_symbols:
                 market_type = get_market_type(symbol)
                 is_open, reason = is_market_open(symbol)

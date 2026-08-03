@@ -1547,6 +1547,50 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                     trade_signal.take_profit = new_tp
             
             # =============================================
+            # PRE-JUDGE ZONE HARD BLOCK
+            # Kill zone-illegal limits before spending a judge call.
+            # =============================================
+            from ..execution.trade_execution import entry_retrace_pct
+            from .opportunity_scanner import pre_judge_zone_block_reason
+
+            _pj_retrace = entry_retrace_pct(
+                analysis_results, trade_signal.entry_price or current_price
+            )
+            if _pj_retrace is None:
+                try:
+                    _pj_retrace = float(_retrace_pct) if _retrace_pct is not None else None
+                except Exception:
+                    _pj_retrace = None
+            _pj_zone_reason = pre_judge_zone_block_reason(
+                order_type=getattr(trade_signal, "order_type", "market") or "market",
+                direction=trade_signal.direction,
+                retrace_pct=_pj_retrace,
+            )
+            if _pj_zone_reason:
+                print(f"[BLOCKED] {symbol}: pre-judge {_pj_zone_reason}", flush=True)
+                logger.warning(f"[PRE-JUDGE-ZONE] {symbol}: {_pj_zone_reason}")
+                if bot_state:
+                    bot_state.trade_decision(symbol, "blocked", _pj_zone_reason)
+                    bot_state.symbol_complete(symbol, "pre_judge_zone")
+                try:
+                    await bot._record_terminal_decision(
+                        "mechanical_reject",
+                        symbol,
+                        gate_id="pre_judge_zone",
+                        reason=_pj_zone_reason,
+                        direction=trade_signal.direction,
+                        confidence=trade_signal.confidence,
+                    )
+                except Exception:
+                    pass
+                if _trade_reservation is not None:
+                    try:
+                        bot._release_trade_reservation(_trade_reservation)
+                    except Exception:
+                        pass
+                return
+
+            # =============================================
             # TRADE JUDGE (pre-execution validation)
             # =============================================
             # Import once before REJECT/DEMOTE/APPROVE branches. A late import

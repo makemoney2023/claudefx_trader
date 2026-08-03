@@ -201,6 +201,38 @@ export const api = {
       { method: 'POST' }
     ),
   
+  getOpportunities: () =>
+    fetchApi<{
+      enabled: boolean
+      last_scan_at: string | null
+      results: OpportunityRow[]
+      total: number
+    }>('/api/opportunities'),
+
+  getOpportunityHotList: () =>
+    fetchApi<{ hot: OpportunityHotEntry[]; total: number }>('/api/opportunities/hot'),
+
+  forceOpportunityScan: () =>
+    fetchApi<{
+      success: boolean
+      total: number
+      promotable: number
+      hot: OpportunityHotEntry[]
+      results: OpportunityRow[]
+    }>('/api/opportunities/scan', { method: 'POST', requiresAuth: true }),
+
+  promoteOpportunity: (symbol: string) =>
+    fetchApi<{ success: boolean; symbol: string; hot: OpportunityHotEntry[] }>(
+      `/api/opportunities/promote/${symbol}`,
+      { method: 'POST', requiresAuth: true }
+    ),
+
+  removeOpportunityHot: (symbol: string) =>
+    fetchApi<{ success: boolean; hot: OpportunityHotEntry[] }>(
+      `/api/opportunities/hot/${symbol}`,
+      { method: 'DELETE', requiresAuth: true }
+    ),
+
   getBotStatus: () =>
     fetchApi<BotStatus>('/api/bot/status'),
   
@@ -1107,6 +1139,35 @@ export interface MT5Symbol {
   digits?: number
   volume_min?: number
   volume_max?: number
+}
+
+export interface OpportunityRow {
+  symbol: string
+  has_setup: boolean
+  direction: string
+  confluence_count: number
+  confluence_factors: string[]
+  confidence: number
+  risk_reward: number
+  zone_ok: boolean
+  retrace_pct?: number | null
+  in_kill_zone: boolean
+  is_crypto: boolean
+  spread_ok: boolean
+  score: number
+  promotable: boolean
+  reason: string
+  session_name: string
+}
+
+export interface OpportunityHotEntry {
+  symbol: string
+  score: number
+  direction: string
+  reason: string
+  promoted_at: string
+  expires_at: string
+  ttl_minutes_remaining: number
 }
 
 export interface BotStatus {

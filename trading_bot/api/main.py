@@ -447,6 +447,16 @@ async def _run_bot_background():
         )
         logger.info("Independent position management loop launched (10s interval)")
         print("[BOT] Independent position management loop launched (10s interval)", flush=True)
+
+        if settings.trading.opportunity_scanner_enabled:
+            _bot_instance._opportunity_scan_task = asyncio.create_task(
+                _bot_instance._opportunity_scan_loop()
+            )
+            logger.info(
+                "Opportunity scanner loop launched "
+                f"({settings.trading.opportunity_scanner_interval_seconds}s)"
+            )
+            print("[BOT] Opportunity scanner loop launched", flush=True)
         
         while _bot_instance.running:
             await _bot_instance._trading_cycle()
@@ -480,6 +490,13 @@ async def _run_bot_background():
                 except asyncio.CancelledError:
                     pass
                 print("[BOT] Position management loop stopped", flush=True)
+            if getattr(_bot_instance, "_opportunity_scan_task", None):
+                _bot_instance._opportunity_scan_task.cancel()
+                try:
+                    await _bot_instance._opportunity_scan_task
+                except asyncio.CancelledError:
+                    pass
+                print("[BOT] Opportunity scanner loop stopped", flush=True)
             await _bot_instance.shutdown()
 
 # Global MT5 client
@@ -562,7 +579,7 @@ def create_app() -> FastAPI:
         return await call_next(request)
     
     # Register routers
-    from .routes import activity, backtest, bot_status, news, silver, goal, crypto, scaling, session, precious_metals, learning, orders, intelligence
+    from .routes import activity, backtest, bot_status, news, silver, goal, crypto, scaling, session, precious_metals, learning, orders, intelligence, opportunities
     app.include_router(trades.router, prefix="/api/trades", tags=["Trades"])
     app.include_router(backtest.router, prefix="/api/backtest", tags=["Backtesting"])
     app.include_router(analysis.router, prefix="/api/analysis", tags=["Analysis"])
@@ -580,6 +597,7 @@ def create_app() -> FastAPI:
     app.include_router(learning.router, tags=["Learning System"])
     app.include_router(orders.router, prefix="/api", tags=["Pending Orders"])
     app.include_router(intelligence.router, prefix="/api", tags=["Market Intelligence"])
+    app.include_router(opportunities.router, prefix="/api", tags=["Opportunities"])
     app.include_router(ws_router, prefix="/ws", tags=["WebSocket"])
     
     # Health check endpoint
@@ -780,6 +798,11 @@ def _sync_bot_services_to_api(bot):
             from .routes.news import set_firecrawl_service as set_news_firecrawl
             set_news_firecrawl(bot.firecrawl_service)
             logger.info("Synced firecrawl_service to API and news routes")
+
+        if getattr(bot, "opportunity_scanner", None) is not None:
+            from .routes.opportunities import set_opportunity_scanner
+            set_opportunity_scanner(bot.opportunity_scanner, bot)
+            logger.info("Synced opportunity_scanner to API")
         
         logger.info("Bot services synced to API routes")
         

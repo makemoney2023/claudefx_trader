@@ -499,6 +499,33 @@ class TradingSettings(BaseSettings):
         default=0.10,
         description="Max portfolio risk fraction per correlation group",
     )
+    opportunity_scanner_enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable mechanical opportunity scanner (Market Watch scan + hot list). "
+            "No Claude in scan phase. Env: TRADING_OPPORTUNITY_SCANNER_ENABLED"
+        ),
+    )
+    opportunity_scanner_interval_seconds: int = Field(
+        default=150,
+        description="Seconds between mechanical opportunity scans",
+    )
+    opportunity_scanner_max_universe: int = Field(
+        default=40,
+        description="Max symbols scored per scan",
+    )
+    opportunity_scanner_hot_list_size: int = Field(
+        default=3,
+        description="Max symbols promoted into the temporary hot list",
+    )
+    opportunity_scanner_hot_ttl_minutes: int = Field(
+        default=60,
+        description="Hot-list entry TTL in minutes",
+    )
+    opportunity_scanner_min_rr: float = Field(
+        default=1.5,
+        description="Minimum R:R for hot-list promotion",
+    )
 
 
 class TimeframeSettings(BaseSettings):

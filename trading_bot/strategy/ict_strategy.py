@@ -162,7 +162,8 @@ class ICTStrategy:
         ltf_data: pd.DataFrame,
         symbol: str,
         htf_name: str = "H4",
-        ltf_name: str = "M15"
+        ltf_name: str = "M15",
+        require_tradeable_session: bool = True,
     ) -> Optional[TradeSetup]:
         """
         Analyze market data and identify trade setups.
@@ -173,6 +174,9 @@ class ICTStrategy:
             symbol: Trading symbol
             htf_name: HTF timeframe name
             ltf_name: LTF timeframe name
+            require_tradeable_session: When True (default), return None outside
+                kill-zone/tradeable sessions. Opportunity scanner passes False
+                so mechanical scoring can run off-hours.
             
         Returns:
             TradeSetup if valid setup found, None otherwise
@@ -189,7 +193,7 @@ class ICTStrategy:
         
         # Step 1: Check if we're in a valid session
         session_info = self.kill_zone_checker.get_current_session()
-        if not session_info.is_tradeable:
+        if require_tradeable_session and not session_info.is_tradeable:
             logger.info(f"Not in tradeable session: {session_info.session_name}")
             return None
         
