@@ -108,6 +108,37 @@ class TestGatePipeline:
         assert outcome.blocked is False
         assert outcome.confidence_delta == 0.05
 
+    def test_htf_cap_plus_session_penalty_stays_at_execution_floor(self):
+        """HTF cap to 60% then -5% session haircut must not fall below 60%.
+
+        That interaction was blocking every Claude signal that had any HTF
+        disagreement (very common) via scaling_manager confidence gate.
+        """
+        from trading_bot.services.gate_pipeline import evaluate_structure_and_quality_gates
+        from trading_bot.services.entry_gates import EXECUTION_CONFIDENCE_FLOOR
+
+        ctx = _ctx(
+            direction="short",
+            confidence=0.80,
+            d1_bias="bearish",
+            h4_bias="bullish",  # single HTF oppose → cap at 0.60
+            m15_bias="bearish",
+            analysis_results={
+                "volume": {"relative_volume": 1.0},
+                "fvg": {"bullish": 0, "bearish": 3},
+                "order_blocks": {"bullish": 0, "bearish": 2},
+            },
+        )
+
+        outcome = evaluate_structure_and_quality_gates(
+            ctx,
+            session_name="london",
+            is_kill_zone=False,
+        )
+        assert outcome.blocked is False, getattr(outcome, "reason", None)
+        assert ctx.confidence >= EXECUTION_CONFIDENCE_FLOOR - 1e-9
+        assert ctx.confidence >= 0.60
+
     def test_off_hours_blocks_low_rr(self):
         ctx = _ctx(off_hours_mode=True, actual_rr=2.0)
         outcome = evaluate_structure_and_quality_gates(ctx)

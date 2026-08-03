@@ -60,8 +60,16 @@ class TradeContext:
                     f"{old:.0%}->{self.confidence:.0%}"
                 )
         if outcome.confidence_delta is not None:
+            from .entry_gates import EXECUTION_CONFIDENCE_FLOOR
+
             old = self.confidence
-            self.confidence = max(0.40, self.confidence - outcome.confidence_delta)
+            # Soft haircuts must not push below the hard execution floor.
+            # HTF/AMD caps land at 0.60; a further -0.05 session penalty was
+            # producing 0.55 and failing every scaling_manager confidence check.
+            self.confidence = max(
+                EXECUTION_CONFIDENCE_FLOOR,
+                self.confidence - outcome.confidence_delta,
+            )
             if self.trade_signal is not None and hasattr(self.trade_signal, "confidence"):
                 self.trade_signal.confidence = self.confidence
             if old != self.confidence:
