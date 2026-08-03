@@ -206,3 +206,18 @@ The gold/silver ratio measures how many ounces of silver it takes to buy one oun
 2. During high geopolitical risk, favor gold
 3. During ratio compression, favor silver
 4. Use session timing - London/NY overlap best
+
+## Broker Data Quality (LHFX / MT5)
+
+Gold M15 history often contains a ~1h15 daily maintenance hole that is **not**
+corruption. The live `market_data_quality` gate (`trading_bot/mt5/ohlcv_quality.py`)
+allows:
+
+- DST-aware 5–7 PM New York rollover gaps (≤3h)
+- Recurring same-time daily closures (≥2 dates in the fetch)
+- A **single** provisional metals gap (45m–3h) when the window is too short to
+  prove recurrence (common Monday after weekend reopen)
+
+Multiple irregular daytime gaps, forex gaps, and outages >3h still fail closed
+(`gate_id=gap`). Look for `[DATA-QUALITY] XAUUSD: BLOCKED` in logs if analysis
+never reaches Claude.

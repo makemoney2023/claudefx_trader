@@ -3,8 +3,9 @@ OHLCV quality validation for live analysis and trading.
 
 Rejects frames that are too short, stale, NaN-contaminated, OHLC-invalid,
 or contain mid-session gaps that would corrupt ICT structure detection.
-Weekend/session-close gaps and bounded metals rollover closures are exempted
-without allowing ordinary daytime outages.
+Weekend/session-close gaps, bounded metals rollover closures, and a single
+provisional metals maintenance hole (Monday/short windows) are exempted
+without allowing multiple irregular daytime outages.
 """
 
 from __future__ import annotations
@@ -162,6 +163,39 @@ def _recurring_metals_maintenance_gaps(
     return recognized
 
 
+def _is_provisional_metals_maintenance_gap(
+    *,
+    symbol: str,
+    gaps: pd.Series,
+    timestamp: pd.Timestamp,
+) -> bool:
+    """Allow one bounded metals gap when a recurring schedule isn't proven yet.
+
+    After a weekend, M15 windows often contain only Friday→Sunday (session
+    break, already exempt) plus a single broker maintenance hole. Requiring
+    two matching dates permanently blocked LHFX XAUUSD on Mondays
+    (2026-08-03: ``1 mid-session gap(s), largest=0 days 01:15:00``).
+
+    Still fail-closed when multiple non-matching mid-session gaps appear, or
+    when the single gap exceeds the metals rollover bound.
+    """
+    from trading_bot.config import get_symbol_spec
+
+    if get_symbol_spec(symbol).category != "metal":
+        return False
+    if len(gaps) != 1 or timestamp not in gaps.index:
+        return False
+
+    duration = gaps.loc[timestamp]
+    if isinstance(duration, pd.Series):
+        duration = duration.iloc[0]
+    if duration > pd.Timedelta(hours=_METALS_ROLLOVER_MAX_HOURS):
+        return False
+    if duration < pd.Timedelta(minutes=45):
+        return False
+    return True
+
+
 def validate_ohlcv(
     df: Optional[pd.DataFrame],
     *,
@@ -279,6 +313,11 @@ def validate_ohlcv(
                                 symbol=symbol,
                                 previous_bar=df.index[df.index.get_loc(timestamp) - 1],
                                 current_bar=timestamp,
+                            )
+                            and not _is_provisional_metals_maintenance_gap(
+                                symbol=symbol,
+                                gaps=possible_corrupt,
+                                timestamp=timestamp,
                             )
                         )
                         for timestamp in possible_corrupt.index

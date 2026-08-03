@@ -101,13 +101,27 @@ class TestValidateOhlcv:
         assert result.valid is False
         assert "ohlc" in result.gate_id or "ohlc" in result.reason.lower()
 
-    def test_large_gap_fails_outside_weekend(self):
+    def test_two_irregular_xau_mid_session_gaps_fail(self):
         from trading_bot.mt5.ohlcv_quality import validate_ohlcv
 
-        # Thursday 10:00 UTC series with mid-session 2h gap — not a weekend close
-        df = _m15_bars(40, gap_at=20)
+        # Two non-matching daytime holes — not a daily maintenance schedule.
+        df = _m15_bars(60, gap_at=15, gap_duration=timedelta(hours=2))
+        # Inject a second irregular gap later in the series
+        t = df.index[-1].to_pydatetime() + timedelta(hours=2, minutes=15)
+        extra_times = [t + timedelta(minutes=15 * i) for i in range(20)]
+        extra = pd.DataFrame(
+            {
+                "open": [2100.0 + i for i in range(20)],
+                "high": [2101.0 + i for i in range(20)],
+                "low": [2099.0 + i for i in range(20)],
+                "close": [2100.5 + i for i in range(20)],
+                "volume": [100] * 20,
+            },
+            index=pd.DatetimeIndex(extra_times, name="time"),
+        )
+        df = pd.concat([df, extra])
         result = validate_ohlcv(
-            df, symbol="XAUUSD", timeframe="M15", expected_count=40, now=_now_after(df)
+            df, symbol="XAUUSD", timeframe="M15", expected_count=80, now=_now_after(df)
         )
         assert result.valid is False
         assert "gap" in result.gate_id or "gap" in result.reason.lower()
@@ -190,6 +204,39 @@ class TestValidateOhlcv:
             df, symbol="XAUUSD", timeframe="M15", expected_count=120, now=_now_after(df)
         )
         assert result.valid is True
+
+    def test_single_broker_xau_maintenance_gap_monday_window_passes(self):
+        """Monday reopen: only one LHFX 1h15 maintenance gap visible in M15 window.
+
+        Production 2026-08-03: blocked with
+        '1 mid-session gap(s), largest=0 days 01:15:00' because recurrence
+        required >=2 matching dates and the weekend absorbed Friday's hole.
+        """
+        from trading_bot.mt5.ohlcv_quality import validate_ohlcv
+
+        # ~80 bars from 00:00 start → still inside day 1 → exactly one 03:00 gap.
+        df = _m15_bars_with_recurring_daily_gap(n=80)
+        deltas = df.index.to_series().diff().dropna()
+        mid_session = deltas[
+            (deltas > deltas.median() * 3) & (deltas < pd.Timedelta(hours=6))
+        ]
+        assert len(mid_session) == 1
+        assert mid_session.max() == pd.Timedelta(hours=1, minutes=15)
+
+        result = validate_ohlcv(
+            df, symbol="XAUUSD", timeframe="M15", expected_count=80, now=_now_after(df)
+        )
+        assert result.valid is True
+
+    def test_single_broker_maintenance_gap_still_fails_for_forex(self):
+        from trading_bot.mt5.ohlcv_quality import validate_ohlcv
+
+        df = _m15_bars_with_recurring_daily_gap(n=80)
+        result = validate_ohlcv(
+            df, symbol="EURUSD", timeframe="M15", expected_count=80, now=_now_after(df)
+        )
+        assert result.valid is False
+        assert result.gate_id == "gap"
 
     def test_nan_fails(self):
         from trading_bot.mt5.ohlcv_quality import validate_ohlcv
