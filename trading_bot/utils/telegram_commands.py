@@ -62,6 +62,8 @@ class TelegramCommandHandler:
             '/news': (self._cmd_news, 'News &amp; blackout status'),
             '/calendar': (self._cmd_calendar, 'Economic calendar'),
             '/analysis': (self._cmd_analysis, 'Last signal for a symbol'),
+            '/scan': (self._cmd_scan, 'Run opportunity scanner now'),
+            '/hot': (self._cmd_hot, 'Show opportunity hot list'),
             # Configuration
             '/symbols': (self._cmd_symbols, 'Trading symbols'),
             '/mode': (self._cmd_mode, 'Scaling mode &amp; tier'),
@@ -187,7 +189,7 @@ class TelegramCommandHandler:
             "Status &amp; Monitoring": ['/help', '/status', '/account', '/positions', '/orders', '/activity'],
             "Performance": ['/pnl', '/stats', '/goal', '/session', '/daily', '/weekly'],
             "Trade Actions": ['/close', '/closeall', '/stop', '/start', '/modify'],
-            "Market Intel": ['/news', '/calendar', '/analysis'],
+            "Market Intel": ['/news', '/calendar', '/analysis', '/scan', '/hot'],
             "Configuration": ['/symbols', '/mode', '/config'],
         }
         
@@ -691,6 +693,99 @@ class TelegramCommandHandler:
             await self._reply(f"No recent signal found for {symbol}.")
         except Exception as e:
             await self._reply(f"Analysis error: {e}")
+
+    async def _cmd_scan(self, args):
+        """Run the mechanical opportunity scanner and report hot list."""
+        bot = self._bot
+        if not bot:
+            await self._reply("Bot not initialized yet. Start the bot first.")
+            return
+
+        scanner = getattr(bot, "opportunity_scanner", None)
+        if scanner is None:
+            await self._reply(
+                "Opportunity scanner not available. Start the bot, then try /scan again."
+            )
+            return
+
+        if getattr(scanner, "scan_in_progress", False):
+            await self._reply("Scan already running — try /hot in a minute.")
+            return
+
+        await self._reply(
+            "Starting mechanical opportunity scan (no Claude)…\n"
+            "This can take 30–90s. I'll reply when done."
+        )
+
+        try:
+            from ..config import settings
+
+            results = await scanner.scan_once(base_symbols=list(settings.trading.symbols))
+        except Exception as e:
+            await self._reply(f"<b>Scan failed:</b> {str(e)[:200]}")
+            return
+
+        promotable = [r for r in results if getattr(r, "promotable", False)]
+        hot = scanner.hot.to_list() if getattr(scanner, "hot", None) else []
+        top = sorted(results, key=lambda r: getattr(r, "score", 0), reverse=True)[:8]
+
+        lines = [
+            "<b>Opportunity Scan Complete</b>",
+            f"Universe scored: {len(results)}",
+            f"Promotable: {len(promotable)}",
+            "",
+            "<b>Hot list</b>",
+        ]
+        if hot:
+            for h in hot:
+                lines.append(
+                    f"  {h.get('symbol')} {h.get('direction', '')} "
+                    f"score={float(h.get('score', 0)):.2f} "
+                    f"ttl={h.get('ttl_minutes_remaining', '?')}m"
+                )
+        else:
+            lines.append("  (empty — nothing new beyond base symbols)")
+
+        lines.append("")
+        lines.append("<b>Top scores</b>")
+        if top:
+            for r in top:
+                flag = "✓" if r.promotable else "·"
+                direction = r.direction or "-"
+                lines.append(
+                    f"  {flag} {r.symbol} {direction} "
+                    f"{r.score:.2f} ({r.reason})"
+                )
+        else:
+            lines.append("  (no results)")
+
+        await self._reply("\n".join(lines))
+
+    async def _cmd_hot(self, args):
+        """Show current opportunity hot list + TTLs."""
+        bot = self._bot
+        if not bot:
+            await self._reply("Bot not initialized yet.")
+            return
+        scanner = getattr(bot, "opportunity_scanner", None)
+        if scanner is None:
+            await self._reply("Opportunity scanner not available.")
+            return
+
+        hot = scanner.hot.to_list()
+        if not hot:
+            await self._reply("<b>Hot list empty</b>\nSend /scan to refresh.")
+            return
+
+        lines = [f"<b>Hot List ({len(hot)})</b>\n"]
+        for h in hot:
+            lines.append(
+                f"  {h.get('symbol')} {h.get('direction', '')} "
+                f"score={float(h.get('score', 0)):.2f} "
+                f"ttl={h.get('ttl_minutes_remaining', '?')}m\n"
+                f"    {h.get('reason', '')}"
+            )
+        await self._reply("\n".join(lines))
     
     # =========================================================================
     # CONFIGURATION COMMANDS
