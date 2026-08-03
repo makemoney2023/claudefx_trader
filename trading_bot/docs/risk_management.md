@@ -42,11 +42,19 @@ immediately before order send.
 ### Direction quality gates
 
 - **ICT confirmation** defaults to `active`: incomplete passive retracements
-  (limit without displacement-origin), reversals without sweep+MSS+displacement,
-  and continuations without HTF+MSS+displacement are hard rejects.
+  (limit without displacement-origin / invalid PD zone), reversals without
+  sweep+MSS+displacement, and continuations without HTF+MSS+displacement are
+  hard rejects. Fingerprint `zone_valid` is derived from PD retrace
+  (short ≥50% / long ≤50%), not left always-true.
 - **Zone gate**: shorts below 50% retrace / longs above 50% hard-block unless
   **both** directional sweep and displacement are present. Confidence and R:R
-  alone no longer bypass wrong-zone location.
+  alone no longer bypass wrong-zone location. Displacement includes
+  directional impulse candles, not only `distribution_confirmed`.
+- **TOD / volatile regime**: weak hours and `volatile_ranging` require **70%**
+  confidence (above the 60% execution floor so the gate is not a no-op).
+- **M15 pullback**: HTF-aligned pending limits against opposing M15 are allowed
+  when confidence ≥68% and RR ≥2.0 (soft-capped to 68%); otherwise reject as
+  `m15_pullback_quality`.
 
 ### Lot Size Reference
 

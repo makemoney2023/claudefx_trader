@@ -68,6 +68,19 @@ def _truthy_factor(data: Any, *, attr: str, key: str) -> bool:
     return bool(hasattr(data, attr) and getattr(data, attr))
 
 
+def _zone_valid_for_direction(ctx: TradeContext) -> bool:
+    """Sell premium / buy discount — used by ICT fingerprint zone_valid."""
+    pd = ctx.pd_analysis
+    if pd is None:
+        return True
+    retrace = float(getattr(pd, "retracement_percent", 0.5) or 0.5)
+    _dir = (ctx.direction or "").lower()
+    return (
+        (_dir == "short" and retrace >= 0.5)
+        or (_dir == "long" and retrace <= 0.5)
+    )
+
+
 def _evaluate_ict_confirmation_for_ctx(ctx: TradeContext) -> GateOutcome:
     """Build fingerprint from context and run shadow/active ICT confirmation."""
     from ..config import settings
@@ -89,6 +102,7 @@ def _evaluate_ict_confirmation_for_ctx(ctx: TradeContext) -> GateOutcome:
         d1_bias=ctx.d1_bias,
         h4_bias=ctx.h4_bias,
         analysis_results=ctx.analysis_results,
+        zone_valid=_zone_valid_for_direction(ctx),
     )
     # Stash for persistence / telemetry
     ctx.analysis_results = dict(ctx.analysis_results or {})
@@ -208,7 +222,7 @@ def evaluate_zone_and_regime_gates(
 
         _ar = ctx.analysis_results or {}
         _has_sweep = has_directional_sweep(ctx.direction, _ar.get("liquidity"))
-        _has_disp = has_displacement(_ar)
+        _has_disp = has_displacement(_ar, direction=ctx.direction)
         zg = evaluate_zone_gate(
             direction=ctx.direction,
             confidence=ctx.confidence,

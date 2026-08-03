@@ -58,18 +58,32 @@ class TestM15GateCharacterization:
         assert outcome.blocked is True
         assert outcome.gate_id == "m15_structure"
 
-    def test_m15_pullback_rejects_below_floor(self):
-        # The 0.55 pullback cap always died at the 0.60 floor; it now
-        # rejects explicitly at this gate with its own gate_id.
+    def test_m15_pullback_allows_quality_htf_limit(self):
+        # HTF-aligned pending limits vs opposing M15 are allowed with soft cap.
         ctx = _ctx(
             m15_bias="bearish",
             order_type="buy_limit",
             d1_bias="bullish",
             h4_bias="bullish",
+            confidence=0.72,
+            actual_rr=2.5,
+        )
+        outcome = evaluate_m15_gate(ctx)
+        assert outcome.blocked is False
+        assert outcome.confidence_cap == 0.68
+
+    def test_m15_pullback_rejects_low_quality(self):
+        ctx = _ctx(
+            m15_bias="bearish",
+            order_type="buy_limit",
+            d1_bias="bullish",
+            h4_bias="bullish",
+            confidence=0.62,
+            actual_rr=2.5,
         )
         outcome = evaluate_m15_gate(ctx)
         assert outcome.blocked is True
-        assert outcome.gate_id == "m15_pullback_cap"
+        assert outcome.gate_id == "m15_pullback_quality"
 
 
 class TestHTFGateCharacterization:
@@ -97,10 +111,20 @@ class TestScalingGateCharacterization:
 class TestCorrelationCharacterization:
     def test_correlation_blocks_via_pipeline(self):
         ctx = _ctx(confidence=0.80)
+        # Complete ICT confirms so the pipeline reaches correlation.
         ctx.analysis_results = {
             "volume": {"relative_volume": 1.0},
             "fvg": SimpleNamespace(bullish_fvgs=[1], bearish_fvgs=[]),
             "order_blocks": SimpleNamespace(bullish_obs=[1], bearish_obs=[]),
+            "displacement": {
+                "distribution_confirmed": True,
+                "distribution_direction": "bullish",
+                "last_bullish": {"index": 1},
+            },
+            "market_structure": {
+                "structure_breaks": [{"type": "mss_bullish"}]
+            },
+            "liquidity": {},
         }
         outcome = evaluate_pre_execution_gates(
             ctx,

@@ -19,7 +19,11 @@ No confirmation thresholds or setup-family rules change.
 
 Wrong-zone entries (short below 50% retrace / long above 50%) are also
 hard-blocked by the zone gate unless both directional sweep and displacement
-are present — conf/RR alone is no longer a bypass.
+are present — conf/RR alone is no longer a bypass. Setup fingerprint
+`zone_valid` is computed from the same PD retrace rule and feeds the ICT
+passive-limit confirm. Displacement confirmation accepts directional impulse
+(`last_bullish` / `last_bearish` / recent list), not only
+`distribution_confirmed`.
 
 ## Data flow
 

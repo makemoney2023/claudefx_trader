@@ -441,16 +441,29 @@ def _gate_ctx(**kwargs):
 class TestTruthfulGateRejects:
     """Caps that land below the 0.60 execution floor must reject at their own gate."""
 
-    def test_m15_pullback_rejects_explicitly(self):
+    def test_m15_pullback_allows_quality_soft_cap(self):
         from trading_bot.services.entry_gates import evaluate_m15_gate
 
         ctx = _gate_ctx(
             m15_bias="bearish", order_type="buy_limit",
             d1_bias="bullish", h4_bias="bullish",
+            confidence=0.72, actual_rr=2.5,
+        )
+        outcome = evaluate_m15_gate(ctx)
+        assert outcome.blocked is False
+        assert outcome.confidence_cap == 0.68
+
+    def test_m15_pullback_rejects_low_quality_explicitly(self):
+        from trading_bot.services.entry_gates import evaluate_m15_gate
+
+        ctx = _gate_ctx(
+            m15_bias="bearish", order_type="buy_limit",
+            d1_bias="bullish", h4_bias="bullish",
+            confidence=0.62, actual_rr=2.5,
         )
         outcome = evaluate_m15_gate(ctx)
         assert outcome.blocked is True
-        assert outcome.gate_id == "m15_pullback_cap"
+        assert outcome.gate_id == "m15_pullback_quality"
 
     def test_htf_counter_scalp_rejects_explicitly(self):
         from trading_bot.services.entry_gates import evaluate_htf_alignment_gate

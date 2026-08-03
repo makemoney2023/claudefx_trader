@@ -18,6 +18,16 @@ os.environ["TRADING_ICT_CONFIRMATION_MODE"] = "shadow"
 _runtime_settings.trading.ict_confirmation_mode = "shadow"
 
 
+@pytest.fixture(autouse=True)
+def _isolate_ict_confirmation_mode():
+    """Keep suite ICT mode at shadow so .env.local / test mutations cannot leak."""
+    os.environ["TRADING_ICT_CONFIRMATION_MODE"] = "shadow"
+    _runtime_settings.trading.ict_confirmation_mode = "shadow"
+    yield
+    os.environ["TRADING_ICT_CONFIRMATION_MODE"] = "shadow"
+    _runtime_settings.trading.ict_confirmation_mode = "shadow"
+
+
 # Mock classes for testing without MT5 connection
 @dataclass
 class MockPosition:

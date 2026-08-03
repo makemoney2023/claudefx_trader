@@ -82,13 +82,73 @@ def has_mss_or_choch(direction: str, market_structure: Any) -> bool:
     return False
 
 
-def has_displacement(analysis_results: Dict[str, Any]) -> bool:
+def has_displacement(
+    analysis_results: Dict[str, Any],
+    direction: str = "",
+) -> bool:
+    """True when a directional impulse exists for the trade.
+
+    Accepts ``distribution_confirmed`` (legacy) OR a recent displacement candle
+    in the trade direction (``last_bullish`` / ``last_bearish`` / recent list).
+    Direction-agnostic callers still succeed on any confirmed/recent impulse.
+    """
     disp = analysis_results.get("displacement")
     if disp is None:
         return False
+
+    d = (direction or "").lower()
+    want = "bullish" if d == "long" else ("bearish" if d == "short" else "")
+
     if isinstance(disp, dict):
-        return bool(disp.get("distribution_confirmed"))
-    return bool(getattr(disp, "distribution_confirmed", False))
+        if disp.get("distribution_confirmed"):
+            dist_dir = (disp.get("distribution_direction") or "").lower()
+            if not want or not dist_dir or dist_dir == want:
+                return True
+        last_bull = disp.get("last_bullish")
+        last_bear = disp.get("last_bearish")
+        if want == "bullish" and last_bull:
+            return True
+        if want == "bearish" and last_bear:
+            return True
+        if not want and (last_bull or last_bear):
+            return True
+        recent = disp.get("recent_displacements") or []
+        if want:
+            for item in recent:
+                item_dir = (
+                    item.get("direction")
+                    if isinstance(item, dict)
+                    else getattr(item, "direction", "")
+                )
+                if (item_dir or "").lower() == want:
+                    return True
+            return False
+        return bool(recent)
+
+    if getattr(disp, "distribution_confirmed", False):
+        dist_dir = (getattr(disp, "distribution_direction", None) or "").lower()
+        if not want or not dist_dir or dist_dir == want:
+            return True
+    last_bull = getattr(disp, "last_bullish", None)
+    last_bear = getattr(disp, "last_bearish", None)
+    if want == "bullish" and last_bull:
+        return True
+    if want == "bearish" and last_bear:
+        return True
+    if not want and (last_bull or last_bear):
+        return True
+    recent = getattr(disp, "recent_displacements", None) or []
+    if want:
+        for item in recent:
+            item_dir = (
+                item.get("direction")
+                if isinstance(item, dict)
+                else getattr(item, "direction", "")
+            )
+            if (item_dir or "").lower() == want:
+                return True
+        return False
+    return bool(recent)
 
 
 def htf_aligned(direction: str, d1_bias: str, h4_bias: str) -> bool:
@@ -167,7 +227,7 @@ def build_setup_fingerprint(
     ar = analysis_results or {}
     sweep = has_directional_sweep(direction, ar.get("liquidity"))
     mss = has_mss_or_choch(direction, ar.get("market_structure"))
-    disp = has_displacement(ar)
+    disp = has_displacement(ar, direction=direction)
     aligned = htf_aligned(direction, d1_bias, h4_bias)
 
     # Feature tags for persistence / analytics

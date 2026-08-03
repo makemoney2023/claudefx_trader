@@ -190,14 +190,21 @@ def evaluate_direction_alignment_gate(
     return GateOutcome.pass_through("direction_alignment")
 
 
+# Elevated floors sit above EXECUTION_CONFIDENCE_FLOOR so these gates
+# actually raise the bar instead of duplicating the 60% reject.
+WEAK_HOUR_MIN_CONFIDENCE = 0.70
+VOLATILE_REGIME_MIN_CONFIDENCE = 0.70
+M15_PULLBACK_MIN_CONFIDENCE = 0.68
+
+
 def evaluate_tod_gate(
     *,
     utc_hour: int,
     weak_hours: tuple,
     confidence: float,
-    min_confidence: float = 0.60,
+    min_confidence: float = WEAK_HOUR_MIN_CONFIDENCE,
 ) -> Tuple[bool, str]:
-    """Time-of-day gate: weak hours need elevated confidence."""
+    """Time-of-day gate: weak hours need elevated confidence (default 70%)."""
     if utc_hour not in weak_hours:
         return False, ""
     if confidence >= min_confidence:
@@ -212,7 +219,7 @@ def evaluate_volatile_regime_gate(
     *,
     regime_type: str,
     confidence: float,
-    min_confidence: float = 0.60,
+    min_confidence: float = VOLATILE_REGIME_MIN_CONFIDENCE,
 ) -> Tuple[bool, str]:
     if (regime_type or "").lower() != "volatile_ranging":
         return False, ""
@@ -263,15 +270,20 @@ def evaluate_m15_gate(ctx: "TradeContext") -> GateOutcome:
     is_pullback = d1_supports and h4_supports and is_pending_limit
 
     if is_pullback:
-        # The old 0.55 pullback cap always died at the 0.60 execution floor.
-        # Same net behavior, but reject here so logs name the real gate.
-        return GateOutcome.block(
-            gate_id="m15_pullback_cap",
-            reason=(
-                f"{_dir.upper()} pullback vs M15 {_m15}: capped at 0.55, "
-                f"below the {EXECUTION_CONFIDENCE_FLOOR:.2f} execution floor."
-            ),
-            stage="m15_gate",
+        # HTF-aligned pending limits against opposing M15 are classic pullbacks.
+        # Require elevated quality; soft-cap confidence but stay above the floor.
+        if ctx.confidence < M15_PULLBACK_MIN_CONFIDENCE or ctx.actual_rr < 2.0:
+            return GateOutcome.block(
+                gate_id="m15_pullback_quality",
+                reason=(
+                    f"{_dir.upper()} pullback vs M15 {_m15}: need "
+                    f"{M15_PULLBACK_MIN_CONFIDENCE:.0%} conf + 2:1 RR, "
+                    f"got {ctx.confidence:.0%} / {ctx.actual_rr:.1f}:1."
+                ),
+                stage="m15_gate",
+            )
+        return GateOutcome.cap_confidence(
+            M15_PULLBACK_MIN_CONFIDENCE, "m15_pullback_cap"
         )
 
     return GateOutcome.block(

@@ -194,35 +194,35 @@ class TestDirectionAlignmentGateBasics:
 
 
 class TestTodGate:
-    def test_blocks_weak_hour_below_60(self):
+    def test_blocks_weak_hour_below_70(self):
         blocked, _ = evaluate_tod_gate(
             utc_hour=12,
             weak_hours=(12, 13),
-            confidence=0.59,
+            confidence=0.69,
         )
         assert blocked is True
 
-    def test_allows_weak_hour_at_60(self):
+    def test_allows_weak_hour_at_70(self):
         blocked, _ = evaluate_tod_gate(
             utc_hour=12,
             weak_hours=(12, 13),
-            confidence=0.60,
+            confidence=0.70,
         )
         assert blocked is False
 
 
 class TestVolatileRegime:
-    def test_blocks_below_60_in_volatile_ranging(self):
+    def test_blocks_below_70_in_volatile_ranging(self):
         blocked, _ = evaluate_volatile_regime_gate(
             regime_type="volatile_ranging",
-            confidence=0.59,
+            confidence=0.69,
         )
         assert blocked is True
 
-    def test_allows_60_in_volatile_ranging(self):
+    def test_allows_70_in_volatile_ranging(self):
         blocked, _ = evaluate_volatile_regime_gate(
             regime_type="volatile_ranging",
-            confidence=0.60,
+            confidence=0.70,
         )
         assert blocked is False
 
