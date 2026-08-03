@@ -7,6 +7,7 @@ trading cycle merges with TRADING_SYMBOLS.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
@@ -16,6 +17,31 @@ from ..utils.logging import get_logger
 logger = get_logger(__name__)
 
 _METALS = frozenset({"XAUUSD", "XAGUSD", "GOLD", "SILVER"})
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """Coerce to a JSON-safe finite Python float (nan/inf → default)."""
+    if value is None:
+        return default
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(out):
+        return default
+    return out
+
+
+def _safe_optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(out):
+        return None
+    return out
 
 
 def _as_utc(now: Optional[datetime] = None) -> datetime:
@@ -287,22 +313,22 @@ class Opportunity:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "symbol": self.symbol,
-            "has_setup": self.has_setup,
-            "direction": self.direction,
-            "confluence_count": self.confluence_count,
-            "confluence_factors": self.confluence_factors,
-            "confidence": self.confidence,
-            "risk_reward": self.risk_reward,
-            "zone_ok": self.zone_ok,
-            "retrace_pct": self.retrace_pct,
-            "in_kill_zone": self.in_kill_zone,
-            "is_crypto": self.is_crypto,
-            "spread_ok": self.spread_ok,
-            "score": self.score,
-            "promotable": self.promotable,
-            "reason": self.reason,
-            "session_name": self.session_name,
+            "symbol": str(self.symbol),
+            "has_setup": bool(self.has_setup),
+            "direction": str(self.direction or ""),
+            "confluence_count": int(self.confluence_count or 0),
+            "confluence_factors": [str(f) for f in (self.confluence_factors or [])],
+            "confidence": _safe_float(self.confidence),
+            "risk_reward": _safe_float(self.risk_reward),
+            "zone_ok": bool(self.zone_ok),
+            "retrace_pct": _safe_optional_float(self.retrace_pct),
+            "in_kill_zone": bool(self.in_kill_zone),
+            "is_crypto": bool(self.is_crypto),
+            "spread_ok": bool(self.spread_ok),
+            "score": _safe_float(self.score),
+            "promotable": bool(self.promotable),
+            "reason": str(self.reason or ""),
+            "session_name": str(self.session_name or ""),
         }
 
 
@@ -342,6 +368,7 @@ class OpportunityScanner:
         self.hot = HotList(max_size=hot_list_size, ttl_minutes=hot_ttl_minutes)
         self.last_results: List[Opportunity] = []
         self.last_scan_at: Optional[datetime] = None
+        self.scan_in_progress: bool = False
 
     def build_universe(self, base_symbols: Sequence[str], market_watch: Sequence[str]) -> List[str]:
         combined = list(market_watch) + list(base_symbols)
@@ -375,8 +402,9 @@ class OpportunityScanner:
             )
 
         direction = str(setup.get("direction") or "").lower()
-        conf = float(setup.get("confidence") or 0.0)
-        rr = float(setup.get("risk_reward") or 0.0)
+        conf = _safe_float(setup.get("confidence"))
+        rr = _safe_float(setup.get("risk_reward"))
+        retrace_pct = _safe_optional_float(retrace_pct)
         confluence = setup.get("confluence") or {}
         factors = []
         count = 0
@@ -478,9 +506,22 @@ class OpportunityScanner:
         base_symbols: Sequence[str],
     ) -> List[Opportunity]:
         """Fetch MW + base universe, score mechanically, update hot list."""
+        if self.scan_in_progress:
+            logger.info("[SCAN] skipped — scan already in progress")
+            return list(self.last_results)
+        self.scan_in_progress = True
+        try:
+            return await self._scan_once_impl(base_symbols=base_symbols)
+        finally:
+            self.scan_in_progress = False
+
+    async def _scan_once_impl(
+        self,
+        *,
+        base_symbols: Sequence[str],
+    ) -> List[Opportunity]:
         from ..utils.market_hours import is_market_open
         from ..mt5.ohlcv_quality import validate_ohlcv
-        from ..config import settings
 
         mw_names: List[str] = []
         if self.mt5_client:

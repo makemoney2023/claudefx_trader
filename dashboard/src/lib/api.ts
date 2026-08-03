@@ -205,6 +205,7 @@ export const api = {
     fetchApi<{
       enabled: boolean
       last_scan_at: string | null
+      scanning?: boolean
       results: OpportunityRow[]
       total: number
     }>('/api/opportunities'),
@@ -215,10 +216,11 @@ export const api = {
   forceOpportunityScan: () =>
     fetchApi<{
       success: boolean
-      total: number
-      promotable: number
-      hot: OpportunityHotEntry[]
-      results: OpportunityRow[]
+      status?: string
+      scanning?: boolean
+      message?: string
+      total?: number
+      last_scan_at?: string | null
     }>('/api/opportunities/scan', { method: 'POST', requiresAuth: true }),
 
   promoteOpportunity: (symbol: string) =>

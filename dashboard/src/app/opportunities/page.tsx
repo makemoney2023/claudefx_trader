@@ -40,13 +40,31 @@ export default function OpportunitiesPage() {
 
   const forceScan = async () => {
     setScanning(true)
+    setError(null)
     try {
-      await api.forceOpportunityScan()
-      await load()
+      const started = await api.forceOpportunityScan()
+      // Scan runs in the background (can take 30–90s). Poll until done.
+      const startedAt = Date.now()
+      while (Date.now() - startedAt < 120000) {
+        await new Promise((r) => setTimeout(r, 3000))
+        const ops = await api.getOpportunities()
+        setResults(ops.results || [])
+        setEnabled(ops.enabled)
+        setLastScan(ops.last_scan_at)
+        if (!ops.scanning) {
+          const hotRes = await api.getOpportunityHotList()
+          setHot(hotRes.hot || [])
+          break
+        }
+      }
+      if (started.status === 'already_running') {
+        setError(null)
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Scan failed')
     } finally {
       setScanning(false)
+      await load()
     }
   }
 

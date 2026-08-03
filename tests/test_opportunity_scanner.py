@@ -233,3 +233,55 @@ class TestPreJudgeZoneBlock:
             )
             is None
         )
+
+
+class TestOpportunityJsonSafe:
+    def test_to_dict_rejects_nan_inf(self):
+        import json
+        from trading_bot.services.opportunity_scanner import Opportunity
+
+        opp = Opportunity(
+            symbol="XAUUSD",
+            has_setup=True,
+            direction="long",
+            confidence=float("nan"),
+            risk_reward=float("inf"),
+            retrace_pct=float("nan"),
+            score=float("nan"),
+        )
+        payload = opp.to_dict()
+        # Must round-trip through stdlib JSON (same constraint as API responses)
+        encoded = json.dumps(payload)
+        decoded = json.loads(encoded)
+        assert decoded["confidence"] == 0.0
+        assert decoded["risk_reward"] == 0.0
+        assert decoded["score"] == 0.0
+        assert decoded["retrace_pct"] is None
+
+    def test_score_setup_coerces_bad_retrace(self):
+        from trading_bot.services.opportunity_scanner import OpportunityScanner
+
+        scanner = OpportunityScanner()
+        opp = scanner.score_setup(
+            "EURUSD",
+            {
+                "direction": "long",
+                "confidence": 0.7,
+                "risk_reward": 2.0,
+                "confluence": {"fvg": True},
+            },
+            retrace_pct=float("nan"),
+            in_kill_zone=True,
+            session_name="London",
+            spread_ok=True,
+        )
+        assert opp.retrace_pct is None
+        assert opp.zone_ok is False
+        assert json_safe(opp.to_dict())
+
+
+def json_safe(payload):
+    import json
+
+    json.dumps(payload)
+    return True
