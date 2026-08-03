@@ -578,6 +578,7 @@ class TradingBot:
                 hot_list_size=settings.trading.opportunity_scanner_hot_list_size,
                 hot_ttl_minutes=settings.trading.opportunity_scanner_hot_ttl_minutes,
                 min_rr=settings.trading.opportunity_scanner_min_rr,
+                min_confidence=settings.trading.opportunity_scanner_min_confidence,
                 execution_tf=settings.timeframes.execution_tf,
                 execution_tf_candles=settings.timeframes.execution_tf_candles,
                 htf=settings.timeframes.higher_tf,

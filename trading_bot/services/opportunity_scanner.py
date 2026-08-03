@@ -113,6 +113,17 @@ def compute_opportunity_score(
     )
 
 
+def htf_direction_aligned(direction: str, market_structure: Optional[str]) -> bool:
+    """Require mechanical direction to match HTF trend (reject ranging / opposed)."""
+    d = (direction or "").lower()
+    ms = (market_structure or "").lower()
+    if d == "long":
+        return ms in ("bullish", "bull")
+    if d == "short":
+        return ms in ("bearish", "bear")
+    return False
+
+
 def is_promotable(
     *,
     has_setup: bool,
@@ -120,8 +131,15 @@ def is_promotable(
     spread_ok: bool,
     risk_reward: float,
     min_rr: float,
+    confidence: float = 0.0,
+    min_confidence: float = 0.65,
+    htf_aligned: bool = True,
 ) -> bool:
     if not has_setup or not zone_ok or not spread_ok:
+        return False
+    if not htf_aligned:
+        return False
+    if _safe_float(confidence) < min_confidence:
         return False
     return risk_reward >= min_rr
 
@@ -306,6 +324,8 @@ class Opportunity:
     in_kill_zone: bool = False
     is_crypto: bool = False
     spread_ok: bool = True
+    htf_aligned: bool = False
+    market_structure: str = ""
     score: float = 0.0
     promotable: bool = False
     reason: str = ""
@@ -325,6 +345,8 @@ class Opportunity:
             "in_kill_zone": bool(self.in_kill_zone),
             "is_crypto": bool(self.is_crypto),
             "spread_ok": bool(self.spread_ok),
+            "htf_aligned": bool(self.htf_aligned),
+            "market_structure": str(self.market_structure or ""),
             "score": _safe_float(self.score),
             "promotable": bool(self.promotable),
             "reason": str(self.reason or ""),
@@ -348,6 +370,7 @@ class OpportunityScanner:
         hot_list_size: int = 3,
         hot_ttl_minutes: int = 60,
         min_rr: float = 1.5,
+        min_confidence: float = 0.65,
         execution_tf: str = "M15",
         execution_tf_candles: int = 200,
         htf: str = "H4",
@@ -361,6 +384,7 @@ class OpportunityScanner:
         self.crypto_symbols = set(crypto_symbols or [])
         self.max_universe = max_universe
         self.min_rr = min_rr
+        self.min_confidence = min_confidence
         self.execution_tf = execution_tf
         self.execution_tf_candles = execution_tf_candles
         self.htf = htf
@@ -405,6 +429,8 @@ class OpportunityScanner:
         conf = _safe_float(setup.get("confidence"))
         rr = _safe_float(setup.get("risk_reward"))
         retrace_pct = _safe_optional_float(retrace_pct)
+        market_structure = str(setup.get("market_structure") or "")
+        aligned = htf_direction_aligned(direction, market_structure)
         confluence = setup.get("confluence") or {}
         factors = []
         count = 0
@@ -429,18 +455,28 @@ class OpportunityScanner:
             in_kill_zone=in_kill_zone,
             is_crypto=is_crypto,
         )
+        # Prefer HTF-aligned setups in ranking
+        if aligned:
+            score += 0.10
         promotable = is_promotable(
             has_setup=True,
             zone_ok=zone_ok,
             spread_ok=spread_ok,
             risk_reward=rr,
             min_rr=self.min_rr,
+            confidence=conf,
+            min_confidence=self.min_confidence,
+            htf_aligned=aligned,
         )
         reason = "promotable" if promotable else "filtered"
         if not zone_ok:
             reason = "zone_misaligned"
         elif not spread_ok:
             reason = "spread_blocked"
+        elif not aligned:
+            reason = f"htf_misaligned ({market_structure or 'unknown'} vs {direction})"
+        elif conf < self.min_confidence:
+            reason = f"conf_below_floor ({conf:.2f}<{self.min_confidence})"
         elif rr < self.min_rr:
             reason = f"rr_below_floor ({rr:.2f}<{self.min_rr})"
 
@@ -457,6 +493,8 @@ class OpportunityScanner:
             in_kill_zone=in_kill_zone,
             is_crypto=is_crypto,
             spread_ok=spread_ok,
+            htf_aligned=aligned,
+            market_structure=market_structure,
             score=score,
             promotable=promotable,
             reason=reason,

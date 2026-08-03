@@ -526,6 +526,13 @@ class TradingSettings(BaseSettings):
         default=1.5,
         description="Minimum R:R for hot-list promotion",
     )
+    opportunity_scanner_min_confidence: float = Field(
+        default=0.65,
+        description=(
+            "Minimum mechanical confidence for hot-list promotion. "
+            "Env: TRADING_OPPORTUNITY_SCANNER_MIN_CONFIDENCE"
+        ),
+    )
 
 
 class TimeframeSettings(BaseSettings):

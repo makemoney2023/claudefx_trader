@@ -387,8 +387,10 @@ class ScalingManager:
         if daily_trades >= config.max_daily_trades:
             return False, f"Daily limit reached ({config.max_daily_trades} trades)"
         
-        # Check confidence threshold
-        if confidence < config.confidence_threshold:
+        # Check confidence threshold (whole-percent precision — see confidence_meets_threshold)
+        from .scaling_gates import confidence_meets_threshold
+
+        if not confidence_meets_threshold(confidence, config.confidence_threshold):
             return False, f"Confidence {confidence:.0%} below threshold {config.confidence_threshold:.0%}"
         
         # Check setup grade filter

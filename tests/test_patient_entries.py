@@ -43,6 +43,17 @@ class TestRaisedConfidenceThresholds:
         )
         assert should_trade is True
 
+    def test_aggressive_accepts_confidence_that_rounds_to_threshold(self):
+        """Display-rounded 60% must not fail a 60% threshold (SOLUSD-style)."""
+        manager = self._create_manager()
+        manager.current_mode = TradingMode.AGGRESSIVE
+        should_trade, reason = manager.should_take_trade(
+            setup_grade='A',
+            confidence=0.595,  # formats as 60% with :.0%
+            daily_trades=0,
+        )
+        assert should_trade is True, reason
+
     def test_aggressive_accepts_085_confidence(self):
         """AGGRESSIVE mode should accept trades with 0.85 confidence."""
         manager = self._create_manager()

@@ -137,6 +137,45 @@ class TestZoneAndScore:
         # 4*0.25 + 0.8*0.35 + min(2,4)/4*0.25 + 0.15 = 1.0 + 0.28 + 0.125 + 0.15
         assert abs(score - 1.555) < 1e-9
 
+    def test_hard_reject_htf_misaligned(self):
+        from trading_bot.services.opportunity_scanner import (
+            htf_direction_aligned,
+            is_promotable,
+        )
+
+        assert htf_direction_aligned("short", "bullish") is False
+        assert htf_direction_aligned("long", "bullish") is True
+        assert htf_direction_aligned("short", "bearish") is True
+        assert (
+            is_promotable(
+                has_setup=True,
+                zone_ok=True,
+                spread_ok=True,
+                risk_reward=2.0,
+                min_rr=1.5,
+                confidence=0.70,
+                htf_aligned=False,
+            )
+            is False
+        )
+
+    def test_hard_reject_low_mech_confidence(self):
+        from trading_bot.services.opportunity_scanner import is_promotable
+
+        assert (
+            is_promotable(
+                has_setup=True,
+                zone_ok=True,
+                spread_ok=True,
+                risk_reward=2.0,
+                min_rr=1.5,
+                confidence=0.55,
+                min_confidence=0.65,
+                htf_aligned=True,
+            )
+            is False
+        )
+
     def test_hard_reject_low_rr(self):
         from trading_bot.services.opportunity_scanner import is_promotable
 
@@ -157,6 +196,8 @@ class TestZoneAndScore:
                 spread_ok=True,
                 risk_reward=2.0,
                 min_rr=1.5,
+                confidence=0.70,
+                htf_aligned=True,
             )
             is True
         )

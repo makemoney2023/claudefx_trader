@@ -61,7 +61,7 @@ def evaluate_flip_guard(
     ):
         return GateOutcome.pass_through("flip_guard")
 
-    if confidence < cfg.min_confidence:
+    if not confidence_meets_threshold(confidence, cfg.min_confidence):
         return GateOutcome.block(
             gate_id="direction_flip",
             reason=(
@@ -76,12 +76,27 @@ def evaluate_flip_guard(
     return GateOutcome.pass_through("flip_guard_high_confidence")
 
 
+def confidence_meets_threshold(confidence: float, threshold: float) -> bool:
+    """
+    Compare confidence vs threshold at whole-percent precision.
+
+    Prevents "60% below threshold 60%" blocks when the raw float is e.g. 0.595
+    (formats as 60% with :.0%) but fails a strict ``< 0.60`` check.
+    """
+    try:
+        c = float(confidence)
+        t = float(threshold)
+    except (TypeError, ValueError):
+        return False
+    return round(c * 100) >= round(t * 100)
+
+
 def setup_grade_from_confidence(confidence: float) -> str:
-    if confidence >= 0.85:
+    if confidence_meets_threshold(confidence, 0.85):
         return "A+"
-    if confidence >= 0.75:
+    if confidence_meets_threshold(confidence, 0.75):
         return "A"
-    if confidence >= 0.60:
+    if confidence_meets_threshold(confidence, 0.60):
         return "B"
     return "C"
 
@@ -126,7 +141,7 @@ def evaluate_min_confidence_gate(
     confidence: float,
     min_confidence: float,
 ) -> GateOutcome:
-    if confidence < min_confidence:
+    if not confidence_meets_threshold(confidence, min_confidence):
         return GateOutcome.block(
             gate_id="min_confidence",
             reason=f"Low confidence ({confidence:.2f} < {min_confidence})",

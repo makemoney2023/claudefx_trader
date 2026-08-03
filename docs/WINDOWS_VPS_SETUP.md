@@ -238,6 +238,8 @@ TRADING_CLAUDE_KILL_ZONE_ONLY=true
 # TRADING_OPPORTUNITY_SCANNER_HOT_LIST_SIZE=3
 # TRADING_OPPORTUNITY_SCANNER_HOT_TTL_MINUTES=60
 # TRADING_OPPORTUNITY_SCANNER_MIN_RR=1.5
+# TRADING_OPPORTUNITY_SCANNER_MIN_CONFIDENCE=0.65
+# (hot-list also requires HTF trend aligned with setup direction)
 
 # News gates (blackout windows around red-folder events + stale-calendar
 # fail-closed). The strategy-review changes assume these are ON in live
