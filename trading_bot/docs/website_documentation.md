@@ -54,7 +54,7 @@ The ICT Trading Bot is a sophisticated automated trading system designed to capt
 ### 🎯 100-Pip Expansion System
 
 - **Displacement Detection**: Confirms distribution phase with impulsive candles
-- **IPDA Level Targeting**: Uses PDH/PDL/PWH/PWL as take profit targets
+- **IPDA Level Targeting**: Uses PDH/PDL/PWH/PWL as multi-TP targets when they clear ≥2R; otherwise falls back to a 2R/3R/4R ladder (avoids forex “100-pip” nonsense on crypto/metals)
 - **Premium/Discount Zones**: Ensures optimal entry locations
 - **NWOG Tracking**: New Week Opening Gap targets for confluence
 - **Multi-Tier Take Profits**: 30%/30%/40% scaling out strategy

@@ -444,56 +444,92 @@ class IPDATracker:
         Get recommended take profit levels for scaling out.
         
         Returns multi-target TPs:
-        - TP1: ~1:2 R:R (close 30%)
-        - TP2: Nearest IPDA level (close 30%)
-        - TP3: Second IPDA level / 100-pip target (runner 40%)
-        
-        Args:
-            direction: 'long' or 'short'
-            current_price: Entry price
-            stop_loss: Stop loss price
-            
-        Returns:
-            Dict with tp1, tp2, tp3 levels
+        - TP1: 2R (close 30%)
+        - TP2: Nearest valid IPDA level, else 3R (close 30%)
+        - TP3: Next valid IPDA / 100-pip target if sane, else 4R (runner 40%)
+
+        "100-pip" projections are forex-centric. On crypto/metals where pip≈point,
+        a 100-pip move can be tiny (BTC +$1) or nonsense (DOGE negative). Candidates
+        must be directionally correct, positive, and at least min_r away.
         """
         risk = abs(current_price - stop_loss)
+        if risk <= 0 or current_price <= 0:
+            return {
+                "tp1": None,
+                "tp2": None,
+                "tp3": None,
+                "risk_pips": 0.0,
+                "tp1_r": None,
+                "tp2_r": None,
+                "tp3_r": None,
+            }
+
+        is_long = direction == "long"
         targets = self._analysis.get_targets_for_direction(direction, current_price)
-        
-        # TP1: 2R
-        if direction == 'long':
-            tp1 = current_price + (risk * 2)
-        else:
-            tp1 = current_price - (risk * 2)
-        
-        # TP2: First IPDA target (if exists and reasonable)
-        tp2 = None
-        if targets:
-            first_target = targets[0]
-            # Must be at least 2R away to be worth using
-            target_r = abs(first_target.price - current_price) / risk
-            if target_r >= 2:
-                tp2 = first_target.price
-        
-        # TP3: 100-pip target or second IPDA
-        tp3 = self._analysis.get_100_pip_target(direction, current_price, self.pip_value)
-        
-        # If TP2 wasn't set, use 100-pip for TP2
+
+        def _r_price(multiple: float) -> float:
+            return (
+                current_price + (risk * multiple)
+                if is_long
+                else current_price - (risk * multiple)
+            )
+
+        def _is_valid_tp(price: Optional[float], min_r: float = 2.0) -> bool:
+            if price is None or price <= 0:
+                return False
+            if is_long and price <= current_price:
+                return False
+            if not is_long and price >= current_price:
+                return False
+            return (abs(price - current_price) / risk) >= (min_r - 1e-12)
+
+        tp1 = _r_price(2.0)
+
+        # Prefer structural IPDA targets that clear the min R distance
+        structural: List[float] = []
+        for level in targets:
+            if _is_valid_tp(level.price, min_r=2.0):
+                structural.append(level.price)
+
+        tp2 = structural[0] if structural else None
+        tp3 = structural[1] if len(structural) > 1 else None
+
+        # Optional 100-pip candidate only if it clears sanity (skips BTC +$1 / DOGE negative)
+        pip_target = self._analysis.get_100_pip_target(
+            direction, current_price, self.pip_value
+        )
+        if tp2 is None and _is_valid_tp(pip_target, min_r=2.0):
+            tp2 = pip_target
+        elif tp3 is None and _is_valid_tp(pip_target, min_r=2.0):
+            if tp2 is None or abs(pip_target - tp2) / risk >= 0.5:
+                tp3 = pip_target
+
+        # R-multiple ladder fallback — always directionally correct
         if tp2 is None:
-            tp2 = tp3
-            tp3 = None
-        
-        # If we have second IPDA target, use that for TP3
-        if len(targets) > 1 and tp3 is None:
-            tp3 = targets[1].price
-        
+            tp2 = _r_price(3.0)
+        if tp3 is None:
+            tp3 = _r_price(4.0)
+
+        # Enforce monotonic ladder: TP2 beyond TP1, TP3 beyond TP2
+        if is_long:
+            if tp2 < tp1:
+                tp2 = _r_price(3.0)
+            if tp3 <= tp2:
+                tp3 = _r_price(4.0) if _r_price(4.0) > tp2 else tp2 + risk
+        else:
+            if tp2 > tp1:
+                tp2 = _r_price(3.0)
+            if tp3 >= tp2:
+                tp3 = _r_price(4.0) if _r_price(4.0) < tp2 else tp2 - risk
+
         return {
             "tp1": tp1,
             "tp2": tp2,
             "tp3": tp3,
-            "risk_pips": risk / self.pip_value,
+            "risk_pips": risk / self.pip_value if self.pip_value else 0.0,
             "tp1_r": 2.0,
             "tp2_r": abs(tp2 - current_price) / risk if tp2 else None,
-            "tp3_r": abs(tp3 - current_price) / risk if tp3 else None
+            "tp3_r": abs(tp3 - current_price) / risk if tp3 else None,
         }
     
     def check_sweep(

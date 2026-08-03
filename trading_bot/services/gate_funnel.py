@@ -26,6 +26,8 @@ TERMINAL_OUTCOMES = frozenset({
     "pending_cancelled",
     "market_filled",
     "execution_failure",
+    # Shadow-mode gates that would have blocked (telemetry only; trade continues)
+    "shadow_would_block",
 })
 
 HYPOTHETICAL_OUTCOME_TYPES = frozenset({

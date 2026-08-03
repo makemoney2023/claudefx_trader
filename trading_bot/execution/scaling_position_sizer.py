@@ -588,7 +588,10 @@ class ScalingPositionSizer:
             old_lots = lots
             lots = lots * claude_adj  # Apply clamped adjustment instead of raw override
             claude_adjusted = True
-            adjustments.append(f"Claude adjustment: {old_lots:.2f} -> {lots:.2f} lots ({claude_adj:.2f}x)")
+            # Use 4dp so sub-min-lot intermediates don't log as "0.00 -> 0.00"
+            adjustments.append(
+                f"Claude adjustment: {old_lots:.4f} -> {lots:.4f} lots ({claude_adj:.2f}x)"
+            )
         
         # Final normalization to broker-valid lot size (uses volume_min/max/step from MT5)
         from ..config import normalize_lots

@@ -1395,11 +1395,20 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                     # SANITY CHECK: Validate IPDA TP levels are in a reasonable price range
                     # Max TP should be within 10% of current price for forex, 20% for crypto/metals
                     _entry_ref = trade_signal.entry_price or current_price
+                    _sl_ref = trade_signal.stop_loss
+                    _dir = (trade_signal.direction or "").lower()
+                    _risk = abs(_entry_ref - _sl_ref) if _sl_ref else 0.0
                     _max_tp_pct = 0.20 if symbol in bot.CRYPTO_SYMBOLS or symbol in bot.PRECIOUS_METALS or symbol in bot.INDEX_SYMBOLS or symbol in bot.OIL_SYMBOLS else 0.10
                     
                     def _is_sane_tp(tp_price):
-                        """Check if a TP price is within reasonable range of entry."""
-                        if tp_price is None or tp_price <= 0:
+                        """TP must be positive, correct side, >=1R, and within pct band."""
+                        if tp_price is None or tp_price <= 0 or _entry_ref <= 0:
+                            return False
+                        if _dir == "long" and tp_price <= _entry_ref:
+                            return False
+                        if _dir == "short" and tp_price >= _entry_ref:
+                            return False
+                        if _risk > 0 and abs(tp_price - _entry_ref) / _risk < 1.0 - 1e-12:
                             return False
                         deviation = abs(tp_price - _entry_ref) / _entry_ref
                         return deviation <= _max_tp_pct

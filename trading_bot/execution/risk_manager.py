@@ -155,17 +155,19 @@ class RiskManager:
         else:
             lots = 0.0
         
-        # Normalize to broker-valid lot size (uses volume_min/max/step from MT5)
+        # Cap to config max BEFORE normalize_lots. normalize clamps to broker
+        # volume_max (often 100), which produced bogus "100.0 lots exceeds max 1.0"
+        # warnings on micro-priced cryptos (DOGE) with tight stops.
         from ..config import normalize_lots, settings
-        lots = normalize_lots(symbol, lots)
-        
-        # Gap 25: Enforce maximum position size from settings (may be lower than broker max)
         max_position_size = getattr(settings.trading, 'max_position_size', 1.0)
         if lots > max_position_size:
-            logger.warning(
-                f"Position size {lots} lots exceeds config max {max_position_size} lots - capping"
+            logger.info(
+                f"Position size {lots:.4f} lots exceeds config max "
+                f"{max_position_size} lots — capping before broker normalize"
             )
             lots = max_position_size
+
+        lots = normalize_lots(symbol, lots)
         
         # Calculate units using actual contract size
         spec = get_symbol_spec(symbol)

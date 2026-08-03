@@ -24,6 +24,10 @@ failures return `gate_id=ict_confirmation` through the existing terminal
 decision and counterfactual telemetry paths. Passing setups continue through
 the unchanged risk, judge, and execution stages.
 
+In `shadow` mode, would-block events are recorded as outcome_type
+`shadow_would_block` (a recognized `TERMINAL_OUTCOMES` value in `gate_funnel`)
+for telemetry only — the trade path continues.
+
 ## Safety and verification
 
 - Verify runtime settings load `ict_confirmation_mode=active`.

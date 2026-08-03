@@ -32,6 +32,13 @@ Where:
 
 Position Size = $100 / (20 × $10) = 0.5 lots
 
+On micro-priced symbols (e.g. DOGEUSD) a tight stop can produce a huge
+risk-based lot size before limits apply. `RiskManager` caps to
+`max_position_size` **before** broker `normalize_lots` so the intermediate
+value is never clamped up to broker `volume_max` (often 100) and logged as a
+false oversize warning. Final dollar risk is still enforced by FINAL-RISK
+immediately before order send.
+
 ### Lot Size Reference
 
 | Lot Type | Units | Pip Value (USD pairs) |
