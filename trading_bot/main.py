@@ -1401,7 +1401,24 @@ class TradingBot:
             _weekday = _now_est.weekday()  # 0=Monday, 4=Friday
             
             self._day_of_week_mode_locked = False  # Reset each cycle
-            if _weekday == 0:  # Monday - manipulation day
+            _data_collection = self._should_use_aggressive_data_collection()
+            if _data_collection:
+                # Paper/demo validation: keep AGGRESSIVE; skip Mon/Fri CONSERVATIVE lock
+                if self.scaling_manager:
+                    _prev_mode = self.scaling_manager.current_mode
+                    self.scaling_manager.current_mode = TradingMode.AGGRESSIVE
+                    if self.scaling_manager.current_mode != _prev_mode:
+                        from .api.routes.activity import add_activity
+                        add_activity(
+                            "mode_change",
+                            "Trading mode set to AGGRESSIVE (data collection)",
+                            details={
+                                "mode": "AGGRESSIVE",
+                                "previous": _prev_mode.value,
+                                "reason": "demo_data_collection",
+                            },
+                        )
+            elif _weekday == 0:  # Monday - manipulation day
                 if self.scaling_manager:
                     _prev_mode = self.scaling_manager.current_mode
                     self.scaling_manager.current_mode = TradingMode.CONSERVATIVE
@@ -2835,6 +2852,7 @@ class TradingBot:
             self.scaling_manager,
             settings.trading.max_daily_trades,
             gate_override=gate_override,
+            relax_tier_for_data_collection=self._should_use_aggressive_data_collection(),
         )
 
     @staticmethod

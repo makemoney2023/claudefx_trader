@@ -20,11 +20,15 @@ def effective_max_daily_trades(
     scaling_manager=None,
     config_cap: Optional[int] = None,
     gate_override: Optional[int] = None,
+    *,
+    relax_tier_for_data_collection: bool = False,
 ) -> int:
     """
     Effective daily trade cap: min(tier limit, scaling-mode limit, config cap).
 
-    Tier limits (2–5) are the primary guardrail; mode/config caps cannot exceed intent.
+    Tier limits (2–5) are the primary guardrail for live capital survival.
+    When ``relax_tier_for_data_collection`` is True (demo/paper validation),
+    the equity tier cap is skipped so small accounts can accumulate sample size.
     """
     tier_limit = 5
     if position_sizer is not None:
@@ -34,7 +38,12 @@ def effective_max_daily_trades(
     if scaling_manager is not None:
         mode_limit = scaling_manager.get_mode_config().max_daily_trades
 
-    cap = min(tier_limit, mode_limit)
+    if relax_tier_for_data_collection:
+        # Prefer mode/config throughput over micro-account tier (2/day).
+        cap = mode_limit if scaling_manager is not None else max(tier_limit, 20)
+    else:
+        cap = min(tier_limit, mode_limit)
+
     if gate_override is not None:
         cap = min(cap, gate_override)
     if config_cap is not None:

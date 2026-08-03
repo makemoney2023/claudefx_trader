@@ -222,6 +222,12 @@ TRADING_MIN_RISK_REWARD=2.0
 TRADING_ALLOWED_SESSIONS=["london", "new_york", "london_close"]
 TRADING_AUTO_START_BOT=false
 
+# Paper / strategy validation (collect ~100 samples faster):
+# AGGRESSIVE mode, skip Mon/Fri CONSERVATIVE lock, ignore $500–$1k tier's 2/day cap.
+# Use only on demo/paper — leave false for production live.
+# TRADING_DEMO_DATA_COLLECTION_MODE=true
+# TRADING_MAX_DAILY_TRADES=25
+
 # Claude API time gate (default true): hard-skip Claude/judge/sizing outside
 # ICT kill zones — London 02:00–05:00, NY 07:00–10:00, London Close 10:00–12:00
 # America/New_York (~7 hrs/day). MT5 sync and position management stay on.

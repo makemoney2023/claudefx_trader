@@ -352,8 +352,12 @@ class TradingSettings(BaseSettings):
     demo_data_collection_mode: bool = Field(
         default=False,
         description=(
-            "Enable AGGRESSIVE scaling mode for demo data collection on live MT5. "
-            "Simulation mode always uses AGGRESSIVE. Leave False for production live accounts."
+            "Paper/demo strategy validation: AGGRESSIVE mode, skip Mon/Fri CONSERVATIVE "
+            "lock, and relax the equity-tier daily trade cap (so ~$1k accounts are not "
+            "stuck at 2 trades/day while collecting ~100 paper samples). "
+            "Simulation mode always behaves this way. "
+            "Leave False for production live accounts. "
+            "Env: TRADING_DEMO_DATA_COLLECTION_MODE"
         ),
     )
     symbols: List[str] = Field(

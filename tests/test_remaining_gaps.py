@@ -38,6 +38,20 @@ class TestEffectiveMaxDailyTrades:
         cap = effective_max_daily_trades(3000, sizer, None, config_cap=2)
         assert cap == 2
 
+    def test_data_collection_relaxes_tier_cap(self):
+        """Paper/demo validation must not be stuck at 2 trades/day on small equity."""
+        sizer = ScalingPositionSizer()
+        manager = MagicMock()
+        manager.get_mode_config.return_value = MagicMock(max_daily_trades=30)
+        cap = effective_max_daily_trades(
+            800,
+            sizer,
+            manager,
+            config_cap=25,
+            relax_tier_for_data_collection=True,
+        )
+        assert cap == 25
+
 
 class TestActualRiskAccounting:
     def test_booked_risk_uses_actual_dollars_not_nominal_tier(self):
