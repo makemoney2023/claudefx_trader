@@ -326,6 +326,12 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
         # PRE-CLAUDE VIABILITY: skip the LLM (and chart generation) when the
         # mechanical gate stack already guarantees rejection of every direction.
         from ..utils.win_optimization import pre_claude_viability
+        from ..services.analysis_cooldown import (
+            PRECIOUS_METALS as _METALS_FOR_DISP,
+            last_closed_bar_index,
+            recent_m5_displacement_candle,
+            recent_m5_displacement_direction,
+        )
 
         def _bias_of(tf_analysis) -> str:
             bias = getattr(tf_analysis, "bias", None)
@@ -360,6 +366,38 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
         except (TypeError, ValueError):
             _retrace_pct = None
 
+        # Metals: prefer dedicated M5 displacement (matches wakeup path).
+        # Execution TF is often M15 — using it alone re-skips Asian impulses
+        # that only print as M5 displacement while the M15 bar is still forming.
+        _disp_for_viability = displacement_analysis
+        _disp_raw_count = len(df) if df is not None else 0
+        if (symbol or "").upper() in _METALS_FOR_DISP:
+            try:
+                _m5_disp = await bot._fetch_m5_displacement_analysis(symbol)
+            except Exception:
+                _m5_disp = None
+            if _m5_disp is not None:
+                _disp_for_viability = _m5_disp
+                _disp_raw_count = int(
+                    getattr(_m5_disp, "_raw_bar_count", 0) or 0
+                )
+
+        _disp_direction = None
+        if _disp_for_viability is not None and _disp_raw_count > 0:
+            try:
+                _disp_direction = recent_m5_displacement_direction(
+                    _disp_for_viability,
+                    last_bar_index=last_closed_bar_index(_disp_raw_count),
+                )
+            except Exception:
+                _disp_direction = None
+        if _disp_direction:
+            analysis_results["fresh_displacement_direction"] = _disp_direction
+            logger.info(
+                f"[DISP] {symbol}: fresh displacement={_disp_direction} "
+                f"(bars={_disp_raw_count})"
+            )
+
         if mtf_result is not None:
             _viability = pre_claude_viability(
                 d1_bias=_bias_of(getattr(mtf_result, "daily_analysis", None)),
@@ -370,6 +408,7 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                 in_kill_zone=_in_kill_zone,
                 silver_bullet_window=_sb_window,
                 retrace_pct=_retrace_pct,
+                displacement_direction=_disp_direction,
             )
             if not _viability.proceed:
                 _skip_reason = "; ".join(_viability.reasons)
@@ -493,6 +532,123 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
         for _audit in _norm.audit_log:
             logger.info(f"[A5] {symbol}: {_audit}")
         logger.info(f"Signal price checks passed for {symbol}: Entry={_entry}, SL={_sl}, TP={_tp}")
+
+        # Metals displacement continuation: prefer origin limit, allow early
+        # market, skip late chase once Claude agrees with disp direction.
+        from ..utils.win_optimization import (
+            plan_displacement_continuation_entry,
+            repair_displacement_limit_levels,
+        )
+
+        _cont_disp = _disp_for_viability
+        _cont_raw = _disp_raw_count
+        if (
+            (symbol or "").upper() in _METALS_FOR_DISP
+            and _dir in ("long", "short")
+            and _cont_disp is not None
+            and _cont_raw > 0
+        ):
+            _want_disp = "bullish" if _dir == "long" else "bearish"
+            _closed_idx = last_closed_bar_index(_cont_raw)
+            _live_disp_dir = recent_m5_displacement_direction(
+                _cont_disp,
+                last_bar_index=_closed_idx,
+            )
+            if _live_disp_dir == _want_disp:
+                _disp_c = recent_m5_displacement_candle(
+                    _cont_disp,
+                    last_bar_index=_closed_idx,
+                )
+                if isinstance(_disp_c, dict):
+                    _origin = float(
+                        _disp_c.get("open")
+                        or _disp_c.get("open_price")
+                        or 0.0
+                    )
+                    _raw_ext = (
+                        _disp_c.get("high")
+                        if _dir == "short"
+                        else _disp_c.get("low")
+                    )
+                    _extreme = float(_raw_ext or 0.0)
+                    _creates_fvg = bool(_disp_c.get("creates_fvg", False))
+                else:
+                    _origin = float(
+                        getattr(_disp_c, "open_price", None)
+                        or getattr(_disp_c, "open", 0.0)
+                        or 0.0
+                    )
+                    _raw_ext = (
+                        getattr(_disp_c, "high", None)
+                        if _dir == "short"
+                        else getattr(_disp_c, "low", None)
+                    )
+                    _extreme = float(_raw_ext or 0.0)
+                    _creates_fvg = bool(getattr(_disp_c, "creates_fvg", False))
+                _atr = float(getattr(_cont_disp, "avg_atr", 0.0) or 0.0)
+                if _atr <= 0 and isinstance(_cont_disp, dict):
+                    _atr = float(_cont_disp.get("avg_atr", 0.0) or 0.0)
+                # Only the displacement's own FVG counts as origin zone.
+                _has_zone = _creates_fvg
+                _disp_plan = plan_displacement_continuation_entry(
+                    _dir,
+                    current_price=float(current_price),
+                    atr=_atr,
+                    origin_price=_origin,
+                    has_origin_zone=_has_zone,
+                )
+                logger.info(
+                    f"[DISP-CONTINUATION] {symbol}: {_disp_plan.action} "
+                    f"({_disp_plan.reason})"
+                )
+                if _disp_plan.action == "skip":
+                    if bot_state:
+                        bot_state.trade_decision(
+                            symbol, "rejected", _disp_plan.reason
+                        )
+                        bot_state.symbol_complete(symbol, "disp_continuation_skip")
+                    await bot._record_terminal_decision(
+                        "mechanical_reject",
+                        symbol,
+                        gate_id="displacement_continuation",
+                        direction=_dir,
+                        entry=_entry,
+                        sl=_sl,
+                        tp=_tp,
+                        confidence=trade_signal.confidence,
+                        reason=_disp_plan.reason,
+                    )
+                    return
+                if _disp_plan.action == "limit" and _disp_plan.entry_price:
+                    trade_signal.order_type = _disp_plan.order_type
+                    _entry, _sl, _tp = repair_displacement_limit_levels(
+                        _dir,
+                        entry=float(_disp_plan.entry_price),
+                        stop_loss=float(_sl or 0.0),
+                        take_profit=float(_tp or 0.0),
+                        displacement_extreme=float(_extreme or 0.0),
+                    )
+                    trade_signal.entry_price = _entry
+                    trade_signal.stop_loss = _sl
+                    trade_signal.take_profit = _tp
+                    _norm.entry = _entry
+                    _norm.sl = _sl
+                    _norm.tp = _tp
+                elif _disp_plan.action == "market":
+                    trade_signal.order_type = "market"
+                # Keep gate path aware of the fresh impulse that cleared M15.
+                analysis_results["fresh_displacement_direction"] = _live_disp_dir
+                try:
+                    trade_signal.setup_type = _disp_plan.setup_tag
+                except Exception:
+                    pass
+                existing_fp = getattr(trade_signal, "setup_fingerprint", None)
+                if isinstance(existing_fp, dict):
+                    existing_fp["setup_family"] = _disp_plan.setup_tag
+                else:
+                    trade_signal.setup_fingerprint = {
+                        "setup_family": _disp_plan.setup_tag
+                    }
 
         # ============================================
         # SHARED POST-CLAUDE GATES (live/replay parity)

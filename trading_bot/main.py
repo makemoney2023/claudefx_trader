@@ -57,6 +57,7 @@ from .services.analysis_cooldown import (
     has_recent_m5_displacement,
     resolve_analysis_cooldown_seconds,
     resolve_loss_cooldown_minutes,
+    should_check_metal_displacement_wakeup,
     should_run_analysis,
 )
 from .services.entry_gates import (
@@ -1657,14 +1658,20 @@ class TradingBot:
                             base_seconds=self._analysis_cooldown_seconds,
                         )
                         wakeup = False
-                        if (
-                            last_run is not None
-                            and _in_kill_zone
-                            and sym.upper() in PRECIOUS_METALS
+                        elapsed = (
+                            (now - last_run).total_seconds()
+                            if last_run is not None
+                            else None
+                        )
+                        on_cooldown = (
+                            elapsed is not None and elapsed < cooldown_secs
+                        )
+                        # Metals: M5 displacement wakeup outside kill zones too
+                        # (Asian impulses were otherwise stuck on 180s cooldown).
+                        if should_check_metal_displacement_wakeup(
+                            sym, on_cooldown=on_cooldown
                         ):
-                            elapsed = (now - last_run).total_seconds()
-                            if elapsed < cooldown_secs:
-                                wakeup = await self._m5_displacement_wakeup(sym)
+                            wakeup = await self._m5_displacement_wakeup(sym)
                         run, reason = should_run_analysis(
                             last_run=last_run,
                             now=now,
@@ -1890,30 +1897,50 @@ class TradingBot:
             except Exception:
                 pass
 
-    async def _m5_displacement_wakeup(self, symbol: str) -> bool:
-        """Cheap M5 scan: true when a fresh displacement candle just printed.
+    async def _fetch_m5_displacement_analysis(self, symbol: str):
+        """Fetch M5 OHLCV and run displacement detection.
 
-        Used to short-circuit analysis cooldown for precious metals in kill zone
-        so impulsive M5 moves are not waited out for the full cooldown.
+        Stamps ``_raw_bar_count`` on the analysis for closed-bar index math.
         """
         if not self.mt5_client or not self.displacement_detector:
-            return False
+            return None
         try:
             import pandas as pd
 
             bars = await self.mt5_client.get_ohlcv_data(symbol, "M5", count=40)
             if not bars:
-                return False
+                return None
             df = pd.DataFrame(bars)
-            # Detector strips the forming candle; last closed bar index is len-2
-            # on the raw frame (RangeIndex) before that strip.
-            analysis = self.displacement_detector.detect(df)
             if df is None or len(df) < 3:
+                return None
+            analysis = self.displacement_detector.detect(df)
+            try:
+                analysis._raw_bar_count = len(df)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            return analysis
+        except Exception as e:
+            logger.debug(f"[M5-DISP] {symbol}: fetch failed: {e}")
+            return None
+
+    async def _m5_displacement_wakeup(self, symbol: str) -> bool:
+        """Cheap M5 scan: true when a fresh displacement candle just printed.
+
+        Used to short-circuit analysis cooldown for precious metals (KZ and
+        off-KZ) so impulsive M5 moves are not waited out for the full cooldown.
+        """
+        from .services.analysis_cooldown import last_closed_bar_index
+
+        analysis = await self._fetch_m5_displacement_analysis(symbol)
+        if analysis is None:
+            return False
+        try:
+            raw_count = int(getattr(analysis, "_raw_bar_count", 0) or 0)
+            if raw_count < 3:
                 return False
-            last_closed_index = len(df) - 2  # matches exclude_forming_candle
             hit = has_recent_m5_displacement(
                 analysis,
-                last_bar_index=last_closed_index,
+                last_bar_index=last_closed_bar_index(raw_count),
                 max_age_bars=3,
             )
             if hit:

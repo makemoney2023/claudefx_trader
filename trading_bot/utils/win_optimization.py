@@ -63,6 +63,7 @@ def _direction_structurally_blocked(
     h4_bias: str,
     m15_bias: str,
     amd_phase: str,
+    displacement_direction: Optional[str] = None,
 ) -> Optional[str]:
     """
     Return a reason string when the entry-gate stack guarantees rejection
@@ -72,10 +73,17 @@ def _direction_structurally_blocked(
     0.55-capped exception paths (pullback, counter-trend scalp) land below
     the 0.60 execution floor, so they are dead ends and count as blocked.
     Anything ambiguous (neutral/unknown biases) counts as viable.
+
+    Fresh M5 displacement aligned with ``direction`` clears the M15-oppose
+    block (same role as AMD manipulation), but never clears D1+H4 dual oppose.
     """
     opposing = "bearish" if direction == "long" else "bullish"
+    disp = (displacement_direction or "").lower()
+    disp_aligned = (direction == "long" and disp == "bullish") or (
+        direction == "short" and disp == "bearish"
+    )
 
-    if m15_bias == opposing and amd_phase != "manipulation":
+    if m15_bias == opposing and amd_phase != "manipulation" and not disp_aligned:
         return f"{direction}: M15 {m15_bias} opposes (no manipulation phase)"
 
     if d1_bias == opposing and h4_bias == opposing:
@@ -94,6 +102,7 @@ def pre_claude_viability(
     in_kill_zone: bool = False,
     silver_bullet_window: bool = False,
     retrace_pct: Optional[float] = None,  # retained for call-site compat; unused
+    displacement_direction: Optional[str] = None,
 ) -> PreClaudeViability:
     """
     Decide whether calling Claude can possibly produce an executable trade.
@@ -102,7 +111,8 @@ def pre_claude_viability(
     rejection of every direction — never on judgment calls. Spot premium/
     discount is NOT a skip: anticipatory sell_limit/buy_limit entries are
     judged by ENTRY retrace in limit_zone. During kill zones and Silver
-    Bullet windows we always analyze.
+    Bullet windows we always analyze. Fresh M5 displacement unlocks only
+    the aligned direction's M15-oppose block.
     """
     if in_kill_zone or silver_bullet_window:
         return PreClaudeViability(proceed=True)
@@ -115,10 +125,20 @@ def pre_claude_viability(
         )
 
     long_block = _direction_structurally_blocked(
-        "long", d1_bias, h4_bias, m15_bias, amd_phase
+        "long",
+        d1_bias,
+        h4_bias,
+        m15_bias,
+        amd_phase,
+        displacement_direction=displacement_direction,
     )
     short_block = _direction_structurally_blocked(
-        "short", d1_bias, h4_bias, m15_bias, amd_phase
+        "short",
+        d1_bias,
+        h4_bias,
+        m15_bias,
+        amd_phase,
+        displacement_direction=displacement_direction,
     )
     if long_block and short_block:
         reasons.append(long_block)
@@ -127,6 +147,118 @@ def pre_claude_viability(
     if reasons:
         return PreClaudeViability(proceed=False, reasons=reasons)
     return PreClaudeViability(proceed=True)
+
+
+@dataclass
+class DisplacementContinuationPlan:
+    """Entry preference after a fresh metals displacement impulse."""
+
+    action: str  # limit | market | skip
+    order_type: str = "market"
+    entry_price: Optional[float] = None
+    reason: str = ""
+    setup_tag: str = "displacement_continuation"
+
+
+def plan_displacement_continuation_entry(
+    direction: str,
+    *,
+    current_price: float,
+    atr: float,
+    origin_price: float,
+    has_origin_zone: bool,
+    max_market_excursion_atr: float = 1.0,
+    max_chase_excursion_atr: float = 1.5,
+) -> DisplacementContinuationPlan:
+    """Prefer origin-zone limits; allow early market; skip late chase."""
+    direction = (direction or "").lower()
+    if direction not in ("long", "short"):
+        return DisplacementContinuationPlan(
+            action="skip", reason="invalid direction"
+        )
+    if atr is None or atr <= 0 or current_price <= 0 or origin_price <= 0:
+        return DisplacementContinuationPlan(
+            action="skip", reason="missing atr/price for displacement plan"
+        )
+
+    excursion_atr = abs(float(origin_price) - float(current_price)) / float(atr)
+
+    # Origin zone = structural hold: place limit even after a large impulse.
+    if has_origin_zone:
+        order_type = "buy_limit" if direction == "long" else "sell_limit"
+        return DisplacementContinuationPlan(
+            action="limit",
+            order_type=order_type,
+            entry_price=float(origin_price),
+            reason="displacement origin zone — wait for retrace",
+        )
+
+    if excursion_atr > max_chase_excursion_atr:
+        return DisplacementContinuationPlan(
+            action="skip",
+            reason=(
+                f"late chase: excursion {excursion_atr:.2f}ATR > "
+                f"{max_chase_excursion_atr:.1f}ATR"
+            ),
+        )
+
+    if excursion_atr <= max_market_excursion_atr:
+        return DisplacementContinuationPlan(
+            action="market",
+            order_type="market",
+            entry_price=float(current_price),
+            reason=(
+                f"live expansion within {max_market_excursion_atr:.1f}ATR "
+                f"(excursion {excursion_atr:.2f}ATR)"
+            ),
+        )
+
+    return DisplacementContinuationPlan(
+        action="skip",
+        reason=(
+            f"no origin zone and excursion {excursion_atr:.2f}ATR exceeds "
+            f"market cap {max_market_excursion_atr:.1f}ATR"
+        ),
+    )
+
+
+def repair_displacement_limit_levels(
+    direction: str,
+    *,
+    entry: float,
+    stop_loss: float,
+    take_profit: float,
+    displacement_extreme: float,
+) -> Tuple[float, float, float]:
+    """Keep SL/TP coherent after retargeting entry to displacement origin.
+
+    Short sell_limit: SL must sit above entry (prefer displacement high).
+    Long buy_limit: SL must sit below entry (prefer displacement low).
+    """
+    direction = (direction or "").lower()
+    entry = float(entry)
+    sl = float(stop_loss or 0.0)
+    tp = float(take_profit or 0.0)
+    extreme = float(displacement_extreme or 0.0)
+
+    if direction == "short":
+        floor = extreme if extreme > entry else entry
+        if sl <= entry:
+            sl = floor if floor > entry else entry * 1.001
+        else:
+            sl = max(sl, floor) if floor > entry else sl
+        if tp <= 0 or tp >= entry:
+            tp = entry * 0.995
+    elif direction == "long":
+        ceiling = extreme if extreme < entry else entry
+        if sl <= 0 or sl >= entry:
+            sl = ceiling if ceiling < entry else entry * 0.999
+        else:
+            sl = min(sl, ceiling) if ceiling < entry else sl
+        if tp <= entry:
+            tp = entry * 1.005
+
+    return entry, sl, tp
 
 
 def order_type_matches_direction(order_type: str, direction: str) -> bool:

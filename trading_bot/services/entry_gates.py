@@ -245,6 +245,16 @@ def should_use_zone_gate(
     )
 
 
+def _fresh_displacement_aligned(ctx: "TradeContext") -> bool:
+    """True when stamped fresh displacement matches trade direction."""
+    ar = ctx.analysis_results or {}
+    fresh = (ar.get("fresh_displacement_direction") or "").lower()
+    if not fresh:
+        return False
+    want = "bullish" if (ctx.direction or "").lower() == "long" else "bearish"
+    return fresh == want
+
+
 def evaluate_m15_gate(ctx: "TradeContext") -> GateOutcome:
     """M15 execution timeframe structure gate."""
     _dir = ctx.direction
@@ -255,7 +265,11 @@ def evaluate_m15_gate(ctx: "TradeContext") -> GateOutcome:
         or (_m15 == "bullish" and _dir == "short")
     )
     ctx.m15_opposes = m15_opposes
-    if not m15_opposes or _amd == "manipulation":
+    if (
+        not m15_opposes
+        or _amd == "manipulation"
+        or _fresh_displacement_aligned(ctx)
+    ):
         return GateOutcome.pass_through("m15_gate")
 
     d1_supports = (
