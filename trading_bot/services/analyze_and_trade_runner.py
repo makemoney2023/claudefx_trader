@@ -84,13 +84,34 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
         if bot_state:
             bot_state.analyzing_symbol(symbol)
 
-        # Hard-skip Claude outside ICT kill zones (belt-and-suspenders vs cycle gate)
+        # Hard-skip Claude outside ICT kill zones (belt-and-suspenders vs cycle gate),
+        # unless metals print a fresh M5 displacement (any session).
         from ..analysis.kill_zones import claude_analysis_allowed
+        from ..services.analysis_cooldown import (
+            PRECIOUS_METALS as _KZ_METALS,
+            last_closed_bar_index,
+            recent_m5_displacement_direction,
+        )
         if bot.kill_zone_checker is not None:
             _kz_session = bot.kill_zone_checker.get_current_session()
+            _disp_override = False
+            if (symbol or "").upper() in _KZ_METALS:
+                try:
+                    _kz_disp = await bot._fetch_m5_displacement_analysis(symbol)
+                    if _kz_disp is not None:
+                        _raw_n = int(getattr(_kz_disp, "_raw_bar_count", 0) or 0)
+                        _disp_override = bool(
+                            recent_m5_displacement_direction(
+                                _kz_disp,
+                                last_bar_index=last_closed_bar_index(_raw_n),
+                            )
+                        )
+                except Exception as _kz_disp_err:
+                    logger.debug(f"[KZ-GATE] {symbol}: disp check failed: {_kz_disp_err}")
             if not claude_analysis_allowed(
                 bool(getattr(_kz_session, "is_tradeable", False)),
                 claude_kill_zone_only=settings.trading.claude_kill_zone_only,
+                displacement_override=_disp_override,
             ):
                 next_kz = getattr(_kz_session, "next_kill_zone", None) or "next kill zone"
                 mins = getattr(_kz_session, "next_kill_zone_in_minutes", None)
@@ -103,6 +124,11 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                 if bot_state:
                     bot_state.symbol_complete(symbol, "outside_kill_zone")
                 return
+            if _disp_override and not bool(getattr(_kz_session, "is_tradeable", False)):
+                logger.info(
+                    f"[KZ-GATE] {symbol}: Outside KZ but M5 displacement "
+                    f"override — continuing analysis"
+                )
         
         # POST-LOSS COOLDOWN: Prevent revenge trading
         from ..utils.datetime_utils import as_utc
@@ -367,8 +393,8 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
             _retrace_pct = None
 
         # Metals: prefer dedicated M5 displacement (matches wakeup path).
-        # Execution TF is often M15 — using it alone re-skips Asian impulses
-        # that only print as M5 displacement while the M15 bar is still forming.
+        # Execution TF is often M15 — using it alone re-skips impulses that
+        # only print as M5 displacement while the M15 bar is still forming.
         _disp_for_viability = displacement_analysis
         _disp_raw_count = len(df) if df is not None else 0
         if (symbol or "").upper() in _METALS_FOR_DISP:

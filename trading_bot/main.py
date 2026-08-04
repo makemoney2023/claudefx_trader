@@ -12,7 +12,7 @@ import sys
 import base64
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 
 import numpy as np
 
@@ -1565,27 +1565,54 @@ class TradingBot:
             # Check if we're in a valid kill zone
             session = self.kill_zone_checker.get_current_session()
             print(f"[CYCLE] Session: {session.session_name}, is_tradeable={session.is_tradeable}, is_kill_zone={session.is_kill_zone}", flush=True)
+            _disp_override_symbols: List[str] = []
             if not claude_analysis_allowed(
                 session.is_tradeable,
                 claude_kill_zone_only=settings.trading.claude_kill_zone_only,
             ):
-                next_kz = session.next_kill_zone or "next kill zone"
-                mins = session.next_kill_zone_in_minutes
-                eta = f" in {mins}min" if mins is not None else ""
-                print(
-                    f"[CYCLE] Outside KZ ({session.session_name}) — Claude skipped until {next_kz}{eta}",
-                    flush=True,
-                )
-                logger.info(
-                    f"Outside kill zone ({session.session_name}) — "
-                    f"Claude hard-skipped until {next_kz}{eta}"
-                )
-                self._off_hours_mode = True
-                if bot_state:
-                    bot_state.start_cycle(session.session_name, session.is_tradeable)
-                    bot_state.cycle_complete()
-                return
-            if not session.is_tradeable:
+                # Any session: still analyze metals with a live M5 displacement
+                # (London gaps, Asian, NY, off-hours — not Asian-only).
+                for _sym in list(cycle_symbols):
+                    if (_sym or "").upper() not in PRECIOUS_METALS:
+                        continue
+                    try:
+                        if await self._m5_displacement_wakeup(_sym):
+                            _disp_override_symbols.append(_sym)
+                    except Exception as _disp_err:
+                        logger.debug(
+                            f"[DISP-OVERRIDE] {_sym}: wakeup check failed: {_disp_err}"
+                        )
+                if _disp_override_symbols:
+                    print(
+                        f"[CYCLE] Outside KZ ({session.session_name}) — "
+                        f"M5 displacement override for: "
+                        f"{', '.join(_disp_override_symbols)}",
+                        flush=True,
+                    )
+                    logger.info(
+                        f"Outside kill zone ({session.session_name}) — "
+                        f"displacement override: {_disp_override_symbols}"
+                    )
+                    cycle_symbols = _disp_override_symbols
+                    self._off_hours_mode = False
+                else:
+                    next_kz = session.next_kill_zone or "next kill zone"
+                    mins = session.next_kill_zone_in_minutes
+                    eta = f" in {mins}min" if mins is not None else ""
+                    print(
+                        f"[CYCLE] Outside KZ ({session.session_name}) — Claude skipped until {next_kz}{eta}",
+                        flush=True,
+                    )
+                    logger.info(
+                        f"Outside kill zone ({session.session_name}) — "
+                        f"Claude hard-skipped until {next_kz}{eta}"
+                    )
+                    self._off_hours_mode = True
+                    if bot_state:
+                        bot_state.start_cycle(session.session_name, session.is_tradeable)
+                        bot_state.cycle_complete()
+                    return
+            if not session.is_tradeable and not _disp_override_symbols:
                 # Outside kill zones only crypto may continue (off-hours mode
                 # hard-rejects entries via the off_hours_cap gate anyway).
                 crypto_in_cycle = [s for s in cycle_symbols if s in self.CRYPTO_SYMBOLS]
@@ -1666,8 +1693,8 @@ class TradingBot:
                         on_cooldown = (
                             elapsed is not None and elapsed < cooldown_secs
                         )
-                        # Metals: M5 displacement wakeup outside kill zones too
-                        # (Asian impulses were otherwise stuck on 180s cooldown).
+                        # Metals: M5 displacement wakeup in any session
+                        # (not kill-zone-only — London/NY/Asian/off-hours).
                         if should_check_metal_displacement_wakeup(
                             sym, on_cooldown=on_cooldown
                         ):

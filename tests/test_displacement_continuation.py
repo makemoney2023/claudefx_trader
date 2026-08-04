@@ -109,7 +109,7 @@ class TestMetalWakeupOutsideKillZone:
 
 
 class TestPreClaudeDisplacementBypass:
-    """Asian dump pattern: HTF short OK, M15 still bullish — disp unlocks short."""
+    """Any-session dump pattern: HTF short OK, M15 still bullish — disp unlocks short."""
 
     def test_bearish_disp_unlocks_short_when_m15_bullish(self):
         result = pre_claude_viability(

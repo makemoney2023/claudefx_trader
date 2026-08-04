@@ -57,17 +57,17 @@ immediately before order send.
   `m15_pullback_quality`.
 - **Analysis cadence**: default Claude throttle ~270s per symbol. Precious
   metals (XAU/XAG) use **90s in kill zone** / **180s outside**. A fresh M5
-  displacement can wake metals early **inside or outside kill zones**
-  (never faster than 60s) so Asian impulses are not stuck on the 180s throttle.
-  Fresh M5 displacement also clears the M15-oppose skip for the **aligned**
-  direction in both pre-Claude viability and the live `evaluate_m15_gate`
-  (HTF dual-oppose still blocks). Metals stamp `fresh_displacement_direction`
-  from an M5 scan (not execution-TF M15) so Asian impulses are not re-skipped
-  while the M15 bar is still forming. Entry prefers displacement-origin
-  limits with SL/TP repair after retarget; market only within ~1.0× ATR of
-  origin; late chase beyond ~1.5× ATR without an origin zone is skipped
-  (`setup=displacement_continuation`). Post-loss entry cooldown is
-  **15 minutes** for metals and crypto (30m forex).
+  displacement can wake metals early **in any session** (London/NY/Asian/
+  off-hours — not kill-zone-only; never faster than 60s). A live M5 impulse
+  also overrides the Claude kill-zone hard-skip for that metal. Fresh M5
+  displacement clears the M15-oppose skip for the **aligned** direction in
+  both pre-Claude viability and `evaluate_m15_gate` (HTF dual-oppose still
+  blocks). Metals stamp `fresh_displacement_direction` from an M5 scan (not
+  execution-TF M15) so impulses are not re-skipped while the M15 bar is still
+  forming. Entry prefers displacement-origin limits with SL/TP repair after
+  retarget; market only within ~1.0× ATR of origin; late chase beyond ~1.5×
+  ATR without an origin zone is skipped (`setup=displacement_continuation`).
+  Post-loss entry cooldown is **15 minutes** for metals and crypto (30m forex).
 - **Pyramid adds** (default **off**, `TRADING_PYRAMID_ENABLED`): after a
   primary fill reaches **+1R** with `a_plus` or confidence ≥70%, the bot may
   place **one** same-direction market add sized ≤ primary volume, SL at the

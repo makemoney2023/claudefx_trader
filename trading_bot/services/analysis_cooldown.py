@@ -204,7 +204,8 @@ def should_check_metal_displacement_wakeup(
 ) -> bool:
     """True when metals should scan M5 displacement to break cooldown.
 
-    Kill-zone independent — Asian impulses must wake XAU/XAG too.
+    Kill-zone and session independent — London/NY/Asian/off-hours impulses
+    all wake XAU/XAG the same way.
     """
     return bool(on_cooldown) and _is_precious_metal(symbol)
 

@@ -86,6 +86,7 @@ def claude_analysis_allowed(
     is_tradeable: bool,
     *,
     claude_kill_zone_only: bool = True,
+    displacement_override: bool = False,
 ) -> bool:
     """
     Whether Claude analysis (and judge/sizing) may run for this session.
@@ -93,8 +94,11 @@ def claude_analysis_allowed(
     When ``claude_kill_zone_only`` is True (default), analysis is restricted to
     ICT kill zones where ``is_tradeable`` is True (London 2–5, NY 7–10,
     London Close 10–12 America/New_York). Outside those windows, callers must
-    hard-skip Claude to avoid off-hours API spend.
+    hard-skip Claude to avoid off-hours API spend — unless
+    ``displacement_override`` is True (fresh metals M5 impulse in any session).
     """
+    if displacement_override:
+        return True
     if not claude_kill_zone_only:
         return True
     return bool(is_tradeable)
