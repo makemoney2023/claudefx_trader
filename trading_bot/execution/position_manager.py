@@ -48,6 +48,7 @@ class Position:
     # Trade classification
     trade_type: str = "intraday"  # scalp, intraday, swing
     a_plus: bool = False  # High-confidence / HTF-aligned runner
+    confidence: float = 0.0  # Claude confidence at primary fill (pyramid gate)
     
     # Management
     initial_sl: float = 0.0
@@ -74,6 +75,11 @@ class Position:
     # Close metadata (set before closing for reversal re-entry)
     close_reason: str = ""  # "tp_hit", "sl_hit", "giveback_protection", "near_tp_reversal", "trailing_stop", "claude_close", "manual"
 
+    # Pyramid add tracking (primary may add once after +1R confirmation)
+    pyramid_adds_used: int = 0
+    pyramid_parent_ticket: Optional[int] = None  # set on child adds
+    pyramid_eligible: bool = True  # False for children / low-quality primaries
+
     # Original order ticket (differs from position ticket for filled pending orders)
     order_ticket: Optional[int] = None
     reservation_id: Optional[str] = None
@@ -86,6 +92,9 @@ class Position:
         self.initial_sl = self.stop_loss
         if self.initial_volume == 0.0:
             self.initial_volume = self.volume
+        # Children never pyramid further
+        if self.pyramid_parent_ticket is not None:
+            self.pyramid_eligible = False
     
     @property
     def risk_pips(self) -> float:
@@ -130,6 +139,10 @@ class Position:
             "peak_unrealized_pnl": self.peak_unrealized_pnl,
             "near_tp_reached": self.near_tp_reached,
             "close_reason": self.close_reason,
+            "confidence": self.confidence,
+            "pyramid_adds_used": self.pyramid_adds_used,
+            "pyramid_parent_ticket": self.pyramid_parent_ticket,
+            "pyramid_eligible": self.pyramid_eligible,
         }
 
 
@@ -328,6 +341,10 @@ class PositionManager:
                     'near_tp_reached': position.near_tp_reached,
                     'close_reason': position.close_reason or None,
                     'a_plus': getattr(position, 'a_plus', False),
+                    'confidence': float(getattr(position, 'confidence', 0.0) or 0.0),
+                    'pyramid_adds_used': int(getattr(position, 'pyramid_adds_used', 0) or 0),
+                    'pyramid_parent_ticket': getattr(position, 'pyramid_parent_ticket', None),
+                    'pyramid_eligible': bool(getattr(position, 'pyramid_eligible', True)),
                     'reservation_id': getattr(position, 'reservation_id', None),
                     'remaining_volume': position.volume,
                 })
@@ -378,6 +395,10 @@ class PositionManager:
                         status=PositionStatus(p.status) if p.status else PositionStatus.OPEN,
                         trade_type=getattr(p, 'trade_type', 'intraday') or 'intraday',
                         a_plus=getattr(p, 'a_plus', False) or False,
+                        confidence=float(getattr(p, 'confidence', 0.0) or 0.0),
+                        pyramid_adds_used=int(getattr(p, 'pyramid_adds_used', 0) or 0),
+                        pyramid_parent_ticket=getattr(p, 'pyramid_parent_ticket', None),
+                        pyramid_eligible=bool(getattr(p, 'pyramid_eligible', True)),
                     )
                     position.initial_sl = p.initial_sl
                     position.be_triggered = p.be_triggered

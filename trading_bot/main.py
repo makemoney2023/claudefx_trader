@@ -413,6 +413,8 @@ class TradingBot:
         # right before the next call.
         self._last_analysis_time: Dict[str, datetime] = {}  # symbol -> last analysis datetime
         self._analysis_cooldown_seconds: int = 270
+        # Parent tickets with an in-flight pyramid add (prevents double-fire)
+        self._pyramid_pending_parents: set = set()
 
         self.opportunity_scanner = None
         self._opportunity_scan_task = None
@@ -1074,6 +1076,12 @@ class TradingBot:
                         )
                     if actions:
                         asyncio.create_task(broadcast_trade_update({"event": "position_actions", "actions": actions}))
+
+                    # Confirmation pyramid add (default off — TRADING_PYRAMID_ENABLED)
+                    try:
+                        await self._maybe_place_pyramid_adds(price_data)
+                    except Exception as e:
+                        logger.warning(f"POS-MGR pyramid add error: {e}")
                     
                     # Claude re-evaluation every 6 cycles (every ~60 seconds)
                     # Fire-and-forget: runs in background so it doesn't block the
@@ -1708,6 +1716,180 @@ class TradingBot:
             import traceback
             traceback.print_exc()
     
+    async def _maybe_place_pyramid_adds(self, price_data: Dict[str, float]) -> None:
+        """After +1R confirmation, optionally place one same-direction add.
+
+        Default-disabled via ``settings.trading.pyramid_enabled``.
+        """
+        from types import SimpleNamespace
+
+        from .config import get_symbol_spec
+        from .execution.pyramid_manager import evaluate_pyramid_add
+        from .execution.position_manager import Position
+        from .services.live_trade_gates import compute_booked_risk_percent
+
+        if not getattr(settings.trading, "pyramid_enabled", False):
+            return
+        if not self.position_manager or not self.mt5_client:
+            return
+
+        try:
+            account = await self.mt5_client.get_account_info()
+            equity = float(
+                getattr(account, "equity", 0)
+                or getattr(account, "balance", 0)
+                or 0
+            )
+        except Exception:
+            equity = 0.0
+        if equity <= 0:
+            return
+
+        risk_fraction = float(getattr(self.risk_manager, "risk_per_trade", 0.01) or 0.01)
+        cfg = SimpleNamespace(
+            enabled=True,
+            trigger_r=float(settings.trading.pyramid_trigger_r),
+            max_adds=int(settings.trading.pyramid_max_adds),
+            min_confidence=float(settings.trading.pyramid_min_confidence),
+            size_fraction=float(settings.trading.pyramid_size_fraction),
+            risk_fraction=risk_fraction,
+        )
+
+        now = datetime.now(timezone.utc)
+        parents = list(self.position_manager.positions.values())
+        for parent in parents:
+            if getattr(parent, "pyramid_parent_ticket", None) is not None:
+                continue
+            if parent.ticket in self._pyramid_pending_parents:
+                continue
+
+            if parent.symbol in price_data:
+                parent.current_price = price_data[parent.symbol]
+
+            cooldown_until = getattr(self, "_symbol_loss_cooldowns", {}).get(parent.symbol)
+            in_cooldown = False
+            if cooldown_until is not None:
+                try:
+                    from .utils.datetime_utils import as_utc
+                    in_cooldown = now < as_utc(cooldown_until)
+                except Exception:
+                    in_cooldown = now < cooldown_until
+
+            has_opposite = any(
+                p.symbol == parent.symbol
+                and p.direction != parent.direction
+                and p.ticket != parent.ticket
+                for p in parents
+            )
+
+            spec = get_symbol_spec(parent.symbol)
+            req, reason = evaluate_pyramid_add(
+                parent,
+                config=cfg,
+                account_equity=equity,
+                symbol_spec=spec,
+                in_loss_cooldown=in_cooldown,
+                has_opposite_position=has_opposite,
+                add_already_pending=parent.ticket in self._pyramid_pending_parents,
+            )
+            if req is None:
+                if reason not in ("disabled", "below_trigger_r", "not_eligible", "max_adds"):
+                    logger.debug(
+                        f"[PYRAMID] {parent.symbol}: skip parent=#{parent.ticket} ({reason})"
+                    )
+                continue
+
+            if (
+                self.risk_manager
+                and self.risk_manager.get_remaining_daily_risk() <= 0
+            ):
+                print(
+                    f"[PYRAMID] skip daily risk exhausted parent=#{parent.ticket}",
+                    flush=True,
+                )
+                continue
+
+            self._pyramid_pending_parents.add(parent.ticket)
+            order_type = "buy" if req.direction == "long" else "sell"
+            try:
+                result = await self.mt5_client.place_order(
+                    symbol=req.symbol,
+                    order_type=order_type,
+                    volume=req.lots,
+                    stop_loss=req.stop_loss,
+                    take_profit=req.take_profit,
+                    comment=req.comment,
+                )
+            except Exception as e:
+                self._pyramid_pending_parents.discard(parent.ticket)
+                logger.warning(f"[PYRAMID] {req.symbol}: place_order failed: {e}")
+                continue
+
+            ok = bool(result.get("success")) if isinstance(result, dict) else False
+            if not ok:
+                self._pyramid_pending_parents.discard(parent.ticket)
+                err = result.get("error") if isinstance(result, dict) else result
+                print(f"[PYRAMID] skip order failed parent=#{parent.ticket}: {err}", flush=True)
+                continue
+
+            fill_ticket = result.get("ticket") or result.get("order_id")
+            fill_price = float(result.get("price") or parent.current_price or parent.entry_price)
+            fill_vol = float(result.get("volume") or req.lots)
+
+            child = Position(
+                ticket=int(fill_ticket),
+                symbol=req.symbol,
+                direction=req.direction,
+                volume=fill_vol,
+                entry_price=fill_price,
+                stop_loss=req.stop_loss or fill_price,
+                take_profit=req.take_profit or 0.0,
+                open_time=now,
+                confidence=float(getattr(parent, "confidence", 0.0) or 0.0),
+                a_plus=bool(getattr(parent, "a_plus", False)),
+                trade_type=getattr(parent, "trade_type", "intraday") or "intraday",
+                pyramid_eligible=False,
+                pyramid_parent_ticket=parent.ticket,
+                tp1=getattr(parent, "tp1", 0.0) or 0.0,
+                tp2=getattr(parent, "tp2", 0.0) or 0.0,
+                tp3=getattr(parent, "tp3", 0.0) or req.take_profit or 0.0,
+            )
+            self.position_manager.add_position(child)
+            parent.pyramid_adds_used = int(getattr(parent, "pyramid_adds_used", 0) or 0) + 1
+            self.position_manager._schedule_persist(parent)
+            self._pyramid_pending_parents.discard(parent.ticket)
+
+            try:
+                _risk = compute_booked_risk_percent(
+                    fill_vol, fill_price, req.stop_loss, req.symbol, equity
+                )
+                if _risk > 0 and self.risk_manager:
+                    self.risk_manager.update_daily_risk(_risk)
+            except Exception:
+                pass
+
+            msg = (
+                f"[PYRAMID] {req.symbol}: add placed parent=#{parent.ticket} "
+                f"ticket=#{fill_ticket} lots={fill_vol} trigger={req.trigger_r:.1f}R"
+            )
+            print(msg, flush=True)
+            logger.info(msg)
+            try:
+                from .api.routes.activity import add_activity
+                add_activity(
+                    "pyramid_add",
+                    f"{req.symbol}: pyramid add #{fill_ticket} on parent #{parent.ticket}",
+                    req.symbol,
+                    {
+                        "parent_ticket": parent.ticket,
+                        "ticket": fill_ticket,
+                        "lots": fill_vol,
+                        "trigger_r": req.trigger_r,
+                    },
+                )
+            except Exception:
+                pass
+
     async def _m5_displacement_wakeup(self, symbol: str) -> bool:
         """Cheap M5 scan: true when a fresh displacement candle just printed.
 
@@ -3789,8 +3971,16 @@ Apply the evaluation rules from the system message and reply per the OUTPUT CONT
                                 p for p in self.position_manager.get_all_positions()
                                 if p.symbol == symbol and p.direction == order_direction
                             ]
-                            if existing_positions:
+                            _order_comment = (
+                                getattr(order, "comment", "") or ""
+                            ).lower()
+                            _is_pyramid_order = (
+                                "pyramid" in _order_comment
+                                or bool(getattr(order, "is_pyramid_add", False))
+                            )
+                            if existing_positions and not _is_pyramid_order:
                                 # Already have a position — just cancel the stale limit, don't open another
+                                # (intentional pyramid adds are tagged and may proceed)
                                 cancel_ok = await self.pending_order_manager.cancel_order(
                                     order.ticket, reason=f"duplicate_position (already have {symbol} {order_direction})"
                                 )
@@ -4238,6 +4428,8 @@ Apply the evaluation rules from the system message and reply per the OUTPUT CONT
                         take_profit=mt5_pos.tp,
                         open_time=datetime.now(timezone.utc)
                     )
+                    if "pyramid" in mt5_comment.lower():
+                        position.pyramid_eligible = False
                     if hasattr(self, 'pending_order_manager') and self.pending_order_manager:
                         _orig_order = self.pending_order_manager.filled_order_map.get(ticket)
                         if _orig_order:

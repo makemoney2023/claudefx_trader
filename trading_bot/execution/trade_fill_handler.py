@@ -332,6 +332,13 @@ class TradeFillHandler:
                     # =============================================
                     # MARKET ORDER: Immediately filled, add to position_manager
                     # =============================================
+                    _conf = float(getattr(trade_signal, "confidence", 0.0) or 0.0)
+                    _a_plus = classify_a_plus(
+                        setup_grade.value if hasattr(setup_grade, 'value') else str(setup_grade),
+                        confluence_count or 0,
+                    )
+                    _is_pyramid_child = bool(getattr(trade_signal, "is_pyramid_add", False))
+                    _parent_ticket = getattr(trade_signal, "pyramid_parent_ticket", None)
                     position = Position(
                         ticket=result.ticket,
                         symbol=symbol,
@@ -343,10 +350,14 @@ class TradeFillHandler:
                         open_time=datetime.now(timezone.utc),
                         trade_type=getattr(trade_signal, 'trade_type', 'intraday') or 'intraday',
                         reservation_id=trade_reservation.reservation_id if trade_reservation else None,
-                        a_plus=classify_a_plus(
-                            setup_grade.value if hasattr(setup_grade, 'value') else str(setup_grade),
-                            confluence_count or 0,
+                        a_plus=_a_plus,
+                        confidence=_conf,
+                        pyramid_eligible=(
+                            False
+                            if _is_pyramid_child
+                            else (_a_plus or _conf >= 0.70)
                         ),
+                        pyramid_parent_ticket=_parent_ticket if _is_pyramid_child else None,
                     )
                     if trade_reservation:
                         bot.reservation_ledger.transfer_to_position(

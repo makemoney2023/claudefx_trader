@@ -275,6 +275,14 @@ TRADING_ICT_CONFIRMATION_MODE=active
 # HTF-aligned M15 pullback limits need ≥68% conf + 2:1 RR (else quality reject).
 # Analysis cooldown: default ~270s; XAU/XAG = 90s in kill zone / 180s outside;
 # M5 displacement can wake metals early (min 60s). Loss cooldown: metals 15m.
+#
+# Pyramid add (default OFF): one same-direction add after primary hits +1R
+# with conf>=0.70 or a_plus. Size <= primary; FINAL-RISK still applies.
+# TRADING_PYRAMID_ENABLED=false
+# TRADING_PYRAMID_TRIGGER_R=1.0
+# TRADING_PYRAMID_MAX_ADDS=1
+# TRADING_PYRAMID_MIN_CONFIDENCE=0.70
+# TRADING_PYRAMID_SIZE_FRACTION=1.0
 # Correlated group risk cap (still shadow — logs only until activated):
 # TRADING_CORRELATION_GROUP_MODE=shadow
 # TRADING_CORRELATION_MAX_GROUP_RISK_PCT=0.10

@@ -59,6 +59,11 @@ immediately before order send.
   metals (XAU/XAG) use **90s in kill zone** / **180s outside**. A fresh M5
   displacement can wake metals early (never faster than 60s). Post-loss entry
   cooldown is **15 minutes** for metals and crypto (30m forex).
+- **Pyramid adds** (default **off**, `TRADING_PYRAMID_ENABLED`): after a
+  primary fill reaches **+1R** with `a_plus` or confidence ≥70%, the bot may
+  place **one** same-direction market add sized ≤ primary volume, SL at the
+  primary’s current stop, TP at runner/TP3. Children are not re-pyramided.
+  FINAL-RISK and daily risk still apply; undersized adds are skipped.
 
 ### Lot Size Reference
 

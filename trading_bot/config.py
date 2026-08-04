@@ -512,6 +512,29 @@ class TradingSettings(BaseSettings):
         default=0.10,
         description="Max portfolio risk fraction per correlation group",
     )
+    pyramid_enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable confirmation pyramid adds after primary reaches trigger R. "
+            "Default off — set TRADING_PYRAMID_ENABLED=true on VPS after soak."
+        ),
+    )
+    pyramid_trigger_r: float = Field(
+        default=1.0,
+        description="Minimum open R-multiple on primary before a pyramid add",
+    )
+    pyramid_max_adds: int = Field(
+        default=1,
+        description="Maximum pyramid adds per primary position",
+    )
+    pyramid_min_confidence: float = Field(
+        default=0.70,
+        description="Min primary confidence for pyramid (a_plus bypasses)",
+    )
+    pyramid_size_fraction: float = Field(
+        default=1.0,
+        description="Add size as fraction of primary initial volume (capped at 1.0)",
+    )
     opportunity_scanner_enabled: bool = Field(
         default=False,
         description=(

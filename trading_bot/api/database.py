@@ -261,6 +261,10 @@ class PositionStateModel(Base):
 
     # Explicit A+ classification and reservation ownership
     a_plus: Mapped[bool] = mapped_column(Boolean, default=False)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    pyramid_adds_used: Mapped[int] = mapped_column(Integer, default=0)
+    pyramid_parent_ticket: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=None)
+    pyramid_eligible: Mapped[bool] = mapped_column(Boolean, default=True)
     reservation_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, default=None)
     remaining_volume: Mapped[float] = mapped_column(Float, default=0)
     
@@ -595,6 +599,10 @@ async def init_db():
             ("trades", "setup_fingerprint", "VARCHAR(120)"),
             ("trades", "exit_events", "JSON"),
             ("position_states", "a_plus", "BOOLEAN DEFAULT 0"),
+            ("position_states", "confidence", "FLOAT DEFAULT 0"),
+            ("position_states", "pyramid_adds_used", "INTEGER DEFAULT 0"),
+            ("position_states", "pyramid_parent_ticket", "INTEGER"),
+            ("position_states", "pyramid_eligible", "BOOLEAN DEFAULT 1"),
             ("position_states", "reservation_id", "VARCHAR(50)"),
             ("position_states", "remaining_volume", "FLOAT DEFAULT 0"),
             ("position_states", "created_at", "DATETIME"),

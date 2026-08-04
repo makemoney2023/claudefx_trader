@@ -19,8 +19,14 @@ logger = get_logger(__name__)
 def check_position_conflicts(
     existing_positions: List[Any],
     direction: str,
+    *,
+    allow_pyramid_add: bool = False,
 ) -> GateOutcome:
-    """Block opposite-direction conflict or same-direction stacking."""
+    """Block opposite-direction conflict or same-direction stacking.
+
+    ``allow_pyramid_add=True`` permits a single intentional same-direction
+    add (tagged pyramid) while still blocking opposite-direction conflicts.
+    """
     if not existing_positions:
         return GateOutcome.pass_through("position_check")
 
@@ -34,7 +40,7 @@ def check_position_conflicts(
         )
 
     same_dir = [p for p in existing_positions if p.direction == direction]
-    if same_dir:
+    if same_dir and not allow_pyramid_add:
         return GateOutcome.block(
             gate_id="position_stacking",
             reason="Same-direction position already open",
@@ -272,7 +278,12 @@ class ExecutionCoordinator:
         order_type = getattr(trade_signal, "order_type", "market") or "market"
 
         if existing_positions:
-            conflict = check_position_conflicts(existing_positions, direction)
+            _is_pyramid = bool(getattr(trade_signal, "is_pyramid_add", False))
+            conflict = check_position_conflicts(
+                existing_positions,
+                direction,
+                allow_pyramid_add=_is_pyramid,
+            )
             if conflict.blocked:
                 return ExecutionPrepResult(
                     order_type=order_type,
