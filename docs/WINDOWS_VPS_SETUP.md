@@ -268,9 +268,12 @@ TRADING_NEWS_GATES_ENABLED=true
 # --- Direction quality / expectancy controls ---
 # ICT setup confirmation (default ACTIVE — hard-blocks incomplete confirms):
 TRADING_ICT_CONFIRMATION_MODE=active
-# Wrong-zone (short discount / long premium) requires sweep+displacement;
-# conf/RR alone no longer bypasses. Controlled by TRADING_ZONE_GATE_MODE
-# (default active). ICT fingerprint zone_valid uses PD retrace.
+# Wrong-zone (short discount / long premium) allows HTF-aligned continuation
+# with displacement (sweep optional), or sweep+displacement otherwise;
+# conf/RR alone never bypasses. Controlled by TRADING_ZONE_GATE_MODE
+# (default active). Same HTF+disp predicate also keeps market orders through
+# zone→OTE conversion, displacement parity, ICT MSS/zone checks, and
+# pre-judge market extremes. Extreme limit zone checks still apply.
 # Weak-hour TOD + volatile_ranging floors are 70% (above execution floor).
 # HTF-aligned M15 pullback limits need ≥68% conf + 2:1 RR (else quality reject).
 # Analysis cooldown: default ~270s; XAU/XAG = 90s in kill zone / 180s outside;

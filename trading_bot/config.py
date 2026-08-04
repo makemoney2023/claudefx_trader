@@ -472,22 +472,25 @@ class TradingSettings(BaseSettings):
     zone_misaligned_min_confidence: float = Field(
         default=0.60,
         description=(
-            "Deprecated: wrong-zone now requires sweep+displacement instead of "
-            "conf/RR bypass. Retained for settings compatibility."
+            "Deprecated: wrong-zone now requires HTF+displacement or "
+            "sweep+displacement instead of conf/RR bypass. Retained for "
+            "settings compatibility."
         ),
     )
     zone_misaligned_min_rr: float = Field(
         default=2.0,
         description=(
-            "Deprecated: wrong-zone now requires sweep+displacement instead of "
-            "conf/RR bypass. Retained for settings compatibility."
+            "Deprecated: wrong-zone now requires HTF+displacement or "
+            "sweep+displacement instead of conf/RR bypass. Retained for "
+            "settings compatibility."
         ),
     )
     zone_equilibrium_min_confidence: float = Field(
         default=0.60,
         description=(
             "Deprecated: equilibrium soft-pass removed; location uses 50% mid "
-            "with sweep+displacement override. Retained for compatibility."
+            "with HTF+displacement or sweep+displacement override. Retained "
+            "for compatibility."
         ),
     )
     zone_gate_disabled_symbols: List[str] = Field(

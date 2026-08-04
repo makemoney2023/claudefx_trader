@@ -90,14 +90,19 @@ def has_displacement(
 
     Accepts ``distribution_confirmed`` (legacy) OR a recent displacement candle
     in the trade direction (``last_bullish`` / ``last_bearish`` / recent list).
+    Also accepts ``fresh_displacement_direction`` stamped by the metals M5
+    continuation path (execution-TF displacement often lags the impulse).
     Direction-agnostic callers still succeed on any confirmed/recent impulse.
     """
+    d = (direction or "").lower()
+    want = "bullish" if d == "long" else ("bearish" if d == "short" else "")
+    fresh = (analysis_results.get("fresh_displacement_direction") or "").lower()
+    if want and fresh == want:
+        return True
+
     disp = analysis_results.get("displacement")
     if disp is None:
         return False
-
-    d = (direction or "").lower()
-    want = "bullish" if d == "long" else ("bearish" if d == "short" else "")
 
     if isinstance(disp, dict):
         if disp.get("distribution_confirmed"):
@@ -155,6 +160,15 @@ def htf_aligned(direction: str, d1_bias: str, h4_bias: str) -> bool:
     d = (direction or "").lower()
     aligned = "bullish" if d == "long" else "bearish"
     return (d1_bias or "").lower() == aligned and (h4_bias or "").lower() == aligned
+
+
+def is_htf_displacement_continuation(
+    *,
+    htf_aligned: bool,
+    has_displacement: bool,
+) -> bool:
+    """HTF-aligned impulse: same predicate as zone-gate continuation bypass."""
+    return bool(htf_aligned) and bool(has_displacement)
 
 
 def classify_setup_family(

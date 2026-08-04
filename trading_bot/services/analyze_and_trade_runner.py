@@ -614,14 +614,40 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                 _atr = float(getattr(_cont_disp, "avg_atr", 0.0) or 0.0)
                 if _atr <= 0 and isinstance(_cont_disp, dict):
                     _atr = float(_cont_disp.get("avg_atr", 0.0) or 0.0)
-                # Only the displacement's own FVG counts as origin zone.
-                _has_zone = _creates_fvg
+                # FVG preferred; displacement open still usable as origin limit.
+                _has_zone = _creates_fvg or _origin > 0
+                from .setup_fingerprint import htf_aligned as _htf_aligned_fn
+
+                _disp_d1 = (
+                    (market_data.get("d1_bias") if market_data else None)
+                    or (
+                        _bias_of(getattr(mtf_result, "daily_analysis", None))
+                        if mtf_result is not None
+                        else ""
+                    )
+                    or ""
+                )
+                _disp_h4 = (
+                    (market_data.get("h4_bias") if market_data else None)
+                    or (
+                        _bias_of(getattr(mtf_result, "h4_analysis", None))
+                        if mtf_result is not None
+                        else ""
+                    )
+                    or ""
+                )
+                _disp_htf = _htf_aligned_fn(_dir, _disp_d1, _disp_h4)
+                _claude_ot = (
+                    getattr(trade_signal, "order_type", "market") or "market"
+                ).lower()
                 _disp_plan = plan_displacement_continuation_entry(
                     _dir,
                     current_price=float(current_price),
                     atr=_atr,
                     origin_price=_origin,
                     has_origin_zone=_has_zone,
+                    prefer_market=_claude_ot in ("market", "buy", "sell", ""),
+                    htf_aligned=_disp_htf,
                 )
                 logger.info(
                     f"[DISP-CONTINUATION] {symbol}: {_disp_plan.action} "
@@ -662,6 +688,9 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                     _norm.tp = _tp
                 elif _disp_plan.action == "market":
                     trade_signal.order_type = "market"
+                    analysis_results["disp_continuation_size_mult"] = float(
+                        getattr(_disp_plan, "size_multiplier", 1.0) or 1.0
+                    )
                 # Keep gate path aware of the fresh impulse that cleared M15.
                 analysis_results["fresh_displacement_direction"] = _live_disp_dir
                 try:
@@ -705,10 +734,18 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                 logger.debug(f"Zone validation pre-check failed: {_zone_err}")
                 _zone_valid = None
         # Ensure displacement/AMD visible to shared parity gates.
+        # Prefer the viability/continuation object (M5 for metals) so HTF+disp
+        # exemptions see the same impulse that cleared late-chase — execution-TF
+        # displacement often still lags mid-move.
         # Keep amd_cycle as a dict so entry gates / confluence can use .get();
         # post_claude_gates already accepts either form.
-        if displacement_analysis is not None:
-            analysis_results["displacement"] = displacement_analysis
+        _disp_for_gates = (
+            _disp_for_viability
+            if _disp_for_viability is not None
+            else displacement_analysis
+        )
+        if _disp_for_gates is not None:
+            analysis_results["displacement"] = _disp_for_gates
         if amd_state is not None and not isinstance(
             analysis_results.get("amd_cycle"), dict
         ):
@@ -1133,6 +1170,15 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
             size_multiplier = 1.0
         _edge_mult = getattr(bot, "_edge_size_multiplier", 1.0)
         size_multiplier *= _edge_mult
+        _disp_size_mult = float(
+            (analysis_results or {}).get("disp_continuation_size_mult", 1.0) or 1.0
+        )
+        if _disp_size_mult < 1.0:
+            size_multiplier *= _disp_size_mult
+            logger.info(
+                f"[DISP-CONTINUATION] {symbol}: late-chase size haircut "
+                f"x{_disp_size_mult:.2f} (combined mult={size_multiplier:.2f})"
+            )
 
         # ============================================
         # ENSEMBLE SIZING: mechanical baseline vs Claude agreement
@@ -1752,10 +1798,36 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                     _pj_retrace = float(_retrace_pct) if _retrace_pct is not None else None
                 except Exception:
                     _pj_retrace = None
+            from .setup_fingerprint import has_displacement, htf_aligned
+
+            _pj_d1 = (
+                (market_data.get("d1_bias") if market_data else None)
+                or (
+                    _bias_of(getattr(mtf_result, "daily_analysis", None))
+                    if mtf_result is not None
+                    else ""
+                )
+                or ""
+            )
+            _pj_h4 = (
+                (market_data.get("h4_bias") if market_data else None)
+                or (
+                    _bias_of(getattr(mtf_result, "h4_analysis", None))
+                    if mtf_result is not None
+                    else ""
+                )
+                or ""
+            )
+            _pj_htf = htf_aligned(trade_signal.direction, _pj_d1, _pj_h4)
+            _pj_disp = has_displacement(
+                analysis_results or {}, direction=trade_signal.direction
+            )
             _pj_zone_reason = pre_judge_zone_block_reason(
                 order_type=getattr(trade_signal, "order_type", "market") or "market",
                 direction=trade_signal.direction,
                 retrace_pct=_pj_retrace,
+                htf_aligned=_pj_htf,
+                has_displacement=_pj_disp,
             )
             if _pj_zone_reason:
                 print(f"[BLOCKED] {symbol}: pre-judge {_pj_zone_reason}", flush=True)

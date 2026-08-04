@@ -72,16 +72,35 @@ def evaluate_zone_conversion(
     current_entry: float,
     current_price: float,
     pd_analysis: Any,
+    htf_aligned: bool = False,
+    has_displacement: bool = False,
 ) -> ParityGateOutcome:
     """
     When premium/discount zone is invalid for a market order, convert to OTE
     limit or block if OTE cannot be resolved.
+
+    HTF-aligned displacement continuation keeps the market order (do not
+    demote an impulse chase into a pullback limit).
     """
     if zone_valid:
         return ParityGateOutcome(
             action="unchanged",
             gate_path=["zone_ok"],
             reason=zone_reason or "zone valid",
+        )
+
+    from .setup_fingerprint import is_htf_displacement_continuation
+
+    if is_htf_displacement_continuation(
+        htf_aligned=htf_aligned, has_displacement=has_displacement
+    ):
+        return ParityGateOutcome(
+            action="unchanged",
+            gate_path=["zone_continuation_market"],
+            reason=(
+                zone_reason
+                or "zone invalid — HTF+displacement continuation keeps market"
+            ),
         )
 
     ot = (order_type or "").lower()
@@ -158,8 +177,20 @@ def evaluate_displacement_parity(
     order_type: str,
     distribution_confirmed: Optional[bool],
     amd_phase: Optional[str],
+    htf_aligned: bool = False,
+    has_displacement: bool = False,
 ) -> ParityGateOutcome:
     """Shared displacement decision for market orders."""
+    from .setup_fingerprint import is_htf_displacement_continuation
+
+    if (order_type or "").lower() == "market" and is_htf_displacement_continuation(
+        htf_aligned=htf_aligned, has_displacement=has_displacement
+    ):
+        return ParityGateOutcome(
+            action="allow_market",
+            gate_path=["displacement_continuation_ok"],
+        )
+
     action = displacement_gate_action(
         order_type,
         distribution_confirmed=distribution_confirmed,

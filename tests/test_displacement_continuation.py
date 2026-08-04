@@ -176,25 +176,70 @@ class TestDisplacementContinuationEntryPlan:
         )
         assert plan.action == "market"
         assert plan.order_type == "market"
+        assert plan.size_multiplier == pytest.approx(1.0)
 
-    def test_skips_when_excursion_beyond_1_5atr(self):
+    def test_late_without_claude_market_limits_at_origin(self):
+        """Hybrid C: mid/late impulse without prefer_market → limit at origin."""
         plan = plan_displacement_continuation_entry(
             "short",
-            current_price=4040.0,
+            current_price=4040.0,  # 2.7 ATR from origin
             atr=10.0,
             origin_price=4067.0,
             has_origin_zone=False,
+            prefer_market=False,
+        )
+        assert plan.action == "limit"
+        assert plan.order_type == "sell_limit"
+        assert plan.entry_price == pytest.approx(4067.0)
+
+    def test_claude_market_htf_allows_late_with_haircut(self):
+        """Hybrid C: Claude market + HTF + ≤2.5 ATR → market @ 0.5x."""
+        plan = plan_displacement_continuation_entry(
+            "short",
+            current_price=4047.0,  # 2.0 ATR
+            atr=10.0,
+            origin_price=4067.0,
+            has_origin_zone=False,
+            prefer_market=True,
+            htf_aligned=True,
+        )
+        assert plan.action == "market"
+        assert plan.size_multiplier == pytest.approx(0.5)
+
+    def test_hard_skips_beyond_3atr(self):
+        plan = plan_displacement_continuation_entry(
+            "short",
+            current_price=4030.0,  # 3.7 ATR
+            atr=10.0,
+            origin_price=4067.0,
+            has_origin_zone=False,
+            prefer_market=True,
+            htf_aligned=True,
         )
         assert plan.action == "skip"
-        assert "1.5" in plan.reason or "chase" in plan.reason.lower()
+        assert "3.0" in plan.reason or "chase" in plan.reason.lower()
+
+    def test_between_2_5_and_3_limits_at_origin(self):
+        plan = plan_displacement_continuation_entry(
+            "short",
+            current_price=4040.0,  # 2.7 ATR
+            atr=10.0,
+            origin_price=4067.0,
+            has_origin_zone=False,
+            prefer_market=True,
+            htf_aligned=True,
+        )
+        assert plan.action == "limit"
+        assert plan.entry_price == pytest.approx(4067.0)
 
     def test_long_limit_uses_buy_limit(self):
         plan = plan_displacement_continuation_entry(
             "long",
-            current_price=4075.0,
+            current_price=4090.0,  # 2.3 ATR past origin — late, no prefer_market
             atr=10.0,
             origin_price=4067.0,
             has_origin_zone=True,
+            prefer_market=False,
         )
         assert plan.action == "limit"
         assert plan.order_type == "buy_limit"

@@ -14,10 +14,11 @@ Catch precious-metal displacement impulses in **any session** (London, NY, Asian
 2. **KZ Claude override:** If the cycle would hard-skip Claude outside a tradeable kill zone, still analyze metals that currently show a fresh M5 displacement.
 3. **Pre-Claude bypass (directional):** Fresh strong **M5** displacement (≥1.5× ATR, age ≤3 bars) clears the M15-oppose block for the **aligned** direction only — both in `pre_claude_viability` and `evaluate_m15_gate` (stamped as `fresh_displacement_direction`). Opposite side stays blocked. D1+H4 both-opposing still blocks that direction. Metals must use M5 for this check (execution TF is often M15 and lags the impulse).
 4. **Bar index:** Age checks use `last_closed_bar_index = len(raw_df) - 2` to match `exclude_forming_candle`.
-5. **Entry preference:**
-   - Primary: limit/stop into displacement-origin zone (displacement's own FVG) when available; repair SL/TP so geometry stays valid after retargeting entry.
-   - Secondary: market/stop only if still expanding and excursion from origin ≤ 1.0× ATR.
-   - Skip if excursion > 1.5× ATR with no structural hold (missed — do not chase).
+5. **Entry preference (hybrid late-chase):**
+   - Hard-skip only if excursion from origin > 3.0× ATR.
+   - Claude market + HTF-aligned + excursion ≤ 2.5× ATR → market (full size ≤1.0× ATR, 0.5× size haircut beyond).
+   - Early expansion ≤ 1.0× ATR → market full size.
+   - Otherwise limit at displacement open (FVG preferred but not required); repair SL/TP after retarget.
 6. **Tag:** `setup=displacement_continuation` for expectancy.
 
 ## Non-goals

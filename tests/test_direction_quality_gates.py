@@ -2,7 +2,7 @@
 Direction-quality tighten:
 - ICT confirmation default/active blocks incomplete passive retracements
 - Wrong-zone entries (short discount / long premium) hard-block unless
-  sweep + displacement are both present
+  (HTF-aligned + displacement) OR (sweep + displacement)
 """
 
 import pytest
@@ -112,6 +112,7 @@ class TestWrongZoneRequiresSweepDisplacement:
         assert "confirmed" in result.decision
 
     def test_long_premium_blocked_without_confirm(self):
+        """Displacement alone without HTF alignment still blocks."""
         result = evaluate_zone_gate(
             direction="long",
             confidence=0.70,
@@ -124,6 +125,7 @@ class TestWrongZoneRequiresSweepDisplacement:
             symbol="EURUSD",
             has_sweep=False,
             has_displacement=True,
+            htf_aligned=False,
         )
         assert result.blocked is True
 
@@ -142,6 +144,42 @@ class TestWrongZoneRequiresSweepDisplacement:
             has_displacement=True,
         )
         assert result.blocked is False
+
+    def test_htf_aligned_short_discount_continuation(self):
+        result = evaluate_zone_gate(
+            direction="short",
+            confidence=0.60,
+            actual_rr=1.84,
+            retrace=0.36,
+            zone_str="discount",
+            d1_bias="bearish",
+            is_index=False,
+            settings=ZoneGateSettings(),
+            symbol="XAUUSD",
+            has_sweep=False,
+            has_displacement=True,
+            htf_aligned=True,
+        )
+        assert result.blocked is False
+        assert result.decision == "allowed_wrong_zone_continuation"
+
+    def test_htf_aligned_long_premium_continuation(self):
+        result = evaluate_zone_gate(
+            direction="long",
+            confidence=0.60,
+            actual_rr=2.0,
+            retrace=0.70,
+            zone_str="premium",
+            d1_bias="bullish",
+            is_index=False,
+            settings=ZoneGateSettings(),
+            symbol="EURUSD",
+            has_sweep=False,
+            has_displacement=True,
+            htf_aligned=True,
+        )
+        assert result.blocked is False
+        assert result.decision == "allowed_wrong_zone_continuation"
 
     def test_zone_aligned_short_premium_still_allowed(self):
         result = evaluate_zone_gate(

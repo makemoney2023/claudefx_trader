@@ -503,6 +503,11 @@ def _run_price_gates(
             evaluate_zone_conversion,
             finalize_displacement_conversion,
         )
+        from .setup_fingerprint import has_displacement, htf_aligned
+
+        _h4_bias = (inp.market_data.get("h4_bias") or "").lower()
+        _parity_htf = htf_aligned(direction, d1_bias, _h4_bias)
+        _parity_disp = has_displacement(inp.analysis_results or {}, direction=direction)
 
         # GATE 1: premium/discount zone → OTE limit conversion
         if inp.zone_valid is not None:
@@ -514,6 +519,8 @@ def _run_price_gates(
                 current_entry=entry,
                 current_price=inp.current_price,
                 pd_analysis=inp.pd_analysis,
+                htf_aligned=_parity_htf,
+                has_displacement=_parity_disp,
             )
             if zone_out.action == "convert_pending":
                 zone_out = apply_zone_conversion_levels(
@@ -606,6 +613,8 @@ def _run_price_gates(
             order_type=order_type,
             distribution_confirmed=dist_confirmed,
             amd_phase=amd_phase,
+            htf_aligned=_parity_htf,
+            has_displacement=_parity_disp,
         )
         if disp_out.action == "convert_pending":
             disp_out = finalize_displacement_conversion(

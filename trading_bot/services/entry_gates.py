@@ -52,13 +52,14 @@ def evaluate_zone_gate(
     is_counter_trend_scalp: bool = False,
     has_sweep: bool = False,
     has_displacement: bool = False,
+    htf_aligned: bool = False,
 ) -> ZoneGateResult:
     """Zone-aware direction gate: sell premium, buy discount.
 
     Wrong-zone entries (short below 50% / long above 50%) hard-block unless
-    both a directional sweep and displacement are present. Conf/RR alone no
-    longer bypasses location — that was letting clean FVG fills fire the
-    wrong way from discount shorts / premium longs.
+    either (1) HTF-aligned continuation with directional displacement, or
+    (2) both a directional sweep and displacement. Conf/RR alone never
+    bypasses location.
     """
     if is_counter_trend_scalp:
         return ZoneGateResult(blocked=False, decision="skipped_counter_scalp")
@@ -85,8 +86,16 @@ def evaluate_zone_gate(
     reason = ""
 
     if not in_correct_zone:
-        structure_ok = bool(has_sweep) and bool(has_displacement)
-        if structure_ok:
+        continuation_ok = bool(htf_aligned) and bool(has_displacement)
+        reversal_ok = bool(has_sweep) and bool(has_displacement)
+        if continuation_ok:
+            decision = "allowed_wrong_zone_continuation"
+            reason = (
+                f"ZONE-GATE {direction.upper()} from {zone_str} "
+                f"(retrace={retrace:.0%}) allowed — HTF-aligned continuation "
+                f"(displacement confirmed, sweep optional)"
+            )
+        elif reversal_ok:
             decision = "allowed_wrong_zone_confirmed"
             reason = (
                 f"ZONE-GATE {direction.upper()} from {zone_str} "
@@ -97,8 +106,9 @@ def evaluate_zone_gate(
             decision = "blocked_wrong_zone"
             reason = (
                 f"ZONE-GATE {direction.upper()} from {zone_str} "
-                f"(retrace={retrace:.0%}) — need sweep+displacement "
-                f"(sweep={bool(has_sweep)}, displacement={bool(has_displacement)})"
+                f"(retrace={retrace:.0%}) — need HTF+displacement or "
+                f"sweep+displacement (htf_aligned={bool(htf_aligned)}, "
+                f"sweep={bool(has_sweep)}, displacement={bool(has_displacement)})"
             )
 
     if blocked and settings.gate_mode == "shadow":
@@ -517,15 +527,18 @@ def evaluate_ict_confirmation_gate(
 
     Families:
       - liquidity_reversal (market/stop): sweep + MSS/CHoCH + displacement
-      - continuation (market/stop): HTF + MSS/BOS + displacement (sweep optional)
-      - passive_retracement (limit): HTF + displacement-origin zone; no post-entry
-        confirmation forced (limit cannot know fill-time structure)
+      - continuation (market/stop): HTF + displacement (MSS optional when both
+        present; otherwise HTF + MSS/BOS + displacement; sweep optional)
+      - passive_retracement (limit): HTF + displacement; zone required unless
+        HTF+displacement continuation (impulse demoted/anticipatory)
 
     mode='shadow' never hard-blocks; mode='active' blocks missing confirms;
     mode='disabled' skips.
     """
     if mode not in ("shadow", "active"):
         return IctConfirmationResult(decision="disabled")
+
+    from .setup_fingerprint import is_htf_displacement_continuation
 
     family = getattr(fingerprint, "family", "") or ""
     ot = (order_type or getattr(fingerprint, "order_type", None) or "market").lower()
@@ -534,6 +547,9 @@ def evaluate_ict_confirmation_gate(
     has_disp = bool(getattr(fingerprint, "has_displacement", False))
     htf = bool(getattr(fingerprint, "htf_aligned", False))
     zone_ok = bool(getattr(fingerprint, "zone_valid", True))
+    continuation_struct = is_htf_displacement_continuation(
+        htf_aligned=htf, has_displacement=has_disp
+    )
 
     missing: list[str] = []
     decision = "ok"
@@ -543,7 +559,7 @@ def evaluate_ict_confirmation_gate(
             missing.append("htf_alignment")
         if not has_disp:
             missing.append("displacement_origin")
-        if not zone_ok:
+        if not zone_ok and not continuation_struct:
             missing.append("valid_zone")
         # Do not require sweep/MSS after a limit is working — unknown until fill
         if missing:
@@ -554,7 +570,11 @@ def evaluate_ict_confirmation_gate(
             would = True
         else:
             decision = "passive_limit_ok"
-            reason = "Passive limit: HTF + displacement-origin zone OK"
+            reason = (
+                "Passive limit: HTF + displacement continuation OK"
+                if continuation_struct and not zone_ok
+                else "Passive limit: HTF + displacement-origin zone OK"
+            )
             would = False
     elif family == "liquidity_reversal":
         if not has_sweep:
@@ -573,16 +593,21 @@ def evaluate_ict_confirmation_gate(
     else:  # continuation (default)
         if not htf:
             missing.append("htf_alignment")
-        if not has_mss:
-            missing.append("mss_bos")
         if not has_disp:
             missing.append("displacement")
+        # MSS optional when HTF+displacement already confirm the impulse.
+        if not has_mss and not continuation_struct:
+            missing.append("mss_bos")
         would = bool(missing)
         decision = "continuation_incomplete" if would else "continuation_ok"
         reason = (
             ("Continuation missing: " + ", ".join(missing))
             if would
-            else "Continuation confirmed (HTF+MSS+displacement)"
+            else (
+                "Continuation confirmed (HTF+displacement)"
+                if continuation_struct and not has_mss
+                else "Continuation confirmed (HTF+MSS+displacement)"
+            )
         )
 
     if not would:

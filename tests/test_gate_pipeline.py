@@ -9,9 +9,17 @@ from trading_bot.services.gate_pipeline import (
     count_confluence,
     evaluate_pre_execution_gates,
     evaluate_structure_and_quality_gates,
+    evaluate_zone_and_regime_gates,
 )
 from trading_bot.services.trade_context import TradeContext
 from trading_bot.services.scaling_manager import ScalingManager, TradingMode
+
+
+def _pd(retrace: float, zone: str = "discount"):
+    return SimpleNamespace(
+        retracement_percent=retrace,
+        current_zone=SimpleNamespace(value=zone),
+    )
 
 
 def _ctx(**kwargs) -> TradeContext:
@@ -48,6 +56,60 @@ class TestGatePipeline:
             is_kill_zone=True,
         )
         assert outcome.blocked is False
+
+    def test_zone_gate_allows_htf_continuation_without_sweep(self):
+        """Pipeline wires htf_aligned — short @ 46% with bearish disp clears."""
+        ctx = _ctx(
+            symbol="XAUUSD",
+            direction="short",
+            confidence=0.60,
+            actual_rr=1.99,
+            d1_bias="bearish",
+            h4_bias="bearish",
+            m15_bias="bearish",
+            pd_analysis=_pd(0.46, "equilibrium"),
+            analysis_results={
+                "volume": {"relative_volume": 1.0},
+                "displacement": {
+                    "last_bearish": {"index": 1},
+                    "distribution_confirmed": False,
+                },
+                "liquidity": {},
+            },
+        )
+        outcome = evaluate_zone_and_regime_gates(
+            ctx,
+            zone_settings=ZoneGateSettings(gate_mode="active"),
+            use_zone_gate=True,
+        )
+        assert outcome.blocked is False
+
+    def test_zone_gate_blocks_wrong_zone_without_htf_or_sweep(self):
+        """Neutral HTF + displacement alone must still zone-block (no continuation)."""
+        ctx = _ctx(
+            symbol="XAUUSD",
+            direction="short",
+            confidence=0.60,
+            actual_rr=1.99,
+            d1_bias="",
+            h4_bias="",
+            m15_bias="bearish",
+            pd_analysis=_pd(0.46, "equilibrium"),
+            analysis_results={
+                "volume": {"relative_volume": 1.0},
+                "displacement": {
+                    "last_bearish": {"index": 1},
+                },
+                "liquidity": {},
+            },
+        )
+        outcome = evaluate_zone_and_regime_gates(
+            ctx,
+            zone_settings=ZoneGateSettings(gate_mode="active"),
+            use_zone_gate=True,
+        )
+        assert outcome.blocked is True
+        assert outcome.gate_id == "zone_gate"
 
     def test_volume_dead_market_blocks(self):
         ctx = _ctx(analysis_results={"volume": {"relative_volume": 0.2}})

@@ -29,6 +29,7 @@ def _pd(retrace: float, zone: str = "discount"):
 
 class TestZoneValidWiredIntoIctFingerprint:
     def test_short_in_discount_marks_zone_invalid(self, monkeypatch):
+        """Fingerprint still marks wrong-zone; HTF+disp continuation may pass ICT."""
         from trading_bot.config import settings
 
         monkeypatch.setattr(settings.trading, "ict_confirmation_mode", "active")
@@ -58,8 +59,36 @@ class TestZoneValidWiredIntoIctFingerprint:
         out = _evaluate_ict_confirmation_for_ctx(ctx)
         fp = ctx.analysis_results["setup_fingerprint"]
         assert fp["zone_valid"] is False
+        # HTF+displacement continuation exempts valid_zone for passive limits
+        assert out.blocked is False
+
+    def test_short_in_discount_without_disp_still_blocks_ict(self, monkeypatch):
+        from trading_bot.config import settings
+
+        monkeypatch.setattr(settings.trading, "ict_confirmation_mode", "active")
+
+        ctx = TradeContext(
+            symbol="XAUUSD",
+            direction="short",
+            confidence=0.70,
+            actual_rr=2.2,
+            order_type="sell_limit",
+            d1_bias="bearish",
+            h4_bias="bearish",
+            pd_analysis=_pd(0.33, "discount"),
+            analysis_results={
+                "displacement": {},
+                "market_structure": {
+                    "structure_breaks": [{"type": "choch_bearish"}]
+                },
+                "liquidity": {},
+            },
+        )
+        out = _evaluate_ict_confirmation_for_ctx(ctx)
         assert out.blocked is True
-        assert "valid_zone" in (out.reason or "").lower() or "zone" in (out.reason or "").lower()
+        assert "zone" in (out.reason or "").lower() or "displacement" in (
+            out.reason or ""
+        ).lower()
 
     def test_short_in_premium_marks_zone_valid(self, monkeypatch):
         from trading_bot.config import settings
@@ -93,6 +122,12 @@ class TestZoneValidWiredIntoIctFingerprint:
 
 
 class TestDisplacementBroadened:
+    def test_fresh_m5_stamp_counts_without_displacement_object(self):
+        """Metals M5 path stamps fresh_displacement_direction; gates must see it."""
+        ar = {"fresh_displacement_direction": "bearish"}
+        assert has_displacement(ar, direction="short") is True
+        assert has_displacement(ar, direction="long") is False
+
     def test_last_bearish_counts_for_short(self):
         ar = {
             "displacement": {

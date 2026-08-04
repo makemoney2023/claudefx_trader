@@ -149,11 +149,14 @@ def pre_judge_zone_block_reason(
     order_type: str,
     direction: str,
     retrace_pct: Optional[float],
+    htf_aligned: bool = False,
+    has_displacement: bool = False,
 ) -> Optional[str]:
     """
     Shared hard zone check used before the trade judge.
 
     Mirrors validate_limit_zone for limits and direction_zone_ok for market.
+    HTF+displacement continuation exempts market extreme-zone blocks.
     """
     if retrace_pct is None:
         return None
@@ -166,6 +169,12 @@ def pre_judge_zone_block_reason(
         return f"sell_limit in discount zone ({retrace_pct:.0%})"
 
     if ot in ("market", "buy", "sell", ""):
+        from .setup_fingerprint import is_htf_displacement_continuation
+
+        if is_htf_displacement_continuation(
+            htf_aligned=htf_aligned, has_displacement=has_displacement
+        ):
+            return None
         if d == "long" and retrace_pct >= 0.618:
             return f"ZONE-GATE LONG from premium (retrace={retrace_pct:.0%})"
         if d == "short" and retrace_pct <= 0.382:

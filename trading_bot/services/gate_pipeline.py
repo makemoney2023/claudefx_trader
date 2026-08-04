@@ -218,11 +218,16 @@ def evaluate_zone_and_regime_gates(
     apply_gate_outcomes(ctx, dir_step)
 
     if use_zone_gate and ctx.pd_analysis is not None:
-        from .setup_fingerprint import has_directional_sweep, has_displacement
+        from .setup_fingerprint import (
+            has_directional_sweep,
+            has_displacement,
+            htf_aligned,
+        )
 
         _ar = ctx.analysis_results or {}
         _has_sweep = has_directional_sweep(ctx.direction, _ar.get("liquidity"))
         _has_disp = has_displacement(_ar, direction=ctx.direction)
+        _htf = htf_aligned(ctx.direction, ctx.d1_bias, ctx.h4_bias)
         zg = evaluate_zone_gate(
             direction=ctx.direction,
             confidence=ctx.confidence,
@@ -236,6 +241,7 @@ def evaluate_zone_and_regime_gates(
             is_counter_trend_scalp=ctx.is_counter_trend_scalp,
             has_sweep=_has_sweep,
             has_displacement=_has_disp,
+            htf_aligned=_htf,
         )
         if zg.blocked:
             return GateOutcome.block(

@@ -50,6 +50,24 @@ class TestZoneBlockCharacterization:
         )
         assert result.blocked is True
 
+    def test_htf_continuation_short_discount_allowed(self):
+        result = evaluate_zone_gate(
+            direction="short",
+            confidence=0.60,
+            actual_rr=1.99,
+            retrace=0.46,
+            zone_str="equilibrium",
+            d1_bias="bearish",
+            is_index=False,
+            settings=ZoneGateSettings(),
+            symbol="XAUUSD",
+            has_sweep=False,
+            has_displacement=True,
+            htf_aligned=True,
+        )
+        assert result.blocked is False
+        assert result.decision == "allowed_wrong_zone_continuation"
+
 
 class TestM15GateCharacterization:
     def test_m15_opposes_blocks_non_pullback(self):

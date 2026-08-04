@@ -47,9 +47,18 @@ immediately before order send.
   hard rejects. Fingerprint `zone_valid` is derived from PD retrace
   (short ≥50% / long ≤50%), not left always-true.
 - **Zone gate**: shorts below 50% retrace / longs above 50% hard-block unless
-  **both** directional sweep and displacement are present. Confidence and R:R
-  alone no longer bypass wrong-zone location. Displacement includes
-  directional impulse candles, not only `distribution_confirmed`.
+  either (1) **HTF-aligned continuation** (D1+H4 agree with direction) with
+  directional displacement (sweep optional), or (2) **both** directional
+  sweep and displacement. Confidence and R:R alone never bypass wrong-zone
+  location. Displacement includes directional impulse candles, not only
+  `distribution_confirmed`.
+- **Continuation surfaces** (same HTF+displacement predicate): keep market
+  orders through zone→OTE conversion and displacement parity; ICT continuation
+  treats MSS as optional and passive limits skip `valid_zone`; pre-judge market
+  extreme blocks (short ≤38.2% / long ≥61.8%) are skipped. Extreme limit checks
+  (`buy_limit` >70% / `sell_limit` <30%) stay hard. Metals stamp M5 displacement
+  (and `fresh_displacement_direction`) into analysis results so post-Claude
+  gates see the same impulse as the continuation planner.
 - **TOD / volatile regime**: weak hours and `volatile_ranging` require **70%**
   confidence (above the 60% execution floor so the gate is not a no-op).
 - **M15 pullback**: HTF-aligned pending limits against opposing M15 are allowed
@@ -65,8 +74,9 @@ immediately before order send.
   blocks). Metals stamp `fresh_displacement_direction` from an M5 scan (not
   execution-TF M15) so impulses are not re-skipped while the M15 bar is still
   forming. Entry prefers displacement-origin limits with SL/TP repair after
-  retarget; market only within ~1.0× ATR of origin; late chase beyond ~1.5×
-  ATR without an origin zone is skipped (`setup=displacement_continuation`).
+  retarget. Hybrid late-chase: market within ~1.0× ATR; Claude market + HTF
+  allows market to ~2.5× ATR at 0.5× size; otherwise limit at displacement
+  open; hard-skip only beyond ~3.0× ATR (`setup=displacement_continuation`).
   Post-loss entry cooldown is **15 minutes** for metals and crypto (30m forex).
 - **Pyramid adds** (default **off**, `TRADING_PYRAMID_ENABLED`): after a
   primary fill reaches **+1R** with `a_plus` or confidence ≥70%, the bot may

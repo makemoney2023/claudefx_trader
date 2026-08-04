@@ -158,6 +158,7 @@ class DisplacementContinuationPlan:
     entry_price: Optional[float] = None
     reason: str = ""
     setup_tag: str = "displacement_continuation"
+    size_multiplier: float = 1.0
 
 
 def plan_displacement_continuation_entry(
@@ -168,9 +169,20 @@ def plan_displacement_continuation_entry(
     origin_price: float,
     has_origin_zone: bool,
     max_market_excursion_atr: float = 1.0,
-    max_chase_excursion_atr: float = 1.5,
+    max_chase_excursion_atr: float = 2.5,
+    hard_skip_excursion_atr: float = 3.0,
+    prefer_market: bool = False,
+    htf_aligned: bool = False,
+    late_market_size_mult: float = 0.5,
 ) -> DisplacementContinuationPlan:
-    """Prefer origin-zone limits; allow early market; skip late chase."""
+    """Hybrid late-chase policy for metals displacement continuation.
+
+    1. Hard-skip only beyond ``hard_skip_excursion_atr`` (default 3.0 ATR).
+    2. Claude market + HTF + excursion ≤ ``max_chase_excursion_atr`` (2.5):
+       allow market (full size ≤1 ATR, haircut beyond).
+    3. Early expansion ≤ ``max_market_excursion_atr`` (1.0): market full size.
+    4. Otherwise limit at displacement origin (open), even without an FVG flag.
+    """
     direction = (direction or "").lower()
     if direction not in ("long", "short"):
         return DisplacementContinuationPlan(
@@ -182,23 +194,35 @@ def plan_displacement_continuation_entry(
         )
 
     excursion_atr = abs(float(origin_price) - float(current_price)) / float(atr)
+    limit_ot = "buy_limit" if direction == "long" else "sell_limit"
 
-    # Origin zone = structural hold: place limit even after a large impulse.
-    if has_origin_zone:
-        order_type = "buy_limit" if direction == "long" else "sell_limit"
-        return DisplacementContinuationPlan(
-            action="limit",
-            order_type=order_type,
-            entry_price=float(origin_price),
-            reason="displacement origin zone — wait for retrace",
-        )
-
-    if excursion_atr > max_chase_excursion_atr:
+    if excursion_atr > hard_skip_excursion_atr:
         return DisplacementContinuationPlan(
             action="skip",
             reason=(
                 f"late chase: excursion {excursion_atr:.2f}ATR > "
-                f"{max_chase_excursion_atr:.1f}ATR"
+                f"{hard_skip_excursion_atr:.1f}ATR"
+            ),
+        )
+
+    if (
+        prefer_market
+        and htf_aligned
+        and excursion_atr <= max_chase_excursion_atr
+    ):
+        size_mult = (
+            1.0
+            if excursion_atr <= max_market_excursion_atr
+            else float(late_market_size_mult)
+        )
+        return DisplacementContinuationPlan(
+            action="market",
+            order_type="market",
+            entry_price=float(current_price),
+            size_multiplier=size_mult,
+            reason=(
+                f"Claude market + HTF continuation "
+                f"(excursion {excursion_atr:.2f}ATR, size x{size_mult:.2f})"
             ),
         )
 
@@ -207,8 +231,22 @@ def plan_displacement_continuation_entry(
             action="market",
             order_type="market",
             entry_price=float(current_price),
+            size_multiplier=1.0,
             reason=(
                 f"live expansion within {max_market_excursion_atr:.1f}ATR "
+                f"(excursion {excursion_atr:.2f}ATR)"
+            ),
+        )
+
+    # Mid/late impulse: wait for retrace to displacement open (FVG optional).
+    if float(origin_price) > 0:
+        zone_note = "origin zone" if has_origin_zone else "displacement open"
+        return DisplacementContinuationPlan(
+            action="limit",
+            order_type=limit_ot,
+            entry_price=float(origin_price),
+            reason=(
+                f"{zone_note} — wait for retrace "
                 f"(excursion {excursion_atr:.2f}ATR)"
             ),
         )
@@ -216,7 +254,7 @@ def plan_displacement_continuation_entry(
     return DisplacementContinuationPlan(
         action="skip",
         reason=(
-            f"no origin zone and excursion {excursion_atr:.2f}ATR exceeds "
+            f"no origin and excursion {excursion_atr:.2f}ATR exceeds "
             f"market cap {max_market_excursion_atr:.1f}ATR"
         ),
     )

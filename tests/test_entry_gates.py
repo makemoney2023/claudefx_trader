@@ -112,6 +112,62 @@ class TestZoneGate:
         assert result.blocked is False
         assert result.shadow_only is True
 
+    def test_htf_aligned_short_discount_displacement_allows_continuation(self):
+        """Live log case: SHORT @ 46% with disp, no sweep, HTF bearish."""
+        result = evaluate_zone_gate(
+            direction="short",
+            confidence=0.60,
+            actual_rr=1.99,
+            retrace=0.46,
+            zone_str="equilibrium",
+            d1_bias="bearish",
+            is_index=False,
+            settings=ZoneGateSettings(),
+            symbol="XAUUSD",
+            has_sweep=False,
+            has_displacement=True,
+            htf_aligned=True,
+        )
+        assert result.blocked is False
+        assert result.decision == "allowed_wrong_zone_continuation"
+
+    def test_htf_aligned_long_premium_displacement_allows_continuation(self):
+        result = evaluate_zone_gate(
+            direction="long",
+            confidence=0.65,
+            actual_rr=2.0,
+            retrace=0.70,
+            zone_str="premium",
+            d1_bias="bullish",
+            is_index=False,
+            settings=ZoneGateSettings(),
+            symbol="XAUUSD",
+            has_sweep=False,
+            has_displacement=True,
+            htf_aligned=True,
+        )
+        assert result.blocked is False
+        assert result.decision == "allowed_wrong_zone_continuation"
+
+    def test_displacement_only_without_htf_still_blocks(self):
+        """Continuation bypass requires HTF alignment — disp alone is not enough."""
+        result = evaluate_zone_gate(
+            direction="long",
+            confidence=0.70,
+            actual_rr=2.5,
+            retrace=0.70,
+            zone_str="premium",
+            d1_bias="bullish",
+            is_index=False,
+            settings=ZoneGateSettings(),
+            symbol="EURUSD",
+            has_sweep=False,
+            has_displacement=True,
+            htf_aligned=False,
+        )
+        assert result.blocked is True
+        assert "wrong_zone" in result.decision
+
 
 class TestAmdDistributionGate:
     def test_blocks_distribution_below_rr_2_0(self):
