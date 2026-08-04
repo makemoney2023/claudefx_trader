@@ -273,6 +273,8 @@ TRADING_ICT_CONFIRMATION_MODE=active
 # (default active). ICT fingerprint zone_valid uses PD retrace.
 # Weak-hour TOD + volatile_ranging floors are 70% (above execution floor).
 # HTF-aligned M15 pullback limits need ≥68% conf + 2:1 RR (else quality reject).
+# Analysis cooldown: default ~270s; XAU/XAG = 90s in kill zone / 180s outside;
+# M5 displacement can wake metals early (min 60s). Loss cooldown: metals 15m.
 # Correlated group risk cap (still shadow — logs only until activated):
 # TRADING_CORRELATION_GROUP_MODE=shadow
 # TRADING_CORRELATION_MAX_GROUP_RISK_PCT=0.10

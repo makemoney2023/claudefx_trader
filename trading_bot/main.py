@@ -52,6 +52,13 @@ from .services.news_service import NewsService
 from .services.correlation_service import CorrelationService
 from .services.trade_judge import JudgeOutcome, run_trade_judge
 from .services.live_trade_gates import effective_max_daily_trades
+from .services.analysis_cooldown import (
+    PRECIOUS_METALS,
+    has_recent_m5_displacement,
+    resolve_analysis_cooldown_seconds,
+    resolve_loss_cooldown_minutes,
+    should_run_analysis,
+)
 from .services.entry_gates import (
     ZoneGateSettings,
     should_use_zone_gate,
@@ -1626,20 +1633,51 @@ class TradingBot:
             for i in range(0, len(ordered_symbols), batch_size):
                 batch = ordered_symbols[i:i + batch_size]
                 
+                _in_kill_zone = bool(session.is_kill_zone)
+
                 async def _process_symbol(sym):
                     try:
                         is_crypto = sym in self.CRYPTO_SYMBOLS
                         
-                        # ANALYSIS COOLDOWN: Only call Claude once per 5 minutes per symbol
+                        # ANALYSIS COOLDOWN: metals re-scan faster in kill zones;
+                        # M5 displacement can wake gold/silver early (min 60s).
                         last_run = self._last_analysis_time.get(sym)
                         now = datetime.now(timezone.utc)
-                        if last_run is not None:
+                        cooldown_secs = resolve_analysis_cooldown_seconds(
+                            sym,
+                            is_kill_zone=_in_kill_zone,
+                            base_seconds=self._analysis_cooldown_seconds,
+                        )
+                        wakeup = False
+                        if (
+                            last_run is not None
+                            and _in_kill_zone
+                            and sym.upper() in PRECIOUS_METALS
+                        ):
                             elapsed = (now - last_run).total_seconds()
-                            if elapsed < self._analysis_cooldown_seconds:
-                                return
+                            if elapsed < cooldown_secs:
+                                wakeup = await self._m5_displacement_wakeup(sym)
+                        run, reason = should_run_analysis(
+                            last_run=last_run,
+                            now=now,
+                            cooldown_seconds=cooldown_secs,
+                            displacement_wakeup=wakeup,
+                        )
+                        if not run:
+                            return
                         self._last_analysis_time[sym] = now
+                        if reason == "m5_displacement_wakeup":
+                            print(
+                                f"[CYCLE] {sym}: M5 displacement wakeup "
+                                f"(cooldown was {cooldown_secs}s) — re-analyzing",
+                                flush=True,
+                            )
                         
-                        print(f"[CYCLE] Analyzing {sym} (crypto={is_crypto})...", flush=True)
+                        print(
+                            f"[CYCLE] Analyzing {sym} (crypto={is_crypto}, "
+                            f"cooldown={cooldown_secs}s)...",
+                            flush=True,
+                        )
                         # Per-symbol timeout to prevent one slow symbol from blocking the
                         # batch. Covers Opus 5 low-effort streamed analysis (16k budget,
                         # thinking + images can still take minutes) + judge + execution.
@@ -1670,6 +1708,39 @@ class TradingBot:
             import traceback
             traceback.print_exc()
     
+    async def _m5_displacement_wakeup(self, symbol: str) -> bool:
+        """Cheap M5 scan: true when a fresh displacement candle just printed.
+
+        Used to short-circuit analysis cooldown for precious metals in kill zone
+        so impulsive M5 moves are not waited out for the full cooldown.
+        """
+        if not self.mt5_client or not self.displacement_detector:
+            return False
+        try:
+            import pandas as pd
+
+            bars = await self.mt5_client.get_ohlcv_data(symbol, "M5", count=40)
+            if not bars:
+                return False
+            df = pd.DataFrame(bars)
+            # Detector strips the forming candle; last closed bar index is len-2
+            # on the raw frame (RangeIndex) before that strip.
+            analysis = self.displacement_detector.detect(df)
+            if df is None or len(df) < 3:
+                return False
+            last_closed_index = len(df) - 2  # matches exclude_forming_candle
+            hit = has_recent_m5_displacement(
+                analysis,
+                last_bar_index=last_closed_index,
+                max_age_bars=3,
+            )
+            if hit:
+                logger.info(f"[M5-WAKEUP] {symbol}: recent displacement detected")
+            return hit
+        except Exception as e:
+            logger.debug(f"[M5-WAKEUP] {symbol}: check failed: {e}")
+            return False
+
     def _wire_pending_reservation_accounting(self) -> None:
         """Give pending lifecycle operations the authoritative reservation ledger."""
         self.pending_order_manager.set_budget_reclaim(
@@ -5001,8 +5072,7 @@ Apply the evaluation rules from the system message and reply per the OUTPUT CONT
                         f"blocked for the rest of the day ({_cb_streak} consecutive losses)",
                         flush=True,
                     )
-                _is_crypto_sym = any(c in position.symbol.upper() for c in ['BTC', 'ETH', 'XRP', 'SOL', 'ADA', 'DOGE'])
-                _cooldown_min = 15 if _is_crypto_sym else 30
+                _cooldown_min = resolve_loss_cooldown_minutes(position.symbol)
                 cooldown_until = datetime.now(timezone.utc) + timedelta(minutes=_cooldown_min)
                 self._symbol_loss_cooldowns[position.symbol] = cooldown_until
                 logger.info(

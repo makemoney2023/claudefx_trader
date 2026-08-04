@@ -55,6 +55,10 @@ immediately before order send.
 - **M15 pullback**: HTF-aligned pending limits against opposing M15 are allowed
   when confidence ≥68% and RR ≥2.0 (soft-capped to 68%); otherwise reject as
   `m15_pullback_quality`.
+- **Analysis cadence**: default Claude throttle ~270s per symbol. Precious
+  metals (XAU/XAG) use **90s in kill zone** / **180s outside**. A fresh M5
+  displacement can wake metals early (never faster than 60s). Post-loss entry
+  cooldown is **15 minutes** for metals and crypto (30m forex).
 
 ### Lot Size Reference
 
