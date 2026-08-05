@@ -52,6 +52,9 @@ immediately before order send.
   sweep and displacement. Confidence and R:R alone never bypass wrong-zone
   location. Displacement includes directional impulse candles, not only
   `distribution_confirmed`.
+- **Direction alignment**: counter-D1 non-scalp needs **60% + 2:1 RR** (was
+  3:1 — too strict for gold intraday). D1+H4 both opposing the trade is still
+  hard-blocked by the HTF alignment gate.
 - **Continuation surfaces** (same HTF+displacement predicate): keep market
   orders through zone→OTE conversion and displacement parity; ICT continuation
   treats MSS as optional and passive limits skip `valid_zone`; pre-judge market

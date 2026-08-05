@@ -941,7 +941,7 @@ class TestDirectionAlignmentGate:
     def test_counter_d1_nonscalp_low_rr_blocks(self):
         from trading_bot.services.entry_gates import evaluate_direction_alignment_gate
 
-        ctx = _dir_ctx(direction="long", d1="bearish", confidence=0.65, rr=2.5)
+        ctx = _dir_ctx(direction="long", d1="bearish", confidence=0.65, rr=1.9)
         out = evaluate_direction_alignment_gate(ctx)
         assert out.blocked is True
         assert out.gate_id == "direction_alignment"
@@ -949,7 +949,7 @@ class TestDirectionAlignmentGate:
     def test_counter_d1_nonscalp_quality_passes(self):
         from trading_bot.services.entry_gates import evaluate_direction_alignment_gate
 
-        ctx = _dir_ctx(direction="long", d1="bearish", confidence=0.65, rr=3.5)
+        ctx = _dir_ctx(direction="long", d1="bearish", confidence=0.65, rr=2.2)
         out = evaluate_direction_alignment_gate(ctx)
         assert out.blocked is False
 
@@ -1081,8 +1081,8 @@ class TestDirectionGateParity:
 
     Contract: the new stack is never MORE permissive than the old one.
     Where it is stricter, the divergence must fall in the documented
-    category: counter-D1 non-scalp trades now uniformly need 3:1 RR
-    (the legacy-D1 standard) even when the zone gate is active.
+    category: counter-D1 non-scalp trades need 2:1 RR (and wrong-zone
+    still needs sweep+displacement / HTF+displacement).
     """
 
     @staticmethod
@@ -1194,7 +1194,7 @@ class TestDirectionGateParity:
                 or (direction == "short" and retrace < 0.5)
             )
             allowed = (
-                (opposes and ttype != "scalp" and rr < 3.0)
+                (opposes and ttype != "scalp" and rr < 2.0)
                 or wrong_zone
             )
             assert allowed, (

@@ -138,8 +138,9 @@ def evaluate_direction_alignment_gate(
       60% conf + 2:1 RR when entering from the correct zone).
     - Counter-D1 scalp: confidence capped at 0.70, R:R must clear
       ``scalp_rr_floor``.
-    - Counter-D1 non-scalp: needs 60% confidence + 3:1 R:R (the legacy-D1
-      standard, now applied uniformly whether or not the zone gate is on).
+    - Counter-D1 non-scalp: needs 60% confidence + 2:1 R:R (matches the
+      intraday RR target; D1+H4 both-opposing is still hard-blocked later by
+      ``evaluate_htf_alignment_gate``).
     """
     _dir = ctx.direction
     _d1 = ctx.d1_bias
@@ -148,6 +149,7 @@ def evaluate_direction_alignment_gate(
         or (_d1 == "bearish" and _dir == "long")
     )
     is_scalp = "scalp" in (ctx.trade_type or "").lower()
+    counter_d1_rr_floor = 2.0
 
     if counter_d1:
         if is_scalp:
@@ -163,12 +165,13 @@ def evaluate_direction_alignment_gate(
             if ctx.confidence > 0.70:
                 return GateOutcome.cap_confidence(0.70, "direction_alignment_scalp_cap")
             return GateOutcome.pass_through("direction_alignment")
-        if ctx.confidence < 0.60 or ctx.actual_rr < 3.0:
+        if ctx.confidence < 0.60 or ctx.actual_rr < counter_d1_rr_floor:
             return GateOutcome.block(
                 gate_id="direction_alignment",
                 reason=(
                     f"{_dir.upper()} vs D1 {_d1}: counter-trend needs 60% conf "
-                    f"+ 3:1 RR, got {ctx.confidence:.0%} / {ctx.actual_rr:.1f}:1."
+                    f"+ {counter_d1_rr_floor:.0f}:1 RR, got {ctx.confidence:.0%} / "
+                    f"{ctx.actual_rr:.1f}:1."
                 ),
                 stage="direction_alignment",
             )

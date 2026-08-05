@@ -242,11 +242,36 @@ class TestDirectionAlignmentGateBasics:
             symbol="EURUSD",
             direction="short",
             confidence=0.60,
-            actual_rr=3.0,
+            actual_rr=2.0,
             d1_bias="bullish",
         )
         outcome = evaluate_direction_alignment_gate(ctx)
         assert outcome.blocked is False
+
+    def test_allows_counter_d1_long_live_case(self):
+        """Live block: LONG vs D1 bearish at 68% / 2.2:1 must clear."""
+        ctx = TradeContext(
+            symbol="XAUUSD",
+            direction="long",
+            confidence=0.68,
+            actual_rr=2.2,
+            d1_bias="bearish",
+            trade_type="intraday",
+        )
+        outcome = evaluate_direction_alignment_gate(ctx)
+        assert outcome.blocked is False
+
+    def test_blocks_counter_d1_below_2rr(self):
+        ctx = TradeContext(
+            symbol="XAUUSD",
+            direction="long",
+            confidence=0.68,
+            actual_rr=1.9,
+            d1_bias="bearish",
+        )
+        outcome = evaluate_direction_alignment_gate(ctx)
+        assert outcome.blocked is True
+        assert "2:1" in outcome.reason or "2.0" in outcome.reason
 
 
 class TestTodGate:
