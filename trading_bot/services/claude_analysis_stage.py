@@ -537,6 +537,13 @@ class ClaudeAnalysisStage:
             "liquidity": {
                 "nearest_bsl": float(liq_obj.nearest_bsl) if liq_obj and liq_obj.nearest_bsl else None,
                 "nearest_ssl": float(liq_obj.nearest_ssl) if liq_obj and liq_obj.nearest_ssl else None,
+                "recent_sweeps": [
+                    s.to_dict() if hasattr(s, "to_dict") else s
+                    for s in (
+                        (liq_obj.recent_sweeps[-5:] if hasattr(liq_obj, "recent_sweeps") and liq_obj.recent_sweeps else [])
+                        if liq_obj else []
+                    )
+                ],
                 "all_bsl": [float(p.price) if hasattr(p, 'price') else float(p) 
                             for p in (liq_obj.bsl_pools[-5:] if hasattr(liq_obj, 'bsl_pools') and liq_obj.bsl_pools else [])] if liq_obj else [],
                 "all_ssl": [float(p.price) if hasattr(p, 'price') else float(p) 

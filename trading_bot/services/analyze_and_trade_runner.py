@@ -108,10 +108,13 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                         )
                 except Exception as _kz_disp_err:
                     logger.debug(f"[KZ-GATE] {symbol}: disp check failed: {_kz_disp_err}")
+            from .setup_fingerprint import is_liquidity_reversal_lean_active
+
             if not claude_analysis_allowed(
                 bool(getattr(_kz_session, "is_tradeable", False)),
                 claude_kill_zone_only=settings.trading.claude_kill_zone_only,
                 displacement_override=_disp_override,
+                lean_active=is_liquidity_reversal_lean_active(),
             ):
                 next_kz = getattr(_kz_session, "next_kill_zone", None) or "next kill zone"
                 mins = getattr(_kz_session, "next_kill_zone_in_minutes", None)
@@ -310,7 +313,12 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
         
         # Core ICT analysis via shared orchestrator
         analysis_results = pipeline.analysis.run_core_analysis(symbol, df)
-        
+        if df is not None:
+            try:
+                analysis_results["_raw_bar_count"] = int(len(df))
+            except Exception:
+                pass
+
         # Volume bot_state telemetry
         try:
             volume_analysis = analysis_results.get("volume", {})
@@ -1798,7 +1806,11 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                     _pj_retrace = float(_retrace_pct) if _retrace_pct is not None else None
                 except Exception:
                     _pj_retrace = None
-            from .setup_fingerprint import has_displacement, htf_aligned
+            from .setup_fingerprint import (
+                has_displacement,
+                htf_aligned,
+                is_lean_sweep_fade,
+            )
 
             _pj_d1 = (
                 (market_data.get("d1_bias") if market_data else None)
@@ -1822,12 +1834,19 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
             _pj_disp = has_displacement(
                 analysis_results or {}, direction=trade_signal.direction
             )
+            _pj_lean = is_lean_sweep_fade(
+                trade_signal.direction,
+                analysis_results or {},
+                d1_bias=_pj_d1,
+                h4_bias=_pj_h4,
+            )
             _pj_zone_reason = pre_judge_zone_block_reason(
                 order_type=getattr(trade_signal, "order_type", "market") or "market",
                 direction=trade_signal.direction,
                 retrace_pct=_pj_retrace,
                 htf_aligned=_pj_htf,
                 has_displacement=_pj_disp,
+                lean_sweep_fade=_pj_lean,
             )
             if _pj_zone_reason:
                 print(f"[BLOCKED] {symbol}: pre-judge {_pj_zone_reason}", flush=True)
@@ -1976,6 +1995,22 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
 
             # Handle DEMOTE verdict — convert to pending limit order
             elif judge_outcome.allows_demote_execution():
+                from .setup_fingerprint import is_lean_sweep_fade as _lean_fade_fn
+
+                _demote_lean = _lean_fade_fn(
+                    trade_signal.direction,
+                    analysis_results or {},
+                    d1_bias=str(
+                        (market_data or {}).get("d1_bias")
+                        or (analysis_results or {}).get("d1_bias")
+                        or ""
+                    ),
+                    h4_bias=str(
+                        (market_data or {}).get("h4_bias")
+                        or (analysis_results or {}).get("h4_bias")
+                        or ""
+                    ),
+                )
                 demote = apply_demote_policy(
                     trade_signal.direction,
                     current_price,
@@ -1984,7 +2019,12 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                     trade_signal.take_profit,
                     getattr(trade_signal, "order_type", "market") or "market",
                     judge_outcome.suggested_entry,
+                    lean_sweep_fade=_demote_lean,
                 )
+                if demote.get("reason") == "lean_demote_ignored":
+                    logger.info(
+                        f"[JUDGE] {symbol}: lean_demote_ignored — keeping market"
+                    )
                 demoted_entry = demote["demoted_entry"]
                 trade_signal.order_type = demote["order_type"]
                 trade_signal.stop_loss = demote["stop_loss"]
@@ -2204,6 +2244,31 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                 if bot.position_manager
                 else []
             )
+            # Stamp HTF biases onto AR so prepare_order lean / continuation
+            # exclusion matches pre-judge and ICT predicates.
+            try:
+                analysis_results["d1_bias"] = str(
+                    (market_data or {}).get("d1_bias")
+                    or (
+                        _bias_of(getattr(mtf_result, "daily_analysis", None))
+                        if mtf_result is not None
+                        else ""
+                    )
+                    or analysis_results.get("d1_bias")
+                    or ""
+                )
+                analysis_results["h4_bias"] = str(
+                    (market_data or {}).get("h4_bias")
+                    or (
+                        _bias_of(getattr(mtf_result, "h4_analysis", None))
+                        if mtf_result is not None
+                        else ""
+                    )
+                    or analysis_results.get("h4_bias")
+                    or ""
+                )
+            except Exception:
+                pass
             _exec_prep = bot._execution_coordinator.prepare_order(
                 trade_signal=trade_signal,
                 current_price=current_price,

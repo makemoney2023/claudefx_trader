@@ -29,17 +29,114 @@ def _sweep_type(sweep: Any) -> str:
     return str(getattr(sweep, "type", "") or "").lower()
 
 
-def has_directional_sweep(direction: str, liquidity: Any) -> bool:
+def _sweep_index(sweep: Any) -> Optional[int]:
+    if isinstance(sweep, dict):
+        idx = sweep.get("sweep_index")
+    else:
+        idx = getattr(sweep, "sweep_index", None)
+    if idx is None:
+        return None
+    try:
+        return int(idx)
+    except (TypeError, ValueError):
+        return None
+
+
+# M15 bars: ~3 hours. Stale sweeps must not unlock counter-HTF lean fades.
+LEAN_SWEEP_MAX_AGE_BARS = 12
+
+
+def _sweep_reversal_ok(sweep: Any) -> bool:
+    """Accept sweep unless reversal_detected is explicitly False."""
+    if isinstance(sweep, dict):
+        if "reversal_detected" in sweep and not sweep.get("reversal_detected"):
+            return False
+        return True
+    if hasattr(sweep, "reversal_detected") and sweep.reversal_detected is False:
+        return False
+    return True
+
+
+def _is_ssl_sweep_type(st: str) -> bool:
+    """Long-fade liquidity: SSL / equal lows (live enum values, not 'ssl' substring)."""
+    s = (st or "").lower()
+    return s in (
+        "ssl",
+        "sell_side_liquidity",
+        "equal_lows",
+        "eql",
+    ) or "sell_side" in s or "equal_low" in s
+
+
+def _is_bsl_sweep_type(st: str) -> bool:
+    """Short-fade liquidity: BSL / equal highs."""
+    s = (st or "").lower()
+    return s in (
+        "bsl",
+        "buy_side_liquidity",
+        "equal_highs",
+        "eqh",
+    ) or "buy_side" in s or "equal_high" in s
+
+
+def has_directional_sweep(
+    direction: str,
+    liquidity: Any,
+    *,
+    max_age_bars: Optional[int] = None,
+    reference_bar_index: Optional[int] = None,
+) -> bool:
     """True when a recent sweep aligns with trade direction.
 
-    Longs want SSL (sell-side) swept; shorts want BSL (buy-side) swept.
+    Longs want SSL / equal lows swept; shorts want BSL / equal highs swept.
+    Matches live ``LiquidityType`` values (``sell_side_liquidity`` etc.) used by
+    ``LiquiditySweep.to_dict`` and ``ICTStrategy._check_liquidity_sweep``.
+
+    When ``max_age_bars`` is set, only the last 3 sweeps are considered and each
+    candidate must be within ``max_age_bars`` of ``reference_bar_index`` (or of
+    the newest sweep index in the liquidity list when reference is omitted).
     """
-    want = "ssl" if (direction or "").lower() == "long" else "bsl"
-    for sweep in _get_sweeps(liquidity):
-        st = _sweep_type(sweep)
-        if want in st or st == want:
-            return True
+    d = (direction or "").lower()
+    matcher = _is_ssl_sweep_type if d == "long" else _is_bsl_sweep_type
+    sweeps = _get_sweeps(liquidity)
+    if max_age_bars is not None:
+        sweeps = sweeps[-3:]
+        if reference_bar_index is None:
+            idxs = [i for i in (_sweep_index(s) for s in _get_sweeps(liquidity)) if i is not None]
+            reference_bar_index = max(idxs) if idxs else None
+    for sweep in sweeps:
+        if not matcher(_sweep_type(sweep)):
+            continue
+        if not _sweep_reversal_ok(sweep):
+            continue
+        if max_age_bars is not None and reference_bar_index is not None:
+            idx = _sweep_index(sweep)
+            if idx is not None and (reference_bar_index - idx) > max_age_bars:
+                continue
+        return True
     return False
+
+
+def lean_continues_outside_kill_zone() -> bool:
+    """Main cycle may analyze non-crypto outside KZ when lean flag is active."""
+    return is_liquidity_reversal_lean_active()
+
+
+def _lean_reference_bar_index(analysis_results: Optional[Dict[str, Any]]) -> Optional[int]:
+    ar = analysis_results or {}
+    if ar.get("reference_bar_index") is not None:
+        try:
+            return int(ar["reference_bar_index"])
+        except (TypeError, ValueError):
+            pass
+    raw = ar.get("_raw_bar_count")
+    if raw:
+        try:
+            n = int(raw)
+            return max(0, n - 1)
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 def _structure_breaks(ms: Any) -> Sequence[Any]:
@@ -171,6 +268,53 @@ def is_htf_displacement_continuation(
     return bool(htf_aligned) and bool(has_displacement)
 
 
+def is_liquidity_reversal_lean_active() -> bool:
+    """True when TRADING_LIQUIDITY_REVERSAL_LEAN_MODE=active."""
+    try:
+        from ..config import settings
+
+        mode = getattr(settings.trading, "liquidity_reversal_lean_mode", "off") or "off"
+    except Exception:
+        return False
+    return str(mode).lower() == "active"
+
+
+def is_lean_sweep_fade(
+    direction: str,
+    analysis_results: Optional[Dict[str, Any]],
+    *,
+    d1_bias: str = "",
+    h4_bias: str = "",
+    reference_bar_index: Optional[int] = None,
+) -> bool:
+    """Lean-eligible sweep fade (not HTF+displacement continuation)."""
+    if not is_liquidity_reversal_lean_active():
+        return False
+    ar = analysis_results or {}
+    ref = (
+        reference_bar_index
+        if reference_bar_index is not None
+        else _lean_reference_bar_index(ar)
+    )
+    if not has_directional_sweep(
+        direction,
+        ar.get("liquidity"),
+        max_age_bars=LEAN_SWEEP_MAX_AGE_BARS,
+        reference_bar_index=ref,
+    ):
+        return False
+    aligned = htf_aligned(direction, d1_bias, h4_bias) if (d1_bias or h4_bias) else False
+    # When biases omitted, infer alignment from ar if present
+    if not (d1_bias or h4_bias):
+        d1_bias = str(ar.get("d1_bias") or "")
+        h4_bias = str(ar.get("h4_bias") or "")
+        aligned = htf_aligned(direction, d1_bias, h4_bias)
+    disp = has_displacement(ar, direction=direction)
+    if is_htf_displacement_continuation(htf_aligned=aligned, has_displacement=disp):
+        return False
+    return True
+
+
 def classify_setup_family(
     *,
     direction: str,
@@ -180,21 +324,28 @@ def classify_setup_family(
     sweep: bool,
     mss: bool,
     displacement: bool,
+    lean: Optional[bool] = None,
 ) -> str:
     ot = (order_type or "market").lower()
+    lean_on = is_liquidity_reversal_lean_active() if lean is None else bool(lean)
+    aligned = htf_aligned(direction, d1_bias, h4_bias)
+    # Under lean: directional sweep that is not HTF+disp continuation → fade family
+    # (includes limits so demoted fades keep liquidity_reversal ICT, not passive).
+    if lean_on and sweep and not (aligned and displacement):
+        return "liquidity_reversal"
     if ot in ("buy_limit", "sell_limit", "buy_stop", "sell_stop") and "limit" in ot:
         return "passive_retracement"
     if ot.endswith("_limit"):
         return "passive_retracement"
-    if sweep and (mss or displacement) and not htf_aligned(direction, d1_bias, h4_bias):
+    if sweep and (mss or displacement) and not aligned:
         return "liquidity_reversal"
-    if htf_aligned(direction, d1_bias, h4_bias) and (mss or displacement):
+    if aligned and (mss or displacement):
         return "continuation"
     if sweep and mss:
         return "liquidity_reversal"
     if ot != "market":
         return "passive_retracement"
-    return "continuation" if htf_aligned(direction, d1_bias, h4_bias) else "liquidity_reversal"
+    return "continuation" if aligned else "liquidity_reversal"
 
 
 @dataclass(frozen=True)
@@ -239,7 +390,18 @@ def build_setup_fingerprint(
     zone_valid: bool = True,
 ) -> SetupFingerprint:
     ar = analysis_results or {}
-    sweep = has_directional_sweep(direction, ar.get("liquidity"))
+    lean_on = is_liquidity_reversal_lean_active()
+    # Under lean, fingerprint sweep must match gate age (≤12 bars) so ICT /
+    # sb_lean tags agree with is_lean_sweep_fade eligibility.
+    if lean_on:
+        sweep = has_directional_sweep(
+            direction,
+            ar.get("liquidity"),
+            max_age_bars=LEAN_SWEEP_MAX_AGE_BARS,
+            reference_bar_index=_lean_reference_bar_index(ar),
+        )
+    else:
+        sweep = has_directional_sweep(direction, ar.get("liquidity"))
     mss = has_mss_or_choch(direction, ar.get("market_structure"))
     disp = has_displacement(ar, direction=direction)
     aligned = htf_aligned(direction, d1_bias, h4_bias)
@@ -303,7 +465,10 @@ def build_setup_fingerprint(
         sweep=sweep,
         mss=mss,
         displacement=disp,
+        lean=lean_on,
     )
+    if lean_on and family == "liquidity_reversal" and sweep:
+        tags.append("sb_lean")
     sess = (session or "unknown").lower().replace(" ", "_")[:16]
     reg = (regime or "unknown").lower().replace(" ", "_")[:16]
     tag_part = "+".join(tags) if tags else "none"

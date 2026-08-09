@@ -151,17 +151,22 @@ def pre_judge_zone_block_reason(
     retrace_pct: Optional[float],
     htf_aligned: bool = False,
     has_displacement: bool = False,
+    lean_sweep_fade: bool = False,
 ) -> Optional[str]:
     """
     Shared hard zone check used before the trade judge.
 
     Mirrors validate_limit_zone for limits and direction_zone_ok for market.
-    HTF+displacement continuation exempts market extreme-zone blocks.
+    HTF+displacement continuation and lean sweep-fade exempt market
+    extreme-zone blocks.
     """
     if retrace_pct is None:
         return None
     ot = (order_type or "market").lower()
     d = (direction or "").lower()
+
+    if lean_sweep_fade:
+        return None
 
     if ot == "buy_limit" and retrace_pct > 0.70:
         return f"buy_limit in premium zone ({retrace_pct:.0%})"

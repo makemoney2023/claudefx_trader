@@ -53,13 +53,15 @@ def evaluate_zone_gate(
     has_sweep: bool = False,
     has_displacement: bool = False,
     htf_aligned: bool = False,
+    lean_sweep_fade: bool = False,
 ) -> ZoneGateResult:
     """Zone-aware direction gate: sell premium, buy discount.
 
     Wrong-zone entries (short below 50% / long above 50%) hard-block unless
-    either (1) HTF-aligned continuation with directional displacement, or
-    (2) both a directional sweep and displacement. Conf/RR alone never
-    bypasses location.
+    either (1) HTF-aligned continuation with directional displacement,
+    (2) both a directional sweep and displacement, or
+    (3) lean sweep-fade (directional sweep under liquidity_reversal_lean_mode).
+    Conf/RR alone never bypasses location.
     """
     if is_counter_trend_scalp:
         return ZoneGateResult(blocked=False, decision="skipped_counter_scalp")
@@ -88,6 +90,7 @@ def evaluate_zone_gate(
     if not in_correct_zone:
         continuation_ok = bool(htf_aligned) and bool(has_displacement)
         reversal_ok = bool(has_sweep) and bool(has_displacement)
+        lean_ok = bool(lean_sweep_fade) and bool(has_sweep)
         if continuation_ok:
             decision = "allowed_wrong_zone_continuation"
             reason = (
@@ -100,6 +103,12 @@ def evaluate_zone_gate(
             reason = (
                 f"ZONE-GATE {direction.upper()} from {zone_str} "
                 f"(retrace={retrace:.0%}) allowed — sweep+displacement confirmed"
+            )
+        elif lean_ok:
+            decision = "allowed_wrong_zone_sweep_lean"
+            reason = (
+                f"ZONE-GATE {direction.upper()} from {zone_str} "
+                f"(retrace={retrace:.0%}) allowed — lean sweep-fade"
             )
         else:
             blocked = True
@@ -141,7 +150,10 @@ def evaluate_direction_alignment_gate(
     - Counter-D1 non-scalp: needs 60% confidence + 2:1 R:R (matches the
       intraday RR target; D1+H4 both-opposing is still hard-blocked later by
       ``evaluate_htf_alignment_gate``).
+    - Lean sweep-fade: counter-D1 quality floors skipped.
     """
+    from .setup_fingerprint import is_lean_sweep_fade
+
     _dir = ctx.direction
     _d1 = ctx.d1_bias
     counter_d1 = _d1 in ("bullish", "bearish") and (
@@ -150,6 +162,14 @@ def evaluate_direction_alignment_gate(
     )
     is_scalp = "scalp" in (ctx.trade_type or "").lower()
     counter_d1_rr_floor = 2.0
+
+    if counter_d1 and is_lean_sweep_fade(
+        _dir,
+        ctx.analysis_results or {},
+        d1_bias=ctx.d1_bias,
+        h4_bias=ctx.h4_bias,
+    ):
+        return GateOutcome.pass_through("direction_lean_sweep_fade")
 
     if counter_d1:
         if is_scalp:
@@ -270,6 +290,8 @@ def _fresh_displacement_aligned(ctx: "TradeContext") -> bool:
 
 def evaluate_m15_gate(ctx: "TradeContext") -> GateOutcome:
     """M15 execution timeframe structure gate."""
+    from .setup_fingerprint import is_lean_sweep_fade
+
     _dir = ctx.direction
     _m15 = ctx.m15_bias
     _amd = ctx.amd_phase
@@ -278,6 +300,13 @@ def evaluate_m15_gate(ctx: "TradeContext") -> GateOutcome:
         or (_m15 == "bullish" and _dir == "short")
     )
     ctx.m15_opposes = m15_opposes
+    if m15_opposes and is_lean_sweep_fade(
+        _dir,
+        ctx.analysis_results or {},
+        d1_bias=ctx.d1_bias,
+        h4_bias=ctx.h4_bias,
+    ):
+        return GateOutcome.pass_through("m15_lean_sweep_fade")
     if (
         not m15_opposes
         or _amd == "manipulation"
@@ -325,6 +354,8 @@ def evaluate_m15_gate(ctx: "TradeContext") -> GateOutcome:
 
 def evaluate_htf_alignment_gate(ctx: "TradeContext") -> GateOutcome:
     """HTF D1+H4 alignment gate."""
+    from .setup_fingerprint import is_lean_sweep_fade
+
     _dir = ctx.direction
     d1_opposes = (
         (ctx.d1_bias == "bearish" and _dir == "long")
@@ -337,6 +368,13 @@ def evaluate_htf_alignment_gate(ctx: "TradeContext") -> GateOutcome:
     is_scalp = "scalp" in (ctx.trade_type or "").lower()
 
     if d1_opposes and h4_opposes:
+        if is_lean_sweep_fade(
+            _dir,
+            ctx.analysis_results or {},
+            d1_bias=ctx.d1_bias,
+            h4_bias=ctx.h4_bias,
+        ):
+            return GateOutcome.pass_through("htf_lean_sweep_fade")
         if (
             is_scalp
             and not ctx.m15_opposes
@@ -382,10 +420,20 @@ def _amd_phase_value(amd_raw) -> str:
 
 def evaluate_amd_distribution_gate(ctx: "TradeContext") -> GateOutcome:
     """AMD distribution phase gate."""
+    from .setup_fingerprint import is_lean_sweep_fade
+
     bot_amd = _amd_phase_value(ctx.analysis_results.get("amd_cycle"))
     effective_amd = bot_amd or (ctx.amd_phase or "")
     if effective_amd != "distribution":
         return GateOutcome.pass_through("amd_distribution")
+
+    if is_lean_sweep_fade(
+        ctx.direction,
+        ctx.analysis_results or {},
+        d1_bias=ctx.d1_bias,
+        h4_bias=ctx.h4_bias,
+    ):
+        return GateOutcome.pass_through("amd_lean_sweep_fade")
 
     outcome = GateOutcome.pass_through("amd_distribution")
     if ctx.confidence > 0.60:
@@ -477,7 +525,16 @@ def evaluate_confluence_gate(
     min_confluence: int,
     confidence_override: float,
 ) -> GateOutcome:
+    from .setup_fingerprint import is_lean_sweep_fade
+
     ctx.confluence_count = confluence_count
+    if is_lean_sweep_fade(
+        ctx.direction,
+        ctx.analysis_results or {},
+        d1_bias=ctx.d1_bias,
+        h4_bias=ctx.h4_bias,
+    ):
+        return GateOutcome.pass_through("confluence_lean_sweep_fade")
     if confluence_count >= min_confluence:
         return GateOutcome.pass_through("confluence_gate")
     if ctx.confidence < confidence_override:
@@ -524,6 +581,7 @@ def evaluate_ict_confirmation_gate(
     fingerprint: Any,
     order_type: str = "market",
     mode: str = "shadow",
+    lean_sweep_fade: bool = False,
 ) -> IctConfirmationResult:
     """
     Setup-specific confirmation.
@@ -534,6 +592,10 @@ def evaluate_ict_confirmation_gate(
         present; otherwise HTF + MSS/BOS + displacement; sweep optional)
       - passive_retracement (limit): HTF + displacement; zone required unless
         HTF+displacement continuation (impulse demoted/anticipatory)
+
+    When ``lean_sweep_fade`` is True (same predicate as gate bypasses —
+    fresh directional sweep, not HTF+disp continuation), liquidity_reversal
+    is sweep-only. The bare lean env flag alone does not unlock this path.
 
     mode='shadow' never hard-blocks; mode='active' blocks missing confirms;
     mode='disabled' skips.
@@ -557,7 +619,29 @@ def evaluate_ict_confirmation_gate(
     missing: list[str] = []
     decision = "ok"
 
-    if family == "passive_retracement" or ot.endswith("_limit"):
+    lean_fade = bool(lean_sweep_fade)
+
+    # Liquidity-reversal (including lean limits reclassified as LR) before
+    # the generic *_limit → passive path, so demoted fades keep sweep-only ICT.
+    if family == "liquidity_reversal" or (
+        lean_fade and has_sweep and ot.endswith("_limit")
+    ):
+        if not has_sweep:
+            missing.append("directional_sweep")
+        if not lean_fade:
+            if not has_mss:
+                missing.append("mss_choch")
+            if not has_disp:
+                missing.append("displacement")
+        would = bool(missing)
+        decision = "reversal_incomplete" if would else "reversal_ok"
+        if would:
+            reason = "Liquidity reversal missing: " + ", ".join(missing)
+        elif lean_fade:
+            reason = "Liquidity reversal lean confirmed (sweep-only)"
+        else:
+            reason = "Liquidity reversal confirmed (sweep+MSS+displacement)"
+    elif family == "passive_retracement" or ot.endswith("_limit"):
         if not htf:
             missing.append("htf_alignment")
         if not has_disp:
@@ -579,20 +663,6 @@ def evaluate_ict_confirmation_gate(
                 else "Passive limit: HTF + displacement-origin zone OK"
             )
             would = False
-    elif family == "liquidity_reversal":
-        if not has_sweep:
-            missing.append("directional_sweep")
-        if not has_mss:
-            missing.append("mss_choch")
-        if not has_disp:
-            missing.append("displacement")
-        would = bool(missing)
-        decision = "reversal_incomplete" if would else "reversal_ok"
-        reason = (
-            ("Liquidity reversal missing: " + ", ".join(missing))
-            if would
-            else "Liquidity reversal confirmed (sweep+MSS+displacement)"
-        )
     else:  # continuation (default)
         if not htf:
             missing.append("htf_alignment")

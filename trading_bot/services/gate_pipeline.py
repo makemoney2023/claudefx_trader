@@ -94,6 +94,8 @@ def _evaluate_ict_confirmation_for_ctx(ctx: TradeContext) -> GateOutcome:
     else:
         regime = str(getattr(reg, "type", None) or ctx.regime_type or "")
 
+    from .setup_fingerprint import is_lean_sweep_fade
+
     fp = build_setup_fingerprint(
         direction=ctx.direction,
         order_type=ctx.order_type or "market",
@@ -104,6 +106,12 @@ def _evaluate_ict_confirmation_for_ctx(ctx: TradeContext) -> GateOutcome:
         analysis_results=ctx.analysis_results,
         zone_valid=_zone_valid_for_direction(ctx),
     )
+    _lean_fade = is_lean_sweep_fade(
+        ctx.direction,
+        ctx.analysis_results,
+        d1_bias=ctx.d1_bias,
+        h4_bias=ctx.h4_bias,
+    )
     # Stash for persistence / telemetry
     ctx.analysis_results = dict(ctx.analysis_results or {})
     ctx.analysis_results["setup_fingerprint"] = fp.to_dict()
@@ -112,6 +120,7 @@ def _evaluate_ict_confirmation_for_ctx(ctx: TradeContext) -> GateOutcome:
         fingerprint=fp,
         order_type=ctx.order_type or "market",
         mode=mode,
+        lean_sweep_fade=_lean_fade,
     )
     return result.to_gate_outcome()
 
@@ -222,12 +231,19 @@ def evaluate_zone_and_regime_gates(
             has_directional_sweep,
             has_displacement,
             htf_aligned,
+            is_lean_sweep_fade,
         )
 
         _ar = ctx.analysis_results or {}
         _has_sweep = has_directional_sweep(ctx.direction, _ar.get("liquidity"))
         _has_disp = has_displacement(_ar, direction=ctx.direction)
         _htf = htf_aligned(ctx.direction, ctx.d1_bias, ctx.h4_bias)
+        _lean_fade = is_lean_sweep_fade(
+            ctx.direction,
+            _ar,
+            d1_bias=ctx.d1_bias,
+            h4_bias=ctx.h4_bias,
+        )
         zg = evaluate_zone_gate(
             direction=ctx.direction,
             confidence=ctx.confidence,
@@ -242,6 +258,7 @@ def evaluate_zone_and_regime_gates(
             has_sweep=_has_sweep,
             has_displacement=_has_disp,
             htf_aligned=_htf,
+            lean_sweep_fade=_lean_fade,
         )
         if zg.blocked:
             return GateOutcome.block(

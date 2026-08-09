@@ -504,6 +504,15 @@ class TradingSettings(BaseSettings):
             "(default), 'shadow' logs would-block only, 'disabled' skips"
         ),
     )
+    liquidity_reversal_lean_mode: str = Field(
+        default="off",
+        description=(
+            "SB-style sweep-fade lean: 'off' (default) or 'active'. When active, "
+            "directional-sweep liquidity_reversal setups skip M15 bias, "
+            "displacement/MSS ICT confirms, wrong-zone demote, HTF dual-oppose, "
+            "and Claude runs outside kill zones. Rollback: set to off + restart."
+        ),
+    )
     correlation_group_mode: str = Field(
         default="shadow",
         description=(
@@ -813,6 +822,7 @@ def get_trading_config() -> dict:
         "min_risk_reward": settings.trading.min_risk_reward,
         "allowed_sessions": settings.trading.allowed_sessions,
         "claude_kill_zone_only": settings.trading.claude_kill_zone_only,
+        "liquidity_reversal_lean_mode": settings.trading.liquidity_reversal_lean_mode,
         "max_daily_drawdown": settings.trading.max_daily_drawdown,
         "max_weekly_drawdown": settings.trading.max_weekly_drawdown,
     }

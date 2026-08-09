@@ -16,6 +16,8 @@ from trading_bot.config import settings as _runtime_settings
 
 os.environ["TRADING_ICT_CONFIRMATION_MODE"] = "shadow"
 _runtime_settings.trading.ict_confirmation_mode = "shadow"
+os.environ["TRADING_LIQUIDITY_REVERSAL_LEAN_MODE"] = "off"
+_runtime_settings.trading.liquidity_reversal_lean_mode = "off"
 
 
 @pytest.fixture(autouse=True)
@@ -26,6 +28,16 @@ def _isolate_ict_confirmation_mode():
     yield
     os.environ["TRADING_ICT_CONFIRMATION_MODE"] = "shadow"
     _runtime_settings.trading.ict_confirmation_mode = "shadow"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_liquidity_reversal_lean_mode():
+    """Keep lean off unless a test explicitly enables it."""
+    os.environ["TRADING_LIQUIDITY_REVERSAL_LEAN_MODE"] = "off"
+    _runtime_settings.trading.liquidity_reversal_lean_mode = "off"
+    yield
+    os.environ["TRADING_LIQUIDITY_REVERSAL_LEAN_MODE"] = "off"
+    _runtime_settings.trading.liquidity_reversal_lean_mode = "off"
 
 
 # Mock classes for testing without MT5 connection

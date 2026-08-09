@@ -87,6 +87,7 @@ def claude_analysis_allowed(
     *,
     claude_kill_zone_only: bool = True,
     displacement_override: bool = False,
+    lean_active: bool = False,
 ) -> bool:
     """
     Whether Claude analysis (and judge/sizing) may run for this session.
@@ -95,13 +96,43 @@ def claude_analysis_allowed(
     ICT kill zones where ``is_tradeable`` is True (London 2–5, NY 7–10,
     London Close 10–12 America/New_York). Outside those windows, callers must
     hard-skip Claude to avoid off-hours API spend — unless
-    ``displacement_override`` is True (fresh metals M5 impulse in any session).
+    ``displacement_override`` is True (fresh metals M5 impulse in any session)
+    or ``lean_active`` is True (liquidity_reversal_lean_mode=active).
     """
+    if lean_active:
+        return True
     if displacement_override:
         return True
     if not claude_kill_zone_only:
         return True
     return bool(is_tradeable)
+
+
+def resolve_outside_kz_cycle_symbols(
+    cycle_symbols: List[str],
+    *,
+    crypto_symbols: frozenset,
+    is_tradeable: bool,
+    disp_override_symbols: Optional[List[str]] = None,
+    lean_active: bool = False,
+) -> Tuple[List[str], bool]:
+    """
+    Resolve which symbols the main cycle may analyze outside a kill zone.
+
+    Returns ``(symbols, off_hours_mode)``. Empty symbols means skip the cycle.
+
+    When lean is active, keep the full symbol set and clear off-hours mode so
+    metals/forex are not crypto-filtered and ``off_hours_cap`` does not hard-block
+    lean fades. Displacement-override lists already narrowed the cycle upstream.
+    """
+    symbols = list(cycle_symbols or [])
+    overrides = list(disp_override_symbols or [])
+    if is_tradeable or overrides:
+        return symbols, False
+    if lean_active:
+        return symbols, False
+    crypto_in_cycle = [s for s in symbols if s in crypto_symbols]
+    return crypto_in_cycle, True
 
 
 # ICT Kill Zones (EST times)

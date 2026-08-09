@@ -74,13 +74,14 @@ def evaluate_zone_conversion(
     pd_analysis: Any,
     htf_aligned: bool = False,
     has_displacement: bool = False,
+    lean_sweep_fade: bool = False,
 ) -> ParityGateOutcome:
     """
     When premium/discount zone is invalid for a market order, convert to OTE
     limit or block if OTE cannot be resolved.
 
-    HTF-aligned displacement continuation keeps the market order (do not
-    demote an impulse chase into a pullback limit).
+    HTF-aligned displacement continuation and lean sweep-fade keep the market
+    order (do not demote into a pullback limit).
     """
     if zone_valid:
         return ParityGateOutcome(
@@ -101,6 +102,13 @@ def evaluate_zone_conversion(
                 zone_reason
                 or "zone invalid — HTF+displacement continuation keeps market"
             ),
+        )
+
+    if lean_sweep_fade:
+        return ParityGateOutcome(
+            action="unchanged",
+            gate_path=["zone_lean_market"],
+            reason=zone_reason or "zone invalid — lean sweep-fade keeps market",
         )
 
     ot = (order_type or "").lower()
@@ -179,6 +187,7 @@ def evaluate_displacement_parity(
     amd_phase: Optional[str],
     htf_aligned: bool = False,
     has_displacement: bool = False,
+    lean_sweep_fade: bool = False,
 ) -> ParityGateOutcome:
     """Shared displacement decision for market orders."""
     from .setup_fingerprint import is_htf_displacement_continuation
@@ -189,6 +198,12 @@ def evaluate_displacement_parity(
         return ParityGateOutcome(
             action="allow_market",
             gate_path=["displacement_continuation_ok"],
+        )
+
+    if (order_type or "").lower() == "market" and lean_sweep_fade:
+        return ParityGateOutcome(
+            action="allow_market",
+            gate_path=["liquidity_reversal_lean_ok"],
         )
 
     action = displacement_gate_action(

@@ -16,6 +16,7 @@ Features:
 
 import asyncio
 import base64
+import copy
 import hashlib
 import json
 import time
@@ -32,6 +33,32 @@ from ..utils.logging import get_logger
 from ..utils.win_optimization import validate_signal_coherence
 
 logger = get_logger(__name__)
+
+
+_LEAN_ORDER_TYPE_DESC = (
+    "Choose per ORDER TYPE SELECTION: buy_limit/sell_limit INTO a level (correct zone), "
+    "buy_stop/sell_stop THROUGH a level, or market. LEAN FADE: when a directional liquidity "
+    "sweep just printed (SSL→long / BSL→short), market is allowed WITHOUT a closed "
+    "displacement candle into the reversal FVG. Non-sweep setups still require displacement "
+    "for market. Zone rule for limits remains mandatory."
+)
+
+
+def lean_aware_trade_signal_tools(*, replay: bool = False) -> List[Dict[str, Any]]:
+    """Per-request tool list; mutates order_type description when lean is active."""
+    tool = copy.deepcopy(TRADE_SIGNAL_TOOL)
+    try:
+        from ..services.setup_fingerprint import is_liquidity_reversal_lean_active
+
+        if is_liquidity_reversal_lean_active():
+            tool["input_schema"]["properties"]["order_type"]["description"] = (
+                _LEAN_ORDER_TYPE_DESC
+            )
+    except Exception:
+        pass
+    if replay:
+        return [LOOKUP_STRATEGY_DOC_TOOL, tool]
+    return [tool]
 
 
 # Tool definition for structured trade signal output
@@ -861,11 +888,7 @@ class ClaudeClient:
             strategy_mode=strategy_mode,
             doc_index=doc_index,
         )
-        analysis_tools = (
-            [LOOKUP_STRATEGY_DOC_TOOL, TRADE_SIGNAL_TOOL]
-            if is_replay
-            else [TRADE_SIGNAL_TOOL]
-        )
+        analysis_tools = lean_aware_trade_signal_tools(replay=is_replay)
         
         # Exponential backoff retry for transient errors
         max_attempts = 3
@@ -954,7 +977,7 @@ class ClaudeClient:
                             thinking={"type": "disabled"},
                             output_config={"effort": "low"},
                             system=system_messages,
-                            tools=[TRADE_SIGNAL_TOOL],
+                            tools=lean_aware_trade_signal_tools(replay=False),
                             tool_choice={
                                 "type": "tool",
                                 "name": "submit_trade_analysis",
@@ -1214,6 +1237,21 @@ class ClaudeClient:
             "2) During Distribution phase, the move is done. Avoid new entries unless displacement confirms a fresh cycle. "
             "3) M15 direction rules are detailed in the DIRECTIONAL AUTHORITY section of the analysis prompt."
         )
+        try:
+            from ..services.setup_fingerprint import is_liquidity_reversal_lean_active
+
+            if is_liquidity_reversal_lean_active():
+                identity += (
+                    " LEAN FADE EXCEPTION (liquidity_reversal_lean_mode=active): "
+                    "When a fresh directional liquidity sweep is present "
+                    "(SSL/sell_side/equal_lows → fade LONG; BSL/buy_side/equal_highs → fade SHORT), "
+                    "you MAY take that fade even if M15 opposes and even if D1+H4 both oppose. "
+                    "Market entry is allowed without a closed displacement candle into the "
+                    "reversal FVG after that sweep. Do not invent sweeps. Non-sweep setups "
+                    "still follow the CRITICAL STRUCTURE RULES above."
+                )
+        except Exception:
+            pass
         if strategy_mode == "replay":
             identity += (
                 " REPLAY MODE: Do NOT expect full strategy markdown in this prompt. "
@@ -1234,16 +1272,44 @@ class ClaudeClient:
                 "text": strategy_context,
                 "cache_control": {"type": "ephemeral"},
             }
-        return [
+        messages = [
             {"type": "text", "text": identity},
             {
                 "type": "text",
                 "text": ANALYSIS_RULES,
                 "cache_control": {"type": "ephemeral"},
             },
-            middle,
-            {"type": "text", "text": ANALYSIS_TONE_PREFERENCE},
         ]
+        try:
+            from ..services.setup_fingerprint import is_liquidity_reversal_lean_active
+
+            if is_liquidity_reversal_lean_active():
+                # Non-cached override after cached CORE MANDATE so lean wins.
+                messages.append(
+                    {
+                        "type": "text",
+                        "text": (
+                            "## CORE MANDATE LEAN OVERRIDE (liquidity_reversal_lean_mode=active)\n"
+                            "When a fresh directional liquidity sweep is present "
+                            "(SSL/sell_side/equal_lows → fade LONG; "
+                            "BSL/buy_side/equal_highs → fade SHORT):\n"
+                            "- MARKET is allowed WITHOUT a closed displacement candle when "
+                            "entering the reversal FVG after that sweep.\n"
+                            "- The sweep itself counts as a completed confirmation for MODE 1.\n"
+                            "- Do not invent sweeps. Non-sweep setups keep the standard "
+                            "CORE MANDATE (displacement / BOS / in-zone rules).\n"
+                        ),
+                    }
+                )
+        except Exception:
+            pass
+        messages.extend(
+            [
+                middle,
+                {"type": "text", "text": ANALYSIS_TONE_PREFERENCE},
+            ]
+        )
+        return messages
     
     def _build_analysis_prompt(
         self,
@@ -1260,6 +1326,23 @@ class ClaudeClient:
 - Symbol: {symbol}
 - Timeframe: {timeframe}
 """
+        try:
+            from ..services.setup_fingerprint import is_liquidity_reversal_lean_active
+
+            if is_liquidity_reversal_lean_active():
+                prompt += """
+## LEAN FADE MODE (ACTIVE — liquidity_reversal_lean_mode)
+When a directional liquidity sweep just printed (SSL swept → fade LONG; BSL swept → fade SHORT):
+1. Fading that side is VALID even if M15 still opposes the fade.
+2. Fading is VALID even if D1 and H4 both oppose, provided the sweep is real and fresh.
+3. MARKET entry is allowed WITHOUT a closed displacement candle when entering the
+   reversal FVG left by the sweep snapback.
+4. Still prefer buy-discount / sell-premium when possible; still respect risk/RR floors.
+5. Non-sweep setups keep the normal CORE MANDATE / DIRECTIONAL AUTHORITY rules.
+Do NOT invent sweeps — only use this path when liquidity data shows a clear SSL/BSL run.
+"""
+        except Exception:
+            pass
         
         if market_data:
             prompt += f"""- Current Price: {market_data.get('current_price', 'N/A')}
@@ -1515,6 +1598,21 @@ confirmed per the CORE MANDATE gate). Always set entry_price to the EXACT level 
    a reversal before M15 confirms it.
 5. If D1/H4/H1 are NOT aligned, note this as a warning factor (see the CONFIDENCE ADJUSTMENT RULES in the system message).
 """
+            try:
+                from ..services.setup_fingerprint import is_liquidity_reversal_lean_active
+
+                if is_liquidity_reversal_lean_active():
+                    prompt += """
+LEAN FADE OVERRIDE (takes precedence over DIRECTIONAL AUTHORITY 1/3/4 when a real sweep exists):
+- SSL / sell_side_liquidity / equal_lows just swept → fade LONG is valid even if M15 is bearish
+  and even if D1+H4 are both bearish.
+- BSL / buy_side_liquidity / equal_highs just swept → fade SHORT is valid even if M15 is bullish
+  and even if D1+H4 are both bullish.
+- MARKET is allowed without closed displacement when entering the reversal FVG after that sweep.
+- If liquidity.recent_sweeps does not show a matching sweep, ignore this override.
+"""
+            except Exception:
+                pass
             
             # =============================================
             # EXECUTION & ENTRY TIMEFRAMES (M15 → M5 → M1)
@@ -1666,6 +1764,17 @@ If you find yourself always choosing buy_limit or sell_limit, you are likely mis
 setups. Decide: is the best entry INTO a level (limit), THROUGH a level (stop), or a confirmed
 displacement you must take NOW (market)?
 """
+            try:
+                from ..services.setup_fingerprint import is_liquidity_reversal_lean_active
+
+                if is_liquidity_reversal_lean_active():
+                    prompt += """
+LEAN ORDER TYPE: After a directional SSL/BSL sweep, market into the reversal FVG is valid
+even without a closed displacement candle. Prefer market over inventing a limit just to
+satisfy the standard CORE MANDATE.
+"""
+            except Exception:
+                pass
             
             # =============================================
             # SWING EXHAUSTION VALIDATION
@@ -1713,6 +1822,17 @@ Unicorn/Breaker setups, buy_stop/sell_stop breakouts):
 - Use buy_stop/sell_stop at breakout level if price hasn't broken yet; use market if displacement is already underway.
 - Rounding pattern before the breakout = an extra confirmation feeding your base confidence scale.
 """
+            try:
+                from ..services.setup_fingerprint import is_liquidity_reversal_lean_active
+
+                if is_liquidity_reversal_lean_active():
+                    prompt += """
+LEAN SWING EXEMPTION: For a lean sweep-fade (fresh SSL→long or BSL→short into the
+reversal FVG), the TIER 1 4-swing / rounding hard gate does NOT apply. A completed
+directional sweep is sufficient structure for that path. Still do not invent sweeps.
+"""
+            except Exception:
+                pass
             
             # Fibonacci / OTE Context
             if market_data.get('fibonacci_zone'):
@@ -2853,9 +2973,24 @@ Now run Step 1 and Step 2 from the rubric and respond with the single JSON objec
                 "format": {"type": "json_schema", "schema": JUDGE_OUTPUT_SCHEMA},
             }
             # Static rubric goes in a cached system block (billed once per cache window).
+            _judge_text = JUDGE_RUBRIC
+            try:
+                from ..services.setup_fingerprint import is_liquidity_reversal_lean_active
+
+                if is_liquidity_reversal_lean_active():
+                    _judge_text += (
+                        "\n\n## LEAN FADE NOTE\n"
+                        "liquidity_reversal_lean_mode is ACTIVE. Do NOT DEMOTE solely because "
+                        "M15 opposes, D1+H4 both oppose, or displacement is absent when the "
+                        "analyst cites a fresh directional liquidity sweep (SSL→long / BSL→short). "
+                        "Still REJECT on wrong-side SL/TP, R:R below 1.5:1, daily limit, or named "
+                        "losing patterns. Wrong-zone chase without a stated sweep may still DEMOTE.\n"
+                    )
+            except Exception:
+                pass
             judge_system = [{
                 "type": "text",
-                "text": JUDGE_RUBRIC,
+                "text": _judge_text,
                 "cache_control": {"type": "ephemeral"},
             }]
             try:

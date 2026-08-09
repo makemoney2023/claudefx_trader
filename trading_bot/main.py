@@ -26,7 +26,11 @@ from .analysis.market_structure import MarketStructureAnalyzer
 from .analysis.fair_value_gap import FVGDetector
 from .analysis.order_blocks import OrderBlockDetector
 from .analysis.liquidity import LiquidityMapper
-from .analysis.kill_zones import KillZoneChecker, claude_analysis_allowed
+from .analysis.kill_zones import (
+    KillZoneChecker,
+    claude_analysis_allowed,
+    resolve_outside_kz_cycle_symbols,
+)
 from .analysis.silver_bullet import SilverBulletDetector
 from .analysis.silver_analysis import SilverAnalyzer
 from .analysis.crypto_analysis import CryptoAnalyzer
@@ -1566,9 +1570,12 @@ class TradingBot:
             session = self.kill_zone_checker.get_current_session()
             print(f"[CYCLE] Session: {session.session_name}, is_tradeable={session.is_tradeable}, is_kill_zone={session.is_kill_zone}", flush=True)
             _disp_override_symbols: List[str] = []
+            from .services.setup_fingerprint import is_liquidity_reversal_lean_active
+
             if not claude_analysis_allowed(
                 session.is_tradeable,
                 claude_kill_zone_only=settings.trading.claude_kill_zone_only,
+                lean_active=is_liquidity_reversal_lean_active(),
             ):
                 # Any session: still analyze metals with a live M5 displacement
                 # (London gaps, Asian, NY, off-hours — not Asian-only).
@@ -1613,20 +1620,44 @@ class TradingBot:
                         bot_state.cycle_complete()
                     return
             if not session.is_tradeable and not _disp_override_symbols:
-                # Outside kill zones only crypto may continue (off-hours mode
-                # hard-rejects entries via the off_hours_cap gate anyway).
-                crypto_in_cycle = [s for s in cycle_symbols if s in self.CRYPTO_SYMBOLS]
-                if crypto_in_cycle:
+                # Outside KZ: crypto-only unless lean keeps full set (metals/forex)
+                # and clears off_hours so off_hours_cap does not kill lean fades.
+                from .services.setup_fingerprint import lean_continues_outside_kill_zone
+
+                _lean_cycle = lean_continues_outside_kill_zone()
+                resolved, off_hours = resolve_outside_kz_cycle_symbols(
+                    cycle_symbols,
+                    crypto_symbols=frozenset(self.CRYPTO_SYMBOLS),
+                    is_tradeable=False,
+                    disp_override_symbols=[],
+                    lean_active=_lean_cycle,
+                )
+                if not resolved:
+                    print(
+                        f"[CYCLE] BLOCKED: Outside kill zone ({session.session_name}), no crypto to trade",
+                        flush=True,
+                    )
+                    logger.debug(
+                        f"Outside valid trading session ({session.session_name}), skipping cycle"
+                    )
+                    return
+                if _lean_cycle:
+                    logger.info(
+                        f"Outside kill zone ({session.session_name}) — "
+                        f"lean active, continuing {len(resolved)} symbols"
+                    )
+                    print(
+                        f"[CYCLE] Outside KZ ({session.session_name}) — "
+                        f"lean active, analyzing {len(resolved)} symbols",
+                        flush=True,
+                    )
+                elif off_hours:
                     logger.info(
                         f"Outside kill zone ({session.session_name}) - "
-                        f"forex blocked, {len(crypto_in_cycle)} crypto symbols still active"
+                        f"forex blocked, {len(resolved)} crypto symbols still active"
                     )
-                    cycle_symbols = crypto_in_cycle
-                    self._off_hours_mode = True
-                else:
-                    print(f"[CYCLE] BLOCKED: Outside kill zone ({session.session_name}), no crypto to trade", flush=True)
-                    logger.debug(f"Outside valid trading session ({session.session_name}), skipping cycle")
-                    return
+                cycle_symbols = resolved
+                self._off_hours_mode = off_hours
             else:
                 self._off_hours_mode = False
             
@@ -5943,6 +5974,14 @@ Apply the evaluation rules from the system message and reply per the OUTPUT CONT
             if judge_outcome.allows_demote_execution():
                 from .config import normalize_lots as _nl_demote
 
+                from .services.setup_fingerprint import is_lean_sweep_fade as _lean_fade_fn
+
+                _demote_lean = _lean_fade_fn(
+                    trade_signal.direction,
+                    serialized_analysis if isinstance(serialized_analysis, dict) else {},
+                    d1_bias=str((market_data or {}).get("d1_bias") or ""),
+                    h4_bias=str((market_data or {}).get("h4_bias") or ""),
+                )
                 demote = apply_demote_policy(
                     trade_signal.direction,
                     current_price,
@@ -5951,6 +5990,7 @@ Apply the evaluation rules from the system message and reply per the OUTPUT CONT
                     trade_signal.take_profit or 0.0,
                     getattr(trade_signal, 'order_type', 'market') or 'market',
                     judge_outcome.suggested_entry,
+                    lean_sweep_fade=_demote_lean,
                 )
                 demoted_entry = demote["demoted_entry"]
                 _demote_sl = demote["stop_loss"]

@@ -41,11 +41,29 @@ immediately before order send.
 
 ### Direction quality gates
 
+- **Liquidity reversal lean** (`TRADING_LIQUIDITY_REVERSAL_LEAN_MODE`, default
+  `off`): when `active`, directional-sweep `liquidity_reversal` / `sb_lean`
+  setups skip M15 bias, counter-D1 quality floors, and ICT MSS+displacement
+  when `lean_sweep_fade` is true (fresh ≤12-bar directional sweep; bare lean
+  flag alone does not unlock ICT sweep-only — including demoted limits
+  reclassified as LR),
+  wrong-zone demote (zone gate + conversion keep market), displacement
+  parity, pre-judge extremes (market and limits), AMD distribution RR block,
+  confluence min-count, and D1+H4 dual-oppose. Judge DEMOTE and
+  auto_convert_to_pending keep market (`lean_demote_ignored`). Claude runs
+  outside kill zones; the main cycle keeps metals/forex (not crypto-only)
+  and clears off-hours mode when lean is active. Lean eligibility requires a
+  directional sweep within 12 bars. Prompts/tools get CORE MANDATE LEAN +
+  LEAN SWING exemptions (API spend rises — monitor). Continuation / no-sweep
+  unchanged.
+  Rollback: set `off` and restart. Funnel tags: `sb_lean`,
+  `direction_lean_sweep_fade`, `zone_lean_market`, `liquidity_reversal_lean_ok`,
+  `htf_lean_sweep_fade`, `lean_demote_ignored`.
 - **ICT confirmation** defaults to `active`: incomplete passive retracements
   (limit without displacement-origin / invalid PD zone), reversals without
-  sweep+MSS+displacement, and continuations without HTF+MSS+displacement are
-  hard rejects. Fingerprint `zone_valid` is derived from PD retrace
-  (short ≥50% / long ≤50%), not left always-true.
+  sweep+MSS+displacement (unless lean active → sweep-only), and continuations
+  without HTF+MSS+displacement are hard rejects. Fingerprint `zone_valid` is
+  derived from PD retrace (short ≥50% / long ≤50%), not left always-true.
 - **Zone gate**: shorts below 50% retrace / longs above 50% hard-block unless
   either (1) **HTF-aligned continuation** (D1+H4 agree with direction) with
   directional displacement (sweep optional), or (2) **both** directional

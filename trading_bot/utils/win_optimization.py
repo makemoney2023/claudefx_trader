@@ -64,6 +64,8 @@ def _direction_structurally_blocked(
     m15_bias: str,
     amd_phase: str,
     displacement_direction: Optional[str] = None,
+    *,
+    lean_sweep_for_direction: bool = False,
 ) -> Optional[str]:
     """
     Return a reason string when the entry-gate stack guarantees rejection
@@ -75,7 +77,8 @@ def _direction_structurally_blocked(
     Anything ambiguous (neutral/unknown biases) counts as viable.
 
     Fresh M5 displacement aligned with ``direction`` clears the M15-oppose
-    block (same role as AMD manipulation), but never clears D1+H4 dual oppose.
+    block (same role as AMD manipulation). Lean sweep-fade clears M15-oppose
+    and D1+H4 dual-oppose for that direction only.
     """
     opposing = "bearish" if direction == "long" else "bullish"
     disp = (displacement_direction or "").lower()
@@ -83,10 +86,15 @@ def _direction_structurally_blocked(
         direction == "short" and disp == "bearish"
     )
 
-    if m15_bias == opposing and amd_phase != "manipulation" and not disp_aligned:
+    if (
+        m15_bias == opposing
+        and amd_phase != "manipulation"
+        and not disp_aligned
+        and not lean_sweep_for_direction
+    ):
         return f"{direction}: M15 {m15_bias} opposes (no manipulation phase)"
 
-    if d1_bias == opposing and h4_bias == opposing:
+    if d1_bias == opposing and h4_bias == opposing and not lean_sweep_for_direction:
         return f"{direction}: D1+H4 both {opposing}"
 
     return None
@@ -103,6 +111,7 @@ def pre_claude_viability(
     silver_bullet_window: bool = False,
     retrace_pct: Optional[float] = None,  # retained for call-site compat; unused
     displacement_direction: Optional[str] = None,
+    analysis_results: Optional[dict] = None,
 ) -> PreClaudeViability:
     """
     Decide whether calling Claude can possibly produce an executable trade.
@@ -112,9 +121,19 @@ def pre_claude_viability(
     discount is NOT a skip: anticipatory sell_limit/buy_limit entries are
     judged by ENTRY retrace in limit_zone. During kill zones and Silver
     Bullet windows we always analyze. Fresh M5 displacement unlocks only
-    the aligned direction's M15-oppose block.
+    the aligned direction's M15-oppose block. Lean mode with a known
+    directional sweep unlocks that fade direction through M15/HTF blocks.
     """
     if in_kill_zone or silver_bullet_window:
+        return PreClaudeViability(proceed=True)
+
+    from ..services.setup_fingerprint import (
+        is_lean_sweep_fade,
+        is_liquidity_reversal_lean_active,
+    )
+
+    # Lean-on: do not pre-skip Claude — post gates enforce sweep eligibility.
+    if is_liquidity_reversal_lean_active():
         return PreClaudeViability(proceed=True)
 
     reasons: List[str] = []
@@ -124,6 +143,14 @@ def pre_claude_viability(
             f"volume {relative_volume:.2f}x < 0.3 — dead market blocks all entries"
         )
 
+    ar = analysis_results or {}
+    long_lean = is_lean_sweep_fade(
+        "long", ar, d1_bias=d1_bias, h4_bias=h4_bias
+    )
+    short_lean = is_lean_sweep_fade(
+        "short", ar, d1_bias=d1_bias, h4_bias=h4_bias
+    )
+
     long_block = _direction_structurally_blocked(
         "long",
         d1_bias,
@@ -131,6 +158,7 @@ def pre_claude_viability(
         m15_bias,
         amd_phase,
         displacement_direction=displacement_direction,
+        lean_sweep_for_direction=long_lean,
     )
     short_block = _direction_structurally_blocked(
         "short",
@@ -139,6 +167,7 @@ def pre_claude_viability(
         m15_bias,
         amd_phase,
         displacement_direction=displacement_direction,
+        lean_sweep_for_direction=short_lean,
     )
     if long_block and short_block:
         reasons.append(long_block)
@@ -495,10 +524,23 @@ def apply_demote_policy(
     *,
     at_zone_pct: float = 0.0005,
     default_offset_pct: float = 0.001,
+    lean_sweep_fade: bool = False,
 ) -> Dict[str, Any]:
     entry = original_entry or current_price
     ot = (order_type or "market").lower()
     zone_dist = entry_deviation_pct(entry, current_price)
+
+    # Lean sweep-fades keep market — demoting to limit re-enters zone/ICT death.
+    if lean_sweep_fade and ot == "market":
+        return {
+            "action": "keep_market",
+            "demoted_entry": entry,
+            "order_type": "market",
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "size_multiplier": 1.0,
+            "reason": "lean_demote_ignored",
+        }
 
     if zone_dist <= at_zone_pct and ot == "market":
         return {
