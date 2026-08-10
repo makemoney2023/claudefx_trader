@@ -525,6 +525,7 @@ def apply_demote_policy(
     at_zone_pct: float = 0.0005,
     default_offset_pct: float = 0.001,
     lean_sweep_fade: bool = False,
+    ignore_demote: bool = False,
 ) -> Dict[str, Any]:
     entry = original_entry or current_price
     ot = (order_type or "market").lower()
@@ -540,6 +541,19 @@ def apply_demote_policy(
             "take_profit": take_profit,
             "size_multiplier": 1.0,
             "reason": "lean_demote_ignored",
+        }
+
+    # Claude signal trust: keep emitted order type + prices (market or limit).
+    if ignore_demote:
+        keep_ot = ot if ot else "market"
+        return {
+            "action": "keep_market" if keep_ot == "market" else "keep_limit",
+            "demoted_entry": entry,
+            "order_type": keep_ot,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "size_multiplier": 1.0,
+            "reason": "claude_trust_demote_ignored",
         }
 
     if zone_dist <= at_zone_pct and ot == "market":

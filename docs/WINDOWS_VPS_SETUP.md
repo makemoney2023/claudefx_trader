@@ -266,8 +266,15 @@ TRADING_NEWS_GATES_ENABLED=true
 # (per-gate saved_r / missed_r / net_saved_r tallies plus recent records)
 #
 # --- Direction quality / expectancy controls ---
-# ICT setup confirmation (default ACTIVE — hard-blocks incomplete confirms):
-TRADING_ICT_CONFIRMATION_MODE=active
+# ICT setup confirmation (default DISABLED — Claude signals not killed for
+# missing displacement/MSS; set active to restore hard-blocks):
+TRADING_ICT_CONFIRMATION_MODE=disabled
+# Claude signal trust (default off in config; set active on VPS when deploying
+# this feature). When active and Claude emits long/short with levels, strategy
+# redundancy gates (ICT confirm, volume floor, zone/M15/HTF dual-oppose, etc.)
+# soft-pass with claude_trust_bypass:<gate_id>. Safety stays hard: data/spread,
+# min R:R, FINAL-RISK, daily limits, Judge REJECT, flip guard. Rollback: off.
+TRADING_CLAUDE_SIGNAL_TRUST_MODE=active
 # Wrong-zone (short discount / long premium) allows HTF-aligned continuation
 # with displacement (sweep optional), or sweep+displacement otherwise;
 # conf/RR alone never bypasses. Controlled by TRADING_ZONE_GATE_MODE

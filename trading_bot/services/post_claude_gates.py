@@ -519,6 +519,13 @@ def _run_price_gates(
             h4_bias=_h4_bias,
         )
 
+        # Trust must be visible in price-phase parity (before entry ctx wiring).
+        from .claude_signal_trust import should_apply_claude_signal_trust
+
+        _claude_trust = should_apply_claude_signal_trust(direction)
+        if _claude_trust:
+            gate_path.append("claude_signal_trust")
+
         # GATE 1: premium/discount zone → OTE limit conversion
         if inp.zone_valid is not None:
             zone_out = evaluate_zone_conversion(
@@ -532,6 +539,7 @@ def _run_price_gates(
                 htf_aligned=_parity_htf,
                 has_displacement=_parity_disp,
                 lean_sweep_fade=_lean_fade,
+                claude_signal_trust=_claude_trust,
             )
             if zone_out.action == "convert_pending":
                 zone_out = apply_zone_conversion_levels(
@@ -627,6 +635,7 @@ def _run_price_gates(
             htf_aligned=_parity_htf,
             has_displacement=_parity_disp,
             lean_sweep_fade=_lean_fade,
+            claude_signal_trust=_claude_trust,
         )
         if disp_out.action == "convert_pending":
             disp_out = finalize_displacement_conversion(
@@ -803,6 +812,12 @@ def run_post_claude_gates(
         )
         pipeline_ctx.scaling_aggressive = inp.scaling_aggressive
 
+        from .claude_signal_trust import should_apply_claude_signal_trust
+
+        pipeline_ctx.claude_signal_trust = should_apply_claude_signal_trust(direction)
+        if pipeline_ctx.claude_signal_trust and "claude_signal_trust" not in path:
+            path.append("claude_signal_trust")
+
         session_name = inp.session_name
         is_kill = inp.is_kill_zone
         if not session_name:
@@ -874,6 +889,10 @@ def run_post_claude_gates(
         correlation_check=inp.correlation_check,
     )
     path.extend(perm_outcome.gate_path)
+    # Soft-pass tags land on ctx.gate_path; merge so live logs see bypasses.
+    for tag in pipeline_ctx.gate_path:
+        if tag not in path:
+            path.append(tag)
     signal.confidence = pipeline_ctx.confidence
     if perm_outcome.blocked:
         return _blocked_result(

@@ -1,6 +1,7 @@
 """
-Direction-quality tighten:
-- ICT confirmation default/active blocks incomplete passive retracements
+Direction-quality gates:
+- ICT confirmation default is disabled (Claude signals not killed on family confirms);
+  mode=active still blocks incomplete passive retracements
 - Wrong-zone entries (short discount / long premium) hard-block unless
   (HTF-aligned + displacement) OR (sweep + displacement)
 """
@@ -199,10 +200,52 @@ class TestWrongZoneRequiresSweepDisplacement:
         assert result.decision == "allowed_zone_aligned"
 
 
+class TestIctConfirmationDisabled:
+    def test_disabled_passes_passive_buy_limit_without_displacement(self):
+        """NY KZ XAU case: Claude buy_limit LONG must not die on displacement_origin."""
+        fp = SetupFingerprint(
+            family="passive_retracement",
+            tags=("htf", "mss", "zone"),
+            key="passive_retracement|long|buy_limit|ny|ranging",
+            has_sweep=False,
+            has_mss=True,
+            has_displacement=False,
+            htf_aligned=True,
+            zone_valid=True,
+            direction="long",
+        )
+        out = evaluate_ict_confirmation_gate(
+            fingerprint=fp,
+            order_type="buy_limit",
+            mode="disabled",
+        )
+        assert out.blocked is False
+        assert out.decision == "disabled"
+
+    def test_pipeline_disabled_mode_does_not_block(self, monkeypatch):
+        from trading_bot.config import settings
+        from trading_bot.services.gate_pipeline import _evaluate_ict_confirmation_for_ctx
+        from trading_bot.services.trade_context import TradeContext
+
+        monkeypatch.setattr(settings.trading, "ict_confirmation_mode", "disabled")
+        ctx = TradeContext(
+            symbol="XAUUSD",
+            direction="long",
+            confidence=0.62,
+            actual_rr=2.04,
+            d1_bias="bullish",
+            h4_bias="bullish",
+            order_type="buy_limit",
+            analysis_results={},
+        )
+        out = _evaluate_ict_confirmation_for_ctx(ctx)
+        assert out.blocked is False
+
+
 class TestIctConfirmationDefault:
-    def test_config_default_is_active(self):
+    def test_config_default_is_disabled(self):
         from trading_bot.config import TradingSettings
 
         # Field default (conftest forces env TRADING_ICT_CONFIRMATION_MODE=shadow
         # for test isolation, so don't instantiate Settings() here)
-        assert TradingSettings.model_fields["ict_confirmation_mode"].default == "active"
+        assert TradingSettings.model_fields["ict_confirmation_mode"].default == "disabled"

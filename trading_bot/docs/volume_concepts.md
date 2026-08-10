@@ -13,7 +13,9 @@ The ratio of current volume to the 20-bar moving average:
 - **0.7x - 1.5x**: Normal market conditions
 - **0.5x - 0.7x**: Below-average — marginal participation, proceed with caution
 - **< 0.5x**: Thin market — avoid trading, unreliable price action
-- **< 0.3x**: Extremely thin — no institutional commitment, skip entirely
+- **< 0.3x**: Extremely thin — no institutional commitment; entry volume floor
+  hard-blocks when Claude signal trust is `off`, soft-passes under
+  `TRADING_CLAUDE_SIGNAL_TRUST_MODE=active`
 
 ### Volume Trend
 Direction of volume over recent bars:
@@ -61,7 +63,7 @@ Volume spikes during liquidity sweeps reveal intent:
 
 ```
 IF relative_volume < 0.3:
-    -> NO TRADE (extremely thin market)
+    -> Volume floor hard-blocks when trust off; soft-pass under Claude signal trust
 
 IF relative_volume < 0.5:
     -> Reduce confidence by 15%
@@ -99,6 +101,8 @@ IF relative_volume > 3.0 + reversal:
 ## Integration with Trading Rules
 
 - Always check relative volume BEFORE evaluating a setup
-- Volume confirmation should be a gate, not a filter — low volume = no trade
+- Volume confirmation is a strategy gate: low volume hard-blocks when Claude
+  signal trust is `off`; under `TRADING_CLAUDE_SIGNAL_TRUST_MODE=active` the
+  volume floor soft-passes for Claude long/short emits (safety gates stay hard)
 - Volume-confirmed confluences (displacement + OB + sweep) are the highest-probability setups
 - Log volume metrics for every analysis to track correlation with trade outcomes

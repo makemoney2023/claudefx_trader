@@ -8,8 +8,10 @@ live deployments.
 
 ## Configuration
 
-- `TradingSettings.ict_confirmation_mode` defaults to `active`.
-- Set `TRADING_ICT_CONFIRMATION_MODE=active` explicitly on the VPS `.env.local`
+- `TradingSettings.ict_confirmation_mode` defaults to `disabled` (2026-08-10:
+  Claude signals were dying on passive `displacement_origin` through London/NY).
+- Set `TRADING_ICT_CONFIRMATION_MODE=active` on the VPS `.env.local` only when
+  you want hard ICT family confirms again.
   (required if an older env still pins `shadow`).
 - Keep correlation group sizing in shadow mode.
 
@@ -39,7 +41,8 @@ for telemetry only — the trade path continues.
 
 ## Safety and verification
 
-- Verify runtime settings load `ict_confirmation_mode=active`.
+- Verify runtime settings load `ict_confirmation_mode=disabled` (or `active` if
+  deliberately re-enabled).
 - Run focused active-mode tests for continuation, reversal, and passive limits.
 - Update the stale zone-conversion wiring test to inspect the shared
   `parity_gates` implementation.

@@ -5975,12 +5975,16 @@ Apply the evaluation rules from the system message and reply per the OUTPUT CONT
                 from .config import normalize_lots as _nl_demote
 
                 from .services.setup_fingerprint import is_lean_sweep_fade as _lean_fade_fn
+                from .services.claude_signal_trust import should_ignore_judge_demote
 
                 _demote_lean = _lean_fade_fn(
                     trade_signal.direction,
                     serialized_analysis if isinstance(serialized_analysis, dict) else {},
                     d1_bias=str((market_data or {}).get("d1_bias") or ""),
                     h4_bias=str((market_data or {}).get("h4_bias") or ""),
+                )
+                _ignore_demote = should_ignore_judge_demote(
+                    direction=trade_signal.direction
                 )
                 demote = apply_demote_policy(
                     trade_signal.direction,
@@ -5991,6 +5995,7 @@ Apply the evaluation rules from the system message and reply per the OUTPUT CONT
                     getattr(trade_signal, 'order_type', 'market') or 'market',
                     judge_outcome.suggested_entry,
                     lean_sweep_fade=_demote_lean,
+                    ignore_demote=_ignore_demote,
                 )
                 demoted_entry = demote["demoted_entry"]
                 _demote_sl = demote["stop_loss"]

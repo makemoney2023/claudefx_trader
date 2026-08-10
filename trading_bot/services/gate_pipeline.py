@@ -49,6 +49,13 @@ def _merge_outcome(accumulated: GateOutcome, step: GateOutcome) -> GateOutcome:
     return accumulated
 
 
+def _trust_soft_pass(ctx: TradeContext, step: GateOutcome) -> GateOutcome:
+    if not step.blocked or not getattr(ctx, "claude_signal_trust", False):
+        return step
+    gid = step.gate_id or (step.gate_path[-1] if step.gate_path else "gate")
+    return GateOutcome.pass_through(f"claude_trust_bypass:{gid}")
+
+
 def apply_gate_outcomes(ctx: TradeContext, outcome: GateOutcome) -> None:
     """Apply cumulative gate outcome mutations to context."""
     if outcome.confidence_cap is not None:
@@ -86,7 +93,7 @@ def _evaluate_ict_confirmation_for_ctx(ctx: TradeContext) -> GateOutcome:
     from ..config import settings
     from .setup_fingerprint import build_setup_fingerprint
 
-    mode = getattr(settings.trading, "ict_confirmation_mode", "active") or "active"
+    mode = getattr(settings.trading, "ict_confirmation_mode", "disabled") or "disabled"
     regime = ""
     reg = ctx.analysis_results.get("regime") or {}
     if isinstance(reg, dict):
@@ -221,6 +228,7 @@ def evaluate_zone_and_regime_gates(
     # Direction-vs-D1 policy: single consolidated gate (replaces legacy D1,
     # zone-gate counter-trend branches, and post-Claude counter-scalp check).
     dir_step = evaluate_direction_alignment_gate(ctx, scalp_rr_floor=scalp_rr_floor)
+    dir_step = _trust_soft_pass(ctx, dir_step)
     accumulated = _merge_outcome(accumulated, dir_step)
     if dir_step.blocked:
         return accumulated
@@ -261,11 +269,15 @@ def evaluate_zone_and_regime_gates(
             lean_sweep_fade=_lean_fade,
         )
         if zg.blocked:
-            return GateOutcome.block(
+            step = GateOutcome.block(
                 gate_id="zone_gate",
                 reason=zg.reason,
                 stage="zone_gate",
             )
+            step = _trust_soft_pass(ctx, step)
+            if step.blocked:
+                return step
+            accumulated = _merge_outcome(accumulated, step)
         if zg.shadow_only:
             accumulated.gate_path.append("zone_gate_shadow")
 
@@ -274,11 +286,15 @@ def evaluate_zone_and_regime_gates(
         confidence=ctx.confidence,
     )
     if blocked:
-        return GateOutcome.block(
+        step = GateOutcome.block(
             gate_id="volatile_regime",
             reason=reason,
             stage="regime_gate",
         )
+        step = _trust_soft_pass(ctx, step)
+        if step.blocked:
+            return step
+        accumulated = _merge_outcome(accumulated, step)
 
     blocked, reason = evaluate_tod_gate(
         utc_hour=ctx.utc_hour,
@@ -286,11 +302,15 @@ def evaluate_zone_and_regime_gates(
         confidence=ctx.confidence,
     )
     if blocked:
-        return GateOutcome.block(
+        step = GateOutcome.block(
             gate_id="tod_gate",
             reason=reason,
             stage="tod_gate",
         )
+        step = _trust_soft_pass(ctx, step)
+        if step.blocked:
+            return step
+        accumulated = _merge_outcome(accumulated, step)
 
     return accumulated
 
@@ -312,6 +332,7 @@ def evaluate_structure_and_quality_gates(
         evaluate_post_cooldown_gate,
     ):
         step = step_fn(ctx)
+        step = _trust_soft_pass(ctx, step)
         accumulated = _merge_outcome(accumulated, step)
         if step.blocked:
             return accumulated
@@ -328,6 +349,7 @@ def evaluate_structure_and_quality_gates(
 
     rel_vol = resolve_relative_volume(ctx.analysis_results)
     vol_step = evaluate_volume_gate(ctx, rel_vol)
+    vol_step = _trust_soft_pass(ctx, vol_step)
     accumulated = _merge_outcome(accumulated, vol_step)
     if vol_step.blocked:
         return accumulated
@@ -342,12 +364,14 @@ def evaluate_structure_and_quality_gates(
         min_confluence=min_conf,
         confidence_override=conf_override,
     )
+    conf_step = _trust_soft_pass(ctx, conf_step)
     accumulated = _merge_outcome(accumulated, conf_step)
     if conf_step.blocked:
         return accumulated
 
-    # Setup-family ICT confirmation (default active — blocks incomplete confirms)
+    # Setup-family ICT confirmation (default disabled; active blocks incomplete confirms)
     ict_step = _evaluate_ict_confirmation_for_ctx(ctx)
+    ict_step = _trust_soft_pass(ctx, ict_step)
     return _merge_outcome(accumulated, ict_step)
 
 
@@ -421,6 +445,7 @@ def evaluate_trade_permission_gates(
         daily_trades=daily_trades,
         gate_min_confidence=gate_min_confidence,
     )
+    scale_outcome = _trust_soft_pass(ctx, scale_outcome)
     if scale_outcome.blocked:
         ctx.gate_path.extend(scale_outcome.gate_path)
         return scale_outcome
@@ -433,8 +458,13 @@ def evaluate_trade_permission_gates(
                 reason=reason,
                 stage="correlation_gate",
             )
+            outcome = _trust_soft_pass(ctx, outcome)
+            if outcome.blocked:
+                ctx.gate_path.extend(outcome.gate_path)
+                return outcome
+            ctx.gate_path.extend(scale_outcome.gate_path)
             ctx.gate_path.extend(outcome.gate_path)
-            return outcome
+            return GateOutcome.pass_through("trade_permission_complete")
 
     ctx.gate_path.extend(scale_outcome.gate_path)
     return GateOutcome.pass_through("trade_permission_complete")

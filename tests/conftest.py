@@ -18,6 +18,8 @@ os.environ["TRADING_ICT_CONFIRMATION_MODE"] = "shadow"
 _runtime_settings.trading.ict_confirmation_mode = "shadow"
 os.environ["TRADING_LIQUIDITY_REVERSAL_LEAN_MODE"] = "off"
 _runtime_settings.trading.liquidity_reversal_lean_mode = "off"
+os.environ["TRADING_CLAUDE_SIGNAL_TRUST_MODE"] = "off"
+_runtime_settings.trading.claude_signal_trust_mode = "off"
 
 
 @pytest.fixture(autouse=True)
@@ -38,6 +40,16 @@ def _isolate_liquidity_reversal_lean_mode():
     yield
     os.environ["TRADING_LIQUIDITY_REVERSAL_LEAN_MODE"] = "off"
     _runtime_settings.trading.liquidity_reversal_lean_mode = "off"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_claude_signal_trust_mode():
+    """Keep Claude signal trust off unless a test explicitly enables it."""
+    os.environ["TRADING_CLAUDE_SIGNAL_TRUST_MODE"] = "off"
+    _runtime_settings.trading.claude_signal_trust_mode = "off"
+    yield
+    os.environ["TRADING_CLAUDE_SIGNAL_TRUST_MODE"] = "off"
+    _runtime_settings.trading.claude_signal_trust_mode = "off"
 
 
 # Mock classes for testing without MT5 connection

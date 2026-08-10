@@ -35,6 +35,7 @@ class TradeContext:
     confluence_count: int = 0
     relative_volume: float = 1.0
     scaling_aggressive: bool = False
+    claude_signal_trust: bool = False
     gate_path: List[str] = field(default_factory=list)
     confidence_adjustments: List[str] = field(default_factory=list)
     block_reason: Optional[str] = None

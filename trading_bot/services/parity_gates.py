@@ -75,13 +75,14 @@ def evaluate_zone_conversion(
     htf_aligned: bool = False,
     has_displacement: bool = False,
     lean_sweep_fade: bool = False,
+    claude_signal_trust: bool = False,
 ) -> ParityGateOutcome:
     """
     When premium/discount zone is invalid for a market order, convert to OTE
     limit or block if OTE cannot be resolved.
 
-    HTF-aligned displacement continuation and lean sweep-fade keep the market
-    order (do not demote into a pullback limit).
+    HTF-aligned displacement continuation, lean sweep-fade, and Claude signal
+    trust keep the market order (do not demote into a pullback limit).
     """
     if zone_valid:
         return ParityGateOutcome(
@@ -109,6 +110,16 @@ def evaluate_zone_conversion(
             action="unchanged",
             gate_path=["zone_lean_market"],
             reason=zone_reason or "zone invalid — lean sweep-fade keeps market",
+        )
+
+    if claude_signal_trust:
+        return ParityGateOutcome(
+            action="unchanged",
+            gate_path=["claude_trust_bypass:zone_conversion"],
+            reason=(
+                zone_reason
+                or "zone invalid — claude signal trust keeps order type"
+            ),
         )
 
     ot = (order_type or "").lower()
@@ -188,6 +199,7 @@ def evaluate_displacement_parity(
     htf_aligned: bool = False,
     has_displacement: bool = False,
     lean_sweep_fade: bool = False,
+    claude_signal_trust: bool = False,
 ) -> ParityGateOutcome:
     """Shared displacement decision for market orders."""
     from .setup_fingerprint import is_htf_displacement_continuation
@@ -204,6 +216,12 @@ def evaluate_displacement_parity(
         return ParityGateOutcome(
             action="allow_market",
             gate_path=["liquidity_reversal_lean_ok"],
+        )
+
+    if (order_type or "").lower() == "market" and claude_signal_trust:
+        return ParityGateOutcome(
+            action="allow_market",
+            gate_path=["claude_trust_bypass:displacement_parity"],
         )
 
     action = displacement_gate_action(

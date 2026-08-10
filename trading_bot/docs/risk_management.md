@@ -41,6 +41,17 @@ immediately before order send.
 
 ### Direction quality gates
 
+- **Claude signal trust** (`TRADING_CLAUDE_SIGNAL_TRUST_MODE`, default `off`):
+  when `active` and Claude emits long/short with entry/SL/TP, strategy-redundancy
+  gates soft-pass (log `claude_trust_bypass:<gate_id>` only) — including ICT
+  confirmation, volume floor (&lt;0.3x), zone/M15/HTF dual-oppose, confluence,
+  TOD/regime floors, zone conversion / demote-to-OTE / disp parity, playbook
+  hard gate, prepare-order extreme limit-zone + auto-convert keep Claude order
+  type, Judge DEMOTE keep-as-emitted (`claude_trust_demote_ignored`), and related
+  alignment floors. Safety stays hard: data quality, spread, min R:R, invalid
+  prices, FINAL-RISK / max lot, daily loss / trade caps / drawdown, blocked
+  symbols, Judge REJECT, flip guard / direction circuit breaker. Broader than
+  lean (no fresh-sweep required). Rollback: set `off` and restart.
 - **Liquidity reversal lean** (`TRADING_LIQUIDITY_REVERSAL_LEAN_MODE`, default
   `off`): when `active`, directional-sweep `liquidity_reversal` / `sb_lean`
   setups skip M15 bias, counter-D1 quality floors, and ICT MSS+displacement
@@ -59,20 +70,24 @@ immediately before order send.
   Rollback: set `off` and restart. Funnel tags: `sb_lean`,
   `direction_lean_sweep_fade`, `zone_lean_market`, `liquidity_reversal_lean_ok`,
   `htf_lean_sweep_fade`, `lean_demote_ignored`.
-- **ICT confirmation** defaults to `active`: incomplete passive retracements
-  (limit without displacement-origin / invalid PD zone), reversals without
-  sweep+MSS+displacement (unless lean active → sweep-only), and continuations
-  without HTF+MSS+displacement are hard rejects. Fingerprint `zone_valid` is
-  derived from PD retrace (short ≥50% / long ≤50%), not left always-true.
+- **ICT confirmation** defaults to `disabled` (`TRADING_ICT_CONFIRMATION_MODE`):
+  Claude-emitted signals are not hard-blocked for missing displacement-origin /
+  MSS / sweep family confirms. Set `active` to restore hard rejects on incomplete
+  passive retracements, reversals, and continuations when Claude signal trust is
+  `off`; under trust `active`, incomplete family confirms soft-pass instead.
+  `shadow` logs would-block only. Fingerprint `zone_valid` is still derived from
+  PD retrace (short ≥50% / long ≤50%) for telemetry when the gate runs.
 - **Zone gate**: shorts below 50% retrace / longs above 50% hard-block unless
   either (1) **HTF-aligned continuation** (D1+H4 agree with direction) with
   directional displacement (sweep optional), or (2) **both** directional
-  sweep and displacement. Confidence and R:R alone never bypass wrong-zone
-  location. Displacement includes directional impulse candles, not only
+  sweep and displacement — or Claude signal trust is `active` (soft-pass).
+  Confidence and R:R alone never bypass wrong-zone location when trust is off.
+  Displacement includes directional impulse candles, not only
   `distribution_confirmed`.
 - **Direction alignment**: counter-D1 non-scalp needs **60% + 2:1 RR** (was
-  3:1 — too strict for gold intraday). D1+H4 both opposing the trade is still
-  hard-blocked by the HTF alignment gate.
+  3:1 — too strict for gold intraday). D1+H4 both opposing the trade hard-blocks
+  via the HTF alignment gate when trust is `off`; under trust `active` that
+  dual-oppose block soft-passes.
 - **Continuation surfaces** (same HTF+displacement predicate): keep market
   orders through zone→OTE conversion and displacement parity; ICT continuation
   treats MSS as optional and passive limits skip `valid_zone`; pre-judge market

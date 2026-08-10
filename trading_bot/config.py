@@ -498,10 +498,11 @@ class TradingSettings(BaseSettings):
         description="Symbols where zone gate is disabled (falls back to legacy D1 gate)"
     )
     ict_confirmation_mode: str = Field(
-        default="active",
+        default="disabled",
         description=(
-            "ICT setup confirmation gate: 'active' hard-blocks missing confirmations "
-            "(default), 'shadow' logs would-block only, 'disabled' skips"
+            "ICT setup confirmation gate: 'disabled' skips (default — Claude signals "
+            "are not killed for missing displacement/MSS), 'shadow' logs would-block "
+            "only, 'active' hard-blocks incomplete families"
         ),
     )
     liquidity_reversal_lean_mode: str = Field(
@@ -511,6 +512,14 @@ class TradingSettings(BaseSettings):
             "directional-sweep liquidity_reversal setups skip M15 bias, "
             "displacement/MSS ICT confirms, wrong-zone demote, HTF dual-oppose, "
             "and Claude runs outside kill zones. Rollback: set to off + restart."
+        ),
+    )
+    claude_signal_trust_mode: str = Field(
+        default="off",
+        description=(
+            "When 'active', Claude long/short emits soft-pass strategy gates "
+            "(zone/M15/HTF/volume/ICT/etc.); safety gates stay hard. "
+            "Rollback: off + restart."
         ),
     )
     correlation_group_mode: str = Field(

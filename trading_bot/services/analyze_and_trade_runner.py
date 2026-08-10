@@ -1079,6 +1079,7 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
         # PLAYBOOK HARD GATE (proven negative expectancy combos)
         # ============================================
         from .edge_policies import evaluate_playbook_gate
+        from .claude_signal_trust import should_soft_pass_playbook
 
         _playbook_stats = await _get_playbook_stats(bot)
         _pb_result = evaluate_playbook_gate(
@@ -1089,21 +1090,32 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
             trade_type=getattr(trade_signal, "trade_type", None),
         )
         if _pb_result.blocked:
-            logger.warning(f"[PLAYBOOK-GATE] {symbol}: {_pb_result.reason}")
-            print(f"[BLOCKED] {symbol}: {_pb_result.reason}", flush=True)
-            await bot._record_terminal_decision(
-                "mechanical_reject",
-                symbol,
-                gate_id="playbook_block",
-                direction=trade_signal.direction,
-                entry=trade_signal.entry_price or current_price,
-                sl=trade_signal.stop_loss or 0.0,
-                tp=trade_signal.take_profit or 0.0,
-                confidence=trade_signal.confidence,
-                reason=_pb_result.reason,
-                details={"playbook_stats": _pb_result.stats},
-            )
-            return
+            if should_soft_pass_playbook(direction=trade_signal.direction):
+                logger.info(
+                    f"[PLAYBOOK-GATE] {symbol}: claude_trust_bypass:playbook_block "
+                    f"— {_pb_result.reason}"
+                )
+                print(
+                    f"[PLAYBOOK-GATE] {symbol}: claude_trust_bypass:playbook_block "
+                    f"— {_pb_result.reason}",
+                    flush=True,
+                )
+            else:
+                logger.warning(f"[PLAYBOOK-GATE] {symbol}: {_pb_result.reason}")
+                print(f"[BLOCKED] {symbol}: {_pb_result.reason}", flush=True)
+                await bot._record_terminal_decision(
+                    "mechanical_reject",
+                    symbol,
+                    gate_id="playbook_block",
+                    direction=trade_signal.direction,
+                    entry=trade_signal.entry_price or current_price,
+                    sl=trade_signal.stop_loss or 0.0,
+                    tp=trade_signal.take_profit or 0.0,
+                    confidence=trade_signal.confidence,
+                    reason=_pb_result.reason,
+                    details={"playbook_stats": _pb_result.stats},
+                )
+                return
 
         # Gap 21: Track signal hashes for dedup, but DON'T hard-block.
         # Multiple trades per symbol are allowed if the analysis supports it.
@@ -1849,28 +1861,41 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                 lean_sweep_fade=_pj_lean,
             )
             if _pj_zone_reason:
-                print(f"[BLOCKED] {symbol}: pre-judge {_pj_zone_reason}", flush=True)
-                logger.warning(f"[PRE-JUDGE-ZONE] {symbol}: {_pj_zone_reason}")
-                if bot_state:
-                    bot_state.trade_decision(symbol, "blocked", _pj_zone_reason)
-                    bot_state.symbol_complete(symbol, "pre_judge_zone")
-                try:
-                    await bot._record_terminal_decision(
-                        "mechanical_reject",
-                        symbol,
-                        gate_id="pre_judge_zone",
-                        reason=_pj_zone_reason,
-                        direction=trade_signal.direction,
-                        confidence=trade_signal.confidence,
+                from .claude_signal_trust import should_apply_claude_signal_trust
+
+                if should_apply_claude_signal_trust(trade_signal.direction):
+                    logger.info(
+                        f"[PRE-JUDGE-ZONE] {symbol}: claude_trust_bypass:pre_judge_zone "
+                        f"— skipping block ({_pj_zone_reason})"
                     )
-                except Exception:
-                    pass
-                if _trade_reservation is not None:
+                    print(
+                        f"[PRE-JUDGE-ZONE] {symbol}: claude_trust_bypass:pre_judge_zone "
+                        f"— {_pj_zone_reason}",
+                        flush=True,
+                    )
+                else:
+                    print(f"[BLOCKED] {symbol}: pre-judge {_pj_zone_reason}", flush=True)
+                    logger.warning(f"[PRE-JUDGE-ZONE] {symbol}: {_pj_zone_reason}")
+                    if bot_state:
+                        bot_state.trade_decision(symbol, "blocked", _pj_zone_reason)
+                        bot_state.symbol_complete(symbol, "pre_judge_zone")
                     try:
-                        bot._release_trade_reservation(_trade_reservation)
+                        await bot._record_terminal_decision(
+                            "mechanical_reject",
+                            symbol,
+                            gate_id="pre_judge_zone",
+                            reason=_pj_zone_reason,
+                            direction=trade_signal.direction,
+                            confidence=trade_signal.confidence,
+                        )
                     except Exception:
                         pass
-                return
+                    if _trade_reservation is not None:
+                        try:
+                            bot._release_trade_reservation(_trade_reservation)
+                        except Exception:
+                            pass
+                    return
 
             # =============================================
             # TRADE JUDGE (pre-execution validation)
@@ -1996,6 +2021,7 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
             # Handle DEMOTE verdict — convert to pending limit order
             elif judge_outcome.allows_demote_execution():
                 from .setup_fingerprint import is_lean_sweep_fade as _lean_fade_fn
+                from .claude_signal_trust import should_ignore_judge_demote
 
                 _demote_lean = _lean_fade_fn(
                     trade_signal.direction,
@@ -2011,6 +2037,9 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                         or ""
                     ),
                 )
+                _ignore_demote = should_ignore_judge_demote(
+                    direction=trade_signal.direction
+                )
                 demote = apply_demote_policy(
                     trade_signal.direction,
                     current_price,
@@ -2020,10 +2049,16 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                     getattr(trade_signal, "order_type", "market") or "market",
                     judge_outcome.suggested_entry,
                     lean_sweep_fade=_demote_lean,
+                    ignore_demote=_ignore_demote,
                 )
                 if demote.get("reason") == "lean_demote_ignored":
                     logger.info(
                         f"[JUDGE] {symbol}: lean_demote_ignored — keeping market"
+                    )
+                elif demote.get("reason") == "claude_trust_demote_ignored":
+                    logger.info(
+                        f"[JUDGE] {symbol}: claude_trust_demote_ignored — "
+                        f"keeping {demote.get('order_type')}"
                     )
                 demoted_entry = demote["demoted_entry"]
                 trade_signal.order_type = demote["order_type"]

@@ -57,11 +57,12 @@ def auto_convert_to_pending(
     current_price: float,
     *,
     lean_sweep_fade: bool = False,
+    claude_signal_trust: bool = False,
 ) -> str:
     """Convert market to limit/stop when entry differs from market."""
     if order_type != "market" or not entry_price or current_price <= 0:
         return order_type
-    if lean_sweep_fade:
+    if lean_sweep_fade or claude_signal_trust:
         return order_type
     price_diff_pct = abs(entry_price - current_price) / current_price
     if price_diff_pct <= 0.001:
@@ -97,6 +98,7 @@ def validate_limit_zone(
     retrace_pct: Optional[float],
     *,
     lean_sweep_fade: bool = False,
+    claude_signal_trust: bool = False,
 ) -> GateOutcome:
     """ICT zone validation for limit orders."""
     if order_type not in ("buy_limit", "sell_limit") or retrace_pct is None:
@@ -104,6 +106,9 @@ def validate_limit_zone(
 
     if lean_sweep_fade:
         return GateOutcome.pass_through("limit_zone_lean_sweep_fade")
+
+    if claude_signal_trust:
+        return GateOutcome.pass_through("claude_trust_bypass:limit_zone")
 
     if order_type == "buy_limit" and retrace_pct > 0.70:
         return GateOutcome.block(
@@ -303,6 +308,7 @@ class ExecutionCoordinator:
                 )
 
         from ..services.setup_fingerprint import is_lean_sweep_fade
+        from ..services.claude_signal_trust import should_apply_claude_signal_trust
 
         _lean_fade = is_lean_sweep_fade(
             direction,
@@ -320,6 +326,7 @@ class ExecutionCoordinator:
                     d1_bias=str(_md.get("d1_bias") or ""),
                     h4_bias=str(_md.get("h4_bias") or ""),
                 )
+        _claude_trust = should_apply_claude_signal_trust(direction)
 
         order_type = auto_convert_to_pending(
             order_type,
@@ -327,6 +334,7 @@ class ExecutionCoordinator:
             trade_signal.entry_price or 0,
             current_price,
             lean_sweep_fade=_lean_fade,
+            claude_signal_trust=_claude_trust,
         )
         order_type = fix_limit_stop_labels(order_type, entry_price, current_price)
         trade_signal.order_type = order_type
@@ -345,7 +353,10 @@ class ExecutionCoordinator:
         # Judge ENTRY location (anticipatory limits), not spot print.
         retrace = entry_retrace_pct(analysis_results, entry_price)
         zone_outcome = validate_limit_zone(
-            order_type, retrace, lean_sweep_fade=_lean_fade
+            order_type,
+            retrace,
+            lean_sweep_fade=_lean_fade,
+            claude_signal_trust=_claude_trust,
         )
         if zone_outcome.blocked:
             return ExecutionPrepResult(
