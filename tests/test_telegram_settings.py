@@ -242,6 +242,9 @@ def test_apply_symbols(restore_settings, monkeypatch):
     assert result.needs_apply is True
     with pytest.raises(SettingError):
         apply_symbols(["ETHBTC"], record_activity=False)
+    settings.trading.symbols = ["XAUUSD"]
+    result = apply_symbols(["XAUUSD", "EURUSD"], validate=False, record_activity=False)
+    assert result.new == ["XAUUSD", "EURUSD"]
 
 
 def test_pending_ttl():

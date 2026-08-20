@@ -16,7 +16,7 @@ import numpy as np
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from ...config import settings
+from ...config import get_effective_allowed_sessions, settings
 
 # Lazy imports to avoid circular dependency
 def get_bot_instance():
@@ -305,7 +305,7 @@ async def get_current_session():
     """
     Get current trading session information.
     """
-    checker = KillZoneChecker(allowed_sessions=settings.trading.allowed_sessions)
+    checker = KillZoneChecker(allowed_sessions=get_effective_allowed_sessions())
     session_info = checker.get_current_session()
     
     return SessionResponse(
@@ -392,7 +392,7 @@ async def get_symbol_analysis(
     liquidity_mapper = LiquidityMapper(pip_value=_api_pip)
     fib_analyzer = FibonacciAnalyzer()
     amd_analyzer = PowerOfThreeAnalyzer()
-    session_checker = KillZoneChecker(allowed_sessions=settings.trading.allowed_sessions)
+    session_checker = KillZoneChecker(allowed_sessions=get_effective_allowed_sessions())
     
     # Perform analysis
     structure = structure_analyzer.analyze(df)

@@ -1235,7 +1235,7 @@ class TelegramCommandHandler:
                 await self._reply("Refusing to remove the last trading symbol.")
                 return
 
-        result = apply_symbols(new_list)
+        result = apply_symbols(new_list, validate=False)
         self._schedule_snapshot(
             "telegram_symbols",
             {"old": result.old, "new": result.new},

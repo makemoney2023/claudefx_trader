@@ -428,8 +428,10 @@ class TradingBot:
 
         self.opportunity_scanner = None
         self._opportunity_scan_task = None
-        lock = (getattr(settings.trading, "telegram_mode_lock", "") or "").strip().lower()
-        self._telegram_mode_lock = "" if lock in ("", "auto") else lock
+        from .services.telegram_settings import normalize_mode_lock
+        self._telegram_mode_lock = normalize_mode_lock(
+            getattr(settings.trading, "telegram_mode_lock", "")
+        )
         
         # Dynamic learnings: throttle doc updates to at most once per hour
         self._last_learnings_update: Optional[datetime] = None
@@ -1068,12 +1070,30 @@ class TradingBot:
 
         sessions = get_effective_allowed_sessions()
         result["sessions"] = list(sessions)
-        checker = KillZoneChecker(allowed_sessions=sessions)
-        self.kill_zone_checker = checker
+        if self.kill_zone_checker is not None:
+            self.kill_zone_checker.allowed_sessions = list(sessions)
+            checker = self.kill_zone_checker
+        else:
+            checker = KillZoneChecker(allowed_sessions=sessions)
+            self.kill_zone_checker = checker
         if self.strategy is not None:
             self.strategy.kill_zone_checker = checker
         if self.opportunity_scanner is not None:
             self.opportunity_scanner.kill_zone_checker = checker
+        pom = getattr(self, "pending_order_manager", None)
+        if pom is not None:
+            if hasattr(pom, "set_kill_zone_checker"):
+                pom.set_kill_zone_checker(checker)
+            else:
+                pom.kill_zone_checker = checker
+
+        if getattr(self, "risk_manager", None):
+            self.risk_manager.risk_per_trade = float(settings.trading.risk_per_trade)
+            self.risk_manager.min_risk_reward = float(settings.trading.min_risk_reward)
+        scanner = getattr(self, "opportunity_scanner", None)
+        hot = getattr(scanner, "hot", None) if scanner is not None else None
+        if hot is not None and hasattr(hot, "max_size"):
+            hot.max_size = int(settings.trading.opportunity_scanner_hot_list_size)
 
         mt5 = getattr(self, "mt5_client", None)
         if mt5 is None:

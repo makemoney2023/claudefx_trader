@@ -581,9 +581,10 @@ def apply_symbols(
     *,
     persist: bool = True,
     record_activity: bool = True,
+    validate: bool = True,
 ) -> ApplyResult:
     old = list(settings.trading.symbols)
-    new = [validate_symbol(s) for s in symbols]
+    new = [validate_symbol(s) for s in symbols] if validate else [str(s).upper() for s in symbols]
     settings.trading.symbols = new
     persisted = False
     if persist:

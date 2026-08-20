@@ -55,7 +55,14 @@ async def test_apply_runtime_config_starts_and_stops_scanner(monkeypatch):
     bot = TradingBot()
     bot.running = True
     bot.strategy = SimpleNamespace()
-    bot.opportunity_scanner = SimpleNamespace()
+    bot.opportunity_scanner = SimpleNamespace(hot=SimpleNamespace(max_size=3))
+    bot.pending_order_manager = SimpleNamespace(
+        kill_zone_checker=None,
+        set_kill_zone_checker=lambda checker: setattr(
+            bot.pending_order_manager, "kill_zone_checker", checker
+        ),
+    )
+    bot.risk_manager = SimpleNamespace(risk_per_trade=0.01, min_risk_reward=3.0)
     bot.mt5_client = None
 
     async def fake_loop():
@@ -76,6 +83,9 @@ async def test_apply_runtime_config_starts_and_stops_scanner(monkeypatch):
     assert result["sessions"] == ["london", "new_york", "london_close"]
     assert bot.strategy.kill_zone_checker is bot.kill_zone_checker
     assert bot.opportunity_scanner.kill_zone_checker is bot.kill_zone_checker
+    assert bot.pending_order_manager.kill_zone_checker is bot.kill_zone_checker
+    assert bot.risk_manager.risk_per_trade == settings.trading.risk_per_trade
+    assert bot.opportunity_scanner.hot.max_size == settings.trading.opportunity_scanner_hot_list_size
 
     monkeypatch.setattr(settings.trading, "opportunity_scanner_enabled", False)
     monkeypatch.setattr(settings.trading, "claude_analysis_window", "all_kill_zones")
