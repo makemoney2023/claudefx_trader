@@ -138,6 +138,22 @@ async def test_yes_wrong_code(handler, restore_flags):
 
 
 @pytest.mark.asyncio
+async def test_yes_expired_does_not_apply(handler, restore_flags):
+    from trading_bot.config import settings
+    from trading_bot.services.telegram_settings import new_pending
+
+    settings.trading.claude_signal_trust_mode = "off"
+    pending = new_pending("setting", "trust", "active", now=0.0)
+    pending.expires = 1.0
+    handler._pending_change = pending
+    await handler._cmd_yes([pending.code])
+    assert settings.trading.claude_signal_trust_mode == "off"
+    assert handler._pending_change is None
+    text = handler._reply.await_args.args[0]
+    assert "expired" in text.lower()
+
+
+@pytest.mark.asyncio
 async def test_no_cancels_pending(handler, restore_flags):
     from trading_bot.config import settings
 

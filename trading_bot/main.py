@@ -574,16 +574,20 @@ class TradingBot:
             ob_detector = OrderBlockDetector()
             liquidity_mapper = LiquidityMapper()
             
+            # One kill-zone checker for strategy + scanner + /apply.
+            # Use effective sessions so STRICT_ICT_SESSIONS is honored at boot.
+            from .config import get_effective_allowed_sessions
+            self.kill_zone_checker = KillZoneChecker(
+                allowed_sessions=get_effective_allowed_sessions()
+            )
+
             # Initialize strategy (advisory baseline — see _mechanical_setup_advisory).
-            # Pass a session-configured checker so its session gate matches the bot's.
             self.strategy = ICTStrategy(
                 structure_analyzer=market_structure,
                 fvg_detector=fvg_detector,
                 ob_detector=ob_detector,
                 liquidity_mapper=liquidity_mapper,
-                kill_zone_checker=KillZoneChecker(
-                    allowed_sessions=settings.trading.allowed_sessions
-                )
+                kill_zone_checker=self.kill_zone_checker,
             )
 
             # Mechanical opportunity scanner (hot list; no Claude in scan phase)
@@ -638,11 +642,6 @@ class TradingBot:
                 await asyncio.wait_for(self._refresh_exit_overrides(), timeout=15)
             except Exception as e:
                 logger.debug(f"Exit override refresh skipped: {e}")
-            
-            # Initialize kill zone checker with allowed sessions
-            self.kill_zone_checker = KillZoneChecker(
-                allowed_sessions=settings.trading.allowed_sessions
-            )
             
             # =============================================
             # NEW: Initialize integrated services

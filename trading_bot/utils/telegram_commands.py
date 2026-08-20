@@ -1052,6 +1052,8 @@ class TelegramCommandHandler:
             return
         if spec.name == "risk" and getattr(bot, "risk_manager", None):
             bot.risk_manager.risk_per_trade = float(value)
+        if spec.name == "rr" and getattr(bot, "risk_manager", None):
+            bot.risk_manager.min_risk_reward = float(value)
         if spec.name == "hot":
             scanner = getattr(bot, "opportunity_scanner", None)
             hot = getattr(scanner, "hot", None) if scanner is not None else None

@@ -29,7 +29,7 @@ def handler(monkeypatch):
         _skip_snapshot,
     )
     bot = SimpleNamespace(
-        risk_manager=SimpleNamespace(risk_per_trade=0.01),
+        risk_manager=SimpleNamespace(risk_per_trade=0.01, min_risk_reward=3.0),
         scaling_manager=SimpleNamespace(
             current_mode=TradingMode.NORMAL,
             current_tier="t1",
@@ -112,6 +112,16 @@ async def test_set_risk_rejects_above_max(handler, restore_values):
     assert settings.trading.risk_per_trade == pytest.approx(0.01)
     text = handler._reply.await_args.args[0]
     assert "max" in text.lower()
+
+
+@pytest.mark.asyncio
+async def test_set_rr_updates_risk_manager(handler, restore_values):
+    from trading_bot.config import settings
+
+    settings.trading.min_risk_reward = 3.0
+    await handler._cmd_set(["rr", "2"])
+    assert settings.trading.min_risk_reward == pytest.approx(2.0)
+    assert handler._bot.risk_manager.min_risk_reward == pytest.approx(2.0)
 
 
 @pytest.mark.asyncio
