@@ -428,6 +428,8 @@ class TradingBot:
 
         self.opportunity_scanner = None
         self._opportunity_scan_task = None
+        lock = (getattr(settings.trading, "telegram_mode_lock", "") or "").strip().lower()
+        self._telegram_mode_lock = "" if lock in ("", "auto") else lock
         
         # Dynamic learnings: throttle doc updates to at most once per hour
         self._last_learnings_update: Optional[datetime] = None
@@ -718,6 +720,11 @@ class TradingBot:
                 logger.info("Scaling mode set to AGGRESSIVE (demo data collection)")
                 from .api.routes.activity import add_activity
                 add_activity("mode_change", "Trading mode set to AGGRESSIVE (init)", details={"mode": "AGGRESSIVE", "reason": "demo data collection"})
+            elif self._telegram_mode_lock in ("conservative", "normal", "aggressive"):
+                self.scaling_manager.current_mode = TradingMode(self._telegram_mode_lock)
+                logger.info(
+                    f"Scaling mode locked from Telegram: {self._telegram_mode_lock}"
+                )
             else:
                 logger.info("Scaling mode left at NORMAL (live/production account)")
             
@@ -1013,6 +1020,90 @@ class TradingBot:
             except Exception as e:
                 logger.warning(f"[SCAN] scan loop error: {e}")
             await asyncio.sleep(interval)
+
+    async def apply_runtime_config(self) -> dict:
+        """
+        Apply live settings that do not take effect from mutation alone.
+
+        1. Start/stop the opportunity scanner from opportunity_scanner_should_run().
+        2. Rebuild kill-zone allowed sessions from get_effective_allowed_sessions().
+        3. Resync MT5 symbol specs for settings.trading.symbols.
+        """
+        from .analysis.kill_zones import KillZoneChecker
+        from .config import (
+            get_effective_allowed_sessions,
+            opportunity_scanner_should_run,
+            update_symbol_spec_from_mt5,
+        )
+
+        result = {
+            "scanner": "unchanged",
+            "sessions": [],
+            "symbols_synced": [],
+            "symbols_failed": [],
+        }
+
+        should_run = opportunity_scanner_should_run()
+        task = getattr(self, "_opportunity_scan_task", None)
+        running = task is not None and not task.done()
+        if should_run and not running:
+            if not getattr(self, "running", False):
+                result["scanner"] = "skipped (bot not running)"
+            else:
+                self._opportunity_scan_task = asyncio.create_task(
+                    self._opportunity_scan_loop()
+                )
+                result["scanner"] = "started"
+                logger.info("Opportunity scanner started via apply_runtime_config")
+        elif not should_run and running:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._opportunity_scan_task = None
+            result["scanner"] = "stopped"
+            logger.info("Opportunity scanner stopped via apply_runtime_config")
+        else:
+            result["scanner"] = "running" if running else "idle"
+
+        sessions = get_effective_allowed_sessions()
+        result["sessions"] = list(sessions)
+        checker = KillZoneChecker(allowed_sessions=sessions)
+        self.kill_zone_checker = checker
+        if self.strategy is not None:
+            self.strategy.kill_zone_checker = checker
+        if self.opportunity_scanner is not None:
+            self.opportunity_scanner.kill_zone_checker = checker
+
+        mt5 = getattr(self, "mt5_client", None)
+        if mt5 is None:
+            result["symbols_failed"] = list(settings.trading.symbols)
+        else:
+            for symbol in list(settings.trading.symbols):
+                try:
+                    info = await mt5.get_symbol_info(symbol)
+                    if not info:
+                        result["symbols_failed"].append(symbol)
+                        continue
+                    update_symbol_spec_from_mt5(
+                        symbol=symbol,
+                        trade_contract_size=info.trade_contract_size,
+                        point=info.point,
+                        digits=info.digits,
+                        tick_value=info.trade_tick_value,
+                        volume_min=info.volume_min,
+                        volume_max=info.volume_max,
+                        volume_step=info.volume_step,
+                        swap_long=info.swap_long,
+                        swap_short=info.swap_short,
+                    )
+                    result["symbols_synced"].append(symbol)
+                except Exception as exc:
+                    logger.warning(f"apply_runtime_config spec sync failed for {symbol}: {exc}")
+                    result["symbols_failed"].append(symbol)
+
+        return result
 
     async def _position_management_loop(self):
         """
@@ -1439,20 +1530,45 @@ class TradingBot:
             
             self._day_of_week_mode_locked = False  # Reset each cycle
             _data_collection = self._should_use_aggressive_data_collection()
-            if _data_collection:
-                # Paper/demo validation: keep AGGRESSIVE; skip Mon/Fri CONSERVATIVE lock
+            _mode_lock = getattr(self, "_telegram_mode_lock", "") or ""
+            from .services.telegram_settings import (
+                normalize_mode_lock,
+                resolve_telegram_locked_mode,
+            )
+
+            _auto_mode = None
+            if self.scaling_manager and normalize_mode_lock(_mode_lock):
+                try:
+                    account = await self.mt5_client.get_account_info()
+                    if account:
+                        _auto_mode = self.scaling_manager.determine_mode(account.balance)
+                except Exception as e:
+                    logger.warning(f"Mode lock defensive check failed: {e}")
+
+            _forced = resolve_telegram_locked_mode(
+                _mode_lock,
+                auto_mode=_auto_mode,
+                data_collection=_data_collection,
+            )
+            if _forced is not None:
                 if self.scaling_manager:
                     _prev_mode = self.scaling_manager.current_mode
-                    self.scaling_manager.current_mode = TradingMode.AGGRESSIVE
+                    self.scaling_manager.current_mode = _forced
+                    if _forced == TradingMode.DEFENSIVE:
+                        _reason = "defensive_overrides_telegram_lock"
+                    elif _data_collection:
+                        _reason = "demo_data_collection"
+                    else:
+                        _reason = "telegram_mode_lock"
                     if self.scaling_manager.current_mode != _prev_mode:
                         from .api.routes.activity import add_activity
                         add_activity(
                             "mode_change",
-                            "Trading mode set to AGGRESSIVE (data collection)",
+                            f"Trading mode changed to {_forced.value}",
                             details={
-                                "mode": "AGGRESSIVE",
+                                "mode": _forced.value,
                                 "previous": _prev_mode.value,
-                                "reason": "demo_data_collection",
+                                "reason": _reason,
                             },
                         )
             elif _weekday == 0:  # Monday - manipulation day

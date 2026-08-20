@@ -606,6 +606,15 @@ class TradingSettings(BaseSettings):
             "Env: TRADING_OPPORTUNITY_SCANNER_MIN_CONFIDENCE"
         ),
     )
+    telegram_mode_lock: str = Field(
+        default="",
+        description=(
+            "When set to conservative/normal/aggressive, Telegram /mode lock "
+            "skips Mon/Fri and performance auto-promote. Empty or 'auto' "
+            "clears the lock. DEFENSIVE always wins. "
+            "Env: TRADING_TELEGRAM_MODE_LOCK"
+        ),
+    )
 
 
 class TimeframeSettings(BaseSettings):

@@ -273,6 +273,7 @@ class TelegramCommandHandler:
         self._running = False
         self._update_offset = 0
         self._task: Optional[asyncio.Task] = None
+        self._pending_change = None
         
         # Command registry: command -> (handler_method, description)
         self._commands = {
@@ -302,10 +303,17 @@ class TelegramCommandHandler:
             '/analysis': (self._cmd_analysis, 'Last signal for a symbol'),
             '/scan': (self._cmd_scan, 'Run opportunity scanner now'),
             '/hot': (self._cmd_hot, 'Show opportunity hot list'),
-            # Configuration
-            '/symbols': (self._cmd_symbols, 'Trading symbols'),
-            '/mode': (self._cmd_mode, 'Scaling mode &amp; tier'),
+            # Configuration (allowlisted; no raw .env / secrets)
+            '/flags': (self._cmd_flags, 'Show allowlisted flags'),
+            '/toggle': (self._cmd_toggle, 'Set a flag (on/off or mode)'),
+            '/set': (self._cmd_set, 'Set a numeric parameter'),
+            '/symbol': (self._cmd_symbol, 'Add or remove a symbol'),
+            '/symbols': (self._cmd_symbols, 'List trading symbols'),
+            '/mode': (self._cmd_mode, 'Lock scaling mode or auto'),
             '/config': (self._cmd_config, 'Key trading parameters'),
+            '/apply': (self._cmd_apply, 'Apply scanner / sessions / symbols'),
+            '/yes': (self._cmd_yes, 'Confirm a pending change'),
+            '/no': (self._cmd_no, 'Cancel a pending change'),
         }
     
     def set_bot_instance(self, bot):
@@ -428,7 +436,10 @@ class TelegramCommandHandler:
             "Performance": ['/pnl', '/stats', '/goal', '/session', '/daily', '/weekly'],
             "Trade Actions": ['/close', '/closeall', '/stop', '/start', '/modify'],
             "Market Intel": ['/news', '/calendar', '/analysis', '/scan', '/hot'],
-            "Configuration": ['/symbols', '/mode', '/config'],
+            "Configuration": [
+                '/flags', '/toggle', '/set', '/symbol', '/symbols',
+                '/mode', '/config', '/apply', '/yes', '/no',
+            ],
         }
         
         for category, cmds in categories.items():
@@ -1007,9 +1018,234 @@ class TelegramCommandHandler:
         await self._reply("\n".join(lines))
     
     # =========================================================================
-    # CONFIGURATION COMMANDS
+    # CONFIGURATION COMMANDS (allowlisted — no raw .env / secrets)
     # =========================================================================
-    
+
+    def _schedule_snapshot(self, config_type: str, config_data: dict, reason: str):
+        from ..services.telegram_settings import try_save_config_snapshot
+
+        try:
+            asyncio.get_running_loop().create_task(
+                try_save_config_snapshot(config_type, config_data, reason)
+            )
+        except RuntimeError:
+            pass
+
+    def _clear_pending(self):
+        self._pending_change = None
+
+    def _pending_or_none(self):
+        from ..services.telegram_settings import is_pending_expired
+
+        pending = self._pending_change
+        if pending is None:
+            return None
+        if is_pending_expired(pending.expires):
+            self._clear_pending()
+            return None
+        return pending
+
+    def _sync_live_runtime(self, spec, value):
+        """Push a live setting onto objects that cache a copy at init."""
+        bot = self._bot
+        if not bot:
+            return
+        if spec.name == "risk" and getattr(bot, "risk_manager", None):
+            bot.risk_manager.risk_per_trade = float(value)
+        if spec.name == "hot":
+            scanner = getattr(bot, "opportunity_scanner", None)
+            hot = getattr(scanner, "hot", None) if scanner is not None else None
+            if hot is not None and hasattr(hot, "max_size"):
+                hot.max_size = int(value)
+
+    async def _stage_or_apply_setting(self, spec, value):
+        from ..services.telegram_settings import (
+            apply_setting,
+            format_value,
+            is_dangerous_change,
+            new_pending,
+        )
+
+        current = None
+        try:
+            from ..services.telegram_settings import get_current
+
+            current = get_current(spec)
+        except Exception:
+            current = None
+        if current == value:
+            await self._reply(
+                f"{spec.name} is already <code>{html.escape(format_value(spec, value))}</code>."
+            )
+            return
+
+        if is_dangerous_change(spec, value):
+            pending = new_pending("setting", spec.name, value)
+            self._pending_change = pending
+            await self._reply(
+                "<b>Confirm dangerous change</b>\n\n"
+                f"  {html.escape(spec.name)}: "
+                f"{html.escape(format_value(spec, current))} → "
+                f"{html.escape(format_value(spec, value))}\n\n"
+                f"Reply <code>/yes {pending.code}</code> within 60s or /no to cancel."
+            )
+            return
+
+        result = apply_setting(spec, value)
+        self._sync_live_runtime(spec, result.new)
+        self._schedule_snapshot(
+            "telegram_setting",
+            {"name": spec.name, "old": result.old, "new": result.new},
+            f"telegram /toggle|/set {spec.name}",
+        )
+        await self._reply(self._format_apply_result(spec, result))
+
+    def _format_apply_result(self, spec, result) -> str:
+        from ..services.telegram_settings import format_value
+
+        lines = [
+            f"<b>{html.escape(spec.name)}</b> "
+            f"{html.escape(format_value(spec, result.old))} → "
+            f"{html.escape(format_value(spec, result.new))}"
+        ]
+        if result.needs_apply:
+            lines.append("Runtime not updated yet — send /apply.")
+        if spec.name == "window":
+            lines.append("Scanner auto-run follows this window — send /apply to sync.")
+        if spec.name == "scanner":
+            lines.append("Scanner start/stop needs /apply (ny_open still auto-runs it).")
+        return "\n".join(lines)
+
+    async def _cmd_flags(self, args):
+        """Show allowlisted flags and current values."""
+        from ..services.telegram_settings import format_value, list_flag_specs
+
+        lines = ["<b>Flags</b> (allowlisted — /toggle name value)\n"]
+        for spec in list_flag_specs():
+            marker = " *" if spec.apply == "needs_apply" else ""
+            lines.append(
+                f"  <code>{spec.name}</code> = "
+                f"{html.escape(format_value(spec))}{marker}"
+            )
+        lines.append("\n* needs /apply after change")
+        await self._reply("\n".join(lines))
+
+    async def _cmd_toggle(self, args):
+        """Toggle or set an allowlisted flag."""
+        from ..services.telegram_settings import SettingError, get_spec, parse_toggle
+
+        if not args:
+            await self._reply(
+                "Usage: <code>/toggle name [value]</code>\n"
+                "Names: trust ict lean window news pyramid scanner dryrun demo strictkz\n"
+                "Send /flags to see current values."
+            )
+            return
+        try:
+            spec = get_spec(args[0])
+            if spec.kind not in ("bool", "mode") or spec.name == "modelock":
+                raise SettingError(f"{spec.name} is set with /set or /mode, not /toggle")
+            raw = args[1] if len(args) > 1 else None
+            value = parse_toggle(spec, raw)
+        except SettingError as exc:
+            await self._reply(html.escape(str(exc)))
+            return
+        await self._stage_or_apply_setting(spec, value)
+
+    async def _cmd_set(self, args):
+        """Set an allowlisted numeric parameter."""
+        from ..services.telegram_settings import (
+            SettingError,
+            format_value,
+            get_spec,
+            list_value_specs,
+            parse_set,
+        )
+
+        if not args:
+            lines = ["<b>Settable values</b> (usage: /set name value)\n"]
+            for spec in list_value_specs():
+                span = ""
+                if spec.min_value is not None and spec.max_value is not None:
+                    span = (
+                        f" ({format_value(spec, spec.min_value)}–"
+                        f"{format_value(spec, spec.max_value)})"
+                    )
+                lines.append(
+                    f"  <code>{spec.name}</code> = "
+                    f"{html.escape(format_value(spec))}{html.escape(span)}"
+                )
+            lines.append("\nNo raw lot override — use risk / maxlot / exposure.")
+            await self._reply("\n".join(lines))
+            return
+        try:
+            spec = get_spec(args[0])
+            if spec.name not in {s.name for s in list_value_specs()}:
+                raise SettingError(f"{spec.name} is not a /set value — try /toggle or /mode")
+            raw = " ".join(args[1:]) if len(args) > 1 else None
+            value = parse_set(spec, raw)
+        except SettingError as exc:
+            await self._reply(html.escape(str(exc)))
+            return
+        await self._stage_or_apply_setting(spec, value)
+
+    async def _cmd_symbol(self, args):
+        """Add or remove a trading symbol."""
+        from ..config import settings
+        from ..services.telegram_settings import (
+            SettingError,
+            apply_symbols,
+            validate_symbol,
+        )
+
+        if not args or args[0].lower() not in ("add", "rm", "remove", "del"):
+            await self._reply(
+                "Usage: <code>/symbol add EURUSD</code> or "
+                "<code>/symbol rm EURUSD</code>\n"
+                "Send /symbols to list. New symbols need /apply for MT5 specs."
+            )
+            return
+        action = args[0].lower()
+        if len(args) < 2:
+            await self._reply("Missing symbol. Example: <code>/symbol add EURUSD</code>")
+            return
+        extra = None
+        if self._bot and getattr(self._bot, "BLOCKED_PAIRS", None):
+            extra = self._bot.BLOCKED_PAIRS
+        try:
+            symbol = validate_symbol(args[1], extra)
+        except SettingError as exc:
+            await self._reply(html.escape(str(exc)))
+            return
+
+        current = [str(s).upper() for s in settings.trading.symbols]
+        if action == "add":
+            if symbol in current:
+                await self._reply(f"{html.escape(symbol)} is already in the list.")
+                return
+            new_list = current + [symbol]
+        else:
+            if symbol not in current:
+                await self._reply(f"{html.escape(symbol)} is not in the list.")
+                return
+            new_list = [s for s in current if s != symbol]
+            if not new_list:
+                await self._reply("Refusing to remove the last trading symbol.")
+                return
+
+        result = apply_symbols(new_list)
+        self._schedule_snapshot(
+            "telegram_symbols",
+            {"old": result.old, "new": result.new},
+            f"telegram /symbol {action} {symbol}",
+        )
+        verb = "added" if action == "add" else "removed"
+        await self._reply(
+            f"{html.escape(symbol)} {verb}.\n"
+            f"Symbols: {html.escape(', '.join(result.new))}\n"
+            "Send /apply to resync MT5 specs."
+        )
+
     async def _cmd_symbols(self, args):
         """Show trading symbols."""
         try:
@@ -1023,36 +1259,186 @@ class TelegramCommandHandler:
                 is_open, reason = is_market_open(sym)
                 status = "OPEN" if is_open else "CLOSED"
                 lines.append(f"  {sym} ({mtype.value}) - {status}")
+            lines.append("\nUse <code>/symbol add|rm NAME</code> to change the list.")
             
             await self._reply("\n".join(lines))
         except Exception as e:
             await self._reply(f"Symbols error: {e}")
-    
-    async def _cmd_mode(self, args):
-        """Scaling mode and tier."""
-        bot = self._bot
-        if not bot or not bot.scaling_manager:
-            await self._reply("Scaling manager not available.")
-            return
-        
-        sm = bot.scaling_manager
-        mode = getattr(sm, 'current_mode', 'unknown')
-        tier = getattr(sm, 'current_tier', 'unknown')
-        risk = getattr(sm, 'current_risk_pct', 0)
-        
-        msg = f"""<b>Scaling Status</b>
 
-<b>Mode:</b> {mode}
-<b>Tier:</b> {tier}
-<b>Risk Per Trade:</b> {risk:.1%}"""
-        
-        await self._reply(msg)
+    async def _cmd_mode(self, args):
+        """Show or lock scaling mode. /mode auto clears the lock."""
+        from ..services.telegram_settings import (
+            is_dangerous_mode,
+            new_pending,
+        )
+
+        bot = self._bot
+        sm = getattr(bot, "scaling_manager", None) if bot else None
+        lock = ""
+        if bot:
+            lock = (getattr(bot, "_telegram_mode_lock", "") or "").strip().lower()
+        if not lock:
+            try:
+                from ..config import settings
+
+                lock = (getattr(settings.trading, "telegram_mode_lock", "") or "").strip().lower()
+            except Exception:
+                lock = ""
+        if lock in ("auto",):
+            lock = ""
+
+        if not args:
+            if not sm:
+                await self._reply("Scaling manager not available.")
+                return
+            mode = getattr(sm, "current_mode", "unknown")
+            mode_s = mode.value if hasattr(mode, "value") else str(mode)
+            tier = getattr(sm, "current_tier", "unknown")
+            risk = getattr(sm, "current_risk_pct", 0) or 0
+            lock_s = lock or "auto"
+            await self._reply(
+                "<b>Scaling Status</b>\n\n"
+                f"<b>Mode:</b> {html.escape(mode_s)}\n"
+                f"<b>Lock:</b> {html.escape(lock_s)}\n"
+                f"<b>Tier:</b> {html.escape(str(tier))}\n"
+                f"<b>Risk Per Trade:</b> {float(risk):.1%}\n\n"
+                "Usage: <code>/mode conservative|normal|aggressive|auto</code>"
+            )
+            return
+
+        target = args[0].strip().lower()
+        if target not in ("conservative", "normal", "aggressive", "auto"):
+            await self._reply(
+                "Usage: <code>/mode conservative|normal|aggressive|auto</code>"
+            )
+            return
+
+        if target != "auto" and is_dangerous_mode(target):
+            pending = new_pending("mode", "mode", target)
+            self._pending_change = pending
+            await self._reply(
+                "<b>Confirm dangerous change</b>\n\n"
+                f"  mode → {html.escape(target)}\n\n"
+                f"Reply <code>/yes {pending.code}</code> within 60s or /no to cancel."
+            )
+            return
+
+        await self._apply_mode_lock(target)
+
+    async def _apply_mode_lock(self, target: str):
+        from ..services.scaling_manager import TradingMode
+        from ..services.telegram_settings import MODE_LOCK_SPEC, apply_setting
+
+        persist_value = "" if target == "auto" else target
+        apply_setting(MODE_LOCK_SPEC, persist_value)
+        self._schedule_snapshot(
+            "telegram_mode_lock",
+            {"lock": persist_value},
+            f"telegram /mode {target}",
+        )
+
+        bot = self._bot
+        if bot is not None:
+            bot._telegram_mode_lock = persist_value
+            sm = getattr(bot, "scaling_manager", None)
+            if sm is not None and target != "auto":
+                current = getattr(sm, "current_mode", None)
+                if current != TradingMode.DEFENSIVE:
+                    sm.current_mode = TradingMode(target)
+
+        if target == "auto":
+            await self._reply(
+                "Mode lock cleared. Next cycle will pick conservative/normal "
+                "from day-of-week and performance. DEFENSIVE still always wins."
+            )
+        else:
+            await self._reply(
+                f"Mode locked to <b>{html.escape(target)}</b>. "
+                "Mon/Fri and performance auto-promote are skipped. "
+                "DEFENSIVE still always wins. /mode auto to unlock."
+            )
+
+    async def _cmd_yes(self, args):
+        """Confirm a pending dangerous change."""
+        from ..services.telegram_settings import SettingError, get_spec, is_pending_expired
+
+        pending = self._pending_change
+        if pending is None:
+            await self._reply("No pending change.")
+            return
+        if is_pending_expired(pending.expires):
+            self._clear_pending()
+            await self._reply("Pending change expired. Request it again.")
+            return
+        if not args:
+            await self._reply(f"Usage: <code>/yes {pending.code}</code>")
+            return
+        code = args[0].strip()
+        if code != pending.code:
+            await self._reply("Code does not match. Send /no to cancel.")
+            return
+
+        self._clear_pending()
+        if pending.kind == "mode":
+            await self._apply_mode_lock(str(pending.value))
+            return
+        try:
+            spec = get_spec(pending.name)
+        except SettingError as exc:
+            await self._reply(html.escape(str(exc)))
+            return
+        from ..services.telegram_settings import apply_setting
+
+        result = apply_setting(spec, pending.value)
+        self._sync_live_runtime(spec, result.new)
+        self._schedule_snapshot(
+            "telegram_setting",
+            {"name": spec.name, "old": result.old, "new": result.new},
+            f"telegram /yes {spec.name}",
+        )
+        await self._reply(self._format_apply_result(spec, result))
+
+    async def _cmd_no(self, args):
+        """Cancel a pending dangerous change."""
+        if self._pending_change is None:
+            await self._reply("No pending change.")
+            return
+        self._clear_pending()
+        await self._reply("Pending change cancelled.")
+
+    async def _cmd_apply(self, args):
+        """Apply scanner, kill-zone sessions, and MT5 symbol specs."""
+        bot = self._bot
+        if not bot or not hasattr(bot, "apply_runtime_config"):
+            await self._reply("Bot is not running — start it, then /apply.")
+            return
+        try:
+            result = await bot.apply_runtime_config()
+        except Exception as exc:
+            await self._reply(f"Apply failed: {html.escape(str(exc)[:200])}")
+            return
+        scanner = result.get("scanner", "unchanged")
+        sessions = result.get("sessions") or []
+        synced = result.get("symbols_synced") or []
+        failed = result.get("symbols_failed") or []
+        lines = [
+            "<b>Runtime applied</b>",
+            f"Scanner: {html.escape(str(scanner))}",
+            f"Sessions: {html.escape(', '.join(sessions) or '(default)')}",
+        ]
+        if synced:
+            lines.append(f"MT5 specs synced: {html.escape(', '.join(synced))}")
+        if failed:
+            lines.append(f"MT5 specs failed: {html.escape(', '.join(failed))}")
+        await self._reply("\n".join(lines))
     
     async def _cmd_config(self, args):
         """Show key trading parameters."""
         try:
             from ..config import settings
+            from ..services.telegram_settings import format_value, get_spec
             
+            lock = (getattr(settings.trading, "telegram_mode_lock", "") or "").strip()
             msg = f"""<b>Trading Configuration</b>
 
 <b>Risk Per Trade:</b> {settings.trading.risk_per_trade:.1%}
@@ -1062,7 +1448,12 @@ class TelegramCommandHandler:
 <b>Max Exposure:</b> {settings.trading.max_total_exposure}
 <b>Max Daily DD:</b> {settings.trading.max_daily_drawdown:.1%}
 <b>Max Weekly DD:</b> {settings.trading.max_weekly_drawdown:.1%}
-<b>Sessions:</b> {', '.join(settings.trading.allowed_sessions)}"""
+<b>Sessions:</b> {', '.join(settings.trading.allowed_sessions)}
+<b>Mode lock:</b> {html.escape(lock or 'auto')}
+<b>Trust:</b> {html.escape(format_value(get_spec('trust')))}
+<b>Window:</b> {html.escape(format_value(get_spec('window')))}
+
+Change flags with /flags /toggle, numbers with /set, mode with /mode."""
             
             await self._reply(msg)
         except Exception as e:
