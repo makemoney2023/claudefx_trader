@@ -760,7 +760,7 @@ class ClaudeAnalysisStage:
             )
         
         # Save signal to the signals store (for dashboard display)
-        bot._save_signal(symbol, trade_signal, analysis_results)
+        bot._save_signal(symbol, trade_signal, analysis_results, claude_result)
         asyncio.create_task(broadcast_analysis_update(symbol, {
             "direction": trade_signal.direction,
             "confidence": trade_signal.confidence,

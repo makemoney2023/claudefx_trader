@@ -356,6 +356,39 @@ class GateFunnel:
             logger.error(f"Failed to compute gate analytics: {exc}")
             return {}
 
+    async def get_latest_decision(
+        self,
+        symbol: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the most recent terminal decision, optionally filtered by symbol."""
+        try:
+            async with self._session_maker() as db_session:
+                query = select(SignalDecisionModel).order_by(
+                    SignalDecisionModel.timestamp.desc()
+                )
+                if symbol:
+                    query = query.where(SignalDecisionModel.symbol == symbol.upper())
+                result = await db_session.execute(query.limit(1))
+                row = result.scalar_one_or_none()
+            if not row:
+                return None
+            return {
+                "symbol": row.symbol,
+                "outcome_type": row.outcome_type,
+                "gate_id": row.gate_id,
+                "reason": row.reason,
+                "judge_verdict": row.judge_verdict,
+                "direction": row.direction,
+                "timestamp": row.timestamp,
+                "confidence": row.confidence,
+                "entry": row.entry,
+                "sl": row.sl,
+                "tp": row.tp,
+            }
+        except Exception as exc:
+            logger.debug(f"get_latest_decision failed: {exc}")
+            return None
+
     async def record_post_block_mfe_async(self, gate_block_id: int, mfe_r: float) -> bool:
         try:
             async with self._session_maker() as conn:

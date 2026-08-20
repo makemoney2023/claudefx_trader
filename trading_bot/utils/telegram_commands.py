@@ -6,13 +6,251 @@ to query bot state, manage trades, and view analytics.
 """
 
 import asyncio
+import html
 from datetime import datetime, timedelta
-from typing import Optional, Any
+from typing import Any, Dict, List, Optional, Tuple
 
 from .logging import get_logger
 from .notifications import get_notifier
 
 logger = get_logger(__name__)
+
+TELEGRAM_MESSAGE_LIMIT = 4096
+_ACTIVITY_SOFT_LIMIT = 3800
+
+_PASS_OUTCOMES = frozenset({
+    "market_filled",
+    "pending_placed",
+    "pending_filled",
+})
+_DEMOTE_OUTCOMES = frozenset({"judge_demote"})
+
+
+def classify_signal_outcome(outcome_type: Optional[str]) -> str:
+    """Map a terminal decision to PASS / FAIL / DEMOTE / PENDING."""
+    raw = (outcome_type or "").strip().lower()
+    if not raw:
+        return "PENDING"
+    if raw in _PASS_OUTCOMES:
+        return "PASS"
+    if raw in _DEMOTE_OUTCOMES:
+        return "DEMOTE"
+    return "FAIL"
+
+
+def _fmt_price(value: Any) -> str:
+    try:
+        if value is None or value == "":
+            return "—"
+        num = float(value)
+        if num == 0:
+            return "—"
+        if abs(num) >= 100:
+            return f"{num:.2f}"
+        return f"{num:.5f}"
+    except (TypeError, ValueError):
+        return str(value) if value else "—"
+
+
+def _fmt_list(values: Any) -> str:
+    if not values:
+        return "—"
+    if isinstance(values, str):
+        return values
+    if isinstance(values, dict):
+        return ", ".join(f"{k}={v}" for k, v in values.items() if v not in (None, ""))
+    items = [str(v) for v in values if v not in (None, "")]
+    return ", ".join(items) if items else "—"
+
+
+def format_last_signal_activity(
+    signal: Optional[Dict[str, Any]],
+    decision: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Build the /activity reply: last Claude signal, pass/fail, full analysis."""
+    if not signal:
+        return "No recent Claude signal yet."
+
+    decision = decision or {}
+    symbol = html.escape(str(signal.get("symbol") or decision.get("symbol") or "?"))
+    direction = html.escape(str(signal.get("direction") or decision.get("direction") or "n/a").upper())
+    outcome_type = decision.get("outcome_type") or ""
+    verdict = classify_signal_outcome(outcome_type)
+    gate_id = decision.get("gate_id") or ""
+    reason = decision.get("reason") or ""
+    judge = decision.get("judge_verdict") or ""
+    timestamp = signal.get("timestamp") or decision.get("timestamp") or ""
+    if hasattr(timestamp, "isoformat"):
+        timestamp = timestamp.isoformat()
+    ts_display = html.escape(str(timestamp)[:19].replace("T", " "))
+
+    confidence = signal.get("confidence")
+    try:
+        conf_pct = f"{float(confidence):.0%}" if confidence is not None else "—"
+    except (TypeError, ValueError):
+        conf_pct = "—"
+
+    rr = signal.get("risk_reward")
+    try:
+        rr_str = f"{float(rr):.1f}" if rr not in (None, "") else "—"
+    except (TypeError, ValueError):
+        rr_str = "—"
+
+    trade_type = html.escape(str(signal.get("trade_type") or "intraday"))
+    order_type = html.escape(str(signal.get("order_type") or "market"))
+    structure = html.escape(str(signal.get("market_structure") or "—"))
+    amd = html.escape(str(signal.get("amd_phase") or "—"))
+
+    outcome_label = html.escape(str(outcome_type or "pending"))
+    gate_bit = f" ({html.escape(str(gate_id))})" if gate_id else ""
+    fail_reason = html.escape(str(reason)) if reason else "—"
+    judge_bit = f"\n<b>Judge:</b> {html.escape(str(judge))}" if judge else ""
+
+    reasoning = str(signal.get("reasoning") or "").strip() or "No Claude reasoning stored."
+    reasoning = html.escape(reasoning)
+
+    lines = [
+        "<b>Last Signal</b>",
+        f"<b>{symbol}</b> {direction} — <b>{verdict}</b>",
+        f"<b>Time:</b> {ts_display or '—'}",
+        f"<b>Outcome:</b> {outcome_label}{gate_bit}",
+        f"<b>Pass/Fail reason:</b> {fail_reason}{judge_bit}",
+        "",
+        "<b>Claude Analysis</b>",
+        f"<b>Type:</b> {trade_type}  |  <b>Order:</b> {order_type}",
+        f"<b>Confidence:</b> {conf_pct}  |  <b>R:R:</b> {rr_str}",
+        f"<b>Structure:</b> {structure}  |  <b>AMD:</b> {amd}",
+        f"<b>Entry:</b> {_fmt_price(signal.get('entry_price'))}",
+        f"<b>SL:</b> {_fmt_price(signal.get('stop_loss'))}",
+        f"<b>TP:</b> {_fmt_price(signal.get('take_profit'))}",
+        f"<b>Order blocks:</b> {html.escape(_fmt_list(signal.get('order_blocks')))}",
+        f"<b>FVGs:</b> {html.escape(_fmt_list(signal.get('fvg_zones')))}",
+        f"<b>Liquidity:</b> {html.escape(_fmt_list(signal.get('liquidity_targets')))}",
+        f"<b>Warnings:</b> {html.escape(_fmt_list(signal.get('warnings')))}",
+        "",
+        "<b>Reasoning</b>",
+        reasoning,
+    ]
+    text = "\n".join(lines)
+    if len(text) > _ACTIVITY_SOFT_LIMIT:
+        text = text[: _ACTIVITY_SOFT_LIMIT - 20].rstrip() + "\n…(truncated)"
+    if len(text) > TELEGRAM_MESSAGE_LIMIT:
+        text = text[: TELEGRAM_MESSAGE_LIMIT - 16].rstrip() + "\n…(truncated)"
+    return text
+
+
+def _latest_memory_signal(bot: Any) -> Optional[Dict[str, Any]]:
+    cached = getattr(bot, "_last_claude_signal", None) if bot else None
+    if isinstance(cached, dict) and cached.get("symbol"):
+        return dict(cached)
+    try:
+        from ..api.routes.analysis import get_signals
+
+        signals = get_signals(limit=1)
+        if signals:
+            return dict(signals[0])
+    except Exception:
+        pass
+    per_symbol = getattr(bot, "_last_signal_per_symbol", None) if bot else None
+    if isinstance(per_symbol, dict) and per_symbol:
+        newest: Optional[Tuple[str, Dict[str, Any]]] = None
+        for sym, payload in per_symbol.items():
+            if not isinstance(payload, dict):
+                continue
+            ts = str(payload.get("timestamp") or "")
+            if newest is None or ts >= newest[0]:
+                row = dict(payload)
+                row.setdefault("symbol", sym)
+                newest = (ts, row)
+        if newest:
+            return newest[1]
+    return None
+
+
+async def _latest_db_signal(symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    try:
+        from ..api.database import AnalysisLogModel, async_session
+        from sqlalchemy import desc, select
+
+        async with async_session() as session:
+            query = select(AnalysisLogModel).order_by(desc(AnalysisLogModel.timestamp))
+            if symbol:
+                query = query.where(AnalysisLogModel.symbol == symbol)
+            result = await session.execute(query.limit(1))
+            row = result.scalar_one_or_none()
+        if not row:
+            return None
+        return {
+            "symbol": row.symbol,
+            "direction": row.signal_direction,
+            "confidence": row.confidence,
+            "reasoning": row.reasoning,
+            "market_structure": row.market_structure,
+            "entry_price": row.entry_price,
+            "stop_loss": row.stop_loss,
+            "take_profit": row.take_profit,
+            "trade_type": row.trade_type,
+            "timestamp": row.timestamp,
+            "judge_verdict": row.judge_verdict,
+            "judge_reason": row.judge_reason,
+            "confluence_factors": row.confluence_factors,
+        }
+    except Exception as exc:
+        logger.debug(f"/activity DB signal lookup failed: {exc}")
+        return None
+
+
+async def _latest_decision(
+    bot: Any,
+    symbol: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    cached = getattr(bot, "_last_signal_outcome", None) if bot else None
+    if isinstance(cached, dict) and (
+        not symbol or str(cached.get("symbol") or "").upper() == str(symbol).upper()
+    ):
+        return dict(cached)
+    try:
+        from ..services.gate_funnel import get_gate_funnel
+
+        row = await get_gate_funnel().get_latest_decision(symbol=symbol)
+        if row:
+            return row
+    except Exception as exc:
+        logger.debug(f"/activity decision lookup failed: {exc}")
+    return None
+
+
+async def build_activity_last_signal_reply(bot: Any = None) -> str:
+    """Resolve the latest Claude signal + gate outcome for /activity."""
+    signal = _latest_memory_signal(bot)
+    if signal is None:
+        signal = await _latest_db_signal()
+    if signal is None:
+        return "No recent Claude signal yet."
+
+    symbol = signal.get("symbol")
+    decision = await _latest_decision(bot, symbol=symbol)
+    if decision is None:
+        decision = await _latest_decision(bot, symbol=None)
+    if decision and not decision.get("reason") and signal.get("judge_reason"):
+        decision = dict(decision)
+        decision.setdefault("reason", signal.get("judge_reason"))
+        decision.setdefault("judge_verdict", signal.get("judge_verdict"))
+    if decision is None and signal.get("judge_verdict"):
+        verdict = str(signal.get("judge_verdict") or "").upper()
+        mapped = {
+            "APPROVE": "market_filled",
+            "DEMOTE": "judge_demote",
+            "REJECT": "judge_reject",
+            "UNAVAILABLE": "judge_failure",
+        }.get(verdict, "")
+        decision = {
+            "symbol": symbol,
+            "outcome_type": mapped,
+            "reason": signal.get("judge_reason") or "",
+            "judge_verdict": verdict,
+        }
+    return format_last_signal_activity(signal, decision)
 
 
 class TelegramCommandHandler:
@@ -44,7 +282,7 @@ class TelegramCommandHandler:
             '/account': (self._cmd_account, 'Account balance &amp; equity'),
             '/positions': (self._cmd_positions, 'Open positions'),
             '/orders': (self._cmd_orders, 'Pending orders'),
-            '/activity': (self._cmd_activity, 'Recent activity feed'),
+            '/activity': (self._cmd_activity, 'Last Claude signal + pass/fail'),
             # Performance & Analytics
             '/pnl': (self._cmd_pnl, 'Today\'s P/L and stats'),
             '/stats': (self._cmd_stats, 'Overall performance'),
@@ -300,33 +538,14 @@ class TelegramCommandHandler:
         await self._reply("\n".join(lines))
     
     async def _cmd_activity(self, args):
-        """Recent activity feed."""
+        """Last Claude signal, gate pass/fail, and full analysis."""
         try:
-            from ..api.routes.activity import get_activities
-            activities = get_activities(limit=10)
-        except Exception:
-            await self._reply("Activity feed not available.")
+            text = await build_activity_last_signal_reply(self._bot)
+        except Exception as exc:
+            logger.warning(f"/activity failed: {exc}")
+            await self._reply(f"Could not load last signal: {html.escape(str(exc)[:180])}")
             return
-        
-        if not activities:
-            await self._reply("No recent activity.")
-            return
-        
-        lines = ["<b>Recent Activity</b>\n"]
-        for a in activities[:10]:
-            ts = a.get('timestamp', '')[:16]
-            atype = a.get('type', 'info')
-            symbol = a.get('symbol', '')
-            msg = a.get('message', '')[:80]
-            
-            emoji = {'trade_opened': 'NEW', 'trade_closed': 'CLOSE', 
-                     'signal_generated': 'SIG', 'error': 'ERR', 
-                     'info': 'INFO', 'warning': 'WARN'}.get(atype, atype[:4].upper())
-            
-            sym_str = f" [{symbol}]" if symbol else ""
-            lines.append(f"<code>[{emoji}]{sym_str}</code> {msg}")
-        
-        await self._reply("\n".join(lines))
+        await self._reply(text)
     
     # =========================================================================
     # PERFORMANCE & ANALYTICS COMMANDS

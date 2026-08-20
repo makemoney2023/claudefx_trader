@@ -12,7 +12,7 @@ import sys
 import base64
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 
 import numpy as np
 
@@ -395,6 +395,8 @@ class TradingBot:
         
         # Cycle-to-cycle signal memory (per symbol) for reactive context
         self._last_signal_per_symbol: Dict[str, Dict[str, Any]] = {}
+        self._last_claude_signal: Optional[Dict[str, Any]] = None
+        self._last_signal_outcome: Optional[Dict[str, Any]] = None
         
         # Direction-flip cooldown tracking
         self._last_signal_direction: Dict[str, tuple] = {}  # symbol -> (direction, datetime)
@@ -2139,6 +2141,17 @@ class TradingBot:
             except Exception as _cf_err:
                 logger.debug(f"[COUNTERFACTUAL] record failed: {_cf_err}")
 
+        self._last_signal_outcome = {
+            "symbol": symbol,
+            "outcome_type": outcome_type,
+            "gate_id": gate_id,
+            "reason": reason,
+            "judge_verdict": judge_verdict,
+            "direction": direction,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "confidence": confidence,
+        }
+
         funnel = getattr(self, "gate_funnel", None) or get_gate_funnel()
         return await funnel.record_decision(
             outcome_type,
@@ -2467,22 +2480,36 @@ class TradingBot:
         png_data = signature + ihdr + idat + iend
         return base64.b64encode(png_data).decode('utf-8')
     
-    def _save_signal(self, symbol: str, trade_signal, analysis_results):
+    def _save_signal(self, symbol: str, trade_signal, analysis_results, claude_result=None):
         """Save a signal to the API signals store for dashboard display."""
         try:
             from .api.routes.analysis import add_signal
-            
+
+            structure = getattr(trade_signal, "market_structure", None)
+            if not structure:
+                ms = (analysis_results or {}).get("market_structure")
+                structure = getattr(getattr(ms, "trend", None), "value", None) or ""
+
             signal_data = {
-                'symbol': symbol,
-                'direction': trade_signal.direction,
-                'confidence': trade_signal.confidence,
-                'reasoning': trade_signal.reasoning or '',
-                'market_structure': trade_signal.market_structure or analysis_results["market_structure"].trend.value,
-                'entry_price': trade_signal.entry_price,
-                'stop_loss': trade_signal.stop_loss,
-                'take_profit': trade_signal.take_profit,
-                'risk_reward': trade_signal.risk_reward
+                "symbol": symbol,
+                "direction": trade_signal.direction,
+                "confidence": trade_signal.confidence,
+                "reasoning": trade_signal.reasoning or "",
+                "market_structure": structure,
+                "entry_price": trade_signal.entry_price,
+                "stop_loss": trade_signal.stop_loss,
+                "take_profit": trade_signal.take_profit,
+                "risk_reward": trade_signal.risk_reward,
+                "trade_type": getattr(trade_signal, "trade_type", "intraday"),
+                "order_type": getattr(trade_signal, "order_type", "market"),
+                "amd_phase": getattr(trade_signal, "amd_phase", "unknown"),
+                "order_blocks": getattr(trade_signal, "order_blocks", []) or [],
+                "fvg_zones": getattr(trade_signal, "fvg_zones", []) or [],
+                "liquidity_targets": getattr(trade_signal, "liquidity_targets", []) or [],
+                "warnings": list(getattr(claude_result, "warnings", None) or []),
+                "key_levels": dict(getattr(claude_result, "key_levels", None) or {}),
             }
+            self._last_claude_signal = dict(signal_data)
             add_signal(signal_data)
             logger.debug(f"Saved signal for {symbol}: {trade_signal.direction}")
         except Exception as e:
