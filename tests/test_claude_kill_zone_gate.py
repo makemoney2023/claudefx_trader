@@ -65,6 +65,7 @@ class TestRunnerHardSkip:
         from trading_bot.config import settings
 
         monkeypatch.setattr(settings.trading, "claude_kill_zone_only", True)
+        monkeypatch.setattr(settings.trading, "claude_analysis_window", "all_kill_zones")
 
         bot = MagicMock()
         bot._symbol_loss_cooldowns = {}
@@ -92,6 +93,7 @@ class TestRunnerHardSkip:
 
         monkeypatch.setattr(settings.trading, "claude_kill_zone_only", True)
         monkeypatch.setattr(settings.trading, "allow_simulation_trades", False)
+        monkeypatch.setattr(settings.trading, "claude_analysis_window", "all_kill_zones")
 
         bot = MagicMock()
         bot._symbol_loss_cooldowns = {}
@@ -122,6 +124,7 @@ class TestRunnerHardSkip:
 
         monkeypatch.setattr(settings.trading, "claude_kill_zone_only", True)
         monkeypatch.setattr(settings.trading, "allow_simulation_trades", False)
+        monkeypatch.setattr(settings.trading, "claude_analysis_window", "all_kill_zones")
 
         disp = SimpleNamespace(
             recent_displacements=[

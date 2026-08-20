@@ -84,9 +84,16 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
         if bot_state:
             bot_state.analyzing_symbol(symbol)
 
-        # Hard-skip Claude outside ICT kill zones (belt-and-suspenders vs cycle gate),
-        # unless metals print a fresh M5 displacement (any session).
-        from ..analysis.kill_zones import claude_analysis_allowed
+        # Hard-skip Claude outside the configured analysis window.
+        # ny_open: 30min before NY open through NY KZ end (no lean/disp punch-through).
+        # all_kill_zones: ICT KZs, unless metals print a fresh M5 displacement.
+        from ..analysis.kill_zones import (
+            claude_analysis_allowed,
+            format_claude_ny_window_label,
+            is_in_claude_ny_window,
+            minutes_until_claude_ny_window,
+        )
+        from ..config import claude_analysis_window_is_ny_open
         from ..services.analysis_cooldown import (
             PRECIOUS_METALS as _KZ_METALS,
             last_closed_bar_index,
@@ -94,8 +101,12 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
         )
         if bot.kill_zone_checker is not None:
             _kz_session = bot.kill_zone_checker.get_current_session()
+            _lead = int(getattr(settings.trading, "claude_ny_lead_minutes", 30) or 30)
+            _window = getattr(settings.trading, "claude_analysis_window", "ny_open")
+            _ny_only = claude_analysis_window_is_ny_open(_window)
+            _in_ny_window = is_in_claude_ny_window(lead_minutes=_lead)
             _disp_override = False
-            if (symbol or "").upper() in _KZ_METALS:
+            if not _ny_only and (symbol or "").upper() in _KZ_METALS:
                 try:
                     _kz_disp = await bot._fetch_m5_displacement_analysis(symbol)
                     if _kz_disp is not None:
@@ -115,12 +126,18 @@ async def run_analyze_and_trade(bot: "TradingBot", symbol: str, is_crypto: bool 
                 claude_kill_zone_only=settings.trading.claude_kill_zone_only,
                 displacement_override=_disp_override,
                 lean_active=is_liquidity_reversal_lean_active(),
+                analysis_window=_window,
+                in_ny_window=_in_ny_window,
             ):
-                next_kz = getattr(_kz_session, "next_kill_zone", None) or "next kill zone"
-                mins = getattr(_kz_session, "next_kill_zone_in_minutes", None)
+                if _ny_only:
+                    next_kz = format_claude_ny_window_label(_lead)
+                    mins = minutes_until_claude_ny_window(lead_minutes=_lead)
+                else:
+                    next_kz = getattr(_kz_session, "next_kill_zone", None) or "next kill zone"
+                    mins = getattr(_kz_session, "next_kill_zone_in_minutes", None)
                 eta = f" in {mins}min" if mins is not None else ""
                 logger.info(
-                    f"[KZ-GATE] {symbol}: Outside KZ "
+                    f"[KZ-GATE] {symbol}: Outside Claude window "
                     f"({getattr(_kz_session, 'session_name', 'unknown')}) — "
                     f"Claude skipped until {next_kz}{eta}"
                 )

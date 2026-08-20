@@ -409,8 +409,24 @@ class TradingSettings(BaseSettings):
         description=(
             "When True, hard-skip Claude analysis/judge/sizing outside ICT kill "
             "zones (London 2–5, NY 7–10, London Close 10–12 America/New_York). "
+            "Ignored when claude_analysis_window=ny_open (that window is tighter). "
             "Position sync and pending-order management stay on. Set "
             "TRADING_CLAUDE_KILL_ZONE_ONLY=false only for debugging."
+        ),
+    )
+    claude_analysis_window: str = Field(
+        default="ny_open",
+        description=(
+            "Claude spend window: 'ny_open' = 30min before NY open through NY "
+            "kill-zone end (6:30–10:00 ET by default); 'all_kill_zones' = London "
+            "+ NY + London Close. Env: TRADING_CLAUDE_ANALYSIS_WINDOW"
+        ),
+    )
+    claude_ny_lead_minutes: int = Field(
+        default=30,
+        description=(
+            "Minutes before NY open (7:00 ET) to start Claude when "
+            "claude_analysis_window=ny_open. Env: TRADING_CLAUDE_NY_LEAD_MINUTES"
         ),
     )
     dry_run: bool = Field(
@@ -671,6 +687,21 @@ settings = Settings()
 
 # ICT kill-zone sessions (London open, NY AM, London close)
 ICT_KILL_ZONE_SESSIONS: List[str] = ["london", "new_york", "london_close"]
+CLAUDE_ANALYSIS_WINDOW_NY_OPEN = "ny_open"
+CLAUDE_ANALYSIS_WINDOW_ALL_KILL_ZONES = "all_kill_zones"
+
+
+def claude_analysis_window_is_ny_open(value: Optional[str] = None) -> bool:
+    """True when Claude is restricted to the NY open window."""
+    raw = value if value is not None else settings.trading.claude_analysis_window
+    return str(raw or "").strip().lower() in ("ny_open", "ny", "new_york")
+
+
+def opportunity_scanner_should_run() -> bool:
+    """Scanner is explicit-on, or auto-on so ny_open can promote non-gold names."""
+    if bool(settings.trading.opportunity_scanner_enabled):
+        return True
+    return claude_analysis_window_is_ny_open()
 
 
 def get_effective_allowed_sessions() -> List[str]:
@@ -831,6 +862,8 @@ def get_trading_config() -> dict:
         "min_risk_reward": settings.trading.min_risk_reward,
         "allowed_sessions": settings.trading.allowed_sessions,
         "claude_kill_zone_only": settings.trading.claude_kill_zone_only,
+        "claude_analysis_window": settings.trading.claude_analysis_window,
+        "claude_ny_lead_minutes": settings.trading.claude_ny_lead_minutes,
         "liquidity_reversal_lean_mode": settings.trading.liquidity_reversal_lean_mode,
         "max_daily_drawdown": settings.trading.max_daily_drawdown,
         "max_weekly_drawdown": settings.trading.max_weekly_drawdown,

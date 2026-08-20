@@ -82,23 +82,101 @@ class SessionInfo:
     next_kill_zone_in_minutes: Optional[int] = None
 
 
+# New York kill zone (America/New_York): 7:00–10:00. Claude ``ny_open`` window
+# starts ``lead_minutes`` before the open (default 6:30) and ends at 10:00.
+NY_KILL_ZONE_START = time(7, 0)
+NY_KILL_ZONE_END = time(10, 0)
+CLAUDE_NY_WINDOW_DEFAULT_LEAD_MINUTES = 30
+
+
+def _as_new_york(dt: Optional[datetime] = None) -> datetime:
+    zone = pytz.timezone("America/New_York")
+    if dt is None:
+        return datetime.now(zone)
+    if dt.tzinfo is None:
+        return zone.localize(dt)
+    return dt.astimezone(zone)
+
+
+def _clamp_lead_minutes(lead_minutes: int) -> int:
+    try:
+        lead = int(lead_minutes)
+    except (TypeError, ValueError):
+        lead = CLAUDE_NY_WINDOW_DEFAULT_LEAD_MINUTES
+    return max(0, min(lead, 12 * 60))
+
+
+def ny_claude_window_start_minutes(lead_minutes: int = CLAUDE_NY_WINDOW_DEFAULT_LEAD_MINUTES) -> int:
+    """Minutes-from-midnight for the Claude NY warmup start."""
+    start = NY_KILL_ZONE_START.hour * 60 + NY_KILL_ZONE_START.minute
+    return start - _clamp_lead_minutes(lead_minutes)
+
+
+def is_in_claude_ny_window(
+    dt: Optional[datetime] = None,
+    *,
+    lead_minutes: int = CLAUDE_NY_WINDOW_DEFAULT_LEAD_MINUTES,
+) -> bool:
+    """True from (NY open − lead) through NY kill-zone end, inclusive."""
+    now = _as_new_york(dt)
+    current = now.hour * 60 + now.minute
+    start = ny_claude_window_start_minutes(lead_minutes)
+    end = NY_KILL_ZONE_END.hour * 60 + NY_KILL_ZONE_END.minute
+    return start <= current <= end
+
+
+def minutes_until_claude_ny_window(
+    dt: Optional[datetime] = None,
+    *,
+    lead_minutes: int = CLAUDE_NY_WINDOW_DEFAULT_LEAD_MINUTES,
+) -> int:
+    """Minutes until the next NY Claude window; 0 if already inside."""
+    if is_in_claude_ny_window(dt, lead_minutes=lead_minutes):
+        return 0
+    now = _as_new_york(dt)
+    current = now.hour * 60 + now.minute
+    start = ny_claude_window_start_minutes(lead_minutes)
+    if current < start:
+        return start - current
+    return (24 * 60 - current) + start
+
+
+def format_claude_ny_window_label(
+    lead_minutes: int = CLAUDE_NY_WINDOW_DEFAULT_LEAD_MINUTES,
+) -> str:
+    start = ny_claude_window_start_minutes(lead_minutes)
+    return (
+        f"NY Claude window "
+        f"({start // 60:02d}:{start % 60:02d}–"
+        f"{NY_KILL_ZONE_END.hour:02d}:{NY_KILL_ZONE_END.minute:02d} ET)"
+    )
+
+
 def claude_analysis_allowed(
     is_tradeable: bool,
     *,
     claude_kill_zone_only: bool = True,
     displacement_override: bool = False,
     lean_active: bool = False,
+    analysis_window: str = "all_kill_zones",
+    in_ny_window: bool = False,
 ) -> bool:
     """
     Whether Claude analysis (and judge/sizing) may run for this session.
 
-    When ``claude_kill_zone_only`` is True (default), analysis is restricted to
-    ICT kill zones where ``is_tradeable`` is True (London 2–5, NY 7–10,
-    London Close 10–12 America/New_York). Outside those windows, callers must
-    hard-skip Claude to avoid off-hours API spend — unless
-    ``displacement_override`` is True (fresh metals M5 impulse in any session)
-    or ``lean_active`` is True (liquidity_reversal_lean_mode=active).
+    ``analysis_window="ny_open"`` is the spend-control mode: Claude runs only
+    inside the NY window (open minus lead through NY kill-zone end). Lean and
+    metals displacement overrides do **not** punch through that window.
+
+    When ``analysis_window`` is ``all_kill_zones`` (legacy) and
+    ``claude_kill_zone_only`` is True, analysis is restricted to ICT kill
+    zones where ``is_tradeable`` is True (London 2–5, NY 7–10, London Close
+    10–12 America/New_York) — unless ``displacement_override`` or
+    ``lean_active`` is True.
     """
+    window = (analysis_window or "all_kill_zones").strip().lower()
+    if window in ("ny_open", "ny", "new_york"):
+        return bool(in_ny_window)
     if lean_active:
         return True
     if displacement_override:

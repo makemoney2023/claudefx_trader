@@ -29,6 +29,9 @@ from .analysis.liquidity import LiquidityMapper
 from .analysis.kill_zones import (
     KillZoneChecker,
     claude_analysis_allowed,
+    format_claude_ny_window_label,
+    is_in_claude_ny_window,
+    minutes_until_claude_ny_window,
     resolve_outside_kz_cycle_symbols,
 )
 from .analysis.silver_bullet import SilverBulletDetector
@@ -919,19 +922,31 @@ class TradingBot:
         logger.info("Starting main trading loop...")
         logger.info(f"Trading symbols: {settings.trading.symbols}")
         logger.info(f"Allowed sessions: {settings.trading.allowed_sessions}")
+        logger.info(
+            f"Claude analysis window: {settings.trading.claude_analysis_window} "
+            f"(lead={settings.trading.claude_ny_lead_minutes}min)"
+        )
         logger.info(f"Max daily trades: {settings.trading.max_daily_trades}")
         
         # Launch independent position management loop
         self._position_mgr_task = asyncio.create_task(self._position_management_loop())
         logger.info("Independent position management loop launched (10s interval)")
 
-        if settings.trading.opportunity_scanner_enabled:
+        from .config import opportunity_scanner_should_run
+
+        if opportunity_scanner_should_run():
             self._opportunity_scan_task = asyncio.create_task(
                 self._opportunity_scan_loop()
             )
+            _scanner_reason = (
+                "enabled"
+                if settings.trading.opportunity_scanner_enabled
+                else "auto (ny_open Claude window)"
+            )
             logger.info(
                 "Opportunity scanner loop launched "
-                f"({settings.trading.opportunity_scanner_interval_seconds}s interval)"
+                f"({settings.trading.opportunity_scanner_interval_seconds}s interval, "
+                f"{_scanner_reason})"
             )
         
         self._last_state_save = datetime.now(timezone.utc)
@@ -1566,29 +1581,38 @@ class TradingBot:
             
             print(f"[CYCLE] Passed drawdown/profit/limit checks, checking kill zone...", flush=True)
             
-            # Check if we're in a valid kill zone
+            # Check if we're in a valid Claude analysis window
             session = self.kill_zone_checker.get_current_session()
             print(f"[CYCLE] Session: {session.session_name}, is_tradeable={session.is_tradeable}, is_kill_zone={session.is_kill_zone}", flush=True)
             _disp_override_symbols: List[str] = []
+            from .config import claude_analysis_window_is_ny_open
             from .services.setup_fingerprint import is_liquidity_reversal_lean_active
+
+            _lead = int(getattr(settings.trading, "claude_ny_lead_minutes", 30) or 30)
+            _window = getattr(settings.trading, "claude_analysis_window", "ny_open")
+            _ny_only = claude_analysis_window_is_ny_open(_window)
+            _in_ny_window = is_in_claude_ny_window(lead_minutes=_lead)
 
             if not claude_analysis_allowed(
                 session.is_tradeable,
                 claude_kill_zone_only=settings.trading.claude_kill_zone_only,
                 lean_active=is_liquidity_reversal_lean_active(),
+                analysis_window=_window,
+                in_ny_window=_in_ny_window,
             ):
-                # Any session: still analyze metals with a live M5 displacement
-                # (London gaps, Asian, NY, off-hours — not Asian-only).
-                for _sym in list(cycle_symbols):
-                    if (_sym or "").upper() not in PRECIOUS_METALS:
-                        continue
-                    try:
-                        if await self._m5_displacement_wakeup(_sym):
-                            _disp_override_symbols.append(_sym)
-                    except Exception as _disp_err:
-                        logger.debug(
-                            f"[DISP-OVERRIDE] {_sym}: wakeup check failed: {_disp_err}"
-                        )
+                # Legacy all_kill_zones only: metals M5 displacement can wake Claude.
+                # ny_open never punches through — that is the API-spend control.
+                if not _ny_only:
+                    for _sym in list(cycle_symbols):
+                        if (_sym or "").upper() not in PRECIOUS_METALS:
+                            continue
+                        try:
+                            if await self._m5_displacement_wakeup(_sym):
+                                _disp_override_symbols.append(_sym)
+                        except Exception as _disp_err:
+                            logger.debug(
+                                f"[DISP-OVERRIDE] {_sym}: wakeup check failed: {_disp_err}"
+                            )
                 if _disp_override_symbols:
                     print(
                         f"[CYCLE] Outside KZ ({session.session_name}) — "
@@ -1603,15 +1627,20 @@ class TradingBot:
                     cycle_symbols = _disp_override_symbols
                     self._off_hours_mode = False
                 else:
-                    next_kz = session.next_kill_zone or "next kill zone"
-                    mins = session.next_kill_zone_in_minutes
+                    if _ny_only:
+                        next_kz = format_claude_ny_window_label(_lead)
+                        mins = minutes_until_claude_ny_window(lead_minutes=_lead)
+                    else:
+                        next_kz = session.next_kill_zone or "next kill zone"
+                        mins = session.next_kill_zone_in_minutes
                     eta = f" in {mins}min" if mins is not None else ""
                     print(
-                        f"[CYCLE] Outside KZ ({session.session_name}) — Claude skipped until {next_kz}{eta}",
+                        f"[CYCLE] Outside Claude window ({session.session_name}) — "
+                        f"Claude skipped until {next_kz}{eta}",
                         flush=True,
                     )
                     logger.info(
-                        f"Outside kill zone ({session.session_name}) — "
+                        f"Outside Claude window ({session.session_name}) — "
                         f"Claude hard-skipped until {next_kz}{eta}"
                     )
                     self._off_hours_mode = True
@@ -1619,7 +1648,11 @@ class TradingBot:
                         bot_state.start_cycle(session.session_name, session.is_tradeable)
                         bot_state.cycle_complete()
                     return
-            if not session.is_tradeable and not _disp_override_symbols:
+            # 6:30–7:00 ET is inside the NY Claude window but not a kill zone.
+            # Keep the scanner hot list + base symbols; do not crypto-filter.
+            if _ny_only and _in_ny_window:
+                self._off_hours_mode = False
+            elif not session.is_tradeable and not _disp_override_symbols:
                 # Outside KZ: crypto-only unless lean keeps full set (metals/forex)
                 # and clears off_hours so off_hours_cap does not kill lean fades.
                 from .services.setup_fingerprint import lean_continues_outside_kill_zone

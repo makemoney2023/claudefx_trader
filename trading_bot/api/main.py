@@ -448,7 +448,9 @@ async def _run_bot_background():
         logger.info("Independent position management loop launched (10s interval)")
         print("[BOT] Independent position management loop launched (10s interval)", flush=True)
 
-        if settings.trading.opportunity_scanner_enabled:
+        from ..config import opportunity_scanner_should_run
+
+        if opportunity_scanner_should_run():
             _bot_instance._opportunity_scan_task = asyncio.create_task(
                 _bot_instance._opportunity_scan_loop()
             )
