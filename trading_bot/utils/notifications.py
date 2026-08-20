@@ -68,11 +68,133 @@ class NotificationType(Enum):
     """Types of notifications."""
     TRADE_OPENED = "trade_opened"
     TRADE_CLOSED = "trade_closed"
+    PENDING_PLACED = "pending_placed"
+    PENDING_FILLED = "pending_filled"
+    PENDING_CANCELLED = "pending_cancelled"
+    TRADING_HALTED = "trading_halted"
+    CONNECTION = "connection"
     SIGNAL_GENERATED = "signal_generated"
     ERROR = "error"
     WARNING = "warning"
+    ALERT = "alert"
     DAILY_SUMMARY = "daily_summary"
     INFO = "info"
+
+
+_CANCEL_REASON_LABELS = {
+    "expired": "expired (not filled)",
+    "replaced_by_newer": "replaced by newer signal",
+    "volatility_spike": "volatility spike",
+    "external": "cancelled on broker",
+    "manual": "cancelled",
+}
+
+
+def _risk_reward_label(entry_price: float, stop_loss: float, take_profit: float) -> str:
+    sl_dist = abs(float(entry_price or 0) - float(stop_loss or 0)) if stop_loss else 0
+    tp_dist = abs(float(take_profit or 0) - float(entry_price or 0)) if take_profit else 0
+    if sl_dist <= 0:
+        return "N/A"
+    return f"{tp_dist / sl_dist:.1f}"
+
+
+def format_pending_placed(
+    symbol: str,
+    direction: str,
+    order_type: str,
+    entry_price: float,
+    stop_loss: Optional[float],
+    take_profit: Optional[float],
+    lots: float,
+    ticket: Optional[int] = None,
+    expires_min: Optional[float] = None,
+    confidence: Optional[float] = None,
+) -> str:
+    """HTML card for a newly placed pending order."""
+    fp = lambda p: TelegramNotifier._format_price(float(p or 0), symbol)
+    rr = _risk_reward_label(entry_price, stop_loss or 0, take_profit or 0)
+    conf_line = ""
+    if confidence:
+        conf_line = f"\n<b>Confidence:</b> {float(confidence):.0%}"
+    exp_line = ""
+    if expires_min is not None:
+        exp_line = f"\n<b>Expires:</b> ~{max(0, int(round(expires_min)))} min"
+    ticket_line = f"\n<b>Ticket:</b> {ticket}" if ticket else ""
+    return f"""⏳ <b>Pending Placed</b>
+
+<b>Symbol:</b> {symbol}
+<b>Type:</b> {str(order_type or '').replace('_', ' ').upper()}
+<b>Direction:</b> {str(direction or '').upper()}
+<b>Entry:</b> {fp(entry_price)}
+<b>Stop Loss:</b> {fp(stop_loss) if stop_loss else '—'}
+<b>Take Profit:</b> {fp(take_profit) if take_profit else '—'}
+<b>R:R:</b> 1:{rr}
+<b>Size:</b> {lots} lots{conf_line}{exp_line}{ticket_line}"""
+
+
+def format_pending_filled(
+    symbol: str,
+    direction: str,
+    fill_price: float,
+    ticket: Optional[int] = None,
+    position_ticket: Optional[int] = None,
+    lots: Optional[float] = None,
+) -> str:
+    """HTML card when a pending order becomes a position."""
+    fp = lambda p: TelegramNotifier._format_price(float(p or 0), symbol)
+    extra = ""
+    if lots:
+        extra += f"\n<b>Size:</b> {lots} lots"
+    if ticket:
+        extra += f"\n<b>Order:</b> {ticket}"
+    if position_ticket:
+        extra += f"\n<b>Position:</b> {position_ticket}"
+    return f"""✅ <b>Pending Filled</b>
+
+<b>Symbol:</b> {symbol}
+<b>Direction:</b> {str(direction or '').upper()}
+<b>Fill:</b> {fp(fill_price)}{extra}"""
+
+
+def format_pending_cancelled(
+    symbol: str,
+    direction: str,
+    order_type: str,
+    entry_price: float,
+    ticket: Optional[int] = None,
+    reason: str = "",
+) -> str:
+    """HTML card when a pending order is cancelled or expired."""
+    fp = lambda p: TelegramNotifier._format_price(float(p or 0), symbol)
+    label = _CANCEL_REASON_LABELS.get(
+        str(reason or "").strip().lower(),
+        str(reason or "cancelled").replace("_", " "),
+    )
+    ticket_line = f"\n<b>Ticket:</b> {ticket}" if ticket else ""
+    return f"""🚫 <b>Pending Cancelled</b>
+
+<b>Symbol:</b> {symbol}
+<b>Type:</b> {str(order_type or '').replace('_', ' ').upper()}
+<b>Direction:</b> {str(direction or '').upper()}
+<b>Entry:</b> {fp(entry_price)}
+<b>Reason:</b> {label}{ticket_line}"""
+
+
+def format_trading_halted(reason: str, detail: str = "") -> str:
+    extra = f"\n{detail}" if detail else ""
+    return (
+        f"🛑 <b>Trading Halted</b>\n\n"
+        f"<b>Reason:</b> {reason}{extra}\n"
+        f"New entries paused. Position management continues."
+    )
+
+
+def format_connection_alert(reconnected: bool = False, detail: str = "") -> str:
+    if reconnected:
+        extra = f"\n{detail}" if detail else ""
+        return f"🔌 <b>MT5 Reconnected</b>{extra}"
+    extra = f"\n{detail}" if detail else "\nReconnection failed. Trading paused until MT5 is back."
+    return f"🔌 <b>MT5 Disconnected</b>{extra}"
 
 
 class TelegramNotifier:
@@ -286,10 +408,7 @@ class TelegramNotifier:
         emoji = "📈" if direction.lower() == "long" else "📉"
         fp = lambda p: self._format_price(p, symbol)
         
-        # Calculate risk/reward
-        sl_dist = abs(entry_price - stop_loss) if stop_loss else 0
-        tp_dist = abs(take_profit - entry_price) if take_profit else 0
-        rr = f"{tp_dist / sl_dist:.1f}" if sl_dist > 0 else "N/A"
+        rr = _risk_reward_label(entry_price, stop_loss, take_profit)
         
         # Get swap cost info from symbol spec
         swap_line = ""
@@ -446,6 +565,68 @@ async def notify(
             unconfirmed=kwargs.get('unconfirmed', False)
         )
     
+    elif notification_type == NotificationType.PENDING_PLACED:
+        return await notifier.send_message(
+            format_pending_placed(
+                symbol=kwargs.get("symbol", "Unknown"),
+                direction=kwargs.get("direction", ""),
+                order_type=kwargs.get("order_type", "pending"),
+                entry_price=kwargs.get("entry_price", 0),
+                stop_loss=kwargs.get("stop_loss"),
+                take_profit=kwargs.get("take_profit"),
+                lots=kwargs.get("lots", 0),
+                ticket=kwargs.get("ticket"),
+                expires_min=kwargs.get("expires_min"),
+                confidence=kwargs.get("confidence"),
+            )
+        )
+
+    elif notification_type == NotificationType.PENDING_FILLED:
+        return await notifier.send_message(
+            format_pending_filled(
+                symbol=kwargs.get("symbol", "Unknown"),
+                direction=kwargs.get("direction", ""),
+                fill_price=kwargs.get("fill_price", kwargs.get("entry_price", 0)),
+                ticket=kwargs.get("ticket"),
+                position_ticket=kwargs.get("position_ticket"),
+                lots=kwargs.get("lots"),
+            )
+        )
+
+    elif notification_type == NotificationType.PENDING_CANCELLED:
+        return await notifier.send_message(
+            format_pending_cancelled(
+                symbol=kwargs.get("symbol", "Unknown"),
+                direction=kwargs.get("direction", ""),
+                order_type=kwargs.get("order_type", "pending"),
+                entry_price=kwargs.get("entry_price", 0),
+                ticket=kwargs.get("ticket"),
+                reason=kwargs.get("reason", ""),
+            )
+        )
+
+    elif notification_type == NotificationType.TRADING_HALTED:
+        return await notifier.send_message(
+            format_trading_halted(
+                reason=kwargs.get("reason") or message,
+                detail=kwargs.get("detail", ""),
+            )
+        )
+
+    elif notification_type == NotificationType.CONNECTION:
+        return await notifier.send_message(
+            format_connection_alert(
+                reconnected=bool(kwargs.get("reconnected")),
+                detail=kwargs.get("detail", ""),
+            )
+        )
+
+    elif notification_type == NotificationType.ALERT:
+        return await notifier.send_message(message)
+
+    elif notification_type == NotificationType.WARNING:
+        return await notifier.send_message(f"⚠️ {message}")
+
     elif notification_type == NotificationType.ERROR:
         return await notifier.notify_error(message, kwargs.get('context'))
     
@@ -463,3 +644,12 @@ async def notify(
     else:
         # Generic message
         return await notifier.send_message(f"ℹ️ {message}")
+
+
+async def safe_notify(notification_type: NotificationType, message: str = "", **kwargs) -> bool:
+    """Best-effort notify — never raises into trading paths."""
+    try:
+        return await notify(notification_type, message, **kwargs)
+    except Exception as exc:
+        logger.debug(f"Notification skipped ({notification_type}): {exc}")
+        return False

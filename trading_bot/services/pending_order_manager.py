@@ -219,6 +219,60 @@ class PendingOrderManager:
     def set_kill_zone_checker(self, checker):
         """Set the kill zone checker."""
         self.kill_zone_checker = checker
+
+    async def _notify_lifecycle(
+        self,
+        kind: str,
+        order: "PendingOrder",
+        *,
+        reason: Optional[str] = None,
+        position_ticket: Optional[int] = None,
+    ) -> None:
+        """Push a Telegram card for pending place / fill / cancel. Fail-open."""
+        try:
+            from ..utils.notifications import NotificationType, safe_notify
+
+            if kind == "placed":
+                await safe_notify(
+                    NotificationType.PENDING_PLACED,
+                    "Pending placed",
+                    symbol=order.symbol,
+                    direction=order.direction,
+                    order_type=order.order_type,
+                    entry_price=order.price,
+                    stop_loss=order.stop_loss,
+                    take_profit=order.take_profit,
+                    lots=order.volume,
+                    ticket=order.ticket,
+                    expires_min=order.minutes_remaining,
+                )
+                return
+            if kind == "filled":
+                fill = order.fill_price if order.fill_price is not None else order.price
+                await safe_notify(
+                    NotificationType.PENDING_FILLED,
+                    "Pending filled",
+                    symbol=order.symbol,
+                    direction=order.direction,
+                    fill_price=fill,
+                    lots=order.volume,
+                    ticket=order.ticket,
+                    position_ticket=position_ticket,
+                )
+                return
+            if kind == "cancelled":
+                await safe_notify(
+                    NotificationType.PENDING_CANCELLED,
+                    "Pending cancelled",
+                    symbol=order.symbol,
+                    direction=order.direction,
+                    order_type=order.order_type,
+                    entry_price=order.price,
+                    reason=reason or order.cancel_reason,
+                    ticket=order.ticket,
+                )
+        except Exception as exc:
+            logger.debug(f"Pending lifecycle notify skipped ({kind}): {exc}")
     
     async def add_order(
         self,
@@ -293,6 +347,7 @@ class PendingOrderManager:
             f"Tracking pending order: {order_type} {symbol} @ {price}, "
             f"expires in {order.minutes_remaining:.0f}min"
         )
+        await self._notify_lifecycle("placed", order)
         
         return order
     
@@ -401,6 +456,7 @@ class PendingOrderManager:
                     logger.warning(f"Decision recorder failed for order {ticket}: {e}")
             
             logger.info(f"Order {ticket} cancelled: {reason}")
+            await self._notify_lifecycle("cancelled", order, reason=reason)
             return True
             
         except Exception as e:
@@ -523,6 +579,11 @@ class PendingOrderManager:
                         f"Order {ticket} filled at {order.fill_price} "
                         f"(matched via {match_method}, position={pos_ticket})"
                     )
+                    await self._notify_lifecycle(
+                        "filled",
+                        order,
+                        position_ticket=pos_ticket,
+                    )
                     continue
                 
                 # Not in pending orders, not in open positions.
@@ -551,6 +612,11 @@ class PendingOrderManager:
                     logger.info(
                         f"Order {ticket} filled at {order.fill_price} then closed at "
                         f"{close_price} — P/L: ${pnl:.2f}"
+                    )
+                    await self._notify_lifecycle(
+                        "filled",
+                        order,
+                        position_ticket=deal_result.get("position_id"),
                     )
                     
                     close_event = self._build_closed_trade_event(
@@ -581,6 +647,7 @@ class PendingOrderManager:
                         flush=True
                     )
                     logger.info(f"Order {ticket} was cancelled externally")
+                    await self._notify_lifecycle("cancelled", order, reason="external")
             
             return {
                 "filled": len(filled),

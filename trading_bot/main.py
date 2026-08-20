@@ -81,7 +81,7 @@ from .services.claude_trade_manager import ClaudeTradeManager
 from .services.pending_order_manager import PendingOrderManager
 from .services.trade_reservations import TradeReservationLedger, ReservationState
 from .services.firecrawl_intelligence import FirecrawlIntelligenceService
-from .utils.notifications import notify, NotificationType, get_notifier
+from .utils.notifications import notify, NotificationType, get_notifier, safe_notify
 from .utils.state_persistence import save_full_state, load_full_state, get_persistence
 from .utils.market_hours import is_market_open, should_avoid_new_trades, get_next_market_open
 from .utils.instance_lock import ensure_single_instance, release_instance_lock
@@ -439,6 +439,12 @@ class TradingBot:
         # Volatility spike response state
         self._volatility_pause_until: Optional[datetime] = None
         self._volatility_spike_expiry: Dict[str, datetime] = {}
+
+        # Telegram debounce: once until the condition clears
+        self._mt5_disconnect_notified = False
+        self._news_failclosed_notified = False
+        self._defensive_halt_logged = False
+        self._profit_target_notified = False
         
         # Edge policy state: regime tags for fill telemetry, playbook cache
         self._last_regime_by_symbol: Dict[str, Optional[str]] = {}
@@ -1337,8 +1343,9 @@ class TradingBot:
             if self.mt5_client and not self.mt5_client.is_simulation:
                 if not await self.mt5_client.ensure_connected():
                     logger.error("MT5 connection lost and reconnection failed")
-                    await self._notify_error("MT5 disconnected", "Reconnection failed")
+                    await self._notify_mt5_disconnected("Reconnection failed")
                     return
+                await self._notify_mt5_reconnected()
             
             # ============================================
             # STEP 0B: CHECK MARKET HOURS (WEEKEND)
@@ -1644,6 +1651,11 @@ class TradingBot:
                     )
                     if bot_state:
                         bot_state.error(None, "Trading halted — DEFENSIVE mode")
+                    await safe_notify(
+                        NotificationType.TRADING_HALTED,
+                        "DEFENSIVE mode halt",
+                        reason="DEFENSIVE mode (severe drawdown)",
+                    )
                 print("[CYCLE] BLOCKED for new trades: DEFENSIVE mode halt (positions still being managed)", flush=True)
                 return
             else:
@@ -1671,14 +1683,23 @@ class TradingBot:
                     logger.warning(
                         "News calendar UNKNOWN/stale — blocking all new trades until refreshed (fail-closed)"
                     )
-                    from .api.routes.activity import add_activity
-                    add_activity(
-                        "news_calendar_stale",
-                        "News calendar stale — fail-closed, no new trades",
-                        details={"fail_closed": True},
-                    )
+                    if not getattr(self, "_news_failclosed_notified", False):
+                        self._news_failclosed_notified = True
+                        from .api.routes.activity import add_activity
+                        add_activity(
+                            "news_calendar_stale",
+                            "News calendar stale — fail-closed, no new trades",
+                            details={"fail_closed": True},
+                        )
+                        await safe_notify(
+                            NotificationType.TRADING_HALTED,
+                            "News calendar fail-closed",
+                            reason="News calendar stale (fail-closed)",
+                            detail="New entries blocked until the economic calendar refreshes.",
+                        )
                     print("[CYCLE] BLOCKED: News calendar stale (fail-closed)", flush=True)
                     return
+                self._news_failclosed_notified = False
             elif not settings.trading.news_gates_enabled:
                 logger.info(
                     "News gates disabled (TRADING_NEWS_GATES_ENABLED=false) — "
@@ -3556,12 +3577,9 @@ class TradingBot:
             # Get account info
             account = await self.mt5_client.get_account_info()
             if not account:
-                # MT5 connection lost - alert and pause
+                # MT5 connection lost - alert once until reconnect
                 logger.error("KILL SWITCH: Cannot reach MT5 - pausing trading")
-                await notify(
-                    NotificationType.ERROR,
-                    "KILL SWITCH: MT5 connection lost - trading paused",
-                )
+                await self._notify_mt5_disconnected("Kill switch cannot reach MT5")
                 from .api.routes.activity import add_activity
                 add_activity(
                     "kill_switch",
@@ -3619,9 +3637,11 @@ class TradingBot:
                     logger.warning(
                         f"KILL SWITCH: Weekly drawdown {weekly_drawdown:.1%} exceeds limit {max_weekly_dd:.1%} - STOPPING"
                     )
-                    await notify(
-                        NotificationType.ERROR,
-                        f"KILL SWITCH: Weekly drawdown {weekly_drawdown:.1%} - all trading halted until next week",
+                    await safe_notify(
+                        NotificationType.TRADING_HALTED,
+                        "Weekly drawdown kill switch",
+                        reason=f"Weekly drawdown {weekly_drawdown:.1%}",
+                        detail=f"Limit: {max_weekly_dd:.1%}. Trading halted until next week.",
                     )
                     from .api.routes.activity import add_activity
                     add_activity(
@@ -3642,9 +3662,11 @@ class TradingBot:
                     logger.warning(
                         f"KILL SWITCH: Daily drawdown {daily_drawdown:.1%} exceeds limit {max_daily_dd:.1%} - STOPPING"
                     )
-                    await notify(
-                        NotificationType.ERROR,
-                        f"KILL SWITCH: Daily drawdown {daily_drawdown:.1%} - trading paused for today",
+                    await safe_notify(
+                        NotificationType.TRADING_HALTED,
+                        "Daily drawdown kill switch",
+                        reason=f"Daily drawdown {daily_drawdown:.1%}",
+                        detail=f"Limit: {max_daily_dd:.1%}. New entries paused for today.",
                     )
                     from .api.routes.activity import add_activity
                     add_activity(
@@ -3665,9 +3687,9 @@ class TradingBot:
                     logger.warning(
                         f"DRAWDOWN WARNING: Daily drawdown {daily_drawdown:.1%} approaching limit {max_daily_dd:.1%}"
                     )
-                    await notify(
-                        NotificationType.ERROR,
-                        f"WARNING: Daily drawdown at {daily_drawdown:.1%} (limit: {max_daily_dd:.1%})",
+                    await safe_notify(
+                        NotificationType.WARNING,
+                        f"Daily drawdown at {daily_drawdown:.1%} (limit: {max_daily_dd:.1%})",
                     )
             else:
                 self._daily_warning_sent = False
@@ -3716,6 +3738,12 @@ class TradingBot:
                         f"Daily profit target reached: +{daily_profit_pct:.1%} (realized)",
                         None,
                         {"profit_pct": daily_profit_pct, "target": max_daily_profit}
+                    )
+                    await safe_notify(
+                        NotificationType.TRADING_HALTED,
+                        "Daily profit lock",
+                        reason=f"Daily profit lock (+{daily_profit_pct:.1%})",
+                        detail=f"Target: {max_daily_profit:.1%}. New entries paused to lock in gains.",
                     )
                 return True
             else:
@@ -6653,6 +6681,29 @@ Apply the evaluation rules from the system message and reply per the OUTPUT CONT
             )
         except Exception as e:
             logger.error(f"Failed to send error notification: {e}")
+
+    async def _notify_mt5_disconnected(self, detail: str = "") -> None:
+        """Telegram CONNECTION card once until MT5 comes back."""
+        if getattr(self, "_mt5_disconnect_notified", False):
+            return
+        self._mt5_disconnect_notified = True
+        await safe_notify(
+            NotificationType.CONNECTION,
+            "MT5 disconnected",
+            reconnected=False,
+            detail=detail,
+        )
+
+    async def _notify_mt5_reconnected(self) -> None:
+        """Telegram reconnect ping after a prior disconnect notification."""
+        if not getattr(self, "_mt5_disconnect_notified", False):
+            return
+        self._mt5_disconnect_notified = False
+        await safe_notify(
+            NotificationType.CONNECTION,
+            "MT5 reconnected",
+            reconnected=True,
+        )
     
     def get_status_summary(self) -> dict:
         """
